@@ -3883,7 +3883,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        user_config: Optional[dict] = None,
+        attachment_count: int = 0,
+        explicit_model: bool = False,
+        repo_mutation: bool | None = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -3903,6 +3913,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        smart_routing = None
+        gjc_prepared = None
+        try:
+            from hermes_cli.smart_model_routing import (
+                apply_decision_to_runtime,
+                decide_route,
+                record_current_task_policy_decision,
+            )
+
+            decision = decide_route(
+                user_message,
+                config=user_config or getattr(self, "config", None),
+                has_multimodal=attachment_count > 0,
+                explicit_model=explicit_model,
+                repo_mutation=repo_mutation,
+            )
+            model, runtime, smart_routing = apply_decision_to_runtime(
+                decision,
+                current_model=model,
+                current_runtime=runtime,
+            )
+            try:
+                record_current_task_policy_decision(smart_routing)
+            except Exception:
+                logger.debug("smart_model_routing policy persistence failed", exc_info=True)
+            if (
+                isinstance(smart_routing, dict)
+                and str(smart_routing.get("selected_lane") or "").startswith("gjc_")
+                and not smart_routing.get("blocked")
+            ):
+                from hermes_cli.gjc_coordinator import prepare_current_task_gjc_execution
+
+                gjc_prepared = prepare_current_task_gjc_execution(
+                    config=user_config or getattr(self, "config", None),
+                    routing_metadata=smart_routing,
+                    prompt=user_message,
+                )
+                if gjc_prepared.get("blocked"):
+                    smart_routing = {**smart_routing, **gjc_prepared}
+                elif gjc_prepared.get("enabled"):
+                    smart_routing = {
+                        **smart_routing,
+                        "gjc_execution": {
+                            "task_id": gjc_prepared.get("task_id"),
+                            "lane": gjc_prepared.get("lane"),
+                            "workflow": gjc_prepared.get("workflow"),
+                        },
+                    }
+        except Exception:
+            logger.debug("smart_model_routing decision failed", exc_info=True)
+
         route = {
             "model": model,
             "runtime": runtime,
@@ -3915,6 +3976,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tuple(runtime["args"]),
             ),
         }
+        if smart_routing is not None:
+            route["smart_routing"] = smart_routing
+            if smart_routing.get("blocked"):
+                route["blocked"] = smart_routing
+            elif isinstance(gjc_prepared, dict) and gjc_prepared.get("enabled"):
+                route["gjc_execution"] = gjc_prepared
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -13285,7 +13352,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            image_count = sum(
+                1
+                for i, _path in enumerate(media_urls)
+                if (media_types[i] if i < len(media_types) else "").startswith("image/")
+            )
+            try:
+                turn_route = self._resolve_turn_agent_config(
+                    prompt,
+                    model,
+                    runtime_kwargs,
+                    user_config=user_config,
+                    attachment_count=image_count,
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            if turn_route.get("blocked"):
+                await adapter.send(
+                    source.chat_id,
+                    turn_route["blocked"].get("message") or f"Background task {task_id} was blocked by policy.",
+                    metadata=_thread_metadata,
+                )
+                return
+            if turn_route.get("gjc_execution"):
+                from hermes_cli.gjc_coordinator import run_gjc_execution
+
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    run_gjc_execution,
+                    turn_route["gjc_execution"],
+                )
+                response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                await adapter.send(
+                    source.chat_id,
+                    response or f"Background task {task_id} completed through GJC.",
+                    metadata=_thread_metadata,
+                )
+                return
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -18049,7 +18155,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            pending_native = getattr(self, "_pending_native_image_paths_by_session", None) or {}
+            try:
+                turn_route = self._resolve_turn_agent_config(
+                    message,
+                    model,
+                    runtime_kwargs,
+                    user_config=user_config,
+                    attachment_count=len(pending_native.get(session_key) or []),
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            if turn_route.get("blocked"):
+                return turn_route["blocked"].get("message") or "Smart model routing blocked this turn."
+            if turn_route.get("gjc_execution"):
+                from hermes_cli.gjc_coordinator import run_gjc_execution
+
+                result = run_gjc_execution(turn_route["gjc_execution"])
+                return result.get("final_response", "") if isinstance(result, dict) else str(result)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool

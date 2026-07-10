@@ -977,6 +977,53 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Per-turn policy-first model routing. Disabled by default. When enabled,
+    # Hermes classifies the request before model selection and may route safe
+    # read-only turns to a configured lane target. Mutation-capable and
+    # high-risk turns fail closed unless their gate is explicitly set to allow.
+    "smart_model_routing": {
+        "enabled": False,
+        "respect_explicit_model": False,
+        "gates": {
+            "repo_mutation": "block",  # block | allow
+            "high_risk": "allow",      # block | allow
+            "gjc_escalation": "block", # block | allow; still requires task approval
+        },
+        "gjc_coordinator": {
+            "enabled": False,
+            "command": "gjc",
+            "args": ["mcp-serve", "coordinator"],
+            "tool": "gjc_delegate_plan",
+            "question_answer_tool": "gjc_coordinator_submit_question_answer",
+            "bounded_await_tool": "gjc_coordinator_await_turn",
+            "timeout": 300,
+            "connect_timeout": 60,
+            "session_command": "",
+            "env": {},
+        },
+        "routes": {
+            "cheap_chat": {
+                "provider": "",
+                "model": "",
+            },
+            "reasoning": {
+                "provider": "",
+                "model": "",
+            },
+            "codex_implementation": {
+                "provider": "",
+                "model": "",
+            },
+            "research_readonly": {
+                "provider": "",
+                "model": "",
+            },
+            "multimodal": {
+                "provider": "",
+                "model": "",
+            },
+        },
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.

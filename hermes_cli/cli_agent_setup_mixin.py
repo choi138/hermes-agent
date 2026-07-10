@@ -171,7 +171,13 @@ class CLIAgentSetupMixin:
 
         return True
 
-    def _resolve_turn_agent_config(self, user_message: str) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        *,
+        attachment_count: int = 0,
+        repo_mutation: bool | None = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single user turn.
 
         Always uses the session's primary model/provider.  If the user has
@@ -190,11 +196,67 @@ class CLIAgentSetupMixin:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        smart_routing = None
+        gjc_prepared = None
+        try:
+            from hermes_cli.smart_model_routing import (
+                apply_decision_to_runtime,
+                decide_route,
+                record_current_task_policy_decision,
+            )
+
+            decision = decide_route(
+                user_message,
+                config=getattr(self, "config", None),
+                has_multimodal=attachment_count > 0,
+                explicit_model=not bool(getattr(self, "_model_is_default", True)),
+                repo_mutation=repo_mutation,
+            )
+            routed_model, runtime, smart_routing = apply_decision_to_runtime(
+                decision,
+                current_model=self.model,
+                current_runtime=runtime,
+            )
+            try:
+                record_current_task_policy_decision(smart_routing)
+            except Exception:
+                from cli import logger
+
+                logger.debug("smart_model_routing policy persistence failed", exc_info=True)
+            if (
+                isinstance(smart_routing, dict)
+                and str(smart_routing.get("selected_lane") or "").startswith("gjc_")
+                and not smart_routing.get("blocked")
+            ):
+                from hermes_cli.gjc_coordinator import prepare_current_task_gjc_execution
+
+                gjc_prepared = prepare_current_task_gjc_execution(
+                    config=getattr(self, "config", None),
+                    routing_metadata=smart_routing,
+                    prompt=user_message,
+                )
+                if gjc_prepared.get("blocked"):
+                    smart_routing = {**smart_routing, **gjc_prepared}
+                elif gjc_prepared.get("enabled"):
+                    smart_routing = {
+                        **smart_routing,
+                        "gjc_execution": {
+                            "task_id": gjc_prepared.get("task_id"),
+                            "lane": gjc_prepared.get("lane"),
+                            "workflow": gjc_prepared.get("workflow"),
+                        },
+                    }
+        except Exception:
+            from cli import logger
+
+            logger.debug("smart_model_routing decision failed", exc_info=True)
+            routed_model = self.model
+
         route = {
-            "model": self.model,
+            "model": routed_model,
             "runtime": runtime,
             "signature": (
-                self.model,
+                routed_model,
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
@@ -202,6 +264,12 @@ class CLIAgentSetupMixin:
                 tuple(runtime["args"]),
             ),
         }
+        if smart_routing is not None:
+            route["smart_routing"] = smart_routing
+            if smart_routing.get("blocked"):
+                route["blocked"] = smart_routing
+            elif isinstance(gjc_prepared, dict) and gjc_prepared.get("enabled"):
+                route["gjc_execution"] = gjc_prepared
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:
@@ -349,7 +417,7 @@ class CLIAgentSetupMixin:
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
-                max_tokens=self.max_tokens,
+                max_tokens=runtime.get("max_tokens") if runtime.get("max_tokens") is not None else self.max_tokens,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 disabled_toolsets=self.disabled_toolsets,

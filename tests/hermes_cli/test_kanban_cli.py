@@ -159,6 +159,28 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_control_plane_approval_question_evidence_gjc(kanban_home):
+    out = kc.run_slash("create 'gjc gated' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    requested = kc.run_slash(f"approval request {tid} --type gjc_escalation 'allow gjc'")
+    approval_id = int(re.search(r"#(\d+)", requested).group(1))
+    assert f"Approval requested #{approval_id}" in requested
+    assert f"Approved #{approval_id}" in kc.run_slash(f"approval approve {approval_id} --by tester")
+
+    asked = kc.run_slash(f"question ask {tid} 'Which target package?'")
+    question_id = int(re.search(r"#(\d+)", asked).group(1))
+    assert f"Answered #{question_id}" in kc.run_slash(f"question answer {question_id} 'payments'")
+
+    assert "Evidence recorded" in kc.run_slash(
+        f"evidence add {tid} --kind gjc_artifact --ref artifact://plan"
+    )
+    state_json = json.loads(kc.run_slash(f"gjc state {tid} --json"))
+    assert state_json["approved"] is True
+    assert state_json["open_questions"] == []
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

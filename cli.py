@@ -12100,7 +12100,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
+        try:
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                attachment_count=len(images or []),
+            )
+        except TypeError as exc:
+            if "attachment_count" not in str(exc):
+                raise
+            turn_route = self._resolve_turn_agent_config(message)
+        if turn_route.get("blocked"):
+            response = turn_route["blocked"].get("message") or "Smart model routing blocked this turn."
+            _cprint(f"{_DIM}{response}{_RST}")
+            return response
+        if turn_route.get("gjc_execution"):
+            from hermes_cli.gjc_coordinator import run_gjc_execution
+
+            response_payload = run_gjc_execution(turn_route["gjc_execution"])
+            response = (
+                response_payload.get("final_response")
+                if isinstance(response_payload, dict)
+                else str(response_payload)
+            )
+            if response:
+                _cprint(response)
+            return response
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -12129,8 +12153,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 from hermes_cli.config import load_config
 
                 _img_mode = decide_image_input_mode(
-                    (self.provider or "").strip(),
-                    (self.model or "").strip(),
+                    (turn_route["runtime"].get("provider") or self.provider or "").strip(),
+                    (turn_route.get("model") or self.model or "").strip(),
                     load_config(),
                 )
             except Exception as _img_exc:
@@ -12177,7 +12201,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
                 _ctx_len = get_model_context_length(
-                    self.model, base_url=self.base_url or "", api_key=self.api_key or "",
+                    turn_route.get("model") or self.model,
+                    base_url=turn_route["runtime"].get("base_url") or self.base_url or "",
+                    api_key=turn_route["runtime"].get("api_key") or self.api_key or "",
                     config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None)
                 _ctx_result = preprocess_context_references(
                     message, cwd=os.getcwd(), context_length=_ctx_len)
@@ -16145,7 +16171,27 @@ def main(
                                 single_query_images,
                                 announce=False,
                             )
-                    turn_route = cli._resolve_turn_agent_config(effective_query)
+                    try:
+                        turn_route = cli._resolve_turn_agent_config(
+                            effective_query,
+                            attachment_count=len(single_query_images or []) + len(single_query_image_urls or []),
+                        )
+                    except TypeError as exc:
+                        if "attachment_count" not in str(exc):
+                            raise
+                        turn_route = cli._resolve_turn_agent_config(effective_query)
+                    if turn_route.get("blocked"):
+                        print(turn_route["blocked"].get("message") or "Smart model routing blocked this turn.")
+                        return
+                    if turn_route.get("gjc_execution"):
+                        from hermes_cli.gjc_coordinator import run_gjc_execution
+
+                        result = run_gjc_execution(turn_route["gjc_execution"])
+                        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        if response:
+                            print(response)
+                        print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                        sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
                     if turn_route["signature"] != cli._active_agent_route_signature:
                         cli.agent = None
                     if cli._init_agent(
