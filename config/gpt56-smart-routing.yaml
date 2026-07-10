@@ -1,0 +1,34 @@
+# Non-secret desired-state overlay for GPT-5.6 smart routing.
+#
+# Merge these keys into the Hermes host's ~/.hermes/config.yaml; do not replace
+# that file wholesale. The live config also contains provider endpoint and
+# credential wiring, which must remain outside version control.
+#
+# `provider: main` preserves the active provider/base URL/credentials and only
+# changes the model selected for the matched routing lane.
+model:
+  default: gpt-5.6-sol
+
+smart_model_routing:
+  enabled: true
+  respect_explicit_model: false
+  gates:
+    repo_mutation: allow
+    high_risk: allow
+    gjc_escalation: block
+  routes:
+    cheap_chat:
+      provider: main
+      model: gpt-5.6-terra
+    reasoning:
+      provider: main
+      model: gpt-5.6-terra
+    research_readonly:
+      provider: main
+      model: gpt-5.6-terra
+    codex_implementation:
+      provider: main
+      model: gpt-5.6-sol
+    multimodal:
+      provider: main
+      model: gpt-5.6-sol
