@@ -123,6 +123,8 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_APPROVAL_STATUSES = {"pending", "approved", "denied", "cancelled"}
+VALID_QUESTION_STATUSES = {"open", "answered", "cancelled"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1088,6 +1090,213 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass
+class PolicyDecisionRecord:
+    """Durable control-plane policy decision for a task/run."""
+
+    id: int
+    task_id: str
+    run_id: Optional[int]
+    policy_version: str
+    selected_lane: str
+    allowed_lanes: list[str]
+    classification: dict
+    required_gates: list[str]
+    blockers: list[str]
+    fail_closed: bool
+    allow_mutation: bool
+    mutation_classes: list[str]
+    reason: str
+    metadata: dict
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PolicyDecisionRecord":
+        def _load_json(name: str, fallback):
+            raw = row[name]
+            if not raw:
+                return fallback
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return fallback
+            return parsed
+
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+            policy_version=row["policy_version"] or "",
+            selected_lane=row["selected_lane"] or "",
+            allowed_lanes=list(_load_json("allowed_lanes", [])),
+            classification=dict(_load_json("classification", {})),
+            required_gates=list(_load_json("required_gates", [])),
+            blockers=list(_load_json("blockers", [])),
+            fail_closed=bool(row["fail_closed"]),
+            allow_mutation=bool(row["allow_mutation"]),
+            mutation_classes=list(_load_json("mutation_classes", [])),
+            reason=row["reason"] or "",
+            metadata=dict(_load_json("metadata", {})),
+            created_at=int(row["created_at"]),
+        )
+
+
+@dataclass
+class TaskApprovalRecord:
+    """Durable approval gate attached to a task/run."""
+
+    id: int
+    task_id: str
+    run_id: Optional[int]
+    approval_type: str
+    status: str
+    requested_by: Optional[str]
+    resolved_by: Optional[str]
+    reason: str
+    metadata: dict
+    created_at: int
+    resolved_at: Optional[int]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "TaskApprovalRecord":
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+            approval_type=row["approval_type"] or "",
+            status=row["status"] or "",
+            requested_by=row["requested_by"],
+            resolved_by=row["resolved_by"],
+            reason=row["reason"] or "",
+            metadata=dict(_loads_json(row["metadata"], {})),
+            created_at=int(row["created_at"]),
+            resolved_at=(
+                int(row["resolved_at"]) if row["resolved_at"] is not None else None
+            ),
+        )
+
+
+@dataclass
+class TaskQuestionRecord:
+    """Durable human question attached to a task/run."""
+
+    id: int
+    task_id: str
+    run_id: Optional[int]
+    question: str
+    answer_shape: str
+    status: str
+    answer: Optional[str]
+    metadata: dict
+    created_at: int
+    resolved_at: Optional[int]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "TaskQuestionRecord":
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+            question=row["question"] or "",
+            answer_shape=row["answer_shape"] or "text",
+            status=row["status"] or "",
+            answer=row["answer"],
+            metadata=dict(_loads_json(row["metadata"], {})),
+            created_at=int(row["created_at"]),
+            resolved_at=(
+                int(row["resolved_at"]) if row["resolved_at"] is not None else None
+            ),
+        )
+
+
+@dataclass
+class TaskEvidenceRecord:
+    """Artifact/evidence reference attached to a task/run."""
+
+    id: int
+    task_id: str
+    run_id: Optional[int]
+    kind: str
+    path: Optional[str]
+    ref: Optional[str]
+    metadata: dict
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "TaskEvidenceRecord":
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+            kind=row["kind"] or "",
+            path=row["path"],
+            ref=row["ref"],
+            metadata=dict(_loads_json(row["metadata"], {})),
+            created_at=int(row["created_at"]),
+        )
+
+
+@dataclass
+class GJCSessionRecord:
+    """Hermes-side view of a Coordinator MCP GJC session/turn."""
+
+    id: int
+    task_id: str
+    run_id: Optional[int]
+    lane: str
+    workflow: str
+    gjc_session_id: Optional[str]
+    gjc_turn_id: Optional[str]
+    turn_status: str
+    active_turn_policy: str
+    event_after_seq: Optional[int]
+    approval_gate: Optional[str]
+    question_ids: list[int]
+    evidence_paths: list[str]
+    artifact_refs: list[str]
+    final_response_ref: Optional[str]
+    terminal_status: Optional[str]
+    blocker: Optional[str]
+    report_status_written_at: Optional[int]
+    metadata: dict
+    created_at: int
+    updated_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "GJCSessionRecord":
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+            lane=row["lane"] or "",
+            workflow=row["workflow"] or "",
+            gjc_session_id=row["gjc_session_id"],
+            gjc_turn_id=row["gjc_turn_id"],
+            turn_status=row["turn_status"] or "",
+            active_turn_policy=row["active_turn_policy"] or "reject",
+            event_after_seq=(
+                int(row["event_after_seq"])
+                if row["event_after_seq"] is not None
+                else None
+            ),
+            approval_gate=row["approval_gate"],
+            question_ids=[int(x) for x in _loads_json(row["question_ids"], [])],
+            evidence_paths=list(_loads_json(row["evidence_paths"], [])),
+            artifact_refs=list(_loads_json(row["artifact_refs"], [])),
+            final_response_ref=row["final_response_ref"],
+            terminal_status=row["terminal_status"],
+            blocker=row["blocker"],
+            report_status_written_at=(
+                int(row["report_status_written_at"])
+                if row["report_status_written_at"] is not None
+                else None
+            ),
+            metadata=dict(_loads_json(row["metadata"], {})),
+            created_at=int(row["created_at"]),
+            updated_at=int(row["updated_at"]),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1201,6 +1410,86 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_policy_decisions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id           TEXT NOT NULL,
+    run_id            INTEGER,
+    policy_version    TEXT NOT NULL,
+    selected_lane     TEXT NOT NULL,
+    allowed_lanes     TEXT NOT NULL DEFAULT '[]',
+    classification    TEXT NOT NULL DEFAULT '{}',
+    required_gates    TEXT NOT NULL DEFAULT '[]',
+    blockers          TEXT NOT NULL DEFAULT '[]',
+    fail_closed       INTEGER NOT NULL DEFAULT 0,
+    allow_mutation    INTEGER NOT NULL DEFAULT 0,
+    mutation_classes  TEXT NOT NULL DEFAULT '[]',
+    reason            TEXT,
+    metadata          TEXT NOT NULL DEFAULT '{}',
+    created_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_approvals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    run_id         INTEGER,
+    approval_type  TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    requested_by   TEXT,
+    resolved_by    TEXT,
+    reason         TEXT,
+    metadata       TEXT NOT NULL DEFAULT '{}',
+    created_at     INTEGER NOT NULL,
+    resolved_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS task_questions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    run_id         INTEGER,
+    question       TEXT NOT NULL,
+    answer_shape   TEXT NOT NULL DEFAULT 'text',
+    status         TEXT NOT NULL,
+    answer         TEXT,
+    metadata       TEXT NOT NULL DEFAULT '{}',
+    created_at     INTEGER NOT NULL,
+    resolved_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS task_evidence (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    run_id         INTEGER,
+    kind           TEXT NOT NULL,
+    path           TEXT,
+    ref            TEXT,
+    metadata       TEXT NOT NULL DEFAULT '{}',
+    created_at     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_gjc_sessions (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id                  TEXT NOT NULL,
+    run_id                   INTEGER,
+    lane                     TEXT NOT NULL,
+    workflow                 TEXT NOT NULL,
+    gjc_session_id           TEXT,
+    gjc_turn_id              TEXT,
+    turn_status              TEXT NOT NULL,
+    active_turn_policy       TEXT NOT NULL DEFAULT 'reject',
+    event_after_seq          INTEGER,
+    approval_gate            TEXT,
+    question_ids             TEXT NOT NULL DEFAULT '[]',
+    evidence_paths           TEXT NOT NULL DEFAULT '[]',
+    artifact_refs            TEXT NOT NULL DEFAULT '[]',
+    final_response_ref       TEXT,
+    terminal_status          TEXT,
+    blocker                  TEXT,
+    report_status_written_at INTEGER,
+    metadata                 TEXT NOT NULL DEFAULT '{}',
+    created_at               INTEGER NOT NULL,
+    updated_at               INTEGER NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1269,6 +1558,11 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_policy_task           ON task_policy_decisions(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_approvals_task        ON task_approvals(task_id, approval_type, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_questions_task        ON task_questions(task_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_evidence_task         ON task_evidence(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_gjc_sessions_task     ON task_gjc_sessions(task_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -3095,6 +3389,779 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
             )
         )
     return out
+
+
+def _json_text(value: Any, fallback: Any) -> str:
+    try:
+        return json.dumps(value if value is not None else fallback, ensure_ascii=False)
+    except Exception:
+        return json.dumps(fallback, ensure_ascii=False)
+
+
+def _loads_json(raw: Any, fallback: Any) -> Any:
+    if raw in (None, ""):
+        return fallback
+    try:
+        return json.loads(raw)
+    except Exception:
+        return fallback
+
+
+def record_policy_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    decision: dict[str, Any],
+    *,
+    run_id: Optional[int] = None,
+) -> int:
+    """Persist a control-plane policy decision for ``task_id``.
+
+    ``decision`` is intentionally a plain mapping so callers can pass the
+    metadata emitted by ``hermes_cli.smart_model_routing.decision_metadata``
+    without importing the routing dataclasses into the kanban layer.
+    """
+    if not task_id or not str(task_id).strip():
+        raise ValueError("task_id is required")
+    if not isinstance(decision, dict):
+        raise ValueError("policy decision must be a dict")
+
+    now = int(time.time())
+    selected_lane = str(decision.get("selected_lane") or "primary")
+    policy_version = str(decision.get("policy_version") or "unknown")
+    allowed_lanes = decision.get("allowed_lanes")
+    classification = decision.get("classification")
+    required_gates = decision.get("required_gates")
+    blockers = decision.get("blockers")
+    mutation_classes = decision.get("mutation_classes")
+    metadata = dict(decision)
+
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        cur = conn.execute(
+            """
+            INSERT INTO task_policy_decisions (
+                task_id, run_id, policy_version, selected_lane,
+                allowed_lanes, classification, required_gates, blockers,
+                fail_closed, allow_mutation, mutation_classes, reason,
+                metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                run_id,
+                policy_version,
+                selected_lane,
+                _json_text(allowed_lanes, []),
+                _json_text(classification, {}),
+                _json_text(required_gates, []),
+                _json_text(blockers, []),
+                1 if decision.get("fail_closed") else 0,
+                1 if decision.get("allow_mutation") else 0,
+                _json_text(mutation_classes, []),
+                str(decision.get("reason") or ""),
+                _json_text(metadata, {}),
+                now,
+            ),
+        )
+        decision_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "policy_decision",
+            {
+                "policy_decision_id": decision_id,
+                "policy_version": policy_version,
+                "selected_lane": selected_lane,
+                "fail_closed": bool(decision.get("fail_closed")),
+                "blockers": list(blockers) if isinstance(blockers, list) else [],
+            },
+            run_id=run_id,
+        )
+        return decision_id
+
+
+def list_policy_decisions(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[PolicyDecisionRecord]:
+    rows = conn.execute(
+        "SELECT * FROM task_policy_decisions WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    return [PolicyDecisionRecord.from_row(row) for row in rows]
+
+
+def _ensure_task_exists_for_control_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> None:
+    if not task_id or not str(task_id).strip():
+        raise ValueError("task_id is required")
+    if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+        raise ValueError(f"unknown task {task_id}")
+
+
+def request_task_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_type: str = "gjc_escalation",
+    reason: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    run_id: Optional[int] = None,
+    requested_by: Optional[str] = None,
+) -> int:
+    """Create a durable approval gate for a task/run."""
+    approval_type = str(approval_type or "").strip()
+    if not approval_type:
+        raise ValueError("approval_type is required")
+    now = int(time.time())
+    with write_txn(conn):
+        _ensure_task_exists_for_control_state(conn, task_id)
+        cur = conn.execute(
+            """
+            INSERT INTO task_approvals (
+                task_id, run_id, approval_type, status, requested_by,
+                reason, metadata, created_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                run_id,
+                approval_type,
+                requested_by,
+                reason,
+                _json_text(metadata, {}),
+                now,
+            ),
+        )
+        approval_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "approval_requested",
+            {
+                "approval_id": approval_id,
+                "approval_type": approval_type,
+                "reason": reason,
+            },
+            run_id=run_id,
+        )
+        return approval_id
+
+
+def ensure_task_approval_requested(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_type: str = "gjc_escalation",
+    reason: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    run_id: Optional[int] = None,
+    requested_by: Optional[str] = None,
+) -> TaskApprovalRecord:
+    """Return an existing active approval gate, or create a pending one."""
+    approval_type = str(approval_type or "").strip()
+    if not approval_type:
+        raise ValueError("approval_type is required")
+    existing = conn.execute(
+        """
+        SELECT * FROM task_approvals
+         WHERE task_id = ?
+           AND approval_type = ?
+           AND status IN ('pending', 'approved')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id, approval_type),
+    ).fetchone()
+    if existing is not None:
+        return TaskApprovalRecord.from_row(existing)
+    approval_id = request_task_approval(
+        conn,
+        task_id,
+        approval_type=approval_type,
+        reason=reason,
+        metadata=metadata,
+        run_id=run_id,
+        requested_by=requested_by,
+    )
+    row = conn.execute(
+        "SELECT * FROM task_approvals WHERE id = ?", (approval_id,)
+    ).fetchone()
+    return TaskApprovalRecord.from_row(row)
+
+
+def resolve_task_approval(
+    conn: sqlite3.Connection,
+    approval_id: int,
+    *,
+    status: str,
+    resolved_by: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Resolve a pending approval as approved/denied/cancelled."""
+    status = str(status or "").strip().lower()
+    if status not in VALID_APPROVAL_STATUSES - {"pending"}:
+        raise ValueError(
+            f"approval status must be one of {sorted(VALID_APPROVAL_STATUSES - {'pending'})}"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM task_approvals WHERE id = ?", (int(approval_id),)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] != "pending":
+            return False
+        merged_metadata = dict(_loads_json(row["metadata"], {}))
+        if metadata:
+            merged_metadata.update(metadata)
+        cur = conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = ?, resolved_by = ?, resolved_at = ?, metadata = ?
+             WHERE id = ? AND status = 'pending'
+            """,
+            (
+                status,
+                resolved_by,
+                now,
+                _json_text(merged_metadata, {}),
+                int(approval_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            row["task_id"],
+            "approval_resolved",
+            {
+                "approval_id": int(approval_id),
+                "approval_type": row["approval_type"],
+                "status": status,
+                "resolved_by": resolved_by,
+            },
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+        )
+        return True
+
+
+def approve_latest_task_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_type: str = "gjc_escalation",
+    resolved_by: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> int:
+    """Approve the latest pending gate, creating one first when absent."""
+    approval = ensure_task_approval_requested(
+        conn,
+        task_id,
+        approval_type=approval_type,
+        metadata=metadata,
+        requested_by=resolved_by,
+    )
+    if approval.status == "approved":
+        return approval.id
+    if not resolve_task_approval(
+        conn,
+        approval.id,
+        status="approved",
+        resolved_by=resolved_by,
+        metadata=metadata,
+    ):
+        raise ValueError(f"approval {approval.id} is not pending")
+    return approval.id
+
+
+def list_task_approvals(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_type: Optional[str] = None,
+) -> list[TaskApprovalRecord]:
+    params: list[Any] = [task_id]
+    query = "SELECT * FROM task_approvals WHERE task_id = ?"
+    if approval_type:
+        query += " AND approval_type = ?"
+        params.append(approval_type)
+    query += " ORDER BY created_at ASC, id ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [TaskApprovalRecord.from_row(row) for row in rows]
+
+
+def latest_task_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_type: str = "gjc_escalation",
+) -> Optional[TaskApprovalRecord]:
+    row = conn.execute(
+        """
+        SELECT * FROM task_approvals
+         WHERE task_id = ? AND approval_type = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id, approval_type),
+    ).fetchone()
+    return TaskApprovalRecord.from_row(row) if row is not None else None
+
+
+def request_task_question(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    question: str,
+    answer_shape: str = "text",
+    metadata: Optional[dict] = None,
+    run_id: Optional[int] = None,
+) -> int:
+    """Create a durable question that must be answered before execution."""
+    question = str(question or "").strip()
+    if not question:
+        raise ValueError("question is required")
+    answer_shape = str(answer_shape or "text").strip() or "text"
+    now = int(time.time())
+    with write_txn(conn):
+        _ensure_task_exists_for_control_state(conn, task_id)
+        cur = conn.execute(
+            """
+            INSERT INTO task_questions (
+                task_id, run_id, question, answer_shape, status,
+                metadata, created_at
+            ) VALUES (?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (
+                task_id,
+                run_id,
+                question,
+                answer_shape,
+                _json_text(metadata, {}),
+                now,
+            ),
+        )
+        question_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "question_requested",
+            {
+                "question_id": question_id,
+                "answer_shape": answer_shape,
+                "question": question,
+            },
+            run_id=run_id,
+        )
+        return question_id
+
+
+def answer_task_question(
+    conn: sqlite3.Connection,
+    question_id: int,
+    *,
+    answer: str,
+    metadata: Optional[dict] = None,
+) -> bool:
+    answer = str(answer or "").strip()
+    if not answer:
+        raise ValueError("answer is required")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM task_questions WHERE id = ?", (int(question_id),)
+        ).fetchone()
+        if row is None or row["status"] != "open":
+            return False
+        merged_metadata = dict(_loads_json(row["metadata"], {}))
+        if metadata:
+            merged_metadata.update(metadata)
+        cur = conn.execute(
+            """
+            UPDATE task_questions
+               SET status = 'answered', answer = ?, resolved_at = ?, metadata = ?
+             WHERE id = ? AND status = 'open'
+            """,
+            (answer, now, _json_text(merged_metadata, {}), int(question_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            row["task_id"],
+            "question_answered",
+            {"question_id": int(question_id)},
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+        )
+        return True
+
+
+def cancel_task_question(
+    conn: sqlite3.Connection,
+    question_id: int,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM task_questions WHERE id = ?", (int(question_id),)
+        ).fetchone()
+        if row is None or row["status"] != "open":
+            return False
+        cur = conn.execute(
+            """
+            UPDATE task_questions
+               SET status = 'cancelled', resolved_at = ?
+             WHERE id = ? AND status = 'open'
+            """,
+            (now, int(question_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            row["task_id"],
+            "question_cancelled",
+            {"question_id": int(question_id), "reason": reason},
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+        )
+        return True
+
+
+def list_task_questions(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+) -> list[TaskQuestionRecord]:
+    params: list[Any] = [task_id]
+    query = "SELECT * FROM task_questions WHERE task_id = ?"
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at ASC, id ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [TaskQuestionRecord.from_row(row) for row in rows]
+
+
+def list_open_task_questions(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[TaskQuestionRecord]:
+    return list_task_questions(conn, task_id, status="open")
+
+
+def record_task_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    path: Optional[str] = None,
+    ref: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    run_id: Optional[int] = None,
+) -> int:
+    """Record an artifact/evidence path or external reference."""
+    kind = str(kind or "").strip()
+    if not kind:
+        raise ValueError("evidence kind is required")
+    if not (path or ref):
+        raise ValueError("evidence requires path or ref")
+    now = int(time.time())
+    with write_txn(conn):
+        _ensure_task_exists_for_control_state(conn, task_id)
+        cur = conn.execute(
+            """
+            INSERT INTO task_evidence (
+                task_id, run_id, kind, path, ref, metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                run_id,
+                kind,
+                path,
+                ref,
+                _json_text(metadata, {}),
+                now,
+            ),
+        )
+        evidence_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "evidence_recorded",
+            {
+                "evidence_id": evidence_id,
+                "kind": kind,
+                "path": path,
+                "ref": ref,
+            },
+            run_id=run_id,
+        )
+        return evidence_id
+
+
+def list_task_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[TaskEvidenceRecord]:
+    rows = conn.execute(
+        "SELECT * FROM task_evidence WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    return [TaskEvidenceRecord.from_row(row) for row in rows]
+
+
+def create_gjc_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lane: str,
+    workflow: str,
+    run_id: Optional[int] = None,
+    gjc_session_id: Optional[str] = None,
+    gjc_turn_id: Optional[str] = None,
+    turn_status: str = "starting",
+    active_turn_policy: str = "reject",
+    event_after_seq: Optional[int] = None,
+    approval_gate: Optional[str] = None,
+    question_ids: Optional[Iterable[int]] = None,
+    evidence_paths: Optional[Iterable[str]] = None,
+    artifact_refs: Optional[Iterable[str]] = None,
+    final_response_ref: Optional[str] = None,
+    terminal_status: Optional[str] = None,
+    blocker: Optional[str] = None,
+    report_status_written_at: Optional[int] = None,
+    metadata: Optional[dict] = None,
+) -> int:
+    """Create a Hermes-side GJC session/turn record."""
+    lane = str(lane or "").strip()
+    workflow = str(workflow or "").strip()
+    if not lane:
+        raise ValueError("lane is required")
+    if not workflow:
+        raise ValueError("workflow is required")
+    now = int(time.time())
+    with write_txn(conn):
+        _ensure_task_exists_for_control_state(conn, task_id)
+        cur = conn.execute(
+            """
+            INSERT INTO task_gjc_sessions (
+                task_id, run_id, lane, workflow, gjc_session_id,
+                gjc_turn_id, turn_status, active_turn_policy, event_after_seq,
+                approval_gate, question_ids, evidence_paths, artifact_refs,
+                final_response_ref, terminal_status, blocker,
+                report_status_written_at, metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                run_id,
+                lane,
+                workflow,
+                gjc_session_id,
+                gjc_turn_id,
+                turn_status,
+                active_turn_policy,
+                event_after_seq,
+                approval_gate,
+                _json_text(list(question_ids or []), []),
+                _json_text(list(evidence_paths or []), []),
+                _json_text(list(artifact_refs or []), []),
+                final_response_ref,
+                terminal_status,
+                blocker,
+                report_status_written_at,
+                _json_text(metadata, {}),
+                now,
+                now,
+            ),
+        )
+        session_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "gjc_session_created",
+            {
+                "gjc_record_id": session_id,
+                "lane": lane,
+                "workflow": workflow,
+                "turn_status": turn_status,
+                "gjc_session_id": gjc_session_id,
+                "gjc_turn_id": gjc_turn_id,
+            },
+            run_id=run_id,
+        )
+        return session_id
+
+
+def update_gjc_session(
+    conn: sqlite3.Connection,
+    session_id: int,
+    **updates: Any,
+) -> bool:
+    """Update mutable fields on a GJC session and append an audit event."""
+    allowed = {
+        "gjc_session_id",
+        "gjc_turn_id",
+        "turn_status",
+        "active_turn_policy",
+        "event_after_seq",
+        "approval_gate",
+        "question_ids",
+        "evidence_paths",
+        "artifact_refs",
+        "final_response_ref",
+        "terminal_status",
+        "blocker",
+        "report_status_written_at",
+        "metadata",
+    }
+    clean = {k: v for k, v in updates.items() if k in allowed}
+    if not clean:
+        return False
+    now = int(time.time())
+    json_fields = {"question_ids", "evidence_paths", "artifact_refs", "metadata"}
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM task_gjc_sessions WHERE id = ?", (int(session_id),)
+        ).fetchone()
+        if row is None:
+            return False
+        assignments = []
+        params: list[Any] = []
+        for key, value in clean.items():
+            assignments.append(f"{key} = ?")
+            if key in json_fields:
+                fallback = {} if key == "metadata" else []
+                params.append(_json_text(value, fallback))
+            else:
+                params.append(value)
+        assignments.append("updated_at = ?")
+        params.append(now)
+        params.append(int(session_id))
+        conn.execute(
+            f"UPDATE task_gjc_sessions SET {', '.join(assignments)} WHERE id = ?",
+            tuple(params),
+        )
+        _append_event(
+            conn,
+            row["task_id"],
+            "gjc_session_updated",
+            {
+                "gjc_record_id": int(session_id),
+                "fields": sorted(clean),
+                "turn_status": clean.get("turn_status"),
+                "blocker": clean.get("blocker"),
+            },
+            run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+        )
+        return True
+
+
+def latest_gjc_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[GJCSessionRecord]:
+    row = conn.execute(
+        """
+        SELECT * FROM task_gjc_sessions
+         WHERE task_id = ?
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    return GJCSessionRecord.from_row(row) if row is not None else None
+
+
+def list_gjc_sessions(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[GJCSessionRecord]:
+    rows = conn.execute(
+        "SELECT * FROM task_gjc_sessions WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    return [GJCSessionRecord.from_row(row) for row in rows]
+
+
+def gjc_coordination_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_type: str = "gjc_escalation",
+) -> dict[str, Any]:
+    """Return the first-class state gates for a GJC escalation."""
+    approval = latest_task_approval(
+        conn,
+        task_id,
+        approval_type=approval_type,
+    )
+    questions = list_open_task_questions(conn, task_id)
+    active_row = conn.execute(
+        """
+        SELECT * FROM task_gjc_sessions
+         WHERE task_id = ?
+           AND turn_status IN (
+                'starting',
+                'running',
+                'waiting',
+                'waiting_for_answer',
+                'waiting_for_coordinator',
+                'approval_waiting',
+                'timeout'
+           )
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    active_session = (
+        GJCSessionRecord.from_row(active_row) if active_row is not None else None
+    )
+    return {
+        "task_id": task_id,
+        "approval_type": approval_type,
+        "approval": None if approval is None else {
+            "id": approval.id,
+            "status": approval.status,
+            "reason": approval.reason,
+            "resolved_by": approval.resolved_by,
+        },
+        "approved": bool(approval and approval.status == "approved"),
+        "open_questions": [
+            {
+                "id": q.id,
+                "question": q.question,
+                "answer_shape": q.answer_shape,
+                "metadata": q.metadata,
+            }
+            for q in questions
+        ],
+        "active_session": None if active_session is None else {
+            "id": active_session.id,
+            "lane": active_session.lane,
+            "workflow": active_session.workflow,
+            "turn_status": active_session.turn_status,
+            "active_turn_policy": active_session.active_turn_policy,
+            "gjc_session_id": active_session.gjc_session_id,
+            "gjc_turn_id": active_session.gjc_turn_id,
+            "event_after_seq": active_session.event_after_seq,
+            "question_ids": list(active_session.question_ids or []),
+            "evidence_paths": list(active_session.evidence_paths or []),
+            "artifact_refs": list(active_session.artifact_refs or []),
+        },
+    }
 
 
 def _append_event(

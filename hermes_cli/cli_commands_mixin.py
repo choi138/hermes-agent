@@ -1624,6 +1624,9 @@ class CLICommandsMixin:
         _cprint("  You can continue chatting — results will appear when done.\n")
 
         turn_route = self._resolve_turn_agent_config(prompt)
+        if turn_route.get("blocked"):
+            _cprint(turn_route["blocked"].get("message") or "Smart model routing blocked this background task.")
+            return
 
         def run_background():
             set_sudo_password_callback(self._sudo_password_callback)
@@ -1633,54 +1636,60 @@ class CLICommandsMixin:
             except Exception:
                 pass
             try:
-                bg_agent = AIAgent(
-                    model=turn_route["model"],
-                    api_key=turn_route["runtime"].get("api_key"),
-                    base_url=turn_route["runtime"].get("base_url"),
-                    provider=turn_route["runtime"].get("provider"),
-                    api_mode=turn_route["runtime"].get("api_mode"),
-                    acp_command=turn_route["runtime"].get("command"),
-                    acp_args=turn_route["runtime"].get("args"),
-                    max_tokens=turn_route["runtime"].get("max_tokens"),
-                    max_iterations=self.max_turns,
-                    enabled_toolsets=self.enabled_toolsets,
-                    quiet_mode=True,
-                    verbose_logging=False,
-                    session_id=task_id,
-                    platform="cli",
-                    session_db=self._session_db,
-                    reasoning_config=self.reasoning_config,
-                    service_tier=self.service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
-                    providers_allowed=self._providers_only,
-                    providers_ignored=self._providers_ignore,
-                    providers_order=self._providers_order,
-                    provider_sort=self._provider_sort,
-                    provider_require_parameters=self._provider_require_params,
-                    provider_data_collection=self._provider_data_collection,
-                    openrouter_min_coding_score=self._openrouter_min_coding_score,
-                    fallback_model=self._fallback_model,
-                )
-                # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
-                bg_agent._print_fn = lambda *_a, **_kw: None
+                if turn_route.get("gjc_execution"):
+                    from hermes_cli.gjc_coordinator import run_gjc_execution
 
-                def _bg_thinking(text: str) -> None:
-                    # Concurrent bg tasks may race on _spinner_text; acceptable for best-effort UI.
-                    if not self._agent_running:
-                        self._spinner_text = text
-                        if self._app:
-                            self._app.invalidate()
+                    result = run_gjc_execution(turn_route["gjc_execution"])
+                    response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                else:
+                    bg_agent = AIAgent(
+                        model=turn_route["model"],
+                        api_key=turn_route["runtime"].get("api_key"),
+                        base_url=turn_route["runtime"].get("base_url"),
+                        provider=turn_route["runtime"].get("provider"),
+                        api_mode=turn_route["runtime"].get("api_mode"),
+                        acp_command=turn_route["runtime"].get("command"),
+                        acp_args=turn_route["runtime"].get("args"),
+                        max_tokens=turn_route["runtime"].get("max_tokens"),
+                        max_iterations=self.max_turns,
+                        enabled_toolsets=self.enabled_toolsets,
+                        quiet_mode=True,
+                        verbose_logging=False,
+                        session_id=task_id,
+                        platform="cli",
+                        session_db=self._session_db,
+                        reasoning_config=self.reasoning_config,
+                        service_tier=self.service_tier,
+                        request_overrides=turn_route.get("request_overrides"),
+                        providers_allowed=self._providers_only,
+                        providers_ignored=self._providers_ignore,
+                        providers_order=self._providers_order,
+                        provider_sort=self._provider_sort,
+                        provider_require_parameters=self._provider_require_params,
+                        provider_data_collection=self._provider_data_collection,
+                        openrouter_min_coding_score=self._openrouter_min_coding_score,
+                        fallback_model=self._fallback_model,
+                    )
+                    # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
+                    bg_agent._print_fn = lambda *_a, **_kw: None
 
-                bg_agent.thinking_callback = _bg_thinking
+                    def _bg_thinking(text: str) -> None:
+                        # Concurrent bg tasks may race on _spinner_text; acceptable for best-effort UI.
+                        if not self._agent_running:
+                            self._spinner_text = text
+                            if self._app:
+                                self._app.invalidate()
 
-                result = bg_agent.run_conversation(
-                    user_message=prompt,
-                    task_id=task_id,
-                )
+                    bg_agent.thinking_callback = _bg_thinking
 
-                response = result.get("final_response", "") if result else ""
-                if not response and result and result.get("error"):
-                    response = f"Error: {result['error']}"
+                    result = bg_agent.run_conversation(
+                        user_message=prompt,
+                        task_id=task_id,
+                    )
+
+                    response = result.get("final_response", "") if result else ""
+                    if not response and result and result.get("error"):
+                        response = f"Error: {result['error']}"
 
                 # Display result in the CLI (thread-safe via patch_stdout).
                 # Force a TUI refresh first so spinner/status bar don't overlap

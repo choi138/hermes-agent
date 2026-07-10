@@ -850,6 +850,73 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- control-plane gates for GJC / durable workers ---
+    p_approval = sub.add_parser(
+        "approval",
+        help="Manage durable task approvals (including GJC escalation gates)",
+    )
+    approval_sub = p_approval.add_subparsers(dest="approval_action")
+    a_list = approval_sub.add_parser("list", help="List approvals for a task")
+    a_list.add_argument("task_id")
+    a_list.add_argument("--type", default=None, dest="approval_type")
+    a_list.add_argument("--json", action="store_true")
+    a_request = approval_sub.add_parser("request", help="Request approval for a task")
+    a_request.add_argument("task_id")
+    a_request.add_argument("--type", default="gjc_escalation", dest="approval_type")
+    a_request.add_argument("reason", nargs="*")
+    a_approve = approval_sub.add_parser("approve", help="Approve a pending approval id")
+    a_approve.add_argument("approval_id", type=int)
+    a_approve.add_argument("--by", default=None, dest="resolved_by")
+    a_deny = approval_sub.add_parser("deny", aliases=["reject"], help="Deny a pending approval id")
+    a_deny.add_argument("approval_id", type=int)
+    a_deny.add_argument("--by", default=None, dest="resolved_by")
+
+    p_question = sub.add_parser(
+        "question",
+        help="Manage durable task questions required before worker execution",
+    )
+    question_sub = p_question.add_subparsers(dest="question_action")
+    q_list = question_sub.add_parser("list", help="List questions for a task")
+    q_list.add_argument("task_id")
+    q_list.add_argument("--open", action="store_true", dest="open_only")
+    q_list.add_argument("--json", action="store_true")
+    q_ask = question_sub.add_parser("ask", help="Create a question for a task")
+    q_ask.add_argument("task_id")
+    q_ask.add_argument("--shape", default="text", dest="answer_shape")
+    q_ask.add_argument("question", nargs="+")
+    q_answer = question_sub.add_parser("answer", help="Answer a pending question id")
+    q_answer.add_argument("question_id", type=int)
+    q_answer.add_argument("answer", nargs="+")
+    q_cancel = question_sub.add_parser("cancel", help="Cancel a pending question id")
+    q_cancel.add_argument("question_id", type=int)
+    q_cancel.add_argument("reason", nargs="*")
+
+    p_evidence = sub.add_parser(
+        "evidence",
+        help="List or record task evidence/artifact references",
+    )
+    evidence_sub = p_evidence.add_subparsers(dest="evidence_action")
+    e_list = evidence_sub.add_parser("list", help="List evidence for a task")
+    e_list.add_argument("task_id")
+    e_list.add_argument("--json", action="store_true")
+    e_add = evidence_sub.add_parser("add", help="Record an evidence path or artifact ref")
+    e_add.add_argument("task_id")
+    e_add.add_argument("--kind", default="manual")
+    e_add.add_argument("--path", default=None)
+    e_add.add_argument("--ref", default=None)
+
+    p_gjc = sub.add_parser(
+        "gjc",
+        help="Inspect GJC Coordinator MCP state for a task",
+    )
+    gjc_sub = p_gjc.add_subparsers(dest="gjc_action")
+    g_state = gjc_sub.add_parser("state", help="Show approval/question/session gates")
+    g_state.add_argument("task_id")
+    g_state.add_argument("--json", action="store_true")
+    g_sessions = gjc_sub.add_parser("sessions", help="List GJC session/turn records")
+    g_sessions.add_argument("task_id")
+    g_sessions.add_argument("--json", action="store_true")
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -973,6 +1040,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "approval": _cmd_approval,
+            "question": _cmd_question,
+            "evidence": _cmd_evidence,
+            "gjc":      _cmd_gjc,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -2699,6 +2770,266 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _approval_to_dict(a: kb.TaskApprovalRecord) -> dict[str, Any]:
+    return {
+        "id": a.id,
+        "task_id": a.task_id,
+        "run_id": a.run_id,
+        "approval_type": a.approval_type,
+        "status": a.status,
+        "requested_by": a.requested_by,
+        "resolved_by": a.resolved_by,
+        "reason": a.reason,
+        "metadata": a.metadata,
+        "created_at": a.created_at,
+        "resolved_at": a.resolved_at,
+    }
+
+
+def _question_to_dict(q: kb.TaskQuestionRecord) -> dict[str, Any]:
+    return {
+        "id": q.id,
+        "task_id": q.task_id,
+        "run_id": q.run_id,
+        "question": q.question,
+        "answer_shape": q.answer_shape,
+        "status": q.status,
+        "answer": q.answer,
+        "metadata": q.metadata,
+        "created_at": q.created_at,
+        "resolved_at": q.resolved_at,
+    }
+
+
+def _evidence_to_dict(e: kb.TaskEvidenceRecord) -> dict[str, Any]:
+    return {
+        "id": e.id,
+        "task_id": e.task_id,
+        "run_id": e.run_id,
+        "kind": e.kind,
+        "path": e.path,
+        "ref": e.ref,
+        "metadata": e.metadata,
+        "created_at": e.created_at,
+    }
+
+
+def _gjc_session_to_dict(s: kb.GJCSessionRecord) -> dict[str, Any]:
+    return {
+        "id": s.id,
+        "task_id": s.task_id,
+        "run_id": s.run_id,
+        "lane": s.lane,
+        "workflow": s.workflow,
+        "gjc_session_id": s.gjc_session_id,
+        "gjc_turn_id": s.gjc_turn_id,
+        "turn_status": s.turn_status,
+        "active_turn_policy": s.active_turn_policy,
+        "event_after_seq": s.event_after_seq,
+        "approval_gate": s.approval_gate,
+        "question_ids": s.question_ids,
+        "evidence_paths": s.evidence_paths,
+        "artifact_refs": s.artifact_refs,
+        "final_response_ref": s.final_response_ref,
+        "terminal_status": s.terminal_status,
+        "blocker": s.blocker,
+        "report_status_written_at": s.report_status_written_at,
+        "metadata": s.metadata,
+        "created_at": s.created_at,
+        "updated_at": s.updated_at,
+    }
+
+
+def _cmd_approval(args: argparse.Namespace) -> int:
+    action = getattr(args, "approval_action", None) or "list"
+    actor = getattr(args, "resolved_by", None) or _profile_author()
+    if action == "list":
+        with kb.connect_closing() as conn:
+            rows = kb.list_task_approvals(
+                conn,
+                args.task_id,
+                approval_type=getattr(args, "approval_type", None),
+            )
+        if getattr(args, "json", False):
+            print(json.dumps([_approval_to_dict(a) for a in rows], indent=2, ensure_ascii=False))
+            return 0
+        if not rows:
+            print("(no approvals)")
+            return 0
+        for a in rows:
+            resolved = f" resolved_by={a.resolved_by}" if a.resolved_by else ""
+            print(f"#{a.id} {a.status:9s} {a.approval_type} task={a.task_id}{resolved}")
+            if a.reason:
+                print(f"  {a.reason}")
+        return 0
+    if action == "request":
+        reason = " ".join(getattr(args, "reason", []) or []).strip() or None
+        with kb.connect_closing() as conn:
+            approval_id = kb.request_task_approval(
+                conn,
+                args.task_id,
+                approval_type=args.approval_type,
+                reason=reason,
+                requested_by=_profile_author(),
+            )
+        print(f"Approval requested #{approval_id} for {args.task_id}")
+        return 0
+    if action == "approve":
+        with kb.connect_closing() as conn:
+            ok = kb.resolve_task_approval(
+                conn,
+                args.approval_id,
+                status="approved",
+                resolved_by=actor,
+            )
+        if not ok:
+            print(f"cannot approve {args.approval_id} (not pending?)", file=sys.stderr)
+            return 1
+        print(f"Approved #{args.approval_id}")
+        return 0
+    if action in {"deny", "reject"}:
+        with kb.connect_closing() as conn:
+            ok = kb.resolve_task_approval(
+                conn,
+                args.approval_id,
+                status="denied",
+                resolved_by=actor,
+            )
+        if not ok:
+            print(f"cannot deny {args.approval_id} (not pending?)", file=sys.stderr)
+            return 1
+        print(f"Denied #{args.approval_id}")
+        return 0
+    print(f"kanban approval: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_question(args: argparse.Namespace) -> int:
+    action = getattr(args, "question_action", None) or "list"
+    if action == "list":
+        with kb.connect_closing() as conn:
+            rows = (
+                kb.list_open_task_questions(conn, args.task_id)
+                if getattr(args, "open_only", False)
+                else kb.list_task_questions(conn, args.task_id)
+            )
+        if getattr(args, "json", False):
+            print(json.dumps([_question_to_dict(q) for q in rows], indent=2, ensure_ascii=False))
+            return 0
+        if not rows:
+            print("(no questions)")
+            return 0
+        for q in rows:
+            print(f"#{q.id} {q.status:9s} task={q.task_id} shape={q.answer_shape}")
+            print(f"  Q: {q.question}")
+            if q.answer:
+                print(f"  A: {q.answer}")
+        return 0
+    if action == "ask":
+        question = " ".join(args.question).strip()
+        with kb.connect_closing() as conn:
+            question_id = kb.request_task_question(
+                conn,
+                args.task_id,
+                question=question,
+                answer_shape=args.answer_shape,
+            )
+        print(f"Question requested #{question_id} for {args.task_id}")
+        return 0
+    if action == "answer":
+        answer = " ".join(args.answer).strip()
+        with kb.connect_closing() as conn:
+            ok = kb.answer_task_question(conn, args.question_id, answer=answer)
+        if not ok:
+            print(f"cannot answer {args.question_id} (not open?)", file=sys.stderr)
+            return 1
+        print(f"Answered #{args.question_id}")
+        return 0
+    if action == "cancel":
+        reason = " ".join(getattr(args, "reason", []) or []).strip() or None
+        with kb.connect_closing() as conn:
+            ok = kb.cancel_task_question(conn, args.question_id, reason=reason)
+        if not ok:
+            print(f"cannot cancel {args.question_id} (not open?)", file=sys.stderr)
+            return 1
+        print(f"Cancelled #{args.question_id}")
+        return 0
+    print(f"kanban question: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_evidence(args: argparse.Namespace) -> int:
+    action = getattr(args, "evidence_action", None) or "list"
+    if action == "list":
+        with kb.connect_closing() as conn:
+            rows = kb.list_task_evidence(conn, args.task_id)
+        if getattr(args, "json", False):
+            print(json.dumps([_evidence_to_dict(e) for e in rows], indent=2, ensure_ascii=False))
+            return 0
+        if not rows:
+            print("(no evidence)")
+            return 0
+        for e in rows:
+            target = e.path or e.ref or "-"
+            print(f"#{e.id} {e.kind:14s} task={e.task_id} {target}")
+        return 0
+    if action == "add":
+        if not (args.path or args.ref):
+            print("kanban evidence add: pass --path or --ref", file=sys.stderr)
+            return 2
+        with kb.connect_closing() as conn:
+            evidence_id = kb.record_task_evidence(
+                conn,
+                args.task_id,
+                kind=args.kind,
+                path=args.path,
+                ref=args.ref,
+            )
+        print(f"Evidence recorded #{evidence_id} for {args.task_id}")
+        return 0
+    print(f"kanban evidence: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_gjc(args: argparse.Namespace) -> int:
+    action = getattr(args, "gjc_action", None) or "state"
+    if action == "state":
+        with kb.connect_closing() as conn:
+            state = kb.gjc_coordination_state(conn, args.task_id)
+        if getattr(args, "json", False):
+            print(json.dumps(state, indent=2, ensure_ascii=False))
+            return 0
+        approval = state.get("approval") or {}
+        print(f"GJC state for {args.task_id}")
+        print(f"  approved:  {'yes' if state.get('approved') else 'no'}")
+        if approval:
+            print(f"  approval:  #{approval.get('id')} {approval.get('status')} ({approval.get('approval_type', 'gjc_escalation')})")
+        questions = state.get("open_questions") or []
+        print(f"  questions: {len(questions)} open")
+        for q in questions:
+            print(f"    #{q['id']} {q['question']}")
+        active = state.get("active_session")
+        if active:
+            print(f"  active:    #{active.get('id')} {active.get('turn_status')} {active.get('workflow')}")
+        return 0
+    if action == "sessions":
+        with kb.connect_closing() as conn:
+            sessions = kb.list_gjc_sessions(conn, args.task_id)
+        if getattr(args, "json", False):
+            print(json.dumps([_gjc_session_to_dict(s) for s in sessions], indent=2, ensure_ascii=False))
+            return 0
+        if not sessions:
+            print("(no GJC sessions)")
+            return 0
+        for s in sessions:
+            print(f"#{s.id} {s.turn_status:10s} {s.workflow:16s} lane={s.lane}")
+            if s.blocker:
+                print(f"  blocker: {s.blocker}")
+        return 0
+    print(f"kanban gjc: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
@@ -2760,6 +3091,10 @@ Common subcommands:
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
+  `approval …`          Request/approve durable execution gates
+  `question …`          List/answer durable worker questions
+  `evidence …`          List/add evidence and artifact refs
+  `gjc state <id>`      Inspect GJC Coordinator MCP gates
   `log <id>`            Worker log
 
 Run `/kanban <subcommand> -h` for arguments. \
