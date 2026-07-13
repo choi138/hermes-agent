@@ -632,6 +632,74 @@ def _fmt_runtime_value(value: Any, default: str = "unknown") -> str:
     return text if text else default
 
 
+# Permanently static whenever a route catalog is active: current-turn route
+# decisions no longer render here (they would flip this line on the routed turn
+# AND flip it back on the next turn -- two whole-prompt cache busts per routing
+# event). Routed directives are delivered on the triggering turn's user
+# message instead; see ``format_routing_directive``. When routes are dormant,
+# the whole DesiredRoute line stays absent to preserve the CurrentRuntime-only
+# mode introduced by the runtime-route awareness port.
+_STATIC_DESIRED_ROUTE_LINE = (
+    "DesiredRoute: label=UNCLASSIFIED target=current strictness=none "
+    'confidence=unknown reason="no current-turn route decision supplied"'
+)
+
+_RUNTIME_ROUTE_POLICY = (
+    "Policy: This block is authoritative for this LLM call; do not infer "
+    "current runtime from stale session headers, memory, or prior turns. "
+    "model_status is diagnostic fallback only. A current-turn routing "
+    "directive, when present, arrives on the current user message as a "
+    "[Routing directive: ...] line and is authoritative for that turn; "
+    "compare it against CurrentRuntime and, if mismatched and not "
+    "user_strict, treat as a routing anomaly before substantive work. "
+    "Routing is bidirectional and may be re-evaluated after context "
+    "discovery."
+)
+
+_RUNTIME_ONLY_POLICY = (
+    "Policy: CurrentRuntime is authoritative for this LLM call; do not infer "
+    "the active runtime from stale session headers, memory, or prior turns. "
+    "model_status is diagnostic fallback only."
+)
+
+
+def format_routing_directive(route: Any) -> str:
+    """Render a one-shot routing directive for current-user-message delivery.
+
+    Replaces the old per-turn ``DesiredRoute`` rendering inside the system
+    prompt: the directive rides the triggering turn's user message (persisted
+    byte-exact via the api_content sidecar), so the system prompt tail stays
+    byte-stable across routing events.
+    """
+    if not isinstance(route, dict) or not route:
+        return ""
+    label = _fmt_runtime_value(
+        route.get("label") or route.get("route_label"), "RUNTIME_OVERRIDE"
+    )
+    provider = _fmt_runtime_value(
+        route.get("target_provider") or route.get("provider"), "current"
+    )
+    model = _fmt_runtime_value(
+        route.get("target_model") or route.get("model"), "current"
+    )
+    effort = _fmt_runtime_value(
+        route.get("target_reasoning_effort") or route.get("reasoning_effort"),
+        "current",
+    )
+    strictness = _fmt_runtime_value(
+        route.get("strictness"), "auto_reconsiderable"
+    )
+    confidence = _fmt_runtime_value(route.get("confidence"), "unknown")
+    source = _fmt_runtime_value(route.get("source"), "pre_gateway_dispatch")
+    reason = str(route.get("reason") or "runtime routing").strip().replace('"', "'")
+    return (
+        "[Routing directive: "
+        f"label={label} target={provider}/{model}/{effort} "
+        f"strictness={strictness} confidence={confidence} source={source} "
+        f'reason="{reason}"]'
+    )
+
+
 def build_runtime_route_block(agent: Any) -> str:
     """Return the API-call-time runtime/route awareness block.
 
@@ -641,9 +709,17 @@ def build_runtime_route_block(agent: Any) -> str:
     boundary so the model can self-identify from authoritative live state
     without calling ``model_status``.
 
-    This branch does not ship the optional ``model_routes`` catalog, so an
-    absent current-turn route degrades to a CurrentRuntime-only block. Trusted
-    pre-dispatch route state still renders DesiredRoute for that one turn.
+    Byte-stability contract (prompt-tail freeze): the rendered text is a pure
+    function of the runtime key tuple ``(provider, model, api_mode, base_url,
+    model_source, reasoning, reasoning_source)`` and is cached on the agent as
+    ``(key_tuple, text)``. Per-API-call recompute is a tuple compare; the same
+    effective runtime always yields the exact same bytes. Mid-turn runtime
+    mutations (fallback activation, model_switch tool) change the tuple and
+    re-render -- a legitimate cache bust.
+
+    When no route catalog is declared, the branch's dormant behavior remains a
+    CurrentRuntime-only block. With a catalog, DesiredRoute is permanently
+    static and current-turn route intent rides the user-message sidecar.
     """
     try:
         from agent.runtime_control import get_runtime_state
@@ -670,61 +746,70 @@ def build_runtime_route_block(agent: Any) -> str:
         reasoning_text = _fmt_runtime_value(reasoning)
         reasoning_source = "default"
 
+    key_tuple = (
+        _fmt_runtime_value(
+            state.get("provider") if isinstance(state, dict) else ""
+        ),
+        _fmt_runtime_value(state.get("model") if isinstance(state, dict) else ""),
+        _fmt_runtime_value(
+            state.get("api_mode") if isinstance(state, dict) else ""
+        ),
+        _fmt_runtime_value(
+            state.get("base_url") if isinstance(state, dict) else ""
+        ),
+        _fmt_runtime_value(
+            state.get("model_source") if isinstance(state, dict) else "agent",
+            "agent",
+        ),
+        reasoning_text,
+        reasoning_source,
+    )
+    cached = getattr(agent, "_runtime_route_block_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and cached[0] == key_tuple
+        and isinstance(cached[1], str)
+    ):
+        return cached[1]
+
+    route_info = None
+    try:
+        from agent.runtime_control import _route_status_info
+
+        route_info = _route_status_info(agent)
+    except Exception:
+        route_info = None
+
     current = (
         "CurrentRuntime: "
-        f"provider={_fmt_runtime_value(state.get('provider') if isinstance(state, dict) else '')} "
-        f"model={_fmt_runtime_value(state.get('model') if isinstance(state, dict) else '')} "
+        f"provider={key_tuple[0]} "
+        f"model={key_tuple[1]} "
         f"reasoning={reasoning_text} "
-        f"api={_fmt_runtime_value(state.get('api_mode') if isinstance(state, dict) else '')} "
-        f"endpoint={_fmt_runtime_value(state.get('base_url') if isinstance(state, dict) else '')} "
-        f"source={_fmt_runtime_value(state.get('model_source') if isinstance(state, dict) else 'agent', 'agent')}"
+        f"api={key_tuple[2]} "
+        f"endpoint={key_tuple[3]} "
+        f"source={key_tuple[4]} "
+        # Always emitted (default ``default``): a presence-toggling suffix
+        # shifts every byte after it and re-keys the provider prompt cache.
+        f"reasoning_source={reasoning_source}"
     )
-    if reasoning_source and reasoning_source != "default":
-        current += f" reasoning_source={reasoning_source}"
 
-    lines = ["# Runtime/Route State", current]
-    route = getattr(agent, "_runtime_route_state", None)
-    if isinstance(route, dict) and route:
-        label = _fmt_runtime_value(
-            route.get("label") or route.get("route_label"), "RUNTIME_OVERRIDE"
-        )
-        provider = _fmt_runtime_value(
-            route.get("target_provider") or route.get("provider"), "current"
-        )
-        model = _fmt_runtime_value(
-            route.get("target_model") or route.get("model"), "current"
-        )
-        effort = _fmt_runtime_value(
-            route.get("target_reasoning_effort") or route.get("reasoning_effort"),
-            "current",
-        )
-        strictness = _fmt_runtime_value(
-            route.get("strictness"), "auto_reconsiderable"
-        )
-        confidence = _fmt_runtime_value(route.get("confidence"), "unknown")
-        source = _fmt_runtime_value(route.get("source"), "pre_gateway_dispatch")
-        reason = str(route.get("reason") or "runtime routing").strip().replace('"', "'")
-        lines.append(
-            "DesiredRoute: "
-            f"label={label} target={provider}/{model}/{effort} "
-            f"strictness={strictness} confidence={confidence} source={source} "
-            f'reason="{reason}"'
-        )
-        lines.append(
-            "Policy: This block is authoritative for this LLM call; do not infer "
-            "current runtime from stale session headers, memory, or prior turns. "
-            "model_status is diagnostic fallback only. Compare CurrentRuntime and "
-            "DesiredRoute; if mismatched and not user_strict, treat as a routing "
-            "anomaly before substantive work. Routing is bidirectional and may be "
-            "re-evaluated after context discovery."
+    if isinstance(route_info, dict):
+        text = (
+            "# Runtime/Route State\n"
+            + current
+            + "\n"
+            + _STATIC_DESIRED_ROUTE_LINE
+            + "\n"
+            + _RUNTIME_ROUTE_POLICY
         )
     else:
-        lines.append(
-            "Policy: CurrentRuntime is authoritative for this LLM call; do not infer "
-            "the active runtime from stale session headers, memory, or prior turns. "
-            "model_status is diagnostic fallback only."
-        )
-    return "\n".join(lines)
+        text = "# Runtime/Route State\n" + current + "\n" + _RUNTIME_ONLY_POLICY
+    try:
+        agent._runtime_route_block_cache = (key_tuple, text)
+    except Exception:
+        pass
+    return text
 
 
 def compose_effective_system_prompt(agent: Any, base_prompt: str) -> str:
@@ -834,6 +919,7 @@ __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
     "build_runtime_route_block",
+    "format_routing_directive",
     "compose_effective_system_prompt",
     "invalidate_system_prompt",
     "format_tools_for_system_message",
