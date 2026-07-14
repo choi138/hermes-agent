@@ -294,6 +294,129 @@ def test_markdown_budget_ignores_escaped_literal_backtick():
     assert truncated.endswith("…")
 
 
+def test_markdown_budget_ignores_escaped_literal_emphasis():
+    note = "safe words \\*literal emphasis then retained evidence " + ("more " * 30)
+
+    truncated = _truncate_kanban_markdown(note, 80)
+
+    assert "retained evidence" in truncated
+
+
+def test_markdown_budget_ignores_triple_backticks_inside_inline_code():
+    source = 'safe `literal ``` not fence` retained evidence ' + ('more ' * 30)
+
+    actual = _truncate_kanban_markdown(source, 80)
+
+    assert 'retained evidence' in actual
+
+
+def test_markdown_budget_matches_inline_code_backtick_run_length():
+    source = 'safe ```literal ```` not closer``` retained evidence ' + ('more ' * 30)
+
+    actual = _truncate_kanban_markdown(source, 90)
+
+    assert 'retained evidence' in actual
+
+
+@pytest.mark.parametrize(
+    "source_line",
+    [
+        "```literal ` not fence```",
+        "```python`invalid info string```",
+    ],
+)
+def test_markdown_budget_treats_line_start_backtick_span_as_inline(source_line):
+    source = f"safe\n{source_line}\nretained evidence " + ("more " * 30)
+
+    actual = _truncate_kanban_markdown(source, 100)
+
+    assert "retained evidence" in actual
+
+
+@pytest.mark.parametrize(
+    ("indentation", "retains_evidence"),
+    [("", False), (" ", False), ("  ", False), ("   ", False), ("    ", True), ("\t", True)],
+)
+def test_markdown_budget_limits_fence_opener_indentation(
+    indentation,
+    retains_evidence,
+):
+    source = (
+        f"safe\n{indentation}```python\nunfinished retained evidence "
+        + ("more " * 30)
+    )
+
+    actual = _truncate_kanban_markdown(source, 100)
+
+    assert ("retained evidence" in actual) is retains_evidence
+
+
+@pytest.mark.parametrize("indentation", ["    ", "\t"])
+def test_markdown_budget_ignores_all_backticks_on_indented_code_line(indentation):
+    source = (
+        f"safe\n{indentation}```literal```\nretained evidence " + ("more " * 30)
+    )
+
+    actual = _truncate_kanban_markdown(source, 100)
+
+    assert "retained evidence" in actual
+
+
+@pytest.mark.parametrize(
+    ("backslashes", "retains_evidence"),
+    [("\\", False), ("\\\\", True)],
+)
+def test_markdown_budget_uses_escape_parity_before_genuine_fence_closer(
+    backslashes,
+    retains_evidence,
+):
+    source = (
+        f"safe\n{backslashes}```python\nbody\n```\nretained evidence "
+        + ("more " * 30)
+    )
+
+    actual = _truncate_kanban_markdown(source, 100)
+
+    assert ("retained evidence" in actual) is retains_evidence
+
+
+@pytest.mark.parametrize(
+    ("backslashes", "retains_evidence"),
+    [("\\", True), ("\\\\", False)],
+)
+def test_markdown_budget_uses_backslash_parity_for_fences(
+    backslashes,
+    retains_evidence,
+):
+    source = (
+        f"safe\n{backslashes}```python\nunfinished retained evidence "
+        + ("more " * 30)
+    )
+
+    actual = _truncate_kanban_markdown(source, 100)
+
+    assert ("retained evidence" in actual) is retains_evidence
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer", "retains_evidence"),
+    [("```", "```", True), ("```", "````", True), ("````", "```", False)],
+)
+def test_markdown_budget_recognizes_fence_run_lengths(
+    opener,
+    closer,
+    retains_evidence,
+):
+    source = (
+        f"safe\n{opener}text\nliteral ``` inside\n{closer}\nretained evidence "
+        + ("more " * 30)
+    )
+
+    actual = _truncate_kanban_markdown(source, 100)
+
+    assert ("retained evidence" in actual) is retains_evidence
+
+
 def test_discord_role_delivery_long_unbroken_token_is_omitted_not_mid_token_clipped():
     message = _role_message("heartbeat", {"note": "가" * 3000})
 

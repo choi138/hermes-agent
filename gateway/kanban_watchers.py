@@ -60,6 +60,41 @@ def _is_escaped_markdown_delimiter(value: str, index: int) -> bool:
     return bool(backslashes % 2)
 
 
+def _is_markdown_fence_line_start(value: str, index: int) -> bool:
+    """Return whether a backtick run has valid fenced-code indentation."""
+    line_start = value.rfind("\n", 0, index) + 1
+    indentation = value[line_start:index]
+    return len(indentation) <= 3 and not indentation.strip(" ")
+
+
+def _is_markdown_fence_opener(value: str, index: int, run_end: int) -> bool:
+    """Return whether a backtick run is a valid opening fenced-code line."""
+    if not _is_markdown_fence_line_start(value, index):
+        return False
+    line_end = value.find("\n", run_end)
+    if line_end < 0:
+        line_end = len(value)
+    return "`" not in value[run_end:line_end]
+
+
+def _is_markdown_indented_code_backtick(value: str, index: int) -> bool:
+    """Return whether a backtick run is literal within an indented code line."""
+    line_start = value.rfind("\n", 0, index) + 1
+    line_prefix = value[line_start:index]
+    leading_whitespace = line_prefix[: len(line_prefix) - len(line_prefix.lstrip(" \t"))]
+    return "\t" in leading_whitespace or len(leading_whitespace) >= 4
+
+
+def _is_markdown_fence_closer(value: str, index: int, run_end: int) -> bool:
+    """Return whether a backtick run is a closing fenced-code line."""
+    if not _is_markdown_fence_line_start(value, index):
+        return False
+    line_end = value.find("\n", run_end)
+    if line_end < 0:
+        line_end = len(value)
+    return not value[run_end:line_end].strip(" \t")
+
+
 def _truncate_kanban_markdown(value: str, limit: int) -> str:
     """Budget one Markdown field without raw mid-token clipping."""
     text = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -80,27 +115,47 @@ def _truncate_kanban_markdown(value: str, limit: int) -> str:
 
     # If omission lands inside Markdown, discard the incomplete construct
     # instead of emitting a dangling fence/emphasis/code span.
-    if candidate.count("```") % 2:
-        candidate = candidate[: candidate.rfind("```")].rstrip()
-    in_fence = False
-    unmatched_code_span: Optional[int] = None
+    unmatched_fence: Optional[tuple[int, int]] = None
+    unmatched_code_span: Optional[tuple[int, int]] = None
     unmatched_emphasis: dict[str, Optional[int]] = {
         marker: None for marker in ("**", "__", "*", "_")
     }
     index = 0
     while index < len(candidate):
+        if candidate[index] == "`":
+            run_end = index + 1
+            while run_end < len(candidate) and candidate[run_end] == "`":
+                run_end += 1
+            run_length = run_end - index
+            if _is_escaped_markdown_delimiter(candidate, index):
+                index = run_end
+                continue
+            if unmatched_fence is not None:
+                if run_length >= unmatched_fence[1] and _is_markdown_fence_closer(
+                    candidate, index, run_end
+                ):
+                    unmatched_fence = None
+                index = run_end
+                continue
+            if unmatched_code_span is not None:
+                if run_length == unmatched_code_span[1]:
+                    unmatched_code_span = None
+                index = run_end
+                continue
+            if run_length >= 3 and _is_markdown_fence_opener(
+                candidate, index, run_end
+            ):
+                unmatched_fence = (index, run_length)
+            elif _is_markdown_indented_code_backtick(candidate, index):
+                pass
+            else:
+                unmatched_code_span = (index, run_length)
+            index = run_end
+            continue
         if _is_escaped_markdown_delimiter(candidate, index):
             index += 1
             continue
-        if candidate.startswith("```", index):
-            in_fence = not in_fence
-            index += 3
-            continue
-        if candidate[index] == "`" and not in_fence:
-            unmatched_code_span = index if unmatched_code_span is None else None
-            index += 1
-            continue
-        if not in_fence and unmatched_code_span is None:
+        if unmatched_fence is None and unmatched_code_span is None:
             marker = next(
                 (
                     marker
@@ -118,7 +173,11 @@ def _truncate_kanban_markdown(value: str, limit: int) -> str:
         index += 1
     unclosed = [
         start
-        for start in (unmatched_code_span, *unmatched_emphasis.values())
+        for start in (
+            unmatched_fence[0] if unmatched_fence is not None else None,
+            unmatched_code_span[0] if unmatched_code_span is not None else None,
+            *unmatched_emphasis.values(),
+        )
         if start is not None
     ]
     if unclosed:
