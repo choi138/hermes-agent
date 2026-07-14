@@ -1335,9 +1335,10 @@ KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
         "Signal that you're still alive during a long operation "
-        "(training, encoding, large crawls). Call every few minutes so "
-        "humans see liveness separately from PID checks. Pure side "
-        "effect — no work changes."
+        "(training, encoding, large crawls). Pure side effect — no work "
+        "changes. Empty automatic heartbeats remain silent. For a meaningful "
+        "milestone note, use 2–3 concise fields in the user's language when "
+        "possible; do not paste raw command or file dumps."
     ),
     "parameters": {
         "type": "object",
@@ -1349,8 +1350,9 @@ KANBAN_HEARTBEAT_SCHEMA = {
             "note": {
                 "type": "string",
                 "description": (
-                    "Optional short note describing current progress. "
-                    "Shown in the event log."
+                    "Optional concise progress note. Prefer explicit Markdown "
+                    "fields for current stage, verified evidence/result, and "
+                    "next action. Shown in the event log and subscribed chat."
                 ),
             },
             "board": _board_schema_prop(),

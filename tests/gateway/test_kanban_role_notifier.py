@@ -1,9 +1,11 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from gateway.config import Platform
+from gateway.kanban_watchers import _truncate_kanban_markdown
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -72,7 +74,239 @@ def _make_discord_runner(
     return runner
 
 
-def test_discord_completion_uses_event_run_profile_after_reassignment(tmp_path, monkeypatch):
+def _role_message(
+    kind,
+    payload=None,
+    *,
+    task_id="t_123",
+    title="Lifecycle formatting",
+    result=None,
+):
+    return GatewayRunner._kanban_role_delivery_message(
+        {"task_id": task_id},
+        SimpleNamespace(kind=kind, payload=payload),
+        SimpleNamespace(title=title, result=result),
+        "engineering",
+        "shinei",
+    )
+
+
+def test_discord_role_delivery_running_uses_compact_markdown_without_faux_role():
+    message = _role_message(
+        "spawned",
+        title="Implement lifecycle formatting",
+    )
+
+    assert message == (
+        "### Running · `t_123` · `[engineering]`\n"
+        "**Task:** Implement lifecycle formatting"
+    )
+    assert "@shinei" not in message
+
+
+def test_discord_role_delivery_progress_preserves_structured_markdown_and_legacy_note():
+    structured = _role_message(
+        "heartbeat",
+        {
+            "note": "**Current:** formatter\n**Evidence:** 3 tests passed\n**Next:** outbox"
+        },
+    )
+    legacy = _role_message("heartbeat", {"note": "unit tests are green"})
+
+    assert structured == (
+        "### Progress · `t_123` · `[engineering]`\n"
+        "**Current:** formatter\n**Evidence:** 3 tests passed\n**Next:** outbox"
+    )
+    assert legacy == (
+        "### Progress · `t_123` · `[engineering]`\n**Update:** unit tests are green"
+    )
+    assert _role_message("heartbeat", {"note": "  "}) is None
+    assert "@shinei" not in structured + legacy
+
+
+def test_discord_progress_preserves_indented_code_and_trailing_markdown_spaces():
+    note = "    indented code\nnext line  "
+
+    message = _role_message("heartbeat", {"note": note})
+
+    assert message == f"### Progress · `t_123` · `[engineering]`\n{note}"
+
+
+def test_discord_role_delivery_neutralizes_real_mention_tokens():
+    message = _role_message(
+        "heartbeat",
+        {"note": "users <@123> <@!456>, role <@&789>, @everyone and @here"},
+    )
+
+    for active_token in (
+        "<@123>",
+        "<@!456>",
+        "<@&789>",
+        "@everyone",
+        "@here",
+    ):
+        assert active_token not in message
+    assert "<@\u200b123>" in message
+    assert "<@\u200b!456>" in message
+    assert "<@\u200b&789>" in message
+    assert "@\u200beveryone" in message
+    assert "@\u200bhere" in message
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "block_kind", "label"),
+    [
+        ("blocked", "needs_input", "Needs input"),
+        ("dependency_wait", "dependency", "Waiting on"),
+        ("blocked", "transient", "Retry issue"),
+        ("blocked", "capability", "Limitation"),
+        ("blocked", None, "Blocked by"),
+    ],
+)
+def test_discord_role_delivery_blocked_kind_has_truthful_label(
+    event_kind,
+    block_kind,
+    label,
+):
+    message = _role_message(
+        event_kind,
+        {"kind": block_kind, "reason": "The upstream result is unavailable."},
+    )
+
+    assert message == (
+        f"### Blocked · `t_123` · `[engineering]`\n"
+        f"**Task:** Lifecycle formatting\n"
+        f"**{label}:** The upstream result is unavailable."
+    )
+    assert ("Needs input" in message) is (block_kind == "needs_input")
+    assert "@shinei" not in message
+
+
+def test_discord_blocked_preserves_reason_markdown_whitespace():
+    reason = "    indented blocker\nnext line  "
+
+    message = _role_message("blocked", {"kind": "dependency", "reason": reason})
+
+    assert message.endswith(f"**Waiting on:**\n{reason}")
+
+
+def test_discord_role_delivery_completed_preserves_worker_markdown_without_fabrication():
+    message = _role_message(
+        "completed",
+        {"summary": "Implemented formatter.\n\n- 12 tests passed\n- routing unchanged"},
+    )
+    no_evidence = _role_message("completed", {})
+
+    assert message == (
+        "### Completed · `t_123` · `[engineering]`\n"
+        "**Task:** Lifecycle formatting\n"
+        "**Result:**\n"
+        "Implemented formatter.\n\n- 12 tests passed\n- routing unchanged"
+    )
+    assert no_evidence == (
+        "### Completed · `t_123` · `[engineering]`\n**Task:** Lifecycle formatting"
+    )
+    assert "@shinei" not in message + no_evidence
+
+
+def test_discord_completion_reserves_budget_for_result_after_long_task_title():
+    message = _role_message(
+        "completed",
+        {"summary": "Verified evidence: 174 tests passed."},
+        title="very long task " * 300,
+    )
+
+    assert len(message) <= 1800
+    assert "**Task:**" in message
+    assert "**Result:**\nVerified evidence: 174 tests passed." in message
+    assert "…" in message
+
+
+def test_discord_completion_preserves_result_markdown_whitespace():
+    summary = "    indented result\nnext line  "
+
+    message = _role_message("completed", {"summary": summary})
+
+    assert message.endswith(f"**Result:**\n{summary}")
+
+
+def test_discord_role_delivery_budget_is_unicode_safe_and_closes_truncated_fence():
+    note = (
+        "**Current:** 검증 완료 🙂\n"
+        "```python\n" + ("print('한글🙂')\n" * 400) + "```\n**Next:** outbox"
+    )
+
+    message = _role_message("heartbeat", {"note": note})
+
+    assert len(message) <= 1800
+    assert "검증 완료 🙂" in message
+    assert message.endswith("…")
+    assert message.count("```") % 2 == 0
+    assert "\ufffd" not in message
+
+
+def test_markdown_budget_keeps_completed_fence_with_literal_backtick_well_formed():
+    note = 'before\n```python\nprint("`")\n```\nafter ' + ("word " * 40)
+
+    truncated = _truncate_kanban_markdown(note, 120)
+
+    assert len(truncated) <= 120
+    assert 'print("`")\n```' in truncated
+    assert truncated.count("```") == 2
+    assert truncated.endswith("…")
+
+
+def test_markdown_budget_ignores_emphasis_tokens_inside_completed_fence():
+    note = 'before\n```python\nprint("**")\n```\nafter ' + ("word " * 40)
+
+    truncated = _truncate_kanban_markdown(note, 120)
+
+    assert 'print("**")\n```' in truncated
+    assert truncated.count("```") == 2
+    assert truncated.endswith("…")
+
+
+@pytest.mark.parametrize("token", ["`", "**"])
+def test_markdown_budget_drops_unclosed_inline_construct(token):
+    note = f"verified words {token}unfinished " + ("more " * 40)
+
+    truncated = _truncate_kanban_markdown(note, 80)
+
+    assert truncated == "verified words…"
+
+
+def test_discord_role_delivery_long_unbroken_token_is_omitted_not_mid_token_clipped():
+    message = _role_message("heartbeat", {"note": "가" * 3000})
+
+    assert len(message) <= 1800
+    assert message.endswith("…")
+    assert "가" not in message
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "heading"),
+    [
+        ("gave_up", {"error": "spawn failed"}, "Stopped"),
+        ("crashed", None, "Retrying"),
+        ("timed_out", {"limit_seconds": 90}, "Timed out"),
+    ],
+)
+def test_discord_role_delivery_failure_events_keep_context_without_faux_role(
+    kind,
+    payload,
+    heading,
+):
+    message = _role_message(kind, payload)
+
+    assert message.startswith(
+        f"### {heading} · `t_123` · `[engineering]`\n**Task:** Lifecycle formatting"
+    )
+    assert "@shinei" not in message
+
+
+def test_discord_completion_uses_event_run_profile_after_reassignment(
+    tmp_path, monkeypatch
+):
     """A retry/reassignment cannot make an old run speak as the new assignee."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "run-profile-routing.db"))
     _authorize_profiles(monkeypatch, tmp_path, "default", "shinei", "raiden")
@@ -105,7 +339,8 @@ def test_discord_completion_uses_event_run_profile_after_reassignment(tmp_path, 
     asyncio.run(_run_one_role_delivery_tick(monkeypatch, sender))
 
     assert len(shinei.sent) == 1
-    assert "@shinei" in shinei.sent[0]["text"]
+    assert "@shinei" not in shinei.sent[0]["text"]
+    assert shinei.sent[0]["text"].startswith("### Completed")
     assert coordinator.sent == []
     assert raiden.sent == []
 
@@ -133,6 +368,35 @@ def test_discord_execution_uses_active_named_profile_adapter(tmp_path, monkeypat
 
     assert len(shinei.sent) == 1
     assert "active profile completed" in shinei.sent[0]["text"]
+
+
+def test_non_discord_progress_keeps_legacy_message_format(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "telegram-legacy.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy transport", assignee="shinei")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        assert kb.heartbeat_worker(
+            conn,
+            tid,
+            note="legacy update",
+            expected_run_id=task.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    telegram = RecordingAdapter()
+    runner = _make_discord_runner(RecordingAdapter())
+    runner.adapters = {Platform.TELEGRAM: telegram}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [sent["text"] for sent in telegram.sent] == [
+        f"… [default] @shinei Kanban {tid} progress: legacy update"
+    ]
 
 
 def test_discord_execution_uses_active_default_profile_adapter(tmp_path, monkeypatch):
@@ -338,24 +602,40 @@ def test_discord_heartbeat_only_sends_nonempty_note(tmp_path, monkeypatch):
         kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="thread-1")
         task = kb.claim_task(conn, tid)
         assert task is not None
-        assert kb.heartbeat_worker(conn, tid, note=None, expected_run_id=task.current_run_id)
         assert kb.heartbeat_worker(
-            conn, tid, note="unit tests are green", expected_run_id=task.current_run_id,
+            conn, tid, note=None, expected_run_id=task.current_run_id
+        )
+        structured_note = (
+            "**Current:** formatter\n"
+            "**Evidence:** producer → SQLite → consumer\n"
+            "**Next:** routing regression"
+        )
+        assert kb.heartbeat_worker(
+            conn,
+            tid,
+            note=structured_note,
+            expected_run_id=task.current_run_id,
         )
     finally:
         conn.close()
 
     shinei = RecordingAdapter()
     runner = _make_discord_runner(
-        RecordingAdapter(), {"shinei": {Platform.DISCORD: shinei}},
+        RecordingAdapter(),
+        {"shinei": {Platform.DISCORD: shinei}},
     )
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    asyncio.run(_run_one_role_delivery_tick(
-        monkeypatch, _make_discord_runner(shinei, active_profile="shinei"),
-    ))
+    asyncio.run(
+        _run_one_role_delivery_tick(
+            monkeypatch,
+            _make_discord_runner(shinei, active_profile="shinei"),
+        )
+    )
 
     assert len(shinei.sent) == 1
-    assert "unit tests are green" in shinei.sent[0]["text"]
+    assert shinei.sent[0]["text"] == (
+        f"### Progress · `{tid}` · `[default]`\n{structured_note}"
+    )
 
 
 def test_missing_discord_run_adapter_warns_via_coordinator_without_impersonation(
@@ -381,6 +661,8 @@ def test_missing_discord_run_adapter_warns_via_coordinator_without_impersonation
     warning = coordinator.sent[0]["text"].lower()
     assert "delivery failed" in warning
     assert "shinei" in warning
+    assert "@shinei" not in warning
+    assert "`shinei`" in warning
     assert " done" not in warning
 
 

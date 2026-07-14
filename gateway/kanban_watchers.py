@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -30,10 +31,125 @@ _KANBAN_EXECUTION_EVENT_KINDS = frozenset({
     "heartbeat",
     "completed",
     "blocked",
+    "dependency_wait",
     "gave_up",
     "crashed",
     "timed_out",
 })
+
+_KANBAN_ROLE_MESSAGE_LIMIT = 1800
+
+
+def _neutralize_discord_mentions(value: str) -> str:
+    """Keep authored text visible without allowing lifecycle updates to ping."""
+    return (
+        value
+        .replace("<@", "<@\u200b")
+        .replace("@everyone", "@\u200beveryone")
+        .replace("@here", "@\u200bhere")
+    )
+
+
+def _truncate_kanban_markdown(value: str, limit: int) -> str:
+    """Budget one Markdown field without raw mid-token clipping."""
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return "…"[:limit]
+
+    candidate = text[: limit - 1]
+    while candidate and unicodedata.combining(candidate[-1]):
+        candidate = candidate[:-1]
+    boundary = max(
+        candidate.rfind("\n"),
+        candidate.rfind(" "),
+        candidate.rfind("\t"),
+    )
+    candidate = candidate[:boundary].rstrip() if boundary >= 0 else ""
+
+    # If omission lands inside Markdown, discard the incomplete construct
+    # instead of emitting a dangling fence/emphasis/code span.
+    if candidate.count("```") % 2:
+        candidate = candidate[: candidate.rfind("```")].rstrip()
+    in_fence = False
+    unmatched_code_span: Optional[int] = None
+    unmatched_emphasis: Optional[int] = None
+    index = 0
+    while index < len(candidate):
+        if candidate.startswith("```", index):
+            in_fence = not in_fence
+            index += 3
+            continue
+        if candidate[index] == "`" and not in_fence:
+            unmatched_code_span = index if unmatched_code_span is None else None
+            index += 1
+            continue
+        if (
+            candidate.startswith("**", index)
+            and not in_fence
+            and unmatched_code_span is None
+        ):
+            unmatched_emphasis = index if unmatched_emphasis is None else None
+            index += 2
+            continue
+        index += 1
+    unclosed = [
+        start
+        for start in (unmatched_code_span, unmatched_emphasis)
+        if start is not None
+    ]
+    if unclosed:
+        candidate = candidate[: min(unclosed)].rstrip()
+
+    return f"{candidate}…" if candidate else "…"
+
+
+def _render_kanban_role_message(
+    header: str,
+    fields: list[tuple[Optional[str], str, bool]],
+) -> str:
+    """Render a compact header plus at most three line-aware body fields."""
+    prepared: list[tuple[str, str]] = []
+    for label, raw_value, force_multiline in fields[:3]:
+        value = _neutralize_discord_mentions(str(raw_value or ""))
+        if not value.strip():
+            continue
+        multiline = force_multiline or "\n" in value
+        prefix = "\n"
+        if label:
+            prefix += f"**{label}:**" + ("\n" if multiline else " ")
+        prepared.append((prefix, value))
+
+    content_budget = max(
+        0,
+        _KANBAN_ROLE_MESSAGE_LIMIT
+        - len(header)
+        - sum(len(prefix) for prefix, _ in prepared),
+    )
+    budgets = [0] * len(prepared)
+    pending = set(range(len(prepared)))
+    remaining = content_budget
+    while pending:
+        share = remaining // len(pending)
+        completed = {index for index in pending if len(prepared[index][1]) <= share}
+        if not completed:
+            for index in pending:
+                budgets[index] = share
+            for index in sorted(pending, reverse=True)[: remaining % len(pending)]:
+                budgets[index] += 1
+            break
+        for index in completed:
+            budgets[index] = len(prepared[index][1])
+            remaining -= budgets[index]
+        pending -= completed
+
+    message = header
+    for (prefix, value), budget in zip(prepared, budgets):
+        if budget <= 0:
+            continue
+        message += prefix + _truncate_kanban_markdown(value, budget)
+    return message
 
 
 def _kanban_event_profile(kb, conn, event, task) -> Optional[str]:
@@ -212,52 +328,79 @@ class GatewayKanbanWatchersMixin:
 
     @staticmethod
     def _kanban_role_delivery_message(
-        sub, event, task, board_name: str, who: Optional[str],
+        sub,
+        event,
+        task,
+        board_name: str,
+        who: Optional[str],
     ) -> Optional[str]:
         """Render an immutable execution-event snapshot for durable staging."""
         kind = event.kind
         payload = event.payload or {}
         task_id = sub["task_id"]
         title = task.title if task else task_id
-        board_tag = f"[{board_name}] " if board_name != "default" else ""
-        tag = f"@{who} " if who else ""
+        board_tag = f" · `[{board_name}]`" if board_name else ""
         if kind == "spawned":
-            return f"▶ {board_tag}{tag}Kanban {task_id} running — {title}"
+            return _render_kanban_role_message(
+                f"### Running · `{task_id}`{board_tag}",
+                [("Task", title, False)],
+            )
         if kind == "heartbeat":
-            note = str(payload.get("note") or "").strip()
-            if not note:
+            note = str(payload.get("note") or "")
+            if not note.strip():
                 return None
-            return f"… {board_tag}{tag}Kanban {task_id} progress: {note[:500]}"
+            field = (None, note, True) if "\n" in note else ("Update", note, False)
+            return _render_kanban_role_message(
+                f"### Progress · `{task_id}`{board_tag}",
+                [field],
+            )
         if kind == "completed":
-            summary = str(payload.get("summary") or "").strip()
-            if summary:
-                handoff = f"\n{summary.splitlines()[0][:200]}"
-            elif task and task.result:
-                handoff = f"\n{task.result.strip().splitlines()[0][:160]}"
-            else:
-                handoff = ""
-            return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
-        if kind == "blocked":
-            reason = str(payload.get("reason") or "").strip()
-            suffix = f": {reason[:160]}" if reason else ""
-            return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{suffix}"
+            summary = str(payload.get("summary") or "")
+            if not summary.strip() and task and task.result:
+                summary = str(task.result)
+            return _render_kanban_role_message(
+                f"### Completed · `{task_id}`{board_tag}",
+                [("Task", title, False), ("Result", summary, True)],
+            )
+        if kind in {"blocked", "dependency_wait"}:
+            reason = str(payload.get("reason") or "")
+            block_kind = payload.get("kind")
+            label = {
+                "needs_input": "Needs input",
+                "dependency": "Waiting on",
+                "transient": "Retry issue",
+                "capability": "Limitation",
+            }.get(block_kind, "Blocked by")
+            return _render_kanban_role_message(
+                f"### Blocked · `{task_id}`{board_tag}",
+                [("Task", title, False), (label, reason, False)],
+            )
         if kind == "gave_up":
             error = str(payload.get("error") or "").strip()
-            suffix = f"\n{error[:200]}" if error else ""
-            return (
-                f"✖ {board_tag}{tag}Kanban {task_id} gave up "
-                f"after repeated spawn failures{suffix}"
+            return _render_kanban_role_message(
+                f"### Stopped · `{task_id}`{board_tag}",
+                [
+                    ("Task", title, False),
+                    ("State", "Repeated spawn failures", False),
+                    ("Error", error, False),
+                ],
             )
         if kind == "crashed":
-            return (
-                f"✖ {board_tag}{tag}Kanban {task_id} worker crashed "
-                "(pid gone); dispatcher will retry"
+            return _render_kanban_role_message(
+                f"### Retrying · `{task_id}`{board_tag}",
+                [
+                    ("Task", title, False),
+                    ("State", "Worker process exited; dispatcher will retry.", False),
+                ],
             )
         if kind == "timed_out":
             limit = int(payload.get("limit_seconds") or 0)
-            return (
-                f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
-                f"(max_runtime={limit}s); will retry"
+            return _render_kanban_role_message(
+                f"### Timed out · `{task_id}`{board_tag}",
+                [
+                    ("Task", title, False),
+                    ("State", f"Runtime limit {limit}s; dispatcher will retry.", False),
+                ],
             )
         return None
 
@@ -314,8 +457,17 @@ class GatewayKanbanWatchersMixin:
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
         NOTIFY_KINDS = (
-            "spawned", "heartbeat", "completed", "blocked", "gave_up",
-            "crashed", "timed_out", "status", "archived", "unblocked",
+            "spawned",
+            "heartbeat",
+            "completed",
+            "blocked",
+            "dependency_wait",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "status",
+            "archived",
+            "unblocked",
         )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
@@ -723,7 +875,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 warning = (
                                     f"⚠ {board_tag}Kanban {sub['task_id']} delivery failed: "
-                                    f"Discord run profile @{who} could not send the {kind} "
+                                    f"Discord run profile `{who}` could not send the {kind} "
                                     "event; check gateway logs for details."
                                 )
                                 try:

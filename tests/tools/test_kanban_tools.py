@@ -18,6 +18,22 @@ import pytest
 # Gating
 # ---------------------------------------------------------------------------
 
+def test_heartbeat_schema_guides_meaningful_notes_without_changing_silent_liveness():
+    from tools import kanban_tools as kt
+
+    description = kt.KANBAN_HEARTBEAT_SCHEMA["description"]
+    note_description = kt.KANBAN_HEARTBEAT_SCHEMA["parameters"]["properties"]["note"][
+        "description"
+    ]
+
+    assert "2–3 concise fields" in description
+    assert "user's language" in description
+    assert "current stage" in note_description
+    assert "verified evidence/result" in note_description
+    assert "next action" in note_description
+    assert "Empty automatic heartbeats remain silent" in description
+
+
 def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
     zero kanban_* tools in their schema."""

@@ -352,7 +352,8 @@ def test_cross_process_delivery_keeps_immutable_run_profile_after_reassignment(
     ))
 
     assert len(shinei.sent) == 1
-    assert "@shinei" in shinei.sent[0]["text"]
+    assert "@shinei" not in shinei.sent[0]["text"]
+    assert shinei.sent[0]["text"].startswith("### Completed")
     assert raiden.sent == []
     assert coordinator.sent == []
 
@@ -418,8 +419,9 @@ def test_cross_process_completion_uploads_artifact_in_origin_thread(
         ("spawned", None, "running"),
         ("heartbeat", {"note": "halfway"}, "halfway"),
         ("blocked", {"reason": "human input"}, "blocked"),
-        ("gave_up", {"error": "spawn failed"}, "gave up"),
-        ("crashed", None, "crashed"),
+        ("dependency_wait", {"kind": "dependency", "reason": "parent"}, "waiting on"),
+        ("gave_up", {"error": "spawn failed"}, "stopped"),
+        ("crashed", None, "retrying"),
         ("timed_out", {"limit_seconds": 90}, "timed out"),
     ],
 )
