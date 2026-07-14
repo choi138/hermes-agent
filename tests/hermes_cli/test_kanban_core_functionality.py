@@ -1027,6 +1027,9 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
             assert [e.kind for e in events].count("timed_out") == 2
             gave_up = [e for e in events if e.kind == "gave_up"]
             assert gave_up and gave_up[-1].payload["trigger_outcome"] == "timed_out"
+            timed_out_events = [e for e in events if e.kind == "timed_out"]
+            assert gave_up[-1].run_id == timed_out_events[-1].run_id
+            assert gave_up[-1].run_id is not None
         finally:
             conn.close()
     finally:

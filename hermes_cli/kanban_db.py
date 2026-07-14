@@ -7258,6 +7258,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                event_run_id=run_id,
                 event_payload_extra={"pid": pid, "sigkill": killed},
             )
     return timed_out
@@ -7560,7 +7561,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, run_id)
                     )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
@@ -7576,10 +7577,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, run_id in crash_details:
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
@@ -7592,6 +7593,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 failure_limit=1 if (protocol_violation or is_systemic) else None,
                 release_claim=False,
                 end_run=False,
+                event_run_id=run_id,
                 event_payload_extra={"pid": pid, "claimer": claimer},
             )
             if tripped:
@@ -7616,6 +7618,7 @@ def _record_task_failure(
     failure_limit: int = None,
     release_claim: bool = False,
     end_run: bool = False,
+    event_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -7642,9 +7645,10 @@ def _record_task_failure(
       counter; if the breaker trips, the task is re-transitioned
       ``ready → blocked`` and a ``gave_up`` event is emitted.
 
-    ``event_payload_extra`` merges into the ``gave_up`` event payload
-    when the breaker trips, so callers can include outcome-specific
-    context (e.g. pid on crash, elapsed on timeout).
+    ``event_run_id`` identifies the run already closed by timeout/crash
+    callers, so a resulting ``gave_up`` event retains immutable profile
+    attribution. ``event_payload_extra`` merges outcome-specific context
+    (e.g. pid on crash, elapsed on timeout) into that event.
 
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
@@ -7698,7 +7702,7 @@ def _record_task_failure(
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
                 )
-            run_id = None
+            run_id = event_run_id
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(

@@ -25,6 +25,48 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+_KANBAN_EXECUTION_EVENT_KINDS = frozenset({
+    "spawned",
+    "heartbeat",
+    "completed",
+    "blocked",
+    "gave_up",
+    "crashed",
+    "timed_out",
+})
+
+
+def _kanban_event_profile(kb, conn, event, task) -> Optional[str]:
+    """Return the profile that actually produced a worker execution event.
+
+    Modern events carry ``run_id`` and are attributed exclusively through the
+    immutable ``task_runs.profile`` row.  Falling back to the task's current
+    assignee for such an event would misattribute an old attempt after a retry
+    or reassignment.  Only pre-runs legacy events (``run_id IS NULL``) use the
+    historical assignee fallback.
+    """
+    if event.kind not in _KANBAN_EXECUTION_EVENT_KINDS:
+        return None
+    run_id = getattr(event, "run_id", None)
+    if run_id is not None:
+        run = kb.get_run(conn, run_id)
+        if run is None:
+            logger.warning(
+                "kanban notifier: event %s for %s references missing run %s; "
+                "refusing current-assignee fallback",
+                event.id, event.task_id, run_id,
+            )
+            return None
+        return (run.profile or "").strip() or None
+    # Explicit compatibility path for task_events rows created before
+    # task_runs/run_id existed.
+    return (
+        (getattr(task, "assignee", None) or "").strip() or None
+        if task is not None
+        else None
+    )
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -112,14 +154,46 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _kanban_execution_adapter(self, platform, profile: Optional[str]):
+        """Resolve an explicitly-attributed worker adapter without fallback.
+
+        The active profile's adapters live in ``self.adapters`` and are
+        intentionally absent from the central authorization resolver's
+        secondary-profile registry. All other profiles stay behind that policy
+        boundary; a missing, denied, or failed resolution is fail-closed.
+        """
+        profile_name = (profile or "").strip()
+        if not profile_name:
+            return None
+        active_profile = (
+            (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+            or self._active_profile_name()
+            or "default"
+        )
+        if profile_name == active_profile:
+            return (getattr(self, "adapters", None) or {}).get(platform)
+        try:
+            adapter = self._authorization_adapter(platform, profile_name)
+            if isinstance(adapter, str) and not adapter.strip():
+                return None
+            return adapter or None
+        except Exception:
+            logger.warning(
+                "kanban notifier: authorization adapter resolution failed for "
+                "Discord run profile %s",
+                profile_name,
+                exc_info=True,
+            )
+            return None
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll ``kanban_notify_subs`` and deliver task events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. When a task reaches a terminal state
+        stored cursor, including worker start, explicit progress notes, and
+        terminal outcomes. Sends one message per visible event to
+        ``(platform, chat_id, thread_id)``, then advances the cursor. Empty
+        automatic heartbeats remain silent. When a task reaches a final state
         (``completed`` / ``archived``), the subscription is removed.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
@@ -164,7 +238,10 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        NOTIFY_KINDS = (
+            "spawned", "heartbeat", "completed", "blocked", "gave_up",
+            "crashed", "timed_out", "status", "archived", "unblocked",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -274,7 +351,7 @@ class GatewayKanbanWatchersMixin:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=NOTIFY_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -283,11 +360,16 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
                                 )
+                                event_profiles = {
+                                    ev.id: _kanban_event_profile(_kb, conn, ev, task)
+                                    for ev in events
+                                }
                                 deliveries.append({
                                     "sub": sub,
                                     "old_cursor": old_cursor,
                                     "cursor": cursor,
                                     "events": events,
+                                    "event_profiles": event_profiles,
                                     "task": task,
                                     "board": slug,
                                 })
@@ -320,8 +402,10 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
-                    if adapter is None:
+                    coordinator_adapter = self._authorization_adapter(
+                        plat, sub_profile or None,
+                    )
+                    if coordinator_adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                             platform_str, sub["task_id"],
@@ -338,12 +422,75 @@ class GatewayKanbanWatchersMixin:
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
+                        heartbeat_note = ""
+                        if kind == "heartbeat":
+                            if ev.payload and ev.payload.get("note"):
+                                heartbeat_note = str(ev.payload["note"]).strip()
+                            if not heartbeat_note:
+                                # Automatic liveness heartbeats are intentionally
+                                # silent; only explicit milestone notes reach chat.
+                                continue
+                        # Execution events belong to the immutable run profile,
+                        # not the task's mutable current assignee. Discord can
+                        # therefore send through the worker profile's real bot.
+                        who = d.get("event_profiles", {}).get(ev.id)
+                        if who is None and kind not in _KANBAN_EXECUTION_EVENT_KINDS:
+                            who = task.assignee if task and task.assignee else None
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        adapter = coordinator_adapter
+                        role_routed = False
+                        if (
+                            plat == _Platform.DISCORD
+                            and kind in _KANBAN_EXECUTION_EVENT_KINDS
+                        ):
+                            adapter = self._kanban_execution_adapter(plat, who)
+                            role_routed = True
+                            if adapter is None:
+                                role_label = f"@{who}" if who else "<unknown>"
+                                logger.warning(
+                                    "kanban notifier: delivery failed for %s event %s; "
+                                    "Discord adapter for run profile %s is unavailable",
+                                    sub["task_id"], kind, role_label,
+                                )
+                                metadata: dict[str, Any] = {}
+                                if sub.get("thread_id"):
+                                    metadata["thread_id"] = sub["thread_id"]
+                                warning = (
+                                    f"⚠ {board_tag}Kanban {sub['task_id']} delivery failed: "
+                                    f"Discord adapter for run profile {role_label} is unavailable "
+                                    f"({kind} event was not sent by the worker bot)."
+                                )
+                                try:
+                                    await coordinator_adapter.send(
+                                        sub["chat_id"], warning, metadata=metadata,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "kanban notifier: coordinator delivery-failure warning "
+                                        "for %s also failed: %s",
+                                        sub["task_id"], exc,
+                                    )
+                                    await asyncio.to_thread(
+                                        self._kanban_rewind,
+                                        sub,
+                                        d["cursor"],
+                                        d.get("old_cursor", 0),
+                                        board_slug,
+                                    )
+                                    break
+                                else:
+                                    continue
+                        if kind == "spawned":
+                            msg = (
+                                f"▶ {board_tag}{tag}Kanban {sub['task_id']} running"
+                                f" — {title}"
+                            )
+                        elif kind == "heartbeat":
+                            msg = (
+                                f"… {board_tag}{tag}Kanban {sub['task_id']} progress: "
+                                f"{heartbeat_note[:500]}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -397,7 +544,7 @@ class GatewayKanbanWatchersMixin:
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # archived / unblocked are claimed by NOTIFY_KINDS
                             # (so the cursor advances past them and they can't
                             # wedge a later completed/blocked event behind an
                             # unclaimed row) but are intentionally SILENT: an
@@ -446,6 +593,34 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            if role_routed:
+                                logger.warning(
+                                    "kanban notifier: delivery failed for %s event %s "
+                                    "via Discord run profile %s: %s",
+                                    sub["task_id"], kind, who, exc,
+                                )
+                                warning = (
+                                    f"⚠ {board_tag}Kanban {sub['task_id']} delivery failed: "
+                                    f"Discord run profile @{who} could not send the {kind} "
+                                    "event; check gateway logs for details."
+                                )
+                                try:
+                                    await coordinator_adapter.send(
+                                        sub["chat_id"], warning, metadata=metadata,
+                                    )
+                                except Exception as coordinator_exc:
+                                    logger.warning(
+                                        "kanban notifier: coordinator delivery-failure warning "
+                                        "for %s also failed: %s",
+                                        sub["task_id"], coordinator_exc,
+                                    )
+                                else:
+                                    # The coordinator visibly reported the failed
+                                    # worker-bot delivery. Treat that warning as the
+                                    # durable outcome instead of silently retrying
+                                    # through (or impersonating with) the default bot.
+                                    sub_fail_counts.pop(sub_key, None)
+                                    continue
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
@@ -486,7 +661,7 @@ class GatewayKanbanWatchersMixin:
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
+                        # same state. See the longer comment on NOTIFY_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
@@ -545,7 +720,10 @@ class GatewayKanbanWatchersMixin:
                                         source=_source,
                                         internal=True,
                                     )
-                                    await adapter.handle_message(_synth_event)
+                                    # Final synthesis belongs to the originating
+                                    # coordinator session, even when the visible
+                                    # execution notification used a worker bot.
+                                    await coordinator_adapter.handle_message(_synth_event)
                                     logger.info(
                                         "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                         sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,

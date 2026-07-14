@@ -39,22 +39,32 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter whose intake policy should gate authorization.
 
         In multiplex mode, secondary-profile adapters live in
-        ``_profile_adapters[profile]`` while the default/active profile uses
+        ``_profile_adapters[profile]`` while the active profile uses
         ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
-        When a stamped profile has its own adapter registry entry, the default
-        profile's same-platform adapter must not be consulted as a fallback.
+        The default profile is secondary when a named profile owns the gateway,
+        so active identity — not the literal name ``"default"`` — determines
+        which registry is authoritative. When a stamped secondary profile has no
+        adapter registry entry, the active profile's same-platform adapter must
+        not be consulted as a fallback.
         """
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
-            profile_adapters = getattr(self, "_profile_adapters", None) or {}
-            if profile_name in profile_adapters:
-                return profile_adapters[profile_name].get(platform)
-            # Fail closed: a stamped secondary profile with no registry entry
-            # (e.g. its adapter failed to connect) must NOT fall back to the
-            # default profile's adapter — that sends replies out the wrong bot.
-            return None
+        if profile_name:
+            try:
+                active_profile = (
+                    (self._active_profile_name() or "").strip() or "default"
+                )
+            except Exception:
+                active_profile = "default"
+            if profile_name != active_profile:
+                profile_adapters = getattr(self, "_profile_adapters", None) or {}
+                if profile_name in profile_adapters:
+                    return profile_adapters[profile_name].get(platform)
+                # Fail closed: a stamped secondary profile with no registry entry
+                # (e.g. its adapter failed to connect) must NOT fall back to the
+                # active profile's adapter — that sends replies out the wrong bot.
+                return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
 
