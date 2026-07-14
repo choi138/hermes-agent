@@ -275,6 +275,25 @@ def test_markdown_budget_drops_unclosed_inline_construct(token):
     assert truncated == "verified words…"
 
 
+@pytest.mark.parametrize("marker", ["*", "_", "__"])
+def test_markdown_budget_drops_emphasis_whose_closer_is_beyond_budget(marker):
+    note = f"verified {marker}" + ("inside " * 20) + marker + " trailing evidence"
+
+    truncated = _truncate_kanban_markdown(note, 80)
+
+    assert truncated == "verified…"
+
+
+def test_markdown_budget_ignores_escaped_literal_backtick():
+    note = "safe words \\`literal backtick then retained evidence " + ("more " * 30)
+
+    truncated = _truncate_kanban_markdown(note, 80)
+
+    assert len(truncated) <= 80
+    assert truncated.startswith("safe words \\`literal backtick then retained evidence")
+    assert truncated.endswith("…")
+
+
 def test_discord_role_delivery_long_unbroken_token_is_omitted_not_mid_token_clipped():
     message = _role_message("heartbeat", {"note": "가" * 3000})
 

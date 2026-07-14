@@ -50,6 +50,16 @@ def _neutralize_discord_mentions(value: str) -> str:
     )
 
 
+def _is_escaped_markdown_delimiter(value: str, index: int) -> bool:
+    """Return whether the delimiter at index has an odd backslash prefix."""
+    backslashes = 0
+    index -= 1
+    while index >= 0 and value[index] == "\\":
+        backslashes += 1
+        index -= 1
+    return bool(backslashes % 2)
+
+
 def _truncate_kanban_markdown(value: str, limit: int) -> str:
     """Budget one Markdown field without raw mid-token clipping."""
     text = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -74,9 +84,14 @@ def _truncate_kanban_markdown(value: str, limit: int) -> str:
         candidate = candidate[: candidate.rfind("```")].rstrip()
     in_fence = False
     unmatched_code_span: Optional[int] = None
-    unmatched_emphasis: Optional[int] = None
+    unmatched_emphasis: dict[str, Optional[int]] = {
+        marker: None for marker in ("**", "__", "*", "_")
+    }
     index = 0
     while index < len(candidate):
+        if _is_escaped_markdown_delimiter(candidate, index):
+            index += 1
+            continue
         if candidate.startswith("```", index):
             in_fence = not in_fence
             index += 3
@@ -85,18 +100,25 @@ def _truncate_kanban_markdown(value: str, limit: int) -> str:
             unmatched_code_span = index if unmatched_code_span is None else None
             index += 1
             continue
-        if (
-            candidate.startswith("**", index)
-            and not in_fence
-            and unmatched_code_span is None
-        ):
-            unmatched_emphasis = index if unmatched_emphasis is None else None
-            index += 2
-            continue
+        if not in_fence and unmatched_code_span is None:
+            marker = next(
+                (
+                    marker
+                    for marker in unmatched_emphasis
+                    if candidate.startswith(marker, index)
+                ),
+                None,
+            )
+            if marker is not None:
+                unmatched_emphasis[marker] = (
+                    index if unmatched_emphasis[marker] is None else None
+                )
+                index += len(marker)
+                continue
         index += 1
     unclosed = [
         start
-        for start in (unmatched_code_span, unmatched_emphasis)
+        for start in (unmatched_code_span, *unmatched_emphasis.values())
         if start is not None
     ]
     if unclosed:
