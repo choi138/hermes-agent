@@ -7393,6 +7393,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so human-in-the-loop workflows hear back without polling.
         asyncio.create_task(self._kanban_notifier_watcher())
 
+        # Every gateway, including non-dispatch named-profile services, consumes
+        # durable Discord lifecycle deliveries addressed to its exact profile.
+        # This watcher never dispatches workers.
+        asyncio.create_task(self._kanban_role_delivery_watcher())
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -7872,12 +7877,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await asyncio.sleep(1)
 
     def _active_profile_name(self) -> str:
-        """Return the profile name this gateway represents."""
+        """Return this gateway's profile, or blank when identity is unavailable.
+
+        Gateway boot identity is a security boundary for Kanban dispatch. A
+        failed or blank lookup must not be reclassified as ``default`` because
+        that would let an unknown process pass the default-only dispatcher gate.
+        """
         try:
             from hermes_cli.profiles import get_active_profile_name
-            return get_active_profile_name() or "default"
+            return (get_active_profile_name() or "").strip()
         except Exception:
-            return "default"
+            return ""
 
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in

@@ -38,6 +38,28 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
+async def _run_one_role_delivery_tick(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_role_delivery_watcher(interval=1)
+
+
+def _authorize_profiles(monkeypatch, tmp_path, *profiles):
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [
+            (profile, tmp_path / "profiles" / profile) for profile in profiles
+        ],
+    )
+
+
 def _make_discord_runner(
     coordinator, profile_adapters=None, *, active_profile="default",
 ):
@@ -53,6 +75,7 @@ def _make_discord_runner(
 def test_discord_completion_uses_event_run_profile_after_reassignment(tmp_path, monkeypatch):
     """A retry/reassignment cannot make an old run speak as the new assignee."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "run-profile-routing.db"))
+    _authorize_profiles(monkeypatch, tmp_path, "default", "shinei", "raiden")
     kb.init_db()
 
     conn = kb.connect()
@@ -78,6 +101,8 @@ def test_discord_completion_uses_event_run_profile_after_reassignment(tmp_path, 
     )
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    sender = _make_discord_runner(shinei, active_profile="shinei")
+    asyncio.run(_run_one_role_delivery_tick(monkeypatch, sender))
 
     assert len(shinei.sent) == 1
     assert "@shinei" in shinei.sent[0]["text"]
@@ -88,6 +113,7 @@ def test_discord_completion_uses_event_run_profile_after_reassignment(tmp_path, 
 def test_discord_execution_uses_active_named_profile_adapter(tmp_path, monkeypatch):
     """The active profile lives in self.adapters, not _profile_adapters."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "active-profile.db"))
+    _authorize_profiles(monkeypatch, tmp_path, "default", "shinei")
     kb.init_db()
 
     conn = kb.connect()
@@ -102,6 +128,8 @@ def test_discord_execution_uses_active_named_profile_adapter(tmp_path, monkeypat
     shinei = RecordingAdapter()
     runner = _make_discord_runner(shinei, active_profile="shinei")
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_role_delivery_tick(monkeypatch, runner))
 
     assert len(shinei.sent) == 1
     assert "active profile completed" in shinei.sent[0]["text"]
@@ -109,6 +137,7 @@ def test_discord_execution_uses_active_named_profile_adapter(tmp_path, monkeypat
 
 def test_discord_execution_uses_active_default_profile_adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "active-default.db"))
+    _authorize_profiles(monkeypatch, tmp_path, "default")
     kb.init_db()
 
     conn = kb.connect()
@@ -123,6 +152,8 @@ def test_discord_execution_uses_active_default_profile_adapter(tmp_path, monkeyp
     default = RecordingAdapter()
     runner = _make_discord_runner(default)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_role_delivery_tick(monkeypatch, runner))
 
     assert len(default.sent) == 1
     assert "default profile completed" in default.sent[0]["text"]
@@ -255,7 +286,7 @@ def test_secondary_resolver_failure_warns_without_event_or_active_fallback(
     monkeypatch.setattr(runner, "_authorization_adapter", resolve)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert secondary_calls == [(Platform.DISCORD, "raiden")]
+    assert secondary_calls == []
     assert directly_registered.sent == []
     assert len(active.sent) == 1
     warning = active.sent[0]["text"].lower()
@@ -266,6 +297,7 @@ def test_secondary_resolver_failure_warns_without_event_or_active_fallback(
 
 def test_discord_spawned_notifies_running_once_from_run_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "spawned-routing.db"))
+    _authorize_profiles(monkeypatch, tmp_path, "default", "shinei")
     kb.init_db()
 
     conn = kb.connect()
@@ -286,6 +318,9 @@ def test_discord_spawned_notifies_running_once_from_run_profile(tmp_path, monkey
     asyncio.run(_run_one_notifier_tick(
         monkeypatch, _make_discord_runner(coordinator, profile_adapters),
     ))
+    asyncio.run(_run_one_role_delivery_tick(
+        monkeypatch, _make_discord_runner(shinei, active_profile="shinei"),
+    ))
 
     assert len(shinei.sent) == 1
     assert "running" in shinei.sent[0]["text"].lower()
@@ -294,6 +329,7 @@ def test_discord_spawned_notifies_running_once_from_run_profile(tmp_path, monkey
 
 def test_discord_heartbeat_only_sends_nonempty_note(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "heartbeat-routing.db"))
+    _authorize_profiles(monkeypatch, tmp_path, "default", "shinei")
     kb.init_db()
 
     conn = kb.connect()
@@ -314,6 +350,9 @@ def test_discord_heartbeat_only_sends_nonempty_note(tmp_path, monkeypatch):
         RecordingAdapter(), {"shinei": {Platform.DISCORD: shinei}},
     )
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    asyncio.run(_run_one_role_delivery_tick(
+        monkeypatch, _make_discord_runner(shinei, active_profile="shinei"),
+    ))
 
     assert len(shinei.sent) == 1
     assert "unit tests are green" in shinei.sent[0]["text"]

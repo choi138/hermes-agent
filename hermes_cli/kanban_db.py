@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1552,6 +1552,38 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable cross-process handoff for role-authored lifecycle messages. The
+-- dispatch-owning gateway renders and enqueues a delivery; the gateway process
+-- whose immutable profile matches ``sender_profile`` claims it and sends via
+-- that profile's real adapter. No Python adapter object crosses processes.
+-- This is an additive migration: older binaries ignore the table, so rollback
+-- requires no destructive downgrade. New binaries create it on normal init.
+CREATE TABLE IF NOT EXISTS kanban_role_deliveries (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id          INTEGER NOT NULL,
+    task_id           TEXT NOT NULL,
+    event_kind        TEXT NOT NULL,
+    platform          TEXT NOT NULL,
+    chat_id           TEXT NOT NULL,
+    thread_id         TEXT NOT NULL DEFAULT '',
+    sender_profile    TEXT NOT NULL,
+    notifier_profile  TEXT,
+    message           TEXT NOT NULL,
+    event_payload     TEXT,
+    artifact_manifest TEXT NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'pending',
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    text_delivered    INTEGER NOT NULL DEFAULT 0 CHECK(text_delivered IN (0, 1)),
+    next_artifact_index INTEGER NOT NULL DEFAULT 0,
+    available_at      INTEGER NOT NULL DEFAULT 0,
+    claim_token       TEXT,
+    claim_expires     INTEGER,
+    last_error_kind   TEXT,
+    created_at        INTEGER NOT NULL,
+    delivered_at      INTEGER,
+    UNIQUE(event_id, platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1567,6 +1599,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_role_delivery_claim   ON kanban_role_deliveries(sender_profile, platform, status, available_at, id);
 """
 
 
@@ -2300,6 +2333,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    delivery_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='kanban_role_deliveries'"
+    ).fetchone() is not None
+    if delivery_table_exists:
+        delivery_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_role_deliveries)")
+        }
+        if "artifact_manifest" not in delivery_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_role_deliveries",
+                "artifact_manifest",
+                "artifact_manifest TEXT NOT NULL DEFAULT '[]'",
+            )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -9453,6 +9503,9 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    role_delivery_builder: Optional[
+        Callable[[list[Event]], list[dict[str, Any]]]
+    ] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -9487,12 +9540,17 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
-        conn.execute(
+        if role_delivery_builder is not None:
+            for delivery in role_delivery_builder(events):
+                _insert_role_delivery(conn, **delivery)
+        cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
         )
+        if cur.rowcount != 1:
+            raise RuntimeError("notification cursor CAS failed")
         return old_cursor, new_cursor, events
 
 
@@ -9540,6 +9598,319 @@ def rewind_notify_cursor(
             ),
         )
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Durable role-authored notification deliveries
+# ---------------------------------------------------------------------------
+
+def _insert_role_delivery(
+    conn: sqlite3.Connection,
+    *,
+    event_id: int,
+    task_id: str,
+    event_kind: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    sender_profile: str,
+    notifier_profile: Optional[str],
+    message: str,
+    event_payload: Optional[dict] = None,
+    artifact_manifest: Optional[list[str]] = None,
+    created_at: Optional[int] = None,
+) -> bool:
+    """Insert one row inside the caller's transaction and reject identity drift."""
+    requested_profile = (sender_profile or "").strip()
+    if not requested_profile:
+        raise ValueError("role delivery sender profile is blank")
+    event_row = conn.execute(
+        """
+        SELECT e.task_id, e.kind, e.run_id,
+               r.task_id AS run_task_id, r.profile AS run_profile
+          FROM task_events AS e
+          LEFT JOIN task_runs AS r ON r.id = e.run_id
+         WHERE e.id = ?
+        """,
+        (int(event_id),),
+    ).fetchone()
+    if (
+        event_row is None
+        or event_row["task_id"] != task_id
+        or event_row["kind"] != event_kind
+    ):
+        raise ValueError("role delivery event/task linkage mismatch")
+    if (
+        event_row["run_id"] is None
+        or event_row["run_task_id"] != task_id
+    ):
+        raise ValueError("role delivery event has no valid task run")
+    profile = (event_row["run_profile"] or "").strip()
+    if not profile:
+        raise ValueError("role delivery run profile is blank")
+    if requested_profile != profile:
+        raise ValueError("role delivery sender profile mismatch")
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_role_deliveries (
+            event_id, task_id, event_kind, platform, chat_id, thread_id,
+            sender_profile, notifier_profile, message, event_payload,
+            artifact_manifest, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(event_id), task_id, event_kind, platform, chat_id,
+            thread_id or "", profile,
+            (notifier_profile or "").strip() or None,
+            message,
+            json.dumps(event_payload, ensure_ascii=False)
+            if event_payload is not None else None,
+            json.dumps(artifact_manifest or [], ensure_ascii=False),
+            int(time.time()) if created_at is None else int(created_at),
+        ),
+    )
+    if cur.rowcount == 1:
+        return True
+    existing = conn.execute(
+        """
+        SELECT task_id, sender_profile FROM kanban_role_deliveries
+         WHERE event_id = ? AND platform = ?
+           AND chat_id = ? AND thread_id = ?
+        """,
+        (int(event_id), platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if (
+        existing is None
+        or existing["task_id"] != task_id
+        or existing["sender_profile"] != profile
+    ):
+        raise ValueError("role delivery identity conflict")
+    return False
+
+
+def enqueue_role_delivery(
+    conn: sqlite3.Connection,
+    *,
+    event_id: int,
+    task_id: str,
+    event_kind: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    sender_profile: str,
+    notifier_profile: Optional[str],
+    message: str,
+    event_payload: Optional[dict] = None,
+    artifact_manifest: Optional[list[str]] = None,
+) -> bool:
+    """Persist one cross-process role delivery, idempotently by event target."""
+    with write_txn(conn):
+        _insert_role_delivery(
+            conn,
+            event_id=event_id,
+            task_id=task_id,
+            event_kind=event_kind,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            sender_profile=sender_profile,
+            notifier_profile=notifier_profile,
+            message=message,
+            event_payload=event_payload,
+            artifact_manifest=artifact_manifest,
+        )
+    return True
+
+
+def claim_role_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    sender_profile: str,
+    platform: str,
+    claimant: str,
+    lease_seconds: int = 60,
+    limit: int = 1,
+    now: Optional[int] = None,
+) -> list[dict]:
+    """Lease pending deliveries for exactly one profile/platform identity.
+
+    Expired claims are made pending again so a sender-process restart cannot
+    strand work. ``BEGIN IMMEDIATE`` serializes competing instances; each row is
+    updated with a fresh random token before it is returned.
+    """
+    profile = (sender_profile or "").strip()
+    if not profile or not platform:
+        return []
+    ts = int(time.time()) if now is None else int(now)
+    lease_until = ts + max(1, int(lease_seconds))
+    bounded_limit = max(1, min(int(limit), 500))
+    claimed: list[dict] = []
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE kanban_role_deliveries
+               SET status = 'pending', claim_token = NULL, claim_expires = NULL
+             WHERE status = 'claimed' AND claim_expires IS NOT NULL
+               AND claim_expires <= ?
+            """,
+            (ts,),
+        )
+        rows = conn.execute(
+            """
+            SELECT d.* FROM kanban_role_deliveries AS d
+             WHERE d.sender_profile = ? AND d.platform = ?
+               AND d.status = 'pending' AND d.available_at <= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM kanban_role_deliveries AS earlier
+                    WHERE earlier.sender_profile = d.sender_profile
+                      AND earlier.platform = d.platform
+                      AND earlier.chat_id = d.chat_id
+                      AND earlier.thread_id = d.thread_id
+                      AND earlier.id < d.id
+                      AND earlier.status != 'delivered'
+               )
+             ORDER BY d.id ASC LIMIT ?
+            """,
+            (profile, platform, ts, bounded_limit),
+        ).fetchall()
+        for row in rows:
+            token = f"{claimant}:{secrets.token_hex(16)}"
+            cur = conn.execute(
+                """
+                UPDATE kanban_role_deliveries
+                   SET status = 'claimed', claim_token = ?, claim_expires = ?
+                 WHERE id = ? AND status = 'pending'
+                """,
+                (token, lease_until, int(row["id"])),
+            )
+            if cur.rowcount != 1:
+                continue
+            item = dict(row)
+            item["claim_token"] = token
+            try:
+                item["event_payload"] = (
+                    json.loads(item["event_payload"])
+                    if item.get("event_payload") else None
+                )
+            except (TypeError, ValueError):
+                item["event_payload"] = None
+            try:
+                manifest = json.loads(item.get("artifact_manifest") or "[]")
+                item["artifact_manifest"] = (
+                    [path for path in manifest if isinstance(path, str)]
+                    if isinstance(manifest, list) else []
+                )
+            except (TypeError, ValueError):
+                item["artifact_manifest"] = []
+            claimed.append(item)
+    return claimed
+
+
+def renew_role_delivery_lease(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    claim_token: str,
+    lease_seconds: int = 60,
+    now: Optional[int] = None,
+) -> bool:
+    """Extend one active lease without changing its fencing token."""
+    ts = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_role_deliveries
+               SET claim_expires = ?
+             WHERE id = ? AND status = 'claimed' AND claim_token = ?
+               AND claim_expires IS NOT NULL AND claim_expires > ?
+            """,
+            (
+                ts + max(1, int(lease_seconds)),
+                int(delivery_id), claim_token, ts,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def advance_role_delivery_progress(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    claim_token: str,
+    text_delivered: Optional[bool] = None,
+    next_artifact_index: Optional[int] = None,
+) -> bool:
+    """Durably checkpoint text/artifact progress under the active lease token."""
+    assignments: list[str] = []
+    params: list[Any] = []
+    if text_delivered is not None:
+        assignments.append("text_delivered = ?")
+        params.append(1 if text_delivered else 0)
+    if next_artifact_index is not None:
+        assignments.append("next_artifact_index = MAX(next_artifact_index, ?)")
+        params.append(max(0, int(next_artifact_index)))
+    if not assignments:
+        return False
+    params.extend((int(delivery_id), claim_token))
+    with write_txn(conn):
+        cur = conn.execute(
+            f"UPDATE kanban_role_deliveries SET {', '.join(assignments)} "
+            "WHERE id = ? AND status = 'claimed' AND claim_token = ?",
+            params,
+        )
+    return cur.rowcount == 1
+
+
+def complete_role_delivery(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    claim_token: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Acknowledge a leased delivery after its role adapter sent it."""
+    ts = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_role_deliveries
+               SET status = 'delivered', delivered_at = ?,
+                   claim_token = NULL, claim_expires = NULL, last_error_kind = NULL
+             WHERE id = ? AND status = 'claimed' AND claim_token = ?
+            """,
+            (ts, int(delivery_id), claim_token),
+        )
+    return cur.rowcount == 1
+
+
+def retry_role_delivery(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    claim_token: str,
+    error_kind: str,
+    retry_after_seconds: int = 0,
+    terminal: bool = False,
+    now: Optional[int] = None,
+) -> bool:
+    """Release a failed lease for retry, or fail it closed permanently."""
+    ts = int(time.time()) if now is None else int(now)
+    status = "failed" if terminal else "pending"
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_role_deliveries
+               SET status = ?, attempts = attempts + 1, available_at = ?,
+                   claim_token = NULL, claim_expires = NULL, last_error_kind = ?
+             WHERE id = ? AND status = 'claimed' AND claim_token = ?
+            """,
+            (
+                status, ts + max(0, int(retry_after_seconds)),
+                (error_kind or "send_failed")[:80],
+                int(delivery_id), claim_token,
+            ),
+        )
+    return cur.rowcount == 1
 
 
 # ---------------------------------------------------------------------------

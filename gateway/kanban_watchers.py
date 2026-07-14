@@ -186,6 +186,81 @@ class GatewayKanbanWatchersMixin:
             )
             return None
 
+    def _kanban_role_profile_authorized(self, profile: Optional[str]) -> bool:
+        """Whether central profile inventory permits a cross-process sender.
+
+        A profile-local adapter remains the stronger authorization signal. This
+        inventory check is only for the split-process path where the notifier
+        intentionally cannot see the target adapter object.
+        """
+        profile_name = (profile or "").strip()
+        if not profile_name:
+            return False
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            return profile_name in {
+                name for name, _home in profiles_to_serve(multiplex=True)
+            }
+        except Exception:
+            logger.warning(
+                "kanban notifier: profile inventory unavailable; denying cross-process role %s",
+                profile_name,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _kanban_role_delivery_message(
+        sub, event, task, board_name: str, who: Optional[str],
+    ) -> Optional[str]:
+        """Render an immutable execution-event snapshot for durable staging."""
+        kind = event.kind
+        payload = event.payload or {}
+        task_id = sub["task_id"]
+        title = task.title if task else task_id
+        board_tag = f"[{board_name}] " if board_name != "default" else ""
+        tag = f"@{who} " if who else ""
+        if kind == "spawned":
+            return f"▶ {board_tag}{tag}Kanban {task_id} running — {title}"
+        if kind == "heartbeat":
+            note = str(payload.get("note") or "").strip()
+            if not note:
+                return None
+            return f"… {board_tag}{tag}Kanban {task_id} progress: {note[:500]}"
+        if kind == "completed":
+            summary = str(payload.get("summary") or "").strip()
+            if summary:
+                handoff = f"\n{summary.splitlines()[0][:200]}"
+            elif task and task.result:
+                handoff = f"\n{task.result.strip().splitlines()[0][:160]}"
+            else:
+                handoff = ""
+            return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        if kind == "blocked":
+            reason = str(payload.get("reason") or "").strip()
+            suffix = f": {reason[:160]}" if reason else ""
+            return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{suffix}"
+        if kind == "gave_up":
+            error = str(payload.get("error") or "").strip()
+            suffix = f"\n{error[:200]}" if error else ""
+            return (
+                f"✖ {board_tag}{tag}Kanban {task_id} gave up "
+                f"after repeated spawn failures{suffix}"
+            )
+        if kind == "crashed":
+            return (
+                f"✖ {board_tag}{tag}Kanban {task_id} worker crashed "
+                "(pid gone); dispatcher will retry"
+            )
+        if kind == "timed_out":
+            limit = int(payload.get("limit_seconds") or 0)
+            return (
+                f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
+                f"(max_runtime={limit}s); will retry"
+            )
+        return None
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver task events to users.
 
@@ -345,6 +420,63 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
+                                task = _kb.get_task(conn, sub["task_id"])
+                                event_profiles: dict[int, Optional[str]] = {}
+                                staged_role_event_ids: set[int] = set()
+
+                                def _stage_cross_process_rows(events):
+                                    rows = []
+                                    for ev in events:
+                                        who = _kanban_event_profile(_kb, conn, ev, task)
+                                        event_profiles[ev.id] = who
+                                        if platform != _Platform.DISCORD.value:
+                                            continue
+                                        if ev.kind not in _KANBAN_EXECUTION_EVENT_KINDS:
+                                            continue
+                                        # Only an immutable task_runs.profile
+                                        # reached through task_events.run_id may
+                                        # select a sender process. The producer
+                                        # never resolves or sends through a role
+                                        # adapter, even if one is visible locally.
+                                        if getattr(ev, "run_id", None) is None:
+                                            continue
+                                        if not self._kanban_role_profile_authorized(who):
+                                            continue
+                                        message = self._kanban_role_delivery_message(
+                                            sub, ev, task, slug, who,
+                                        )
+                                        if message is None:
+                                            continue
+                                        staged_role_event_ids.add(ev.id)
+                                        rows.append({
+                                            "event_id": ev.id,
+                                            "task_id": sub["task_id"],
+                                            "event_kind": ev.kind,
+                                            "platform": sub["platform"],
+                                            "chat_id": sub["chat_id"],
+                                            "thread_id": sub.get("thread_id") or "",
+                                            "sender_profile": who,
+                                            "notifier_profile": (
+                                                sub.get("notifier_profile")
+                                                or notifier_profile
+                                            ),
+                                            "message": message,
+                                            "event_payload": ev.payload,
+                                            "artifact_manifest": (
+                                                self._kanban_role_artifact_candidates(
+                                                    (
+                                                        getattr(self, "adapters", None)
+                                                        or {}
+                                                    ).get(_Platform.DISCORD),
+                                                    ev.payload,
+                                                    task,
+                                                )
+                                                if ev.kind == "completed" else []
+                                            ),
+                                            "created_at": ev.created_at,
+                                        })
+                                    return rows
+
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
@@ -352,24 +484,29 @@ class GatewayKanbanWatchersMixin:
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
                                     kinds=NOTIFY_KINDS,
+                                    role_delivery_builder=_stage_cross_process_rows,
                                 )
                                 if not events:
                                     continue
-                                task = _kb.get_task(conn, sub["task_id"])
+                                # The builder populates every profile when the
+                                # transaction stages role rows. Fill any gaps
+                                # for local/non-Discord paths after the claim.
+                                for ev in events:
+                                    event_profiles.setdefault(
+                                        ev.id,
+                                        _kanban_event_profile(_kb, conn, ev, task),
+                                    )
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
                                 )
-                                event_profiles = {
-                                    ev.id: _kanban_event_profile(_kb, conn, ev, task)
-                                    for ev in events
-                                }
                                 deliveries.append({
                                     "sub": sub,
                                     "old_cursor": old_cursor,
                                     "cursor": cursor,
                                     "events": events,
                                     "event_profiles": event_profiles,
+                                    "staged_role_event_ids": staged_role_event_ids,
                                     "task": task,
                                     "board": slug,
                                 })
@@ -438,48 +575,20 @@ class GatewayKanbanWatchersMixin:
                             who = task.assignee if task and task.assignee else None
                         tag = f"@{who} " if who else ""
                         adapter = coordinator_adapter
-                        role_routed = False
-                        if (
+                        role_routed = (
                             plat == _Platform.DISCORD
                             and kind in _KANBAN_EXECUTION_EVENT_KINDS
-                        ):
-                            adapter = self._kanban_execution_adapter(plat, who)
-                            role_routed = True
-                            if adapter is None:
-                                role_label = f"@{who}" if who else "<unknown>"
-                                logger.warning(
-                                    "kanban notifier: delivery failed for %s event %s; "
-                                    "Discord adapter for run profile %s is unavailable",
-                                    sub["task_id"], kind, role_label,
-                                )
-                                metadata: dict[str, Any] = {}
-                                if sub.get("thread_id"):
-                                    metadata["thread_id"] = sub["thread_id"]
-                                warning = (
-                                    f"⚠ {board_tag}Kanban {sub['task_id']} delivery failed: "
-                                    f"Discord adapter for run profile {role_label} is unavailable "
-                                    f"({kind} event was not sent by the worker bot)."
-                                )
-                                try:
-                                    await coordinator_adapter.send(
-                                        sub["chat_id"], warning, metadata=metadata,
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "kanban notifier: coordinator delivery-failure warning "
-                                        "for %s also failed: %s",
-                                        sub["task_id"], exc,
-                                    )
-                                    await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
-                                    break
-                                else:
-                                    continue
+                        )
+                        role_cross_process = False
+                        role_resolution_denied = False
+                        if role_routed:
+                            if ev.id in d.get("staged_role_event_ids", set()):
+                                role_cross_process = True
+                            else:
+                                # Blank/missing run profile or inventory denial
+                                # fails closed here; the producer never looks up
+                                # a worker adapter.
+                                role_resolution_denied = True
                         if kind == "spawned":
                             msg = (
                                 f"▶ {board_tag}{tag}Kanban {sub['task_id']} running"
@@ -560,6 +669,19 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
+                            if role_resolution_denied:
+                                raise PermissionError("role adapter authorization denied")
+                            if role_cross_process:
+                                if ev.id not in d.get("staged_role_event_ids", set()):
+                                    raise RuntimeError(
+                                        "role delivery was not atomically staged"
+                                    )
+                                logger.debug(
+                                    "kanban notifier: staged %s event for %s to Discord profile %s on board %s",
+                                    kind, sub["task_id"], who, board_slug,
+                                )
+                                sub_fail_counts.pop(sub_key, None)
+                                continue
                             await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
@@ -751,6 +873,409 @@ class GatewayKanbanWatchersMixin:
                     return
                 await asyncio.sleep(1)
 
+    async def _kanban_role_delivery_watcher(self, interval: float = 5.0) -> None:
+        """Send durable Discord lifecycle handoffs owned by this process profile.
+
+        Every gateway may run this lightweight consumer, including named-profile
+        gateways with ``kanban.dispatch_in_gateway=false``. It never dispatches
+        workers or scans task events; it only leases rows addressed to its exact
+        active profile and sends them through that profile's local Discord
+        adapter. The board DB is the sole cross-process handoff.
+        """
+        from gateway.config import Platform as _Platform
+        from hermes_cli import kanban_db as _kb
+
+        profile = (
+            (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+        )
+        if not profile:
+            logger.warning(
+                "kanban role sender: boot profile is blank; sender disabled"
+            )
+            return
+        claimant = f"{profile}:{os.getpid()}:{id(self)}"
+
+        await asyncio.sleep(5)
+        while self._running:
+            # The outbox consumer is deliberately process-local. The profile
+            # was captured at boot and the only permissible sender is this
+            # gateway's own active Discord adapter map; never consult the
+            # multiplex/authorization resolver for another bot.
+            adapter = (getattr(self, "adapters", None) or {}).get(_Platform.DISCORD)
+            if adapter is not None:
+                def _claim():
+                    claimed: list[dict] = []
+                    try:
+                        boards = _kb.list_boards(include_archived=False)
+                    except Exception:
+                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    seen_db_paths: set[str] = set()
+                    for board_meta in boards:
+                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        db_path = board_meta.get("db_path")
+                        try:
+                            resolved = str(
+                                Path(db_path).expanduser().resolve()
+                                if db_path else _kb.kanban_db_path(slug).resolve()
+                            )
+                        except Exception:
+                            resolved = f"slug:{slug}"
+                        if resolved in seen_db_paths:
+                            continue
+                        seen_db_paths.add(resolved)
+                        try:
+                            conn = _kb.connect(board=slug)
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban role sender: cannot open board %s: %s", slug, exc,
+                            )
+                            continue
+                        try:
+                            rows = _kb.claim_role_deliveries(
+                                conn,
+                                sender_profile=profile,
+                                platform="discord",
+                                claimant=claimant,
+                                limit=1,
+                            )
+                            for row in rows:
+                                row["board"] = slug
+                            claimed.extend(rows)
+                            if claimed:
+                                return claimed
+                        finally:
+                            conn.close()
+                    return claimed
+
+                try:
+                    deliveries = await asyncio.to_thread(_claim)
+                except Exception as exc:
+                    logger.warning("kanban role sender claim failed: %s", exc)
+                    deliveries = []
+
+                for delivery in deliveries:
+                    board_slug = delivery.get("board")
+                    claim_token = delivery["claim_token"]
+                    metadata: dict[str, Any] = {}
+                    if delivery.get("thread_id"):
+                        metadata["thread_id"] = delivery["thread_id"]
+                    current_adapter = (
+                        getattr(self, "adapters", None) or {}
+                    ).get(_Platform.DISCORD)
+                    if current_adapter is None:
+                        try:
+                            await asyncio.to_thread(
+                                self._kanban_retry_role_delivery,
+                                delivery,
+                                claim_token,
+                                "adapter_unavailable",
+                                board_slug,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban role sender: failed to release unavailable-adapter lease %s: %s",
+                                delivery["id"], exc,
+                            )
+                        break
+                    lease_stop = asyncio.Event()
+                    lease_lost = asyncio.Event()
+                    lease_task = asyncio.create_task(
+                        self._kanban_maintain_role_delivery_lease(
+                            delivery, claim_token, board_slug,
+                            lease_stop, lease_lost,
+                        )
+                    )
+                    try:
+                        if lease_lost.is_set():
+                            raise RuntimeError("lost delivery lease before send")
+                        if not delivery.get("text_delivered"):
+                            await current_adapter.send(
+                                delivery["chat_id"],
+                                delivery["message"],
+                                metadata=metadata,
+                            )
+                            if lease_lost.is_set():
+                                raise RuntimeError("lost delivery lease during text send")
+                            # Discord may already have accepted the message when
+                            # this local checkpoint fails. Without a verified
+                            # remote idempotency key, a restart can duplicate the
+                            # text; the outbox therefore guarantees at-least-once,
+                            # not exactly-once, across this accept/ack window.
+                            checkpointed = await asyncio.to_thread(
+                                self._kanban_advance_role_delivery_progress,
+                                delivery,
+                                claim_token,
+                                board_slug,
+                                True,
+                                None,
+                            )
+                            if not checkpointed:
+                                raise RuntimeError("lost text-progress lease")
+                            delivery["text_delivered"] = 1
+
+                        artifacts = (
+                            delivery.get("artifact_manifest") or []
+                            if delivery["event_kind"] == "completed" else []
+                        )
+                        start_index = int(delivery.get("next_artifact_index") or 0)
+                        for index, path in enumerate(
+                            artifacts[start_index:], start=start_index,
+                        ):
+                            if lease_lost.is_set():
+                                raise RuntimeError("lost delivery lease before artifact send")
+                            await self._send_kanban_role_artifact(
+                                adapter=current_adapter,
+                                chat_id=delivery["chat_id"],
+                                metadata=metadata,
+                                path=path,
+                            )
+                            checkpointed = await asyncio.to_thread(
+                                self._kanban_advance_role_delivery_progress,
+                                delivery,
+                                claim_token,
+                                board_slug,
+                                None,
+                                index + 1,
+                            )
+                            if not checkpointed:
+                                raise RuntimeError("lost artifact-progress lease")
+                            delivery["next_artifact_index"] = index + 1
+                    except Exception as exc:
+                        logger.warning(
+                            "kanban role sender: %s event for %s failed via profile %s: %s",
+                            delivery["event_kind"], delivery["task_id"], profile, exc,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                self._kanban_retry_role_delivery,
+                                delivery,
+                                claim_token,
+                                type(exc).__name__,
+                                board_slug,
+                            )
+                        except Exception as retry_exc:
+                            logger.warning(
+                                "kanban role sender: failed to release delivery %s for retry: %s",
+                                delivery["id"], retry_exc,
+                            )
+                        continue
+                    else:
+                        try:
+                            acknowledged = await asyncio.to_thread(
+                                self._kanban_complete_role_delivery,
+                                delivery,
+                                claim_token,
+                                board_slug,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban role sender: acknowledgement failed for delivery %s: %s",
+                                delivery["id"], exc,
+                            )
+                            acknowledged = False
+                        if not acknowledged:
+                            logger.warning(
+                                "kanban role sender: lost acknowledgement lease for delivery %s",
+                                delivery["id"],
+                            )
+                        else:
+                            logger.debug(
+                                "kanban role sender: delivered %s event for %s via profile %s on board %s",
+                                delivery["event_kind"], delivery["task_id"], profile,
+                                board_slug,
+                            )
+                    finally:
+                        lease_stop.set()
+                        try:
+                            await lease_task
+                        except Exception as exc:
+                            lease_lost.set()
+                            logger.warning(
+                                "kanban role sender: lease maintenance failed for delivery %s: %s",
+                                delivery["id"], exc,
+                            )
+
+            for _ in range(int(max(1, interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
+    async def _kanban_maintain_role_delivery_lease(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str],
+        stop: asyncio.Event,
+        lost: asyncio.Event,
+    ) -> None:
+        """Renew a send lease while an adapter call is in flight."""
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=20.0)
+                return
+            except asyncio.TimeoutError:
+                try:
+                    renewed = await asyncio.to_thread(
+                        self._kanban_renew_role_delivery_lease,
+                        delivery,
+                        claim_token,
+                        board,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "kanban role sender: lease renewal failed for delivery %s: %s",
+                        delivery["id"], exc,
+                    )
+                    lost.set()
+                    return
+                if not renewed:
+                    lost.set()
+                    return
+
+    def _kanban_renew_role_delivery_lease(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.renew_role_delivery_lease(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+                lease_seconds=60,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_retry_role_delivery(
+        self,
+        delivery: dict,
+        claim_token: str,
+        error_kind: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            attempts = int(delivery.get("attempts") or 0)
+            return _kb.retry_role_delivery(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+                error_kind=error_kind,
+                retry_after_seconds=min(60, 2 ** min(attempts, 6)),
+            )
+        finally:
+            conn.close()
+
+    def _kanban_advance_role_delivery_progress(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str],
+        text_delivered: Optional[bool],
+        next_artifact_index: Optional[int],
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.advance_role_delivery_progress(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+                text_delivered=text_delivered,
+                next_artifact_index=next_artifact_index,
+            )
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _kanban_role_artifact_candidates(adapter, event_payload, task) -> list[str]:
+        """Resolve existing artifacts once in stable order and enforce safe roots."""
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: str) -> None:
+            expanded = os.path.expanduser(path)
+            if expanded and expanded not in seen and os.path.isfile(expanded):
+                seen.add(expanded)
+                candidates.append(expanded)
+
+        extract = getattr(adapter, "extract_local_files", None)
+        if isinstance(event_payload, dict):
+            raw = event_payload.get("artifacts")
+            if isinstance(raw, (list, tuple)):
+                for item in raw:
+                    if isinstance(item, str):
+                        _add(item)
+            summary = event_payload.get("summary")
+            if callable(extract) and isinstance(summary, str) and summary:
+                paths, _ = extract(summary)
+                for path in paths:
+                    _add(path)
+        result = getattr(task, "result", None) if task is not None else None
+        if callable(extract) and result:
+            paths, _ = extract(str(result))
+            for path in paths:
+                _add(path)
+
+        from gateway.platforms.base import BasePlatformAdapter
+
+        return BasePlatformAdapter.filter_local_delivery_paths(candidates)
+
+    @staticmethod
+    async def _send_kanban_role_artifact(*, adapter, chat_id, metadata, path) -> None:
+        """Send one artifact and propagate failure so its index is not advanced."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        safe_paths = BasePlatformAdapter.filter_local_delivery_paths([path])
+        if len(safe_paths) != 1:
+            raise PermissionError("staged artifact is missing or outside safe roots")
+        path = safe_paths[0]
+
+        from pathlib import Path as _Path
+        from urllib.parse import quote as _quote
+
+        extension = _Path(path).suffix.lower()
+        if extension in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            await adapter.send_multiple_images(
+                chat_id=chat_id,
+                images=[(f"file://{_quote(path)}", "")],
+                metadata=metadata,
+            )
+        elif extension in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}:
+            await adapter.send_video(
+                chat_id=chat_id, video_path=path, metadata=metadata,
+            )
+        else:
+            await adapter.send_document(
+                chat_id=chat_id, file_path=path, metadata=metadata,
+            )
+
+    def _kanban_complete_role_delivery(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.complete_role_delivery(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+            )
+        finally:
+            conn.close()
+
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
     ) -> None:
@@ -937,6 +1462,19 @@ class GatewayKanbanWatchersMixin:
         in-flight ``to_thread`` returns on its own after the current
         ``dispatch_once`` call finishes (typically <1ms on an idle board).
         """
+        # Named-profile gateways may consume role-delivery outbox rows, but only
+        # the immutable default gateway may dispatch workers. Keep this check
+        # ahead of config loading, singleton locking, and all board DB work.
+        active_profile = (
+            (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+        )
+        if active_profile != "default":
+            logger.info(
+                "kanban dispatcher: disabled for non-default or unknown gateway profile %s",
+                active_profile or "<unknown>",
+            )
+            return
+
         # Read config once at boot. If the user flips the flag later, they
         # restart the gateway; same pattern as every other background
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var

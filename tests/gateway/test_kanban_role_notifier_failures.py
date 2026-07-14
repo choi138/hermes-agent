@@ -5,8 +5,10 @@ from hermes_cli import kanban_db as kb
 from tests.gateway.test_kanban_role_notifier import (
     FailingAdapter,
     RecordingAdapter,
+    _authorize_profiles,
     _make_discord_runner,
     _run_one_notifier_tick,
+    _run_one_role_delivery_tick,
 )
 
 
@@ -61,7 +63,7 @@ def test_discord_status_stays_on_coordinator_adapter(tmp_path, monkeypatch):
     assert shinei.sent == []
 
 
-def test_legacy_execution_event_uses_explicit_assignee_fallback(tmp_path, monkeypatch):
+def test_legacy_execution_event_without_run_profile_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "legacy-fallback.db"))
     kb.init_db()
 
@@ -80,13 +82,15 @@ def test_legacy_execution_event_uses_explicit_assignee_fallback(tmp_path, monkey
     )
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(shinei.sent) == 1
-    assert "legacy result" in shinei.sent[0]["text"]
-    assert coordinator.sent == []
+    assert shinei.sent == []
+    assert len(coordinator.sent) == 1
+    assert "delivery failed" in coordinator.sent[0]["text"].lower()
+    assert "legacy result" not in coordinator.sent[0]["text"]
 
 
 def test_final_synthesis_stays_on_coordinator_adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "coordinator-wake.db"))
+    _authorize_profiles(monkeypatch, tmp_path, "default", "shinei")
     kb.init_db()
 
     conn = kb.connect()
@@ -109,6 +113,8 @@ def test_final_synthesis_stays_on_coordinator_adapter(tmp_path, monkeypatch):
         coordinator, {"shinei": {Platform.DISCORD: shinei}},
     )
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    sender = _make_discord_runner(shinei, active_profile="shinei")
+    asyncio.run(_run_one_role_delivery_tick(monkeypatch, sender))
 
     assert len(shinei.sent) == 1
     assert len(coordinator.handled) == 1
