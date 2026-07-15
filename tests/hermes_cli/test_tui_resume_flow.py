@@ -922,6 +922,32 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["aux_clients_shutdown"] is True
 
 
+def test_oneshot_terminal_bridge_forces_launch_cwd_for_local(monkeypatch, tmp_path):
+    import hermes_cli.config as config_mod
+    import hermes_cli.oneshot as oneshot_mod
+
+    configured_cwd = tmp_path / "stale-config-cwd"
+    launch_cwd = tmp_path / "launch-cwd"
+    launch_cwd.mkdir()
+    monkeypatch.chdir(launch_cwd)
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "/stale/inherited/cwd")
+
+    def _fake_bridge(*, config):
+        assert config == {"terminal": {"backend": "local", "cwd": str(configured_cwd)}}
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(configured_cwd))
+
+    monkeypatch.setattr(config_mod, "apply_terminal_config_to_env", _fake_bridge)
+
+    oneshot_mod._apply_oneshot_terminal_config(
+        {"terminal": {"backend": "local", "cwd": str(configured_cwd)}}
+    )
+
+    assert os.environ["TERMINAL_ENV"] == "local"
+    assert os.environ["TERMINAL_CWD"] == str(launch_cwd)
+
+
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     captured = {}
     active_path_during_call = None

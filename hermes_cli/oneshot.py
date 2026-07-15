@@ -294,6 +294,33 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _apply_oneshot_terminal_config(config: dict) -> None:
+    """Mirror classic CLI terminal config before importing/creating the agent.
+
+    ``-z`` bypasses ``cli.load_cli_config()``, whose import-time bridge normally
+    exports ``terminal.*`` as the ``TERMINAL_*`` variables consumed by the tool
+    backends.  Without an equivalent bridge, a stale value inherited from
+    ``~/.hermes/.env`` can silently route oneshot tools to a different machine.
+
+    A local CLI turn always belongs to the directory where Hermes was launched,
+    regardless of a stale configured ``terminal.cwd``.  Remote backends keep
+    their explicit configured cwd.
+    """
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        apply_terminal_config_to_env(config=config)
+    except Exception:
+        logging.debug("Oneshot terminal config bridge failed", exc_info=True)
+
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if backend in {"", "local"}:
+        try:
+            os.environ["TERMINAL_CWD"] = os.getcwd()
+        except OSError:
+            pass
+
+
 def _cleanup_oneshot_resources(agent: object = None, session_db: object = None) -> None:
     """Release process-global and agent-owned resources created by ``-z``.
 
@@ -373,9 +400,13 @@ def _run_agent(
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
-    from run_agent import AIAgent
 
     cfg = load_config()
+    _apply_oneshot_terminal_config(cfg)
+
+    # Import after terminal config is bridged. Some run_agent dependencies read
+    # TERMINAL_* during import, and oneshot must not freeze stale .env values.
+    from run_agent import AIAgent
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
