@@ -15692,7 +15692,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(
+    cli: "HermesCLI",
+    first_response: str,
+    first_api_calls: Optional[int] = None,
+) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -15709,7 +15713,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import (
+        KANBAN_DEFAULT_MAX_TURNS as _DEF_TURNS,
+        run_kanban_goal_loop as _run_loop,
+    )
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -15733,11 +15740,42 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
-    def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
-            user_message=prompt,
-            conversation_history=cli.conversation_history,
+    # One primary-model budget covers the first turn and every goal
+    # continuation. run_conversation resets its IterationBudget each turn, so
+    # clamp max_iterations to the remainder before each call and restore the
+    # configured value afterward.
+    total_iterations = max(1, int(getattr(cli.agent, "max_iterations", 1) or 1))
+    if first_api_calls is None:
+        first_api_calls = getattr(
+            getattr(cli.agent, "iteration_budget", None), "used", 0,
         )
+    try:
+        iterations_used = max(0, min(total_iterations, int(first_api_calls or 0)))
+    except (TypeError, ValueError):
+        iterations_used = 0
+
+    def _run_turn(prompt: str) -> str:
+        nonlocal iterations_used
+        remaining = max(0, total_iterations - iterations_used)
+        if remaining <= 0:
+            raise RuntimeError("kanban cumulative iteration budget exhausted")
+        configured_max = cli.agent.max_iterations
+        cli.agent.max_iterations = remaining
+        try:
+            result = cli.agent.run_conversation(
+                user_message=prompt,
+                conversation_history=cli.conversation_history,
+            )
+        finally:
+            cli.agent.max_iterations = configured_max
+        if isinstance(result, dict):
+            try:
+                used_this_turn = max(0, int(result.get("api_calls") or 0))
+            except (TypeError, ValueError):
+                used_this_turn = 0
+        else:
+            used_this_turn = 0
+        iterations_used = min(total_iterations, iterations_used + used_this_turn)
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -15761,9 +15799,56 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 pass
 
     def _block(reason: str) -> None:
+        import json as _json
+        from tools.kanban_tools import _handle_block
+
+        outcome = _json.loads(_handle_block({
+            "task_id": task_id,
+            "reason": reason,
+            "kind": "needs_input",
+        }))
+        if not outcome.get("ok"):
+            raise RuntimeError(outcome.get("error") or "could not block task")
+
+    def _iteration_budget() -> tuple[int, int]:
+        return iterations_used, total_iterations
+
+    def _progress(event: dict) -> None:
+        if event.get("stage") != "judge":
+            return
+        from agent.redact import redact_sensitive_text as _redact_sensitive_text
+
+        verdict = str(event.get("verdict") or "continue").capitalize()
+        reason = _redact_sensitive_text(
+            str(event.get("reason") or ""), force=True,
+        ).strip()
+        note_lines = [
+            f"**Goal step:** {event.get('turn')}/{event.get('max_turns')}",
+            f"**Judge:** {verdict}",
+        ]
+        if event.get("iterations_total") is not None:
+            note_lines.append(
+                "**Primary calls:** "
+                f"{event.get('iterations_used')}/{event.get('iterations_total')}"
+            )
+        if reason:
+            note_lines.append(f"**Next:** {reason[:300]}")
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            claim_lock = (_os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+            if claim_lock:
+                _kb.heartbeat_claim(c, task_id, claimer=claim_lock)
+            raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+            try:
+                expected_run_id = int(raw_run_id) if raw_run_id else None
+            except ValueError:
+                expected_run_id = None
+            _kb.heartbeat_worker(
+                c,
+                task_id,
+                note="\n".join(note_lines),
+                expected_run_id=expected_run_id,
+            )
         finally:
             try:
                 c.close()
@@ -15779,6 +15864,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        progress_fn=_progress,
+        iteration_budget_fn=_iteration_budget,
     )
 
 
@@ -16248,7 +16335,11 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _run_kanban_goal_loop_q(
+                                    cli,
+                                    response,
+                                    result.get("api_calls") if isinstance(result, dict) else None,
+                                )
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

@@ -245,6 +245,75 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     assert "turn budget" in blocked["reason"].lower()
 
 
+def test_loop_default_budget_is_bounded_to_six_turns(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    turns = []
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-default-budget",
+        goal_text="bounded task",
+        run_turn=lambda p: turns.append(p) or "still going",
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: blocked.update(reason=reason),
+        first_response="turn1",
+    )
+
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == goals.KANBAN_DEFAULT_MAX_TURNS == 6
+    assert len(turns) == 5
+    assert "6/6" in blocked["reason"]
+
+
+def test_loop_reports_structured_judge_progress(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    events = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-progress",
+        goal_text="observable task",
+        run_turn=lambda _p: pytest.fail("turn budget should stop first"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda _r: None,
+        max_turns=1,
+        first_response="not done",
+        progress_fn=events.append,
+        iteration_budget_fn=lambda: (2, 7),
+    )
+
+    assert res["outcome"] == "blocked_budget"
+    assert events == [{
+        "stage": "judge",
+        "task_id": "t-progress",
+        "turn": 1,
+        "max_turns": 1,
+        "verdict": "continue",
+        "reason": "scripted:continue",
+        "iterations_used": 2,
+        "iterations_total": 7,
+    }]
+
+
+def test_loop_blocks_before_turn_when_cumulative_iterations_exhausted(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-iteration-budget",
+        goal_text="bounded primary calls",
+        run_turn=lambda _p: pytest.fail("must not spend another primary call"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: blocked.update(reason=reason),
+        max_turns=10,
+        first_response="still open",
+        iteration_budget_fn=lambda: (4, 4),
+    )
+
+    assert res["outcome"] == "blocked_iterations"
+    assert res["iterations_used"] == res["iterations_total"] == 4
+    assert "cumulative primary-model" in blocked["reason"]
+
+
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
     # then worker completes.
@@ -296,3 +365,97 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         first_response="x",
     )
     assert res["outcome"] == "stopped"
+
+
+def test_cli_goal_loop_shares_iteration_budget_and_emits_progress(
+    kanban_home,
+    monkeypatch,
+):
+    import cli as cli_module
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="observable bounded worker",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.current_run_id is not None
+    assert task.claim_lock
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
+
+    class _FakeAgent:
+        max_iterations = 5
+        session_id = "session-1"
+
+        def __init__(self):
+            self.clamps = []
+
+        def run_conversation(self, *, user_message, conversation_history):
+            self.clamps.append(self.max_iterations)
+            used = 2 if len(self.clamps) == 1 else 1
+            return {
+                "final_response": f"continued:{user_message[:8]}",
+                "api_calls": used,
+            }
+
+    agent = _FakeAgent()
+
+    class _FakeCLI:
+        conversation_history = []
+        session_id = "session-1"
+
+        def __init__(self):
+            self.agent = agent
+
+    captured = {}
+
+    def _fake_loop(**kwargs):
+        captured.update(kwargs)
+        assert kwargs["max_turns"] == goals.KANBAN_DEFAULT_MAX_TURNS
+        assert kwargs["iteration_budget_fn"]() == (2, 5)
+        kwargs["progress_fn"]({
+            "stage": "judge",
+            "turn": 1,
+            "max_turns": goals.KANBAN_DEFAULT_MAX_TURNS,
+            "verdict": "continue",
+            "reason": "run the deterministic checks",
+            "iterations_used": 2,
+            "iterations_total": 5,
+        })
+        kwargs["run_turn"]("continue one")
+        assert kwargs["iteration_budget_fn"]() == (4, 5)
+        kwargs["run_turn"]("continue two")
+        assert kwargs["iteration_budget_fn"]() == (5, 5)
+        return {"outcome": "blocked_iterations"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _fake_loop)
+
+    cli_module._run_kanban_goal_loop_q(
+        _FakeCLI(),
+        first_response="initial",
+        first_api_calls=2,
+    )
+
+    assert agent.clamps == [3, 1]
+    assert agent.max_iterations == 5
+    assert captured["first_response"] == "initial"
+
+    with kb.connect() as conn:
+        heartbeats = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "heartbeat" and (event.payload or {}).get("note")
+        ]
+    assert len(heartbeats) == 1
+    note = heartbeats[0].payload["note"]
+    assert "**Goal step:** 1/6" in note
+    assert "**Judge:** Continue" in note
+    assert "**Primary calls:** 2/5" in note
+    assert "**Next:** run the deterministic checks" in note

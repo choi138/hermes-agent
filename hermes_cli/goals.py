@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+# Dispatcher workers also share one primary-model iteration budget across the
+# whole run. Six judge turns is enough to recover from short/incomplete turns
+# without allowing the old 20x per-turn amplification.
+KANBAN_DEFAULT_MAX_TURNS = 6
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
@@ -1624,9 +1628,11 @@ def run_kanban_goal_loop(
     run_turn,
     task_status_fn,
     block_fn,
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int = KANBAN_DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    progress_fn=None,
+    iteration_budget_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1649,11 +1655,13 @@ def run_kanban_goal_loop(
     ephemeral, so the turn budget lives in a local counter. It is fully
     decoupled from the CLI for testability: callers inject ``run_turn``
     (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    (reason: str -> None). ``progress_fn`` receives structured judge events;
+    ``iteration_budget_fn`` optionally returns ``(used, total)`` for a single
+    primary-model budget shared across every continuation turn.
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_iterations"``, ``"blocked_by_worker"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1663,9 +1671,26 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
-    max_turns = int(max_turns or DEFAULT_MAX_TURNS)
+    def _iteration_budget() -> Optional[tuple[int, int]]:
+        if iteration_budget_fn is None:
+            return None
+        try:
+            used, total = iteration_budget_fn()
+            return max(0, int(used)), max(0, int(total))
+        except Exception:
+            return None
+
+    def _progress(payload: dict[str, Any]) -> None:
+        if progress_fn is None:
+            return
+        try:
+            progress_fn(payload)
+        except Exception:
+            pass
+
+    max_turns = int(max_turns or KANBAN_DEFAULT_MAX_TURNS)
     if max_turns < 1:
-        max_turns = DEFAULT_MAX_TURNS
+        max_turns = KANBAN_DEFAULT_MAX_TURNS
 
     last_response = first_response or ""
     # The first turn already consumed one unit of budget.
@@ -1699,6 +1724,19 @@ def run_kanban_goal_loop(
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+        iteration_budget = _iteration_budget()
+        progress_payload = {
+            "stage": "judge",
+            "task_id": task_id,
+            "turn": turns_used,
+            "max_turns": max_turns,
+            "verdict": verdict,
+            "reason": _truncate(reason, 400),
+        }
+        if iteration_budget is not None:
+            progress_payload["iterations_used"] = iteration_budget[0]
+            progress_payload["iterations_total"] = iteration_budget[1]
+        _progress(progress_payload)
 
         if verdict == "done":
             if nudged_to_finalize:
@@ -1731,6 +1769,35 @@ def run_kanban_goal_loop(
                 _log(f"kanban goal loop: block_fn failed ({exc})")
             return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
 
+        # A continuation turn must not reset the agent's primary-model budget.
+        # The CLI wrapper clamps each run_conversation call to the remaining
+        # amount; this preflight turns exhaustion into a visible sticky block.
+        iteration_budget = _iteration_budget()
+        if (
+            iteration_budget is not None
+            and iteration_budget[1] > 0
+            and iteration_budget[0] >= iteration_budget[1]
+        ):
+            used, total = iteration_budget
+            _log(
+                f"kanban goal loop: task {task_id} exhausted cumulative "
+                f"iteration budget {used}/{total}; blocking"
+            )
+            try:
+                block_fn(
+                    "Goal-mode worker exhausted its cumulative primary-model "
+                    f"iteration budget ({used}/{total}) without completing the task."
+                )
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_iterations",
+                "turns_used": turns_used,
+                "reason": "iteration budget exhausted",
+                "iterations_used": used,
+                "iterations_total": total,
+            }
+
         # Run another turn in the same session.
         try:
             last_response = run_turn(prompt) or ""
@@ -1755,6 +1822,7 @@ __all__ = [
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KANBAN_DEFAULT_MAX_TURNS",
     "DEFAULT_MAX_TURNS",
     "load_goal",
     "save_goal",

@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -1539,6 +1540,7 @@ CREATE TABLE IF NOT EXISTS terminal_intents (
     failure_class TEXT NOT NULL,
     manifest_json TEXT NOT NULL,
     provenance_digest TEXT NOT NULL,
+    producer_attestation TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK(status IN ('pending', 'applied', 'acknowledged')),
     created_at INTEGER NOT NULL,
@@ -1555,6 +1557,16 @@ CREATE TABLE IF NOT EXISTS terminal_postcommit (
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'done')),
     created_at INTEGER NOT NULL,
     completed_at INTEGER
+);
+
+-- Human-facing completion handoff is intentionally separated from the strict
+-- evidence manifest. Tool handlers redact it before insertion; the immutable
+-- digest lets crash replay prove it is applying the exact staged handoff.
+CREATE TABLE IF NOT EXISTS terminal_handoffs (
+    terminal_intent_id TEXT PRIMARY KEY,
+    handoff_json TEXT NOT NULL,
+    handoff_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS correction_lineages (
@@ -2427,6 +2439,50 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
 
+    # Evidence producers now persist an HMAC binding the dispatcher-issued
+    # claim capability to the immutable terminal request. Existing foundation
+    # rows already contain the exact claim and manifest digest, so they can be
+    # deterministically backfilled without weakening replay verification.
+    intent_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='terminal_intents'"
+    ).fetchone() is not None
+    if intent_table_exists:
+        intent_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(terminal_intents)")
+        }
+        if "producer_attestation" not in intent_cols:
+            _add_column_if_missing(
+                conn,
+                "terminal_intents",
+                "producer_attestation",
+                "producer_attestation TEXT",
+            )
+        rows = conn.execute(
+            "SELECT i.terminal_intent_id, i.task_id, i.run_id, i.claim_lock, "
+            "i.action, i.provenance_digest, i.producer_attestation, "
+            "h.handoff_digest FROM terminal_intents i "
+            "LEFT JOIN terminal_handoffs h USING (terminal_intent_id) "
+            "WHERE i.producer_attestation IS NULL OR i.producer_attestation=''"
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE terminal_intents SET producer_attestation=? "
+                "WHERE terminal_intent_id=? AND "
+                "(producer_attestation IS NULL OR producer_attestation='')",
+                (
+                    _terminal_producer_attestation(
+                        terminal_intent_id=row["terminal_intent_id"],
+                        task_id=row["task_id"],
+                        run_id=int(row["run_id"]),
+                        claim_lock=row["claim_lock"],
+                        action=row["action"],
+                        provenance_digest=row["provenance_digest"],
+                        handoff_digest=row["handoff_digest"],
+                    ),
+                    row["terminal_intent_id"],
+                ),
+            )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2936,11 +2992,9 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Idempotency fast path. A second lookup inside the write transaction below
+    # closes the concurrent-creator race; this unlocked read avoids taking a
+    # write lock for ordinary response-loss retries that already have a row.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -2978,6 +3032,15 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -5138,12 +5201,82 @@ class TerminalIntentConflict(RuntimeError):
 _TERMINAL_DECISIONS = frozenset(
     {"verified", "resume", "fresh", "no_retry", "stable_block", "human_gate"}
 )
+_TERMINAL_HANDOFF_FIELDS = frozenset(
+    {"result", "summary", "metadata", "verified_cards"}
+)
+
+
+def _terminal_producer_attestation(
+    *, terminal_intent_id: str, task_id: str, run_id: int, claim_lock: str,
+    action: str, provenance_digest: str, handoff_digest: Optional[str],
+) -> str:
+    """Bind a terminal producer request to its dispatcher claim capability."""
+    payload = json.dumps(
+        {
+            "action": action,
+            "handoff_digest": handoff_digest,
+            "provenance_digest": provenance_digest,
+            "run_id": int(run_id),
+            "task_id": task_id,
+            "terminal_intent_id": terminal_intent_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hmac.new(claim_lock.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _canonical_terminal_handoff(handoff: dict) -> str:
+    """Validate and canonicalize the separately-redacted terminal handoff."""
+    if not isinstance(handoff, dict) or frozenset(handoff) != _TERMINAL_HANDOFF_FIELDS:
+        raise ValueError("invalid terminal handoff fields")
+    for field in ("result", "summary"):
+        value = handoff[field]
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"terminal handoff {field} must be a string or null")
+    metadata = handoff["metadata"]
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("terminal handoff metadata must be an object or null")
+    cards = handoff["verified_cards"]
+    if not isinstance(cards, list) or any(
+        not isinstance(card, str) or not card for card in cards
+    ):
+        raise ValueError("terminal handoff verified_cards must be a string list")
+    try:
+        return json.dumps(
+            handoff, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("terminal handoff must be JSON serializable") from exc
+
+
+def _load_terminal_handoff(
+    conn: sqlite3.Connection, terminal_intent_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT handoff_json, handoff_digest FROM terminal_handoffs "
+        "WHERE terminal_intent_id=?",
+        (terminal_intent_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        handoff = json.loads(row["handoff_json"])
+        canonical = _canonical_terminal_handoff(handoff)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise TerminalIntentConflict("stored terminal handoff is malformed") from exc
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if canonical != row["handoff_json"] or digest != row["handoff_digest"]:
+        raise TerminalIntentConflict("stored terminal handoff digest mismatch")
+    return handoff
 
 
 def create_terminal_intent(
     conn: sqlite3.Connection, *, terminal_intent_id: str, task_id: str,
     run_id: int, claim_lock: str, action: str, decision: str,
     failure_class: str, manifest: dict, provenance_digest: str,
+    handoff: Optional[dict] = None,
 ) -> str:
     """Durably register an evidence-bound terminal request, idempotently.
 
@@ -5162,21 +5295,55 @@ def create_terminal_intent(
     if manifest["failure_class"] != failure_class:
         raise ValueError("failure_class binding mismatch")
     canonical = canonical_evidence_manifest(manifest)
+    handoff_canonical = (
+        _canonical_terminal_handoff(handoff) if handoff is not None else None
+    )
+    handoff_digest = (
+        hashlib.sha256(handoff_canonical.encode("utf-8")).hexdigest()
+        if handoff_canonical is not None else None
+    )
+    producer_attestation = _terminal_producer_attestation(
+        terminal_intent_id=terminal_intent_id,
+        task_id=task_id,
+        run_id=int(run_id),
+        claim_lock=claim_lock,
+        action=action,
+        provenance_digest=provenance_digest,
+        handoff_digest=handoff_digest,
+    )
     values = (
         terminal_intent_id, task_id, int(run_id), claim_lock, action,
-        decision, failure_class, canonical, provenance_digest, now,
+        decision, failure_class, canonical, provenance_digest,
+        producer_attestation, now,
     )
     with write_txn(conn):
         existing = conn.execute(
             "SELECT task_id, run_id, claim_lock, action, decision, failure_class, "
-            "manifest_json, provenance_digest FROM terminal_intents "
+            "manifest_json, provenance_digest, producer_attestation "
+            "FROM terminal_intents "
             "WHERE terminal_intent_id = ?", (terminal_intent_id,),
         ).fetchone()
         if existing is not None:
-            expected = values[1:9]
+            expected = values[1:10]
             observed = tuple(existing)
             if observed != expected:
                 raise TerminalIntentConflict("terminal_intent_id already has different immutable content")
+            stored_handoff = conn.execute(
+                "SELECT handoff_json, handoff_digest FROM terminal_handoffs "
+                "WHERE terminal_intent_id=?",
+                (terminal_intent_id,),
+            ).fetchone()
+            if handoff_canonical is None:
+                if stored_handoff is not None:
+                    raise TerminalIntentConflict(
+                        "terminal_intent_id already has a different immutable handoff"
+                    )
+            elif stored_handoff is None or tuple(stored_handoff) != (
+                handoff_canonical, handoff_digest,
+            ):
+                raise TerminalIntentConflict(
+                    "terminal_intent_id already has a different immutable handoff"
+                )
             return terminal_intent_id
         owner = conn.execute(
             "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
@@ -5198,10 +5365,108 @@ def create_terminal_intent(
         conn.execute(
             "INSERT INTO terminal_intents "
             "(terminal_intent_id, task_id, run_id, claim_lock, action, decision, "
-            "failure_class, manifest_json, provenance_digest, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values,
+            "failure_class, manifest_json, provenance_digest, "
+            "producer_attestation, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values,
         )
+        if handoff_canonical is not None:
+            conn.execute(
+                "INSERT INTO terminal_handoffs "
+                "(terminal_intent_id, handoff_json, handoff_digest, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (terminal_intent_id, handoff_canonical, handoff_digest, now),
+            )
     return terminal_intent_id
+
+
+def create_completion_terminal_intent(
+    conn: sqlite3.Connection, *, terminal_intent_id: str, task_id: str,
+    run_id: int, claim_lock: str, decision: str, failure_class: str,
+    manifest: dict, provenance_digest: str, result: Optional[str] = None,
+    summary: Optional[str] = None, metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+) -> str:
+    """Stage an evidence-bound completion and its redacted structured handoff."""
+    if decision != "verified":
+        raise ValueError("completion decision must be verified")
+    if failure_class != "none":
+        raise ValueError("completion failure_class must be none")
+    if created_cards:
+        verified_cards, phantom_cards = _verify_created_cards(
+            conn, task_id, created_cards,
+        )
+        if phantom_cards:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_hallucination",
+                    {
+                        "phantom_cards": phantom_cards,
+                        "verified_cards": verified_cards,
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result) else None
+                        ),
+                    },
+                )
+            raise HallucinatedCardsError(phantom_cards, task_id)
+    else:
+        verified_cards = []
+    handoff = {
+        "result": result,
+        "summary": summary,
+        "metadata": metadata,
+        "verified_cards": verified_cards,
+    }
+    return create_terminal_intent(
+        conn,
+        terminal_intent_id=terminal_intent_id,
+        task_id=task_id,
+        run_id=run_id,
+        claim_lock=claim_lock,
+        action="complete",
+        decision=decision,
+        failure_class=failure_class,
+        manifest=manifest,
+        provenance_digest=provenance_digest,
+        handoff=handoff,
+    )
+
+
+def create_block_terminal_intent(
+    conn: sqlite3.Connection, *, terminal_intent_id: str, task_id: str,
+    run_id: int, claim_lock: str, decision: str, failure_class: str,
+    manifest: dict, provenance_digest: str, reason: str, kind: str,
+) -> str:
+    """Stage an evidence-bound stable block and its redacted human reason."""
+    if decision not in {"no_retry", "stable_block", "human_gate"}:
+        raise ValueError("block decision must be no_retry, stable_block, or human_gate")
+    if failure_class == "none":
+        raise ValueError("block failure_class must be typed")
+    if kind not in VALID_BLOCK_KINDS - {"dependency"}:
+        raise ValueError(
+            "terminal block evidence requires a stable non-dependency kind"
+        )
+    if manifest.get("block_kind") != kind:
+        raise ValueError("terminal block kind does not match evidence manifest")
+    handoff = {
+        "result": None,
+        "summary": reason,
+        "metadata": None,
+        "verified_cards": [],
+    }
+    return create_terminal_intent(
+        conn,
+        terminal_intent_id=terminal_intent_id,
+        task_id=task_id,
+        run_id=run_id,
+        claim_lock=claim_lock,
+        action="block",
+        decision=decision,
+        failure_class=failure_class,
+        manifest=manifest,
+        provenance_digest=provenance_digest,
+        handoff=handoff,
+    )
 
 
 def _verify_applied_terminal_marker(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
@@ -5211,8 +5476,11 @@ def _verify_applied_terminal_marker(conn: sqlite3.Connection, row: sqlite3.Row) 
     ).fetchone()
     if event is None or event["task_id"] != row["task_id"] or int(event["run_id"]) != int(row["run_id"]):
         raise TerminalIntentConflict("applied terminal event ownership cannot be proven")
-    expected_kind = "completed" if row["action"] == "complete" else "blocked"
-    if event["kind"] != expected_kind:
+    if row["action"] == "complete":
+        valid_event_kinds = {"completed"}
+    else:
+        valid_event_kinds = {"blocked", "block_loop_detected"}
+    if event["kind"] not in valid_event_kinds:
         raise TerminalIntentConflict("applied terminal event kind does not match intent action")
     try:
         payload = json.loads(event["payload"] or "{}")
@@ -5231,6 +5499,32 @@ def _verify_applied_terminal_marker(conn: sqlite3.Connection, row: sqlite3.Row) 
         raise TerminalIntentConflict("applied terminal event failure class does not match intent")
     if payload.get("block_kind") != manifest.get("block_kind"):
         raise TerminalIntentConflict("applied terminal event block kind does not match evidence")
+    handoff_row = conn.execute(
+        "SELECT handoff_digest FROM terminal_handoffs WHERE terminal_intent_id=?",
+        (row["terminal_intent_id"],),
+    ).fetchone()
+    if handoff_row is None:
+        if payload.get("handoff_digest") is not None:
+            raise TerminalIntentConflict("applied terminal event has an unowned handoff")
+    else:
+        _load_terminal_handoff(conn, row["terminal_intent_id"])
+        if payload.get("handoff_digest") != handoff_row["handoff_digest"]:
+            raise TerminalIntentConflict(
+                "applied terminal event handoff digest does not match intent"
+            )
+    expected_attestation = _terminal_producer_attestation(
+        terminal_intent_id=row["terminal_intent_id"],
+        task_id=row["task_id"],
+        run_id=int(row["run_id"]),
+        claim_lock=row["claim_lock"],
+        action=row["action"],
+        provenance_digest=row["provenance_digest"],
+        handoff_digest=(handoff_row["handoff_digest"] if handoff_row else None),
+    )
+    if not row["producer_attestation"] or not hmac.compare_digest(
+        row["producer_attestation"], expected_attestation,
+    ):
+        raise TerminalIntentConflict("terminal producer attestation mismatch")
     try:
         manifest_digest = evidence_manifest_digest(manifest)
     except ValueError as exc:
@@ -5269,10 +5563,17 @@ def _finish_terminal_postcommit(conn: sqlite3.Connection, terminal_intent_id: st
         else:
             hook_name = "kanban_task_blocked"
         task = get_task(conn, row["task_id"])
+        handoff = _load_terminal_handoff(conn, terminal_intent_id) or {}
+        hook_handoff: dict[str, Optional[str]] = {}
+        if row["action"] == "complete":
+            hook_handoff["summary"] = handoff.get("summary") or handoff.get("result")
+        elif handoff:
+            hook_handoff["reason"] = handoff.get("summary")
         _fire_kanban_lifecycle_hook(
             hook_name, row["task_id"], board=get_current_board(),
             assignee=task.assignee if task else None, run_id=int(row["run_id"]),
             terminal_intent_id=terminal_intent_id,
+            **hook_handoff,
         )
         now = int(time.time())
         with write_txn(conn):
@@ -5296,10 +5597,10 @@ def apply_terminal_intent(
 ) -> bool:
     """Apply or replay one terminal intent with exact run/event ownership.
 
-    ``summary`` is accepted for API compatibility but deliberately not persisted:
-    the evidence lane stores only allowlisted structured data. Human prose can be
-    added through the established comment path, where existing redaction policy
-    applies.
+    ``summary`` remains an ignored compatibility argument. Evidence-aware
+    producers stage redacted prose and metadata in ``terminal_handoffs`` before
+    this function runs, so crash replay consumes immutable handoff content rather
+    than trusting a later caller.
     """
     del summary
     row = conn.execute(
@@ -5321,13 +5622,21 @@ def apply_terminal_intent(
         run_id=int(row["run_id"]), terminal_intent_id=terminal_intent_id,
         action=row["action"], now=now,
     )
+    handoff = _load_terminal_handoff(conn, terminal_intent_id)
+    handoff_digest = (
+        hashlib.sha256(
+            _canonical_terminal_handoff(handoff).encode("utf-8")
+        ).hexdigest()
+        if handoff is not None else None
+    )
     evidence_block_kind = manifest["block_kind"]
     if block_kind is not None and block_kind != evidence_block_kind:
         raise TerminalIntentConflict("requested block kind does not match terminal evidence")
     block_kind = evidence_block_kind
     with write_txn(conn):
         task = conn.execute(
-            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
+            "SELECT status, current_run_id, claim_lock, block_kind, "
+            "block_recurrences FROM tasks WHERE id=?",
             (row["task_id"],),
         ).fetchone()
         active_run = conn.execute(
@@ -5353,41 +5662,110 @@ def apply_terminal_intent(
                 _verify_applied_terminal_marker(conn, fresh)
                 return True
             raise TerminalIntentConflict("intent no longer owns the active run and claim")
+        terminal_result = handoff.get("result") if handoff else None
+        terminal_summary = handoff.get("summary") if handoff else None
+        if terminal_summary is None:
+            terminal_summary = terminal_result
+        terminal_metadata = handoff.get("metadata") if handoff else None
+        verified_cards = handoff.get("verified_cards", []) if handoff else []
+        block_recurrences = None
         if row["action"] == "complete":
             status, outcome, event_kind = "done", "completed", "completed"
             conn.execute(
-                "UPDATE tasks SET status='done', completed_at=?, claim_lock=NULL, "
-                "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
-                "block_recurrences=0 WHERE id=? AND current_run_id=?",
-                (now, row["task_id"], row["run_id"]),
+                "UPDATE tasks SET status='done', result=?, completed_at=?, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "block_kind=NULL, block_recurrences=0 "
+                "WHERE id=? AND current_run_id=?",
+                (terminal_result, now, row["task_id"], row["run_id"]),
             )
         else:
             if block_kind not in VALID_BLOCK_KINDS - {"dependency"}:
                 raise ValueError("terminal block intent requires a stable non-dependency block_kind")
-            status, outcome, event_kind = "blocked", "blocked", "blocked"
+            previous_kind = task["block_kind"]
+            previous_recurrences = int(task["block_recurrences"] or 0)
+            block_recurrences = (
+                previous_recurrences + 1 if previous_kind == block_kind else 1
+            )
+            status, outcome = "blocked", "blocked"
+            if block_recurrences >= BLOCK_RECURRENCE_LIMIT:
+                task_status, event_kind = "triage", "block_loop_detected"
+            else:
+                task_status, event_kind = "blocked", "blocked"
             conn.execute(
-                "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
-                "worker_pid=NULL, block_kind=?, block_recurrences=block_recurrences+1 "
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, block_kind=?, block_recurrences=? "
                 "WHERE id=? AND current_run_id=?",
-                (block_kind, row["task_id"], row["run_id"]),
+                (
+                    task_status, block_kind, block_recurrences,
+                    row["task_id"], row["run_id"],
+                ),
             )
         ended_run_id = _end_run(
             conn, row["task_id"], outcome=outcome, status=status,
-            summary=None, metadata=None,
+            summary=terminal_summary, metadata=terminal_metadata,
         )
         if ended_run_id != row["run_id"]:
             raise TerminalIntentConflict("intent ended a different run")
+        terminal_payload: dict = {
+            "terminal_intent_id": terminal_intent_id,
+            "provenance_digest": row["provenance_digest"],
+            "decision": row["decision"],
+            "failure_class": row["failure_class"],
+            "block_kind": block_kind,
+        }
+        if handoff_digest is not None:
+            terminal_payload["handoff_digest"] = handoff_digest
+        if row["action"] == "complete":
+            event_summary = terminal_summary or ""
+            terminal_payload.update({
+                "result_len": len(terminal_result) if terminal_result else 0,
+                "summary": (
+                    event_summary.strip().splitlines()[0][:400]
+                    if event_summary else None
+                ),
+            })
+            if verified_cards:
+                terminal_payload["verified_cards"] = verified_cards
+            if isinstance(terminal_metadata, dict):
+                artifacts = terminal_metadata.get("artifacts")
+                if isinstance(artifacts, (list, tuple)):
+                    cleaned_artifacts = [
+                        str(path).strip() for path in artifacts
+                        if isinstance(path, str) and str(path).strip()
+                    ]
+                    if cleaned_artifacts:
+                        terminal_payload["artifacts"] = cleaned_artifacts
+        else:
+            terminal_payload.update({
+                "reason": terminal_summary,
+                "kind": block_kind,
+                "recurrences": block_recurrences,
+            })
+            if event_kind == "block_loop_detected":
+                terminal_payload["limit"] = BLOCK_RECURRENCE_LIMIT
         event_id = _append_event(
-            conn, row["task_id"], event_kind,
-            {
-                "terminal_intent_id": terminal_intent_id,
-                "provenance_digest": row["provenance_digest"],
-                "decision": row["decision"],
-                "failure_class": row["failure_class"],
-                "block_kind": block_kind,
-            },
+            conn, row["task_id"], event_kind, terminal_payload,
             run_id=int(row["run_id"]),
         )
+        if row["action"] == "complete" and handoff:
+            scan_text = " ".join(filter(None, [
+                handoff.get("summary"), handoff.get("result"),
+            ]))
+            if scan_text:
+                phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+                phantom_refs = [
+                    ref for ref in phantom_refs if ref not in set(verified_cards)
+                ]
+                if phantom_refs:
+                    _append_event(
+                        conn, row["task_id"],
+                        "suspected_hallucinated_references",
+                        {
+                            "phantom_refs": phantom_refs,
+                            "source": "completion_summary",
+                        },
+                        run_id=int(row["run_id"]),
+                    )
         updated = conn.execute(
             "UPDATE terminal_intents SET status='applied', applied_at=?, applied_event_id=? "
             "WHERE terminal_intent_id=? AND status='pending'",

@@ -68,6 +68,41 @@ def test_idempotency_key_returns_existing_task(kanban_home):
         conn.close()
 
 
+def test_idempotency_key_serializes_concurrent_creators(kanban_home):
+    barrier = threading.Barrier(2)
+    created = []
+    errors = []
+
+    def _create(title):
+        conn = kb.connect()
+        try:
+            barrier.wait(timeout=5)
+            created.append(
+                kb.create_task(conn, title=title, idempotency_key="same-retry")
+            )
+        except BaseException as exc:  # pragma: no cover - thread handoff
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=_create, args=(title,))
+        for title in ("first contender", "second contender")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert len(created) == 2
+    assert len(set(created)) == 1
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key='same-retry'"
+        ).fetchone()[0] == 1
+
+
 def test_idempotency_key_ignored_for_archived(kanban_home):
     conn = kb.connect()
     try:

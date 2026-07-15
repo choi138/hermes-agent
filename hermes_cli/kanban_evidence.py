@@ -8,9 +8,16 @@ credentials are deliberately not representable by the manifest schema.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
+import platform
 import re
-from typing import Any, Mapping
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Mapping, Optional
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -68,6 +75,265 @@ _DETERMINISTIC_VERDICT_SOURCES = frozenset(
     {"deterministic_test", "deterministic_build", "static_analysis"}
 )
 _VERDICT_SOURCES = _DETERMINISTIC_VERDICT_SOURCES | frozenset({"llm", "reviewer"})
+
+_LOCKFILE_NAMES = (
+    "uv.lock",
+    "poetry.lock",
+    "pdm.lock",
+    "Pipfile.lock",
+    "requirements.txt",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+)
+_MAX_EVIDENCE_FRESHNESS_SECONDS = 604_800
+_PRODUCER_POLICY_VERSION = "runtime-evidence-v1"
+
+
+def _canonical_json(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("terminal producer input must be JSON serializable") from exc
+
+
+def _domain_digest(label: str, value: Any) -> str:
+    payload = f"{label}\0{_canonical_json(value)}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _file_set_digest(label: str, paths: list[Path]) -> str:
+    """Hash file names and contents without persisting either in evidence."""
+    digest = hashlib.sha256(f"{label}\0".encode("utf-8"))
+    found = False
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+            found = True
+            digest.update(path.name.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(128 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+        except OSError:
+            digest.update(f"unreadable:{path.name}".encode("utf-8"))
+            digest.update(b"\0")
+    if not found:
+        digest.update(b"none")
+    return digest.hexdigest()
+
+
+def _git_provenance(workspace: Optional[str], fallback_seed: str) -> tuple[str, str, str]:
+    """Return commit, committed tree, and a digest of the working-tree state.
+
+    Git metadata is observational only: failure or a non-repository workspace
+    falls back to deterministic object-shaped identifiers. Raw status output is
+    hashed in memory and never crosses the evidence boundary.
+    """
+    root = Path(workspace).expanduser() if workspace else None
+    if root is not None and root.is_dir():
+        try:
+            resolved = subprocess.run(
+                [
+                    "git", "-C", str(root), "rev-parse",
+                    "HEAD^{commit}", "HEAD^{tree}",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            resolved = None
+        if resolved is not None:
+            lines = resolved.stdout.decode("ascii", errors="ignore").splitlines()
+        else:
+            lines = []
+        if (
+            resolved is not None
+            and resolved.returncode == 0
+            and len(lines) >= 2
+            and _GIT_OBJECT_RE.fullmatch(lines[0].strip())
+            and _GIT_OBJECT_RE.fullmatch(lines[1].strip())
+        ):
+            commit, tree = lines[0].strip(), lines[1].strip()
+            try:
+                status = subprocess.run(
+                    [
+                        "git", "-C", str(root), "status", "--porcelain=v1",
+                        "-z", "--untracked-files=normal",
+                    ],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+                state_digest = hashlib.sha256(status.stdout).hexdigest()
+            except (OSError, subprocess.SubprocessError):
+                state_digest = _domain_digest(
+                    "worktree-state-unavailable", fallback_seed,
+                )
+            return commit, tree, state_digest
+
+    commit = hashlib.sha1(f"fallback-commit\0{fallback_seed}".encode()).hexdigest()
+    tree = hashlib.sha1(f"fallback-tree\0{fallback_seed}".encode()).hexdigest()
+    state = _domain_digest("fallback-worktree", fallback_seed)
+    return commit, tree, state
+
+
+def terminal_intent_id(
+    *,
+    claim_lock: str,
+    task_id: str,
+    run_id: int,
+    action: str,
+    decision: str,
+    failure_class: str,
+    block_kind: Optional[str],
+    handoff: Mapping[str, Any],
+) -> str:
+    """Derive a response-loss-safe terminal id from the claim and handoff."""
+    if not isinstance(claim_lock, str) or not claim_lock:
+        raise ValueError("terminal producer requires a claim capability")
+    payload = _canonical_json(
+        {
+            "action": action,
+            "block_kind": block_kind,
+            "decision": decision,
+            "failure_class": failure_class,
+            "handoff": dict(handoff),
+            "run_id": int(run_id),
+            "task_id": task_id,
+        }
+    ).encode("utf-8")
+    digest = hmac.new(claim_lock.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return f"ti_{digest}"
+
+
+def produce_terminal_evidence(
+    *,
+    claim_lock: str,
+    task_id: str,
+    run_id: int,
+    action: str,
+    decision: str,
+    failure_class: str,
+    block_kind: Optional[str],
+    handoff: Mapping[str, Any],
+    workspace: Optional[str] = None,
+    config_path: Optional[str] = None,
+    backend_kind: Optional[str] = None,
+    evidence_at: Optional[int] = None,
+) -> dict[str, Any]:
+    """Produce the strict manifest internally for a dispatcher-owned worker.
+
+    The model supplies only the human handoff fields already present on
+    ``kanban_complete`` / ``kanban_block``. The producer derives the immutable
+    intent id, observes safe local provenance, and hashes every other input so
+    prompts, commands, environment values, and credentials are never stored in
+    the evidence lane.
+    """
+    intent_id = terminal_intent_id(
+        claim_lock=claim_lock,
+        task_id=task_id,
+        run_id=run_id,
+        action=action,
+        decision=decision,
+        failure_class=failure_class,
+        block_kind=block_kind,
+        handoff=handoff,
+    )
+    canonical_handoff = _canonical_json(dict(handoff))
+    fallback_seed = _canonical_json(
+        {"intent": intent_id, "run_id": int(run_id), "task_id": task_id}
+    )
+    source_commit, source_tree, worktree_digest = _git_provenance(
+        workspace, fallback_seed,
+    )
+
+    root = Path(workspace).expanduser() if workspace else None
+    lock_paths = [root / name for name in _LOCKFILE_NAMES] if root else []
+    config_paths = [Path(config_path).expanduser()] if config_path else []
+    normalized_backend = re.sub(
+        r"[^A-Za-z0-9_.:-]+", "-", (backend_kind or "local").strip(),
+    ).strip("-.")[:128]
+    if not normalized_backend or not _ID_RE.fullmatch(normalized_backend):
+        normalized_backend = "local"
+
+    metadata = handoff.get("metadata") if isinstance(handoff, Mapping) else None
+    test_plan = {}
+    if isinstance(metadata, Mapping):
+        for key in ("checks", "tests", "tests_run", "verification"):
+            if key in metadata:
+                test_plan[key] = metadata[key]
+
+    observed_at = int(evidence_at if evidence_at is not None else time.time())
+    manifest = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "run_id": int(run_id),
+        "terminal_intent_id": intent_id,
+        "action": action,
+        "block_kind": block_kind,
+        "source_commit": source_commit,
+        "source_tree": source_tree,
+        "config_digest": _file_set_digest("config", config_paths),
+        "lockfile_digest": _file_set_digest("lockfiles", lock_paths),
+        "toolchain_digest": _domain_digest(
+            "toolchain",
+            {
+                "implementation": platform.python_implementation(),
+                "machine": platform.machine(),
+                "python": list(sys.version_info[:3]),
+                "system": platform.system(),
+            },
+        ),
+        "backend_kind": normalized_backend,
+        "backend_digest": _domain_digest(
+            "backend",
+            {
+                "kind": normalized_backend,
+                "profile": os.environ.get("HERMES_PROFILE") or "worker",
+            },
+        ),
+        "command_digest": _domain_digest(
+            "terminal-call", {"action": action, "handoff": canonical_handoff},
+        ),
+        "test_plan_digest": _domain_digest("test-plan", test_plan),
+        "fixture_digest": _domain_digest("fixtures", {"intent": intent_id}),
+        "seed_digest": _domain_digest("producer-seed", {"intent": intent_id}),
+        "policy_version": _PRODUCER_POLICY_VERSION,
+        "evidence_at": observed_at,
+        "freshness_seconds": _MAX_EVIDENCE_FRESHNESS_SECONDS,
+        "failure_class": failure_class,
+        "checkpoint_digest": _domain_digest(
+            "checkpoint",
+            {
+                "handoff": canonical_handoff,
+                "source_commit": source_commit,
+                "source_tree": source_tree,
+                "worktree_digest": worktree_digest,
+            },
+        ),
+        "side_effect": "unknown",
+    }
+    provenance_digest = evidence_manifest_digest(manifest)
+    return {
+        "terminal_intent_id": intent_id,
+        "decision": decision,
+        "failure_class": failure_class,
+        "manifest": manifest,
+        "provenance_digest": provenance_digest,
+    }
 
 
 def canonical_evidence_manifest(manifest: Mapping[str, Any]) -> str:

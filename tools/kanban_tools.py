@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -116,6 +117,138 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _worker_terminal_capability(task_id: str) -> Optional[tuple[int, str]]:
+    """Return the dispatcher-issued run/claim capability for a task worker.
+
+    Evidence-bound terminal writes are stricter than the legacy lifecycle
+    path: they must prove that this process was spawned for the exact claimed
+    run.  Reading ``tasks.claim_lock`` back from the shared board would turn
+    the database into an authority oracle, so the claim must come from the
+    worker environment populated by the dispatcher.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if not raw_run_id or not claim_lock:
+        return None
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return None
+    if run_id <= 0:
+        return None
+    return run_id, claim_lock
+
+
+def _runtime_terminal_evidence(
+    conn,
+    kb,
+    *,
+    task,
+    run_id: int,
+    claim_lock: str,
+    action: str,
+    decision: str,
+    failure_class: str,
+    block_kind: Optional[str],
+    handoff: dict,
+) -> tuple[dict, bool]:
+    """Produce evidence, or reload the exact staged evidence for a retry."""
+    from hermes_cli.kanban_evidence import (
+        produce_terminal_evidence,
+        terminal_intent_id,
+    )
+
+    intent_id = terminal_intent_id(
+        claim_lock=claim_lock,
+        task_id=task.id,
+        run_id=run_id,
+        action=action,
+        decision=decision,
+        failure_class=failure_class,
+        block_kind=block_kind,
+        handoff=handoff,
+    )
+    existing = conn.execute(
+        "SELECT task_id, run_id, claim_lock, action, decision, failure_class, "
+        "manifest_json, provenance_digest FROM terminal_intents "
+        "WHERE terminal_intent_id=?",
+        (intent_id,),
+    ).fetchone()
+    if existing is not None:
+        expected_owner = (
+            task.id,
+            int(run_id),
+            claim_lock,
+            action,
+            decision,
+            failure_class,
+        )
+        if tuple(existing)[:6] != expected_owner:
+            raise kb.TerminalIntentConflict(
+                "derived terminal intent belongs to different immutable content"
+            )
+        stored_handoff = conn.execute(
+            "SELECT handoff_json FROM terminal_handoffs "
+            "WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        expected_handoff = kb._canonical_terminal_handoff(handoff)
+        if stored_handoff is None or stored_handoff["handoff_json"] != expected_handoff:
+            raise kb.TerminalIntentConflict(
+                "derived terminal intent has a different immutable handoff"
+            )
+        return (
+            {
+                "terminal_intent_id": intent_id,
+                "decision": existing["decision"],
+                "failure_class": existing["failure_class"],
+                "manifest": json.loads(existing["manifest_json"]),
+                "provenance_digest": existing["provenance_digest"],
+            },
+            True,
+        )
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        config_path = str(get_hermes_home() / "config.yaml")
+    except Exception:
+        config_path = None
+    workspace = (
+        os.environ.get("HERMES_KANBAN_WORKSPACE")
+        or task.workspace_path
+        or os.environ.get("TERMINAL_CWD")
+    )
+    evidence = produce_terminal_evidence(
+        claim_lock=claim_lock,
+        task_id=task.id,
+        run_id=run_id,
+        action=action,
+        decision=decision,
+        failure_class=failure_class,
+        block_kind=block_kind,
+        handoff=handoff,
+        workspace=workspace,
+        config_path=config_path,
+        backend_kind=os.environ.get("TERMINAL_ENV") or "local",
+    )
+    return evidence, False
+
+
+def _automatic_create_idempotency_key(parent_task_id: str, request: dict) -> str:
+    """Scope a normalized create request to its spawning worker task."""
+    canonical = json.dumps(
+        {"parent_task_id": parent_task_id, "request": request},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"worker-create:{parent_task_id}:{digest}"
 
 
 def _stamp_worker_session_metadata(
@@ -379,6 +512,19 @@ def _handle_show(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
+            if os.environ.get("HERMES_KANBAN_TASK") == tid:
+                # The formatted context already contains the task body, parent
+                # handoffs, prior runs, and comments. Returning those same rows
+                # again as raw JSON roughly doubled the first worker tool result.
+                return json.dumps({
+                    "task": {
+                        "id": task.id,
+                        "status": task.status,
+                        "current_run_id": task.current_run_id,
+                    },
+                    "children": kb.child_ids(conn, tid),
+                    "worker_context": kb.build_worker_context(conn, tid),
+                })
             comments = kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
@@ -424,11 +570,6 @@ def _handle_show(args: dict, **kw) -> str:
                     for e in events[-50:]   # cap; full log via CLI
                 ],
                 "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
             })
         finally:
             conn.close()
@@ -588,6 +729,31 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    terminal_evidence = args.get("terminal_evidence")
+    if terminal_evidence is not None:
+        expected_fields = {
+            "terminal_intent_id", "decision", "failure_class",
+            "manifest", "provenance_digest",
+        }
+        if not isinstance(terminal_evidence, dict):
+            return tool_error("terminal_evidence must be an object")
+        unknown = sorted(set(terminal_evidence) - expected_fields)
+        missing = sorted(expected_fields - set(terminal_evidence))
+        if unknown or missing:
+            return tool_error(
+                "terminal_evidence fields must match the strict schema; "
+                f"missing={missing}, unknown={unknown}"
+            )
+        if terminal_evidence.get("failure_class") != "none":
+            return tool_error(
+                "completion terminal_evidence requires failure_class=none"
+            )
+        if terminal_evidence.get("decision") != "verified":
+            return tool_error(
+                "completion terminal_evidence requires decision=verified"
+            )
+        if not isinstance(terminal_evidence.get("manifest"), dict):
+            return tool_error("terminal_evidence.manifest must be an object")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -598,7 +764,12 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
+            if (
+                task
+                and task.status == "running"
+                and task.goal_mode
+                and _goal_judge_available()
+            ):
                 verdict = "done"
                 reason = ""
                 try:
@@ -623,13 +794,75 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
-            try:
-                ok = kb.complete_task(
-                    conn, tid,
-                    result=result, summary=summary, metadata=metadata,
-                    created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+            terminal_intent_id = None
+            evidence_already_staged = False
+            capability = _worker_terminal_capability(tid)
+            worker_scoped = os.environ.get("HERMES_KANBAN_TASK") == tid
+            if terminal_evidence is None and worker_scoped:
+                if capability is None:
+                    return tool_error(
+                        "automatic terminal evidence requires the dispatcher "
+                        "run/claim capability"
+                    )
+                if task is None:
+                    return tool_error(f"could not complete {tid} (unknown id)")
+                verified_cards, _phantom_cards = kb._verify_created_cards(
+                    conn, tid, created_cards or [],
                 )
+                handoff = {
+                    "result": result,
+                    "summary": summary,
+                    "metadata": metadata,
+                    "verified_cards": verified_cards,
+                }
+                run_id, claim_lock = capability
+                terminal_evidence, evidence_already_staged = (
+                    _runtime_terminal_evidence(
+                        conn,
+                        kb,
+                        task=task,
+                        run_id=run_id,
+                        claim_lock=claim_lock,
+                        action="complete",
+                        decision="verified",
+                        failure_class="none",
+                        block_kind=None,
+                        handoff=handoff,
+                    )
+                )
+            try:
+                if terminal_evidence is None:
+                    ok = kb.complete_task(
+                        conn, tid,
+                        result=result, summary=summary, metadata=metadata,
+                        created_cards=created_cards,
+                        expected_run_id=_worker_run_id(tid),
+                    )
+                else:
+                    capability = _worker_terminal_capability(tid)
+                    if capability is None:
+                        return tool_error(
+                            "terminal_evidence requires the dispatcher run/claim capability"
+                        )
+                    run_id, claim_lock = capability
+                    terminal_intent_id = terminal_evidence["terminal_intent_id"]
+                    if not evidence_already_staged:
+                        kb.create_completion_terminal_intent(
+                            conn,
+                            terminal_intent_id=terminal_intent_id,
+                            task_id=tid,
+                            run_id=run_id,
+                            claim_lock=claim_lock,
+                            decision=terminal_evidence["decision"],
+                            failure_class=terminal_evidence["failure_class"],
+                            manifest=terminal_evidence["manifest"],
+                            provenance_digest=terminal_evidence["provenance_digest"],
+                            result=result,
+                            summary=summary,
+                            metadata=metadata,
+                            created_cards=created_cards,
+                        )
+                    ok = kb.apply_terminal_intent(conn, terminal_intent_id)
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -655,7 +888,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            response_fields = {
+                "task_id": tid,
+                "run_id": run.id if run else None,
+            }
+            if terminal_intent_id is not None:
+                response_fields["terminal_intent_id"] = terminal_intent_id
+            return _ok(**response_fields)
         finally:
             conn.close()
     except ValueError as e:
@@ -680,45 +919,144 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    kind_was_omitted = kind is None
+    terminal_evidence = args.get("terminal_evidence")
+    worker_scoped = os.environ.get("HERMES_KANBAN_TASK") == tid
+    if terminal_evidence is None and worker_scoped and kind is None:
+        # Worker-originated untyped blocks mean "a human must unblock me" in
+        # practice. Give that stable lane an explicit kind so the runtime can
+        # attest it instead of silently dropping to the legacy write path.
+        kind = "needs_input"
+    if terminal_evidence is not None:
+        expected_fields = {
+            "terminal_intent_id", "decision", "failure_class",
+            "manifest", "provenance_digest",
+        }
+        if not isinstance(terminal_evidence, dict):
+            return tool_error("terminal_evidence must be an object")
+        unknown = sorted(set(terminal_evidence) - expected_fields)
+        missing = sorted(expected_fields - set(terminal_evidence))
+        if unknown or missing:
+            return tool_error(
+                "terminal_evidence fields must match the strict schema; "
+                f"missing={missing}, unknown={unknown}"
+            )
+        if kind in {None, "dependency"}:
+            return tool_error(
+                "block terminal_evidence requires a stable non-dependency kind"
+            )
+        if terminal_evidence.get("failure_class") == "none":
+            return tool_error(
+                "block terminal_evidence requires a typed failure_class"
+            )
+        if terminal_evidence.get("decision") not in {
+            "no_retry", "stable_block", "human_gate",
+        }:
+            return tool_error(
+                "block terminal_evidence decision must be no_retry, "
+                "stable_block, or human_gate"
+            )
+        if not isinstance(terminal_evidence.get("manifest"), dict):
+            return tool_error("terminal_evidence.manifest must be an object")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
-        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
-            conn.close()
-            return tool_error(
-                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
-            )
-        # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
-        # judge gate in #38367). kanban_block is a second exit path out of
-        # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
-        # as terminal, identically to `done`, regardless of kind. Without
-        # this, a worker that learns kanban_complete is gated can just call
-        # kanban_block(reason="anything") to escape the loop instead.
-        # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
-        # kanban_complete, which the judge now gates.
-        task = kb.get_task(conn, tid)
-        if (
-            task
-            and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
-        ):
-            conn.close()
-            return tool_error(
-                f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
-                f"If the task is actually finished or cannot proceed for "
-                f"another reason, call kanban_complete instead — the "
-                f"completion judge will evaluate it."
-            )
         try:
-            ok = kb.block_task(
-                conn, tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id(tid),
-            )
+            if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+                return tool_error(
+                    f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} "
+                    "(or omit it)"
+                )
+            # Goal-mode block gate (Issue #38696, sibling of the
+            # kanban_complete judge gate in #38367). An untyped block must not
+            # become an escape hatch just because ordinary worker blocks are
+            # normalized to needs_input for evidence production.
+            task = kb.get_task(conn, tid)
+            if (
+                task
+                and task.goal_mode
+                and (
+                    kind_was_omitted
+                    or kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+                )
+            ):
+                return tool_error(
+                    f"goal_mode tasks can only block with kind in "
+                    f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} "
+                    f"(got {None if kind_was_omitted else kind!r}). "
+                    f"If the task is actually finished or cannot proceed for "
+                    f"another reason, call kanban_complete instead — the "
+                    f"completion judge will evaluate it."
+                )
+            terminal_intent_id = None
+            evidence_already_staged = False
+            capability = _worker_terminal_capability(tid)
+            if terminal_evidence is None and worker_scoped and kind != "dependency":
+                if capability is None:
+                    return tool_error(
+                        "automatic terminal evidence requires the dispatcher "
+                        "run/claim capability"
+                    )
+                if task is None:
+                    return tool_error(f"could not block {tid} (unknown id)")
+                decision, failure_class = {
+                    "needs_input": ("human_gate", "approval"),
+                    "capability": ("stable_block", "capability"),
+                    "transient": ("human_gate", "worker"),
+                }[kind]
+                handoff = {
+                    "result": None,
+                    "summary": reason,
+                    "metadata": None,
+                    "verified_cards": [],
+                }
+                run_id, claim_lock = capability
+                terminal_evidence, evidence_already_staged = (
+                    _runtime_terminal_evidence(
+                        conn,
+                        kb,
+                        task=task,
+                        run_id=run_id,
+                        claim_lock=claim_lock,
+                        action="block",
+                        decision=decision,
+                        failure_class=failure_class,
+                        block_kind=kind,
+                        handoff=handoff,
+                    )
+                )
+            if terminal_evidence is None:
+                ok = kb.block_task(
+                    conn, tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id(tid),
+                )
+            else:
+                capability = _worker_terminal_capability(tid)
+                if capability is None:
+                    return tool_error(
+                        "terminal_evidence requires the dispatcher run/claim capability"
+                    )
+                run_id, claim_lock = capability
+                terminal_intent_id = terminal_evidence["terminal_intent_id"]
+                if not evidence_already_staged:
+                    kb.create_block_terminal_intent(
+                        conn,
+                        terminal_intent_id=terminal_intent_id,
+                        task_id=tid,
+                        run_id=run_id,
+                        claim_lock=claim_lock,
+                        decision=terminal_evidence["decision"],
+                        failure_class=terminal_evidence["failure_class"],
+                        manifest=terminal_evidence["manifest"],
+                        provenance_digest=terminal_evidence["provenance_digest"],
+                        reason=reason,
+                        kind=kind,
+                    )
+                ok = kb.apply_terminal_intent(
+                    conn, terminal_intent_id, block_kind=kind,
+                )
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
@@ -728,12 +1066,15 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
-            return _ok(
-                task_id=tid,
-                run_id=run.id if run else None,
-                status=landed.status if landed else "blocked",
-                block_kind=kind,
-            )
+            response_fields = {
+                "task_id": tid,
+                "run_id": run.id if run else None,
+                "status": landed.status if landed else "blocked",
+                "block_kind": kind,
+            }
+            if terminal_intent_id is not None:
+                response_fields["terminal_intent_id"] = terminal_intent_id
+            return _ok(**response_fields)
         finally:
             conn.close()
     except ValueError as e:
@@ -870,7 +1211,12 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
-    idempotency_key = args.get("idempotency_key")
+    raw_idempotency_key = args.get("idempotency_key")
+    idempotency_key = (
+        str(raw_idempotency_key).strip()
+        if raw_idempotency_key is not None and str(raw_idempotency_key).strip()
+        else None
+    )
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -891,6 +1237,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    parents = [str(parent).strip() for parent in parents if str(parent).strip()]
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -908,6 +1255,39 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            if idempotency_key is None and _self_tid:
+                normalized_skills = sorted({
+                    str(skill).strip() for skill in (skills or [])
+                    if str(skill).strip()
+                })
+                normalized_request = {
+                    "assignee": str(assignee).strip(),
+                    "body": str(body).strip() if body is not None else None,
+                    "goal_max_turns": (
+                        int(goal_max_turns) if goal_max_turns is not None else None
+                    ),
+                    "goal_mode": bool(goal_mode),
+                    "initial_status": str(initial_status),
+                    "max_runtime_seconds": (
+                        int(max_runtime_seconds)
+                        if max_runtime_seconds is not None else None
+                    ),
+                    "parents": sorted(set(parents)),
+                    "priority": int(priority) if priority is not None else 0,
+                    "project_id": str(project_id).strip() if project_id else None,
+                    "skills": normalized_skills,
+                    "tenant": str(tenant).strip() if tenant else None,
+                    "title": str(title).strip(),
+                    "triage": bool(triage),
+                    "workspace_kind": str(workspace_kind),
+                    "workspace_path": (
+                        str(workspace_path).strip() if workspace_path else None
+                    ),
+                }
+                idempotency_key = _automatic_create_idempotency_key(
+                    _self_tid, normalized_request,
+                )
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1197,21 +1577,9 @@ KANBAN_LIST_SCHEMA = {
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
-        "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
-        "human-readable 1-3 sentence description of what you did; put "
-        "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
-        "tasks via ``kanban_create`` during this run, list their ids "
-        "in ``created_cards`` — the kernel verifies them so phantom "
-        "references are caught before they leak into downstream "
-        "automation. If you produced deliverable files (charts, PDFs, "
-        "spreadsheets, generated images), list their absolute paths "
-        "in ``artifacts`` — the gateway notifier will upload them as "
-        "native attachments to the human who subscribed to the task, "
-        "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "Finish the current task with a durable handoff. Provide ``summary`` "
+        "or legacy ``result``; use ``metadata`` for structured facts. Runtime "
+        "code verifies created-card ids and produces terminal evidence."
     ),
     "parameters": {
         "type": "object",
@@ -1222,63 +1590,33 @@ KANBAN_COMPLETE_SCHEMA = {
             },
             "summary": {
                 "type": "string",
-                "description": (
-                    "Human-readable handoff, 1-3 sentences. Appears in "
-                    "Run History on the dashboard and in downstream "
-                    "workers' context."
-                ),
+                "description": "Human-readable handoff in 1-3 concrete sentences.",
             },
             "metadata": {
                 "type": "object",
                 "description": (
-                    "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "Structured facts such as changed_files, tests_run, "
+                    "decisions, and findings."
                 ),
             },
             "result": {
                 "type": "string",
-                "description": (
-                    "Short result log line (legacy field, maps to "
-                    "task.result). Use ``summary`` instead when "
-                    "possible; this exists for compatibility with "
-                    "callers that still set --result on the CLI."
-                ),
+                "description": "Legacy short result; prefer summary.",
             },
             "created_cards": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Optional structured manifest of task ids you "
-                    "created via ``kanban_create`` during this run. "
-                    "The kernel verifies each id exists and was "
-                    "created by this worker's profile; any phantom "
-                    "id blocks the completion with an error listing "
-                    "what went wrong (auditable in the task's events). "
-                    "Only list ids you got back from a successful "
-                    "``kanban_create`` call — do not invent or "
-                    "remember ids from prose. Omit the field if you "
-                    "did not create any cards."
+                    "Task ids returned by successful kanban_create calls in "
+                    "this run. Phantom or foreign ids reject completion."
                 ),
             },
             "artifacts": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Optional list of absolute paths to deliverable "
-                    "files you produced during this run — generated "
-                    "charts, PDFs, spreadsheets, images, archives. "
-                    "Examples: [\"/tmp/q3-revenue.png\", "
-                    "\"/tmp/report.pdf\"]. The gateway notifier "
-                    "uploads each path as a native attachment to the "
-                    "subscribed chat (images embed inline, everything "
-                    "else uploads as a file) so the deliverable "
-                    "lands with the completion notification. Skip "
-                    "intermediate scratch files and references that "
-                    "are not the deliverable. The path must exist "
-                    "on disk when the notifier runs; missing files "
-                    "are silently skipped."
+                    "Absolute paths to final deliverables for subscribed-chat "
+                    "upload. Paths must exist; omit scratch files."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1290,16 +1628,9 @@ KANBAN_COMPLETE_SCHEMA = {
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
-        "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "Stop for a genuine blocker. ``dependency`` waits for parent work; "
+        "``needs_input`` needs a human decision; ``capability`` is a hard "
+        "access limit; ``transient`` is retryable. Runtime records evidence."
     ),
     "parameters": {
         "type": "object",
@@ -1311,18 +1642,16 @@ KANBAN_BLOCK_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "What you need answered or what stopped you, in one or "
-                    "two sentences. Don't paste the whole conversation; the "
-                    "human has the board and can ask follow-ups via comments."
+                    "What stopped progress or what input is needed, in 1-2 "
+                    "sentences."
                 ),
             },
             "kind": {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "Block route. dependency auto-resumes after parents; other "
+                    "kinds surface for review."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1392,155 +1721,97 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create routed follow-up work. Set an existing profile as assignee and "
+        "use parents for dependencies. Worker retries are idempotent by default."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "title": {
                 "type": "string",
-                "description": "Short task title (required).",
+                "description": "Short task title.",
             },
             "assignee": {
                 "type": "string",
-                "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
-                ),
+                "description": "Existing profile name that will execute the task.",
             },
             "body": {
                 "type": "string",
-                "description": (
-                    "Opening post: full spec, acceptance criteria, "
-                    "links. The assigned worker reads this as part of "
-                    "its context."
-                ),
+                "description": "Specification, acceptance criteria, and links.",
             },
             "parents": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Parent task ids. The new task stays in 'todo' "
-                    "until every parent reaches 'done'; then it "
-                    "auto-promotes to 'ready'. Typical fan-in: list "
-                    "all the researcher task ids when creating a "
-                    "synthesizer task."
+                    "Parent task ids. The task waits in todo until all are done."
                 ),
             },
             "tenant": {
                 "type": "string",
-                "description": (
-                    "Optional namespace for multi-project isolation. "
-                    "Defaults to HERMES_TENANT env if set."
-                ),
+                "description": "Namespace; defaults to HERMES_TENANT.",
             },
             "priority": {
                 "type": "integer",
-                "description": (
-                    "Dispatcher tiebreaker. Higher = picked sooner "
-                    "when multiple ready tasks share an assignee."
-                ),
+                "description": "Dispatcher tiebreaker; higher runs sooner.",
             },
             "workspace_kind": {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],
                 "description": (
-                    "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "scratch (default temp), dir (shared path), or git worktree."
                 ),
             },
             "workspace_path": {
                 "type": "string",
-                "description": (
-                    "Absolute path for 'dir' or 'worktree' workspace. "
-                    "Relative paths are rejected at dispatch."
-                ),
+                "description": "Absolute path for dir or worktree.",
             },
             "project": {
                 "type": "string",
                 "description": (
-                    "Optional project id or slug to link the task to. When "
-                    "set, the task becomes a git worktree under the project's "
-                    "primary repo with a deterministic branch (project slug + "
-                    "task id), instead of a random branch."
+                    "Project id/slug; creates a deterministic project worktree."
                 ),
             },
             "triage": {
                 "type": "boolean",
-                "description": (
-                    "If true, task lands in 'triage' instead of 'todo' "
-                    "— a specifier profile is expected to flesh out "
-                    "the body before work starts."
-                ),
+                "description": "Start in triage for specification before dispatch.",
             },
             "idempotency_key": {
                 "type": "string",
                 "description": (
-                    "If a non-archived task with this key already "
-                    "exists, return that task's id instead of creating "
-                    "a duplicate. Useful for retry-safe automation."
+                    "Explicit retry key; returns an existing non-archived task "
+                    "with the same key. Workers get a deterministic key if omitted."
                 ),
             },
             "max_runtime_seconds": {
                 "type": "integer",
-                "description": (
-                    "Per-task runtime cap. When exceeded, the "
-                    "dispatcher SIGTERMs the worker and re-queues the "
-                    "task with outcome='timed_out'."
-                ),
+                "description": "Runtime cap; timeout terminates and requeues the worker.",
             },
             "initial_status": {
                 "type": "string",
                 "enum": ["running", "blocked"],
                 "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "Initial status; use blocked for an immediate human gate. "
+                    "Defaults to running."
                 ),
             },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Skill names to force-load into the dispatched "
-                    "worker. The kanban lifecycle is already injected "
-                    "automatically; use this to pin a task to a specialist "
-                    "context — e.g. ['translation'] for a translation "
-                    "task, ['github-code-review'] for a reviewer task. "
-                    "The names must match skills installed on the "
-                    "assignee's profile."
+                    "Installed skill names to force-load for the worker."
                 ),
             },
             "goal_mode": {
                 "type": "boolean",
                 "description": (
-                    "Run the dispatched worker in a goal loop. When true, "
-                    "after each turn an auxiliary judge checks the worker's "
-                    "response against this card's title/body; if the work "
-                    "isn't done and budget remains, the worker keeps going "
-                    "in the same session until the judge agrees it's "
-                    "complete (or the goal-turn budget is exhausted, which "
-                    "blocks the task for human review). Use this for "
-                    "open-ended cards where one shot rarely finishes the "
-                    "work. Defaults to false (classic single-shot worker)."
+                    "Enable judged continuation turns for open-ended work. "
+                    "Budget exhaustion blocks for human review."
                 ),
             },
             "goal_max_turns": {
                 "type": "integer",
                 "description": (
-                    "Turn budget for goal_mode workers. Caps how many "
-                    "continuation turns the worker may take before the task "
-                    "is blocked for review. Ignored unless goal_mode is "
-                    "true. Defaults to the goal-engine default (20)."
+                    "Goal-loop turn cap; ignored unless goal_mode. Defaults to 6."
                 ),
             },
             "board": _board_schema_prop(),

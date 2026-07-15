@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -60,6 +61,74 @@ def _manifest(task_id: str, run_id: int, intent_id: str, action: str = "complete
         "checkpoint_digest": _digest("checkpoint"),
         "side_effect": "none",
     }
+
+
+def test_runtime_producer_uses_real_git_provenance_without_leaking_handoff(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from hermes_cli import kanban_evidence as evidence_module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=Evidence Test",
+            "-c", "user.email=evidence@example.invalid",
+            "commit", "-q", "-m", "fixture",
+        ],
+        check=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{commit}"],
+        text=True,
+    ).strip()
+    tree = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        text=True,
+    ).strip()
+
+    evidence = evidence_module.produce_terminal_evidence(
+        claim_lock="claim-secret-must-not-persist",
+        task_id="t_12345678",
+        run_id=1,
+        action="complete",
+        decision="verified",
+        failure_class="none",
+        block_kind=None,
+        handoff={
+            "result": None,
+            "summary": "handoff-secret-must-not-persist",
+            "metadata": {"tests_run": 3},
+            "verified_cards": [],
+        },
+        workspace=str(repo),
+        evidence_at=1_700_000_000,
+    )
+
+    assert evidence["manifest"]["source_commit"] == commit
+    assert evidence["manifest"]["source_tree"] == tree
+    serialized = json.dumps(evidence, sort_keys=True)
+    assert "claim-secret-must-not-persist" not in serialized
+    assert "handoff-secret-must-not-persist" not in serialized
+
+    real_run = evidence_module.subprocess.run
+
+    def _timeout_status(argv, **kwargs):
+        if "status" in argv:
+            raise subprocess.TimeoutExpired(argv, timeout=2)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_module.subprocess, "run", _timeout_status)
+    observed_commit, observed_tree, state_digest = evidence_module._git_provenance(
+        str(repo), "fallback-seed",
+    )
+    assert (observed_commit, observed_tree) == (commit, tree)
+    assert len(state_digest) == 64
 
 
 def test_manifest_is_canonical_bound_and_fail_closed():

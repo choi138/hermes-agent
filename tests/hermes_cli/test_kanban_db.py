@@ -2953,7 +2953,7 @@ class TestSharedBoardPaths:
             title="x",
             body=None,
             assignee="coder",
-            status="ready",
+            status="running",
             priority=0,
             created_by=None,
             created_at=0,
@@ -2961,10 +2961,11 @@ class TestSharedBoardPaths:
             completed_at=None,
             workspace_kind="worktree",
             workspace_path=str(tmp_path / "ws"),
-            claim_lock=None,
+            claim_lock="dispatcher-claim-capability",
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            current_run_id=42,
         )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
@@ -2975,6 +2976,8 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_RUN_ID"] == "42"
+        assert env["HERMES_KANBAN_CLAIM_LOCK"] == "dispatcher-claim-capability"
 
 
 # ---------------------------------------------------------------------------
