@@ -189,6 +189,34 @@ class TestSSHCleanup:
 
         assert "sync_back" in call_order
 
+    def test_ssh_cleanup_syncs_back_only_once(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/u")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+
+        calls = []
+
+        class TrackingSyncManager:
+            def __init__(self, **kwargs):
+                pass
+
+            def sync(self, **kwargs):
+                pass
+
+            def sync_back(self):
+                calls.append("sync_back")
+
+        monkeypatch.setattr(ssh_env, "FileSyncManager", TrackingSyncManager)
+        env = SSHEnvironment(host="h", user="u")
+        env.control_socket = Path("/nonexistent/socket")
+
+        env.cleanup()
+        env.cleanup()
+
+        assert calls == ["sync_back"]
+
     def test_ssh_cleanup_calls_sync_back_before_control_exit(self, monkeypatch):
         """sync_back() must run before the ControlMaster exit command."""
         monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")

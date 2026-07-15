@@ -1279,10 +1279,14 @@ class TestEnvironmentHints:
                     ),
                 }
 
+            def cleanup(self):
+                created["cleaned"] = True
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
             created["env_type"] = env_type
+            created.update(kwargs)
             return _FakeEnv()
 
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
@@ -1292,6 +1296,8 @@ class TestEnvironmentHints:
 
         line = _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
+        assert created.get("probe_only") is True
+        assert created.get("cleaned") is True
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
@@ -1644,5 +1650,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

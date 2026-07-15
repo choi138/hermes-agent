@@ -178,7 +178,8 @@ class SSHEnvironment(BaseEnvironment):
     """
 
     def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+                 timeout: int = 60, port: int = 22, key_path: str = "",
+                 sync_files: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
@@ -203,16 +204,18 @@ class SSHEnvironment(BaseEnvironment):
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
         self._remote_tar_no_overwrite_dir: bool | None = None
+        self._sync_manager: FileSyncManager | None = None
 
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload,
-            delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload,
-            bulk_download_fn=self._ssh_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
+        if sync_files:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
 
         self.init_session()
 
@@ -545,7 +548,8 @@ class SSHEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to remote via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        if self._sync_manager is not None:
+            self._sync_manager.sync()
 
     # ------------------------------------------------------------------
     # Execution
@@ -564,9 +568,13 @@ class SSHEnvironment(BaseEnvironment):
         return _popen_bash(cmd, stdin_data)
 
     def cleanup(self):
-        if self._sync_manager:
+        # Detach first so repeated cleanup (including BaseEnvironment.__del__)
+        # cannot download and apply the same remote archive twice.
+        sync_manager = self._sync_manager
+        self._sync_manager = None
+        if sync_manager is not None:
             logger.info("SSH: syncing files from sandbox...")
-            self._sync_manager.sync_back()
+            sync_manager.sync_back()
 
         if self.control_socket.exists():
             try:

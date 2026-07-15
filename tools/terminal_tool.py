@@ -1391,7 +1391,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: str = None,
+                        probe_only: bool = False):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -1405,6 +1406,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         container_config: Resource config for container backends (cpu, memory, disk, persistent)
         task_id: Task identifier for environment reuse and snapshot keying
         host_cwd: Optional host working directory to bind into Docker when explicitly enabled
+        probe_only: Build only enough environment state for a metadata probe.
+            SSH probes skip credential/skill/cache sync in this mode.
         
     Returns:
         Environment instance with execute() method
@@ -1530,6 +1533,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             key_path=ssh_config.get("key", ""),
             cwd=cwd,
             timeout=timeout,
+            sync_files=not probe_only,
         )
 
     else:

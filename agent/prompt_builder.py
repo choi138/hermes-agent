@@ -875,6 +875,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     if cached is not None:
         return cached or None
 
+    env = None
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.
@@ -938,6 +939,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             container_config=container_config,
             task_id="prompt-backend-probe",
             host_cwd=config.get("host_cwd"),
+            probe_only=True,
         )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
@@ -960,6 +962,17 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        # Probe environments are never registered in terminal_tool's active
+        # environment map, so the normal session cleanup cannot see them.
+        # Close explicitly; otherwise BaseEnvironment.__del__ may run much
+        # later during interpreter teardown.  SSH probe_only mode makes this a
+        # connection-only close with no ~/.hermes sync-back.
+        if env is not None:
+            try:
+                env.cleanup()
+            except Exception:
+                logger.debug("Backend probe cleanup failed", exc_info=True)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}

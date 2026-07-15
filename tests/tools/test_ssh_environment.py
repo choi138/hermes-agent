@@ -200,6 +200,56 @@ class TestSSHPreflight:
         assert env.host == "example.com"
         assert env.user == "alice"
 
+    def test_probe_mode_skips_hermes_file_sync(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "_ensure_remote_dirs",
+            lambda self: pytest.fail("probe mode must not prepare sync directories"),
+        )
+        monkeypatch.setattr(
+            ssh_env,
+            "FileSyncManager",
+            lambda **_kwargs: pytest.fail("probe mode must not create a file sync manager"),
+        )
+
+        env = ssh_env.SSHEnvironment(
+            host="example.com",
+            user="alice",
+            sync_files=False,
+        )
+
+        assert env._sync_manager is None
+        env.control_socket = type(env.control_socket)("/nonexistent/socket")
+        env.cleanup()
+
+    def test_environment_factory_marks_ssh_probe_as_no_sync(self, monkeypatch):
+        from tools import terminal_tool as terminal_mod
+
+        captured = {}
+        sentinel = object()
+
+        def _fake_ssh_environment(**kwargs):
+            captured.update(kwargs)
+            return sentinel
+
+        monkeypatch.setattr(terminal_mod, "_SSHEnvironment", _fake_ssh_environment)
+
+        result = terminal_mod._create_environment(
+            env_type="ssh",
+            image="",
+            cwd="~",
+            timeout=30,
+            ssh_config={"host": "example.com", "user": "alice"},
+            probe_only=True,
+        )
+
+        assert result is sentinel
+        assert captured["sync_files"] is False
+
 
 def _setup_ssh_env(monkeypatch, persistent: bool):
     monkeypatch.setenv("TERMINAL_ENV", "ssh")
