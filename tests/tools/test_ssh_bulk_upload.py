@@ -1,7 +1,9 @@
 """Tests for SSH bulk upload via tar pipe."""
 
 import os
+import stat
 import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,10 +20,39 @@ def _mock_proc(*, returncode=0, poll_return=0, communicate_return=(b"", b""),
     m.stdout = MagicMock()
     m.returncode = returncode
     m.poll.return_value = poll_return
+    m.wait.return_value = returncode
     m.communicate.return_value = communicate_return
     m.stderr = MagicMock()
-    m.stderr.read.return_value = stderr_read
+    m.stderr.read.side_effect = [stderr_read, b""] if stderr_read else [b""]
     return m
+
+
+def _timeout_on_timed_wait(command):
+    def wait(timeout=None):
+        if timeout is not None:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return 0
+
+    return wait
+
+
+def _tar_version() -> str:
+    """Return the local tar implementation banner without raising."""
+    try:
+        result = subprocess.run(
+            ["tar", "--version"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return f"{result.stdout}\n{result.stderr}".lower()
+
+
+_LOCAL_TAR_VERSION = _tar_version()
 
 
 @pytest.fixture
@@ -36,7 +67,11 @@ def mock_env(monkeypatch):
         ssh_env, "FileSyncManager",
         lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
     )
-    return SSHEnvironment(host="example.com", user="testuser")
+    env = SSHEnvironment(host="example.com", user="testuser")
+    # Existing tests exercise the GNU path unless they explicitly opt into
+    # the BSD-compatible fallback.
+    env._remote_tar_no_overwrite_dir = True
+    return env
 
 
 class TestSSHBulkUpload:
@@ -170,6 +205,9 @@ class TestSSHBulkUpload:
         assert "-chf" in tar_cmd
         assert "-" in tar_cmd  # stdout
         assert "-C" in tar_cmd
+        assert "--" in tar_cmd
+        assert tar_cmd[-1] == "cache/x.txt"
+        assert "." not in tar_cmd[tar_cmd.index("--") + 1:]
 
         # ssh: extract from stdin at ~/.hermes, preserving existing dir modes (#17767)
         ssh_str = " ".join(ssh_cmd)
@@ -178,6 +216,83 @@ class TestSSHBulkUpload:
         assert "--no-overwrite-dir" in ssh_str
         assert "-C /home/testuser/.hermes" in ssh_str
         assert "testuser@example.com" in ssh_str
+
+    def test_bsdtar_extract_command_omits_gnu_option(self, mock_env, tmp_path):
+        """Unsupported remote tar implementations must not receive GNU flags."""
+        source = tmp_path / "portable.txt"
+        source.write_text("portable", encoding="utf-8")
+        files = [(str(source), "/home/testuser/.hermes/skills/portable.txt")]
+        mock_env._remote_tar_no_overwrite_dir = False
+
+        popen_cmds = []
+
+        def capture_popen(cmd, **kwargs):
+            popen_cmds.append(cmd)
+            return _mock_proc()
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ), patch.object(subprocess, "Popen", side_effect=capture_popen):
+            mock_env._ssh_bulk_upload(files)
+
+        extract_cmd = popen_cmds[1][-1]
+        assert "tar xf -" in extract_cmd
+        assert "--no-overwrite-dir" not in extract_cmd
+
+    def test_remote_tar_capability_is_detected_once(self, mock_env):
+        """The GNU option probe should be cached for the environment lifetime."""
+        mock_env._remote_tar_no_overwrite_dir = None
+        probe = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with patch.object(subprocess, "run", return_value=probe) as mock_run:
+            assert mock_env._supports_remote_tar_no_overwrite_dir() is True
+            assert mock_env._supports_remote_tar_no_overwrite_dir() is True
+
+        mock_run.assert_called_once()
+        probe_cmd = mock_run.call_args[0][0]
+        assert probe_cmd[-1] == "LC_ALL=C tar --help 2>&1 | grep -q -- --no-overwrite-dir"
+
+    def test_archive_paths_cannot_be_parsed_as_tar_options(self, mock_env, tmp_path):
+        """File-only archive members must follow an explicit option terminator."""
+        source = tmp_path / "payload"
+        source.write_text("safe", encoding="utf-8")
+        remote = "/home/testuser/.hermes/skills/--checkpoint-action=exec=sh"
+        popen_cmds = []
+
+        def capture_popen(cmd, **kwargs):
+            popen_cmds.append(cmd)
+            return _mock_proc()
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ), patch.object(subprocess, "Popen", side_effect=capture_popen):
+            mock_env._ssh_bulk_upload([(str(source), remote)])
+
+        tar_cmd = popen_cmds[0]
+        separator = tar_cmd.index("--")
+        assert tar_cmd[separator + 1:] == ["skills/--checkpoint-action=exec=sh"]
+
+    def test_remote_path_escape_is_rejected_before_spawning(self, mock_env, tmp_path):
+        """Changing archive construction must not weaken staging containment."""
+        source = tmp_path / "payload"
+        source.write_text("safe", encoding="utf-8")
+        escaped = "/home/testuser/.hermes/../outside.txt"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as mock_run, \
+             patch.object(subprocess, "Popen") as mock_popen:
+            with pytest.raises(RuntimeError, match="escapes sync base"):
+                mock_env._ssh_bulk_upload([(str(source), escaped)])
+
+        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
 
     def test_bulk_upload_never_stages_remote_home_prefix(self, mock_env, tmp_path):
         """Regression: do not archive /home/<user> path components."""
@@ -230,11 +345,13 @@ class TestSSHBulkUpload:
         mock_tar.poll.return_value = 1
         mock_tar.communicate.return_value = (b"tar: error", b"")
         mock_tar.stderr = MagicMock()
-        mock_tar.stderr.read.return_value = b"tar: error"
+        mock_tar.stderr.read.side_effect = [b"tar: error", b""]
 
         mock_ssh = MagicMock()
         mock_ssh.communicate.return_value = (b"", b"")
         mock_ssh.returncode = 0
+        mock_ssh.stderr = MagicMock()
+        mock_ssh.stderr.read.return_value = b""
 
         def popen_side_effect(cmd, **kwargs):
             if cmd[0] == "tar":
@@ -264,6 +381,9 @@ class TestSSHBulkUpload:
         mock_ssh = MagicMock()
         mock_ssh.communicate.return_value = (b"", b"Permission denied")
         mock_ssh.returncode = 1
+        mock_ssh.wait.return_value = 1
+        mock_ssh.stderr = MagicMock()
+        mock_ssh.stderr.read.side_effect = [b"Permission denied", b""]
 
         def popen_side_effect(cmd, **kwargs):
             if cmd[0] == "tar":
@@ -275,6 +395,94 @@ class TestSSHBulkUpload:
              patch.object(subprocess, "Popen", side_effect=popen_side_effect):
             with pytest.raises(RuntimeError, match="tar extract over SSH failed"):
                 mock_env._ssh_bulk_upload(files)
+
+    def test_remote_failure_precedes_local_sigpipe_and_preserves_both(self, mock_env, tmp_path):
+        """A remote extract error must remain primary when local tar gets SIGPIPE."""
+        source = tmp_path / "sigpipe.txt"
+        source.write_text("payload", encoding="utf-8")
+        files = [(str(source), "/home/testuser/.hermes/skills/sigpipe.txt")]
+        mock_tar = _mock_proc(returncode=-13, poll_return=-13, stderr_read=b"")
+        mock_ssh = _mock_proc(
+            returncode=1,
+            poll_return=1,
+            communicate_return=(b"", b"Option --no-overwrite-dir is not supported"),
+            stderr_read=b"Option --no-overwrite-dir is not supported",
+        )
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ), patch.object(subprocess, "Popen", side_effect=[mock_tar, mock_ssh]):
+            with pytest.raises(RuntimeError) as exc_info:
+                mock_env._ssh_bulk_upload(files)
+
+        message = str(exc_info.value)
+        assert message.startswith("tar extract over SSH failed (rc=1)")
+        assert "Option --no-overwrite-dir is not supported" in message
+        assert "local tar create also failed (rc=-13)" in message
+        mock_tar.wait.assert_called()
+        mock_ssh.wait.assert_called()
+
+    def test_process_stderr_is_bounded_and_redacted(self, mock_env, tmp_path):
+        """Transport errors must not dump unlimited or credential-like stderr."""
+        source = tmp_path / "error.txt"
+        source.write_text("payload", encoding="utf-8")
+        files = [(str(source), "/home/testuser/.hermes/skills/error.txt")]
+        raw_secret = b"sk-" + b"dummysecretmaterial1234567890"
+        remote_stderr = b"OPENAI_API_KEY=" + raw_secret + b"\n" + (b"x" * 100_000)
+        mock_tar = _mock_proc(returncode=-13, poll_return=-13)
+        mock_ssh = _mock_proc(
+            returncode=1,
+            poll_return=1,
+            communicate_return=(b"", remote_stderr),
+            stderr_read=remote_stderr,
+        )
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ), patch.object(subprocess, "Popen", side_effect=[mock_tar, mock_ssh]):
+            with pytest.raises(RuntimeError) as exc_info:
+                mock_env._ssh_bulk_upload(files)
+
+        message = str(exc_info.value)
+        assert raw_secret.decode() not in message
+        assert "stderr truncated" in message
+        assert len(message) < 20_000
+
+    def test_large_local_stderr_is_drained_without_pipe_deadlock(self, mock_env, tmp_path):
+        """Both real child pipes are drained while the tar stream is active."""
+        source = tmp_path / "drain.txt"
+        source.write_text("payload", encoding="utf-8")
+        files = [(str(source), "/home/testuser/.hermes/skills/drain.txt")]
+        real_popen = subprocess.Popen
+        children = []
+
+        producer = (
+            "import sys; "
+            "sys.stderr.buffer.write(b'x' * 200000); "
+            "sys.stderr.flush(); "
+            "sys.stdout.buffer.write(b'archive-stream')"
+        )
+        consumer = "import sys; sys.stdin.buffer.read()"
+
+        def spawn_real_child(cmd, **kwargs):
+            script = producer if not children else consumer
+            proc = real_popen([sys.executable, "-c", script], **kwargs)
+            children.append(proc)
+            return proc
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ), patch.object(subprocess, "Popen", side_effect=spawn_real_child):
+            mock_env._ssh_bulk_upload(files)
+
+        assert [proc.returncode for proc in children] == [0, 0]
+        assert all(proc.poll() is not None for proc in children)
 
     def test_ssh_command_uses_control_socket(self, mock_env, tmp_path):
         """SSH command for tar extract should reuse ControlMaster socket."""
@@ -316,6 +524,7 @@ class TestSSHBulkUpload:
             lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
         )
         env = SSHEnvironment(host="h", user="u", port=2222, key_path="/my/key")
+        env._remote_tar_no_overwrite_dir = True
 
         f1 = tmp_path / "d.txt"
         f1.write_text("d")
@@ -434,10 +643,16 @@ class TestSSHBulkUpload:
         mock_tar.stdout = MagicMock()
         mock_tar.returncode = None
         mock_tar.poll.return_value = None
+        mock_tar.stderr = MagicMock()
+        mock_tar.stderr.read.return_value = b""
 
         mock_ssh = MagicMock()
         mock_ssh.communicate.side_effect = subprocess.TimeoutExpired("ssh", 120)
+        mock_ssh.wait.side_effect = _timeout_on_timed_wait("ssh")
         mock_ssh.returncode = None
+        mock_ssh.poll.return_value = None
+        mock_ssh.stderr = MagicMock()
+        mock_ssh.stderr.read.return_value = b""
 
         def make_proc(cmd, **kwargs):
             if cmd[0] == "tar":
@@ -452,6 +667,86 @@ class TestSSHBulkUpload:
 
         mock_tar.kill.assert_called_once()
         mock_ssh.kill.assert_called_once()
+        mock_tar.wait.assert_called()
+        mock_ssh.wait.assert_called()
+
+    def test_local_tar_timeout_is_killed_and_both_children_are_reaped(self, mock_env, tmp_path):
+        """A stuck local producer after SSH exit must not leave child processes."""
+        source = tmp_path / "stuck.txt"
+        source.write_text("payload", encoding="utf-8")
+        files = [(str(source), "/home/testuser/.hermes/skills/stuck.txt")]
+        mock_tar = _mock_proc(returncode=None, poll_return=None)
+        mock_tar.communicate.side_effect = subprocess.TimeoutExpired("tar", 10)
+        mock_tar.wait.side_effect = _timeout_on_timed_wait("tar")
+        mock_ssh = _mock_proc(returncode=0, poll_return=0)
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ), patch.object(subprocess, "Popen", side_effect=[mock_tar, mock_ssh]):
+            with pytest.raises(RuntimeError, match="SSH bulk upload timed out"):
+                mock_env._ssh_bulk_upload(files)
+
+        mock_tar.kill.assert_called_once()
+        mock_tar.wait.assert_called()
+        mock_ssh.wait.assert_called()
+
+
+class TestSSHBulkUploadTarIntegration:
+    """Real local tar round trips through the production pipeline."""
+
+    @staticmethod
+    def _make_shell_env(remote_home, *, no_overwrite_dir: bool | None):
+        env = object.__new__(SSHEnvironment)
+        env._remote_home = str(remote_home)
+        env._remote_tar_no_overwrite_dir = no_overwrite_dir
+        env._build_ssh_command = lambda extra_args=None: ["sh", "-c"]
+        return env
+
+    @staticmethod
+    def _assert_round_trip(env, tmp_path):
+        base = tmp_path / "remote home" / ".hermes"
+        parent = base / "skills"
+        parent.mkdir(parents=True)
+        base.chmod(0o700)
+        parent.chmod(0o711)
+        base_mode = stat.S_IMODE(base.stat().st_mode)
+        parent_mode = stat.S_IMODE(parent.stat().st_mode)
+
+        source = tmp_path / "dummy-tool.sh"
+        source.write_text("#!/bin/sh\nprintf portable", encoding="utf-8")
+        source.chmod(0o750)
+        destination = parent / "dummy-tool.sh"
+
+        env._ssh_bulk_upload([(str(source), str(destination))])
+
+        assert destination.read_text(encoding="utf-8") == "#!/bin/sh\nprintf portable"
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o750
+        assert stat.S_IMODE(base.stat().st_mode) == base_mode
+        assert stat.S_IMODE(parent.stat().st_mode) == parent_mode
+
+    @pytest.mark.skipif(
+        sys.platform != "darwin" or "bsdtar" not in _LOCAL_TAR_VERSION,
+        reason="requires macOS BSD tar",
+    )
+    def test_bsdtar_round_trip_preserves_existing_directory_modes(self, tmp_path):
+        """macOS BSD tar succeeds without changing base or parent modes."""
+        remote_home = tmp_path / "remote home"
+        env = self._make_shell_env(remote_home, no_overwrite_dir=None)
+        assert env._supports_remote_tar_no_overwrite_dir() is False
+        self._assert_round_trip(env, tmp_path)
+
+    @pytest.mark.skipif(
+        os.name != "posix" or "gnu tar" not in _LOCAL_TAR_VERSION,
+        reason="requires POSIX GNU tar",
+    )
+    def test_gnu_tar_round_trip_preserves_existing_directory_modes(self, tmp_path):
+        """GNU tar retains the existing no-overwrite-dir protection."""
+        remote_home = tmp_path / "remote home"
+        env = self._make_shell_env(remote_home, no_overwrite_dir=None)
+        assert env._supports_remote_tar_no_overwrite_dir() is True
+        self._assert_round_trip(env, tmp_path)
 
 
 class TestSSHBulkUploadWiring:
@@ -531,7 +826,7 @@ class TestSSHBulkUploadEdgeCases:
         f1.write_text("e")
         files = [(str(f1), "/home/testuser/.hermes/skills/e.txt")]
 
-        mock_tar = _mock_proc()
+        mock_tar = _mock_proc(returncode=None, poll_return=None)
 
         call_count = 0
 

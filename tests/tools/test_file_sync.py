@@ -365,3 +365,34 @@ class TestBulkUpload:
         mgr.sync(force=True)
         bulk_upload.assert_called_once()
         assert len(bulk_upload.call_args[0][0]) == 3
+
+    def test_success_commits_state_and_unchanged_sync_skips_bulk(self, tmp_files):
+        """A successful initial archive is committed and not resent unchanged."""
+        bulk_upload = MagicMock()
+        mgr = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_upload_fn=bulk_upload,
+        )
+
+        mgr.sync(force=True)
+        assert len(mgr._synced_files) == 3
+        assert len(mgr._pushed_hashes) == 3
+
+        mgr.sync(force=True)
+        bulk_upload.assert_called_once()
+
+    def test_failed_bulk_does_not_commit_sync_state(self, tmp_files):
+        """A failed archive must remain retryable instead of recording success."""
+        mgr = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_upload_fn=MagicMock(side_effect=RuntimeError("remote extract failed")),
+        )
+
+        mgr.sync(force=True)
+
+        assert mgr._synced_files == {}
+        assert mgr._pushed_hashes == {}

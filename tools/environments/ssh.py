@@ -3,10 +3,12 @@
 import hashlib
 import logging
 import os
+import posixpath
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _popen_bash
@@ -19,6 +21,139 @@ from tools.environments.file_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+_BULK_UPLOAD_TIMEOUT_SECONDS = 120
+_LOCAL_TAR_EXIT_TIMEOUT_SECONDS = 10
+_MAX_PROCESS_STDERR_BYTES = 16 * 1024
+_PIPE_READ_BYTES = 8192
+
+
+class _BoundedPipeDrain:
+    """Drain a child pipe fully while retaining only a bounded prefix."""
+
+    def __init__(self, pipe, limit: int = _MAX_PROCESS_STDERR_BYTES):
+        self._pipe = pipe
+        self._limit = limit
+        self._captured = bytearray()
+        self._total_bytes = 0
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._started = False
+
+    def start(self) -> None:
+        self._thread.start()
+        self._started = True
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._pipe.read(_PIPE_READ_BYTES)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode(errors="replace")
+                self._total_bytes += len(chunk)
+                remaining = self._limit - len(self._captured)
+                if remaining > 0:
+                    self._captured.extend(chunk[:remaining])
+        except (OSError, ValueError):
+            # A process being killed can close the descriptor while the drain
+            # thread is reading. The child is still reaped by the caller.
+            pass
+        finally:
+            try:
+                self._pipe.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+
+    def finish(self) -> tuple[bytes, int]:
+        if not self._started:
+            try:
+                self._pipe.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+            return bytes(self._captured), self._total_bytes
+        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            try:
+                self._pipe.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+            self._thread.join(timeout=1)
+        return bytes(self._captured), self._total_bytes
+
+
+def _format_process_stderr(captured: bytes, total_bytes: int) -> str:
+    """Decode, bound, and force-redact stderr for exceptions and logs."""
+    from agent.redact import redact_sensitive_text
+
+    text = captured.decode(errors="replace").strip()
+    if total_bytes > len(captured):
+        notice = (
+            f"[stderr truncated: kept {len(captured)} of {total_bytes} bytes]"
+        )
+        text = f"{text}\n{notice}" if text else notice
+    return redact_sensitive_text(text, force=True)
+
+
+def _terminate_and_reap(*processes: subprocess.Popen) -> None:
+    """Kill any live children, then wait for every child to avoid zombies."""
+    for proc in processes:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+
+    for proc in processes:
+        while True:
+            try:
+                proc.wait()
+                break
+            except InterruptedError:
+                continue
+            except (OSError, subprocess.SubprocessError):
+                break
+
+
+def _relative_remote_path(remote_path: str, base: str) -> str:
+    """Return a normalized base-relative POSIX path or reject an escape."""
+    normalized_base = posixpath.normpath(base)
+    normalized_remote = posixpath.normpath(remote_path)
+    try:
+        contained = (
+            posixpath.isabs(normalized_remote)
+            and posixpath.commonpath([normalized_base, normalized_remote])
+            == normalized_base
+        )
+    except ValueError:
+        contained = False
+
+    if not contained or normalized_remote == normalized_base:
+        raise RuntimeError(
+            f"remote path {remote_path!r} escapes sync base {base!r}"
+        )
+
+    relative = posixpath.relpath(normalized_remote, normalized_base)
+    if relative == "." or relative == ".." or relative.startswith("../"):
+        raise RuntimeError(
+            f"remote path {remote_path!r} escapes sync base {base!r}"
+        )
+    return relative
+
+
+def _staging_path(staging: str, relative: str, remote_path: str, base: str) -> str:
+    """Map a POSIX archive member into staging without local path escape."""
+    staging_root = os.path.abspath(staging)
+    staged = os.path.abspath(os.path.join(staging_root, *relative.split("/")))
+    try:
+        contained = os.path.commonpath([staging_root, staged]) == staging_root
+    except ValueError:
+        contained = False
+    if not contained:
+        raise RuntimeError(
+            f"remote path {remote_path!r} escapes sync base {base!r}"
+        )
+    return staged
 
 
 def _ensure_ssh_available() -> None:
@@ -67,6 +202,7 @@ class SSHEnvironment(BaseEnvironment):
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
+        self._remote_tar_no_overwrite_dir: bool | None = None
 
         self._ensure_remote_dirs()
         self._sync_manager = FileSyncManager(
@@ -156,6 +292,40 @@ class SSHEnvironment(BaseEnvironment):
 
     # _get_sync_files provided via iter_sync_files in FileSyncManager init
 
+    def _supports_remote_tar_no_overwrite_dir(self) -> bool:
+        """Probe and cache support for GNU tar's directory-mode guard."""
+        cached = self._remote_tar_no_overwrite_dir
+        if cached is not None:
+            return cached
+
+        cmd = self._build_ssh_command()
+        cmd.append(
+            "LC_ALL=C tar --help 2>&1 | grep -q -- --no-overwrite-dir"
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            supported = result.returncode == 0
+        except (OSError, subprocess.SubprocessError) as exc:
+            # The file-only archive layout below is safe without the option,
+            # so a failed probe conservatively selects the portable path.
+            logger.debug(
+                "SSH: remote tar capability probe failed (%s)",
+                type(exc).__name__,
+            )
+            supported = False
+
+        self._remote_tar_no_overwrite_dir = supported
+        logger.debug(
+            "SSH: remote tar --no-overwrite-dir support = %s", supported
+        )
+        return supported
+
     def _scp_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via scp over ControlMaster."""
         parent = str(Path(remote_path).parent)
@@ -200,7 +370,16 @@ class SSHEnvironment(BaseEnvironment):
             return
 
         base = f"{self._remote_home}/.hermes"
-        parents = unique_parent_dirs(files)
+        validated_files: list[tuple[str, str, str]] = []
+        normalized_files: list[tuple[str, str]] = []
+        normalized_base = posixpath.normpath(base)
+        for host_path, remote_path in files:
+            relative = _relative_remote_path(remote_path, normalized_base)
+            normalized_remote = posixpath.join(normalized_base, relative)
+            validated_files.append((host_path, remote_path, relative))
+            normalized_files.append((host_path, normalized_remote))
+
+        parents = unique_parent_dirs(normalized_files)
         if parents:
             cmd = self._build_ssh_command()
             cmd.append(quoted_mkdir_command(parents))
@@ -220,20 +399,9 @@ class SSHEnvironment(BaseEnvironment):
         # that specific error and fall back to a plain copy; all other
         # OSErrors (e.g. disk full, bad path) are re-raised as normal.
         with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging:
-            for host_path, remote_path in files:
-                try:
-                    rel_remote = os.path.relpath(remote_path, base)
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"remote path {remote_path!r} is not under sync base {base!r}"
-                    ) from exc
-
-                if rel_remote == "." or rel_remote.startswith("../"):
-                    raise RuntimeError(
-                        f"remote path {remote_path!r} escapes sync base {base!r}"
-                    )
-
-                staged = os.path.join(staging, rel_remote)
+            archive_members: list[str] = []
+            for host_path, remote_path, rel_remote in validated_files:
+                staged = _staging_path(staging, rel_remote, remote_path, base)
                 os.makedirs(os.path.dirname(staged), exist_ok=True)
                 try:
                     os.symlink(os.path.abspath(host_path), staged)
@@ -243,14 +411,24 @@ class SSHEnvironment(BaseEnvironment):
                         shutil.copy2(host_path, staged)
                     else:
                         raise
+                archive_members.append(rel_remote)
 
-            tar_cmd = ["tar", "-chf", "-", "-C", staging, "."]
+            # Archive files explicitly instead of archiving '.'.  That omits
+            # directory entries entirely, so BSD tar cannot chmod an existing
+            # base/parent directory even though it lacks --no-overwrite-dir.
+            # The option terminator prevents a remote filename beginning with
+            # '-' from being interpreted by the local tar command.
+            tar_cmd = [
+                "tar", "-chf", "-", "-C", staging, "--", *archive_members,
+            ]
             ssh_cmd = self._build_ssh_command()
-            # --no-overwrite-dir prevents tar from overwriting the mode of
-            # existing directories (e.g. /home/<user>) with the staging
-            # directory's mode.  Without this, a umask 002 produces 0775
-            # dirs which breaks sshd StrictModes (refuses authorized_keys).
-            ssh_cmd.append(f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}")
+            extract_cmd = "tar xf -"
+            if self._supports_remote_tar_no_overwrite_dir():
+                # Retain the GNU defense in depth from #17767.  The file-only
+                # archive makes the fallback safe on BSD tar as well.
+                extract_cmd += " --no-overwrite-dir"
+            extract_cmd += f" -C {shlex.quote(base)}"
+            ssh_cmd.append(extract_cmd)
 
             tar_proc = subprocess.Popen(
                 tar_cmd,
@@ -260,42 +438,75 @@ class SSHEnvironment(BaseEnvironment):
             )
             try:
                 ssh_proc = subprocess.Popen(
-                    ssh_cmd, stdin=tar_proc.stdout, stdout=subprocess.PIPE,
+                    ssh_cmd, stdin=tar_proc.stdout, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
-            except Exception:
-                tar_proc.kill()
-                tar_proc.wait()
+            except BaseException:
+                if tar_proc.stdout is not None:
+                    tar_proc.stdout.close()
+                _terminate_and_reap(tar_proc)
+                if tar_proc.stderr is not None:
+                    tar_proc.stderr.close()
                 raise
 
             # Allow tar_proc to receive SIGPIPE if ssh_proc exits early
-            tar_proc.stdout.close()
+            if tar_proc.stdout is not None:
+                tar_proc.stdout.close()
+
+            tar_stderr_drain = _BoundedPipeDrain(tar_proc.stderr)
+            ssh_stderr_drain = _BoundedPipeDrain(ssh_proc.stderr)
+            drains_started = False
+            timed_out = False
 
             try:
-                _, ssh_stderr = ssh_proc.communicate(timeout=120)
-                # Use communicate() instead of wait() to drain stderr and
-                # avoid deadlock if tar produces more than PIPE_BUF of errors.
-                tar_stderr_raw = b""
-                if tar_proc.poll() is None:
-                    _, tar_stderr_raw = tar_proc.communicate(timeout=10)
-                else:
-                    tar_stderr_raw = tar_proc.stderr.read() if tar_proc.stderr else b""
+                tar_stderr_drain.start()
+                ssh_stderr_drain.start()
+                drains_started = True
+                ssh_proc.wait(timeout=_BULK_UPLOAD_TIMEOUT_SECONDS)
+                tar_proc.wait(timeout=_LOCAL_TAR_EXIT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                tar_proc.kill()
-                ssh_proc.kill()
-                tar_proc.wait()
-                ssh_proc.wait()
+                timed_out = True
+                _terminate_and_reap(tar_proc, ssh_proc)
+            except BaseException:
+                _terminate_and_reap(tar_proc, ssh_proc)
+                raise
+            finally:
+                if not drains_started:
+                    _terminate_and_reap(tar_proc, ssh_proc)
+                tar_stderr_raw, tar_stderr_total = tar_stderr_drain.finish()
+                ssh_stderr_raw, ssh_stderr_total = ssh_stderr_drain.finish()
+
+            if timed_out:
                 raise RuntimeError("SSH bulk upload timed out")
 
-            if tar_proc.returncode != 0:
-                raise RuntimeError(
-                    f"tar create failed (rc={tar_proc.returncode}): "
-                    f"{tar_stderr_raw.decode(errors='replace').strip()}"
-                )
+            tar_stderr = _format_process_stderr(
+                tar_stderr_raw, tar_stderr_total
+            )
+            ssh_stderr = _format_process_stderr(
+                ssh_stderr_raw, ssh_stderr_total
+            )
+
+            # A remote extractor that exits early commonly gives local tar a
+            # secondary SIGPIPE (-13). Report the remote root cause first and
+            # retain both statuses when both children failed.
             if ssh_proc.returncode != 0:
+                message = f"tar extract over SSH failed (rc={ssh_proc.returncode})"
+                if ssh_stderr:
+                    message += f": {ssh_stderr}"
+                if tar_proc.returncode != 0:
+                    message += (
+                        f"; local tar create also failed (rc={tar_proc.returncode})"
+                    )
+                    if tar_stderr:
+                        message += f": {tar_stderr}"
+                raise RuntimeError(message)
+
+            if tar_proc.returncode != 0:
+                message = f"tar create failed (rc={tar_proc.returncode})"
+                if tar_stderr:
+                    message += f": {tar_stderr}"
                 raise RuntimeError(
-                    f"tar extract over SSH failed (rc={ssh_proc.returncode}): "
-                    f"{ssh_stderr.decode(errors='replace').strip()}"
+                    message
                 )
 
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
