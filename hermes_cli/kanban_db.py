@@ -90,6 +90,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_evidence import (
+    canonical_evidence_manifest,
+    evidence_manifest_digest,
+    evaluate_shadow_verification,
+    recovery_decision,
+    validate_evidence_manifest,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1519,6 +1526,49 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Evidence-bound terminal transitions. The manifest is a strict canonical
+-- allowlist containing identifiers/digests only; raw prompts, output, headers,
+-- environment values, and credentials are not representable here.
+CREATE TABLE IF NOT EXISTS terminal_intents (
+    terminal_intent_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    claim_lock TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('complete', 'block')),
+    decision TEXT NOT NULL,
+    failure_class TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    provenance_digest TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'applied', 'acknowledged')),
+    created_at INTEGER NOT NULL,
+    applied_at INTEGER,
+    applied_event_id INTEGER,
+    acknowledged_at INTEGER,
+    UNIQUE(task_id, run_id, action, terminal_intent_id)
+);
+
+CREATE TABLE IF NOT EXISTS terminal_postcommit (
+    terminal_intent_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'done')),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS correction_lineages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_cause_id TEXT NOT NULL,
+    affected_scope_digest TEXT NOT NULL,
+    policy_or_test_plan_version TEXT NOT NULL,
+    independent_variant TEXT NOT NULL,
+    leader_task_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved')),
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1597,6 +1647,12 @@ CREATE INDEX IF NOT EXISTS idx_evidence_task         ON task_evidence(task_id, c
 CREATE INDEX IF NOT EXISTS idx_gjc_sessions_task     ON task_gjc_sessions(task_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_terminal_intents_task ON terminal_intents(task_id, run_id, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_postcommit_status ON terminal_postcommit(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_lineage_active
+    ON correction_lineages(root_cause_id, affected_scope_digest,
+                           policy_or_test_plan_version, independent_variant)
+    WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_role_delivery_claim   ON kanban_role_deliveries(sender_profile, platform, status, available_at, id);
@@ -4221,7 +4277,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4231,11 +4287,12 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return int(cur.lastrowid)
 
 
 def _end_run(
@@ -5072,6 +5129,376 @@ def _scan_prose_for_phantom_ids(
     ).fetchall()
     existing = {r["id"] for r in rows}
     return [m for m in unique if m not in existing]
+
+
+class TerminalIntentConflict(RuntimeError):
+    """The exact run/claim/event ownership required by an intent was lost."""
+
+
+_TERMINAL_DECISIONS = frozenset(
+    {"verified", "resume", "fresh", "no_retry", "stable_block", "human_gate"}
+)
+
+
+def create_terminal_intent(
+    conn: sqlite3.Connection, *, terminal_intent_id: str, task_id: str,
+    run_id: int, claim_lock: str, action: str, decision: str,
+    failure_class: str, manifest: dict, provenance_digest: str,
+) -> str:
+    """Durably register an evidence-bound terminal request, idempotently.
+
+    The stored JSON is canonical and strictly allowlisted by
+    :mod:`hermes_cli.kanban_evidence`; free-form values are never accepted.
+    """
+    now = int(time.time())
+    validate_evidence_manifest(
+        manifest, digest=provenance_digest, task_id=task_id, run_id=run_id,
+        terminal_intent_id=terminal_intent_id, action=action, now=now,
+    )
+    if not claim_lock or len(claim_lock) > 255 or any(ch in claim_lock for ch in "\r\n\x00"):
+        raise ValueError("invalid claim_lock")
+    if not isinstance(decision, str) or decision not in _TERMINAL_DECISIONS:
+        raise ValueError("invalid terminal decision")
+    if manifest["failure_class"] != failure_class:
+        raise ValueError("failure_class binding mismatch")
+    canonical = canonical_evidence_manifest(manifest)
+    values = (
+        terminal_intent_id, task_id, int(run_id), claim_lock, action,
+        decision, failure_class, canonical, provenance_digest, now,
+    )
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT task_id, run_id, claim_lock, action, decision, failure_class, "
+            "manifest_json, provenance_digest FROM terminal_intents "
+            "WHERE terminal_intent_id = ?", (terminal_intent_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = values[1:9]
+            observed = tuple(existing)
+            if observed != expected:
+                raise TerminalIntentConflict("terminal_intent_id already has different immutable content")
+            return terminal_intent_id
+        owner = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        active_run = conn.execute(
+            "SELECT task_id, claim_lock, ended_at FROM task_runs WHERE id=?",
+            (int(run_id),),
+        ).fetchone()
+        if (
+            owner is None or owner["status"] != "running"
+            or owner["current_run_id"] != int(run_id)
+            or owner["claim_lock"] != claim_lock
+            or active_run is None or active_run["task_id"] != task_id
+            or active_run["claim_lock"] != claim_lock
+            or active_run["ended_at"] is not None
+        ):
+            raise TerminalIntentConflict("terminal intent does not own the exact active run and claim")
+        conn.execute(
+            "INSERT INTO terminal_intents "
+            "(terminal_intent_id, task_id, run_id, claim_lock, action, decision, "
+            "failure_class, manifest_json, provenance_digest, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values,
+        )
+    return terminal_intent_id
+
+
+def _verify_applied_terminal_marker(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    event_id = row["applied_event_id"]
+    event = conn.execute(
+        "SELECT task_id, run_id, kind, payload FROM task_events WHERE id = ?", (event_id,),
+    ).fetchone()
+    if event is None or event["task_id"] != row["task_id"] or int(event["run_id"]) != int(row["run_id"]):
+        raise TerminalIntentConflict("applied terminal event ownership cannot be proven")
+    expected_kind = "completed" if row["action"] == "complete" else "blocked"
+    if event["kind"] != expected_kind:
+        raise TerminalIntentConflict("applied terminal event kind does not match intent action")
+    try:
+        payload = json.loads(event["payload"] or "{}")
+        manifest = json.loads(row["manifest_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise TerminalIntentConflict("applied terminal evidence is malformed") from exc
+    if not isinstance(payload, dict) or not isinstance(manifest, dict):
+        raise TerminalIntentConflict("applied terminal evidence is malformed")
+    if payload.get("terminal_intent_id") != row["terminal_intent_id"]:
+        raise TerminalIntentConflict("applied terminal event belongs to another intent")
+    if payload.get("provenance_digest") != row["provenance_digest"]:
+        raise TerminalIntentConflict("applied terminal event provenance digest does not match intent")
+    if payload.get("decision") != row["decision"]:
+        raise TerminalIntentConflict("applied terminal event decision does not match intent")
+    if payload.get("failure_class") != row["failure_class"]:
+        raise TerminalIntentConflict("applied terminal event failure class does not match intent")
+    if payload.get("block_kind") != manifest.get("block_kind"):
+        raise TerminalIntentConflict("applied terminal event block kind does not match evidence")
+    try:
+        manifest_digest = evidence_manifest_digest(manifest)
+    except ValueError as exc:
+        raise TerminalIntentConflict("stored terminal evidence manifest is invalid") from exc
+    if manifest_digest != row["provenance_digest"]:
+        raise TerminalIntentConflict("stored terminal evidence provenance digest does not match intent")
+    bindings = {
+        "task_id": row["task_id"],
+        "run_id": int(row["run_id"]),
+        "terminal_intent_id": row["terminal_intent_id"],
+        "action": row["action"],
+        "failure_class": row["failure_class"],
+    }
+    if any(manifest.get(field) != value for field, value in bindings.items()):
+        raise TerminalIntentConflict("stored terminal evidence binding does not match intent")
+
+
+def _finish_terminal_postcommit(conn: sqlite3.Connection, terminal_intent_id: str) -> None:
+    row = conn.execute(
+        "SELECT i.*, o.status AS outbox_status FROM terminal_intents i "
+        "JOIN terminal_postcommit o USING (terminal_intent_id) "
+        "WHERE i.terminal_intent_id = ?", (terminal_intent_id,),
+    ).fetchone()
+    if row is None:
+        raise TerminalIntentConflict("terminal postcommit marker is missing")
+    _verify_applied_terminal_marker(conn, row)
+    if row["outbox_status"] != "done":
+        # Every internal operation is idempotent. Hooks receive the immutable
+        # intent id as their deduplication key; plugin transports remain
+        # best-effort observers and cannot affect correctness.
+        if row["action"] == "complete":
+            _clear_failure_counter(conn, row["task_id"])
+            recompute_ready(conn)
+            _cleanup_workspace(conn, row["task_id"])
+            hook_name = "kanban_task_completed"
+        else:
+            hook_name = "kanban_task_blocked"
+        task = get_task(conn, row["task_id"])
+        _fire_kanban_lifecycle_hook(
+            hook_name, row["task_id"], board=get_current_board(),
+            assignee=task.assignee if task else None, run_id=int(row["run_id"]),
+            terminal_intent_id=terminal_intent_id,
+        )
+        now = int(time.time())
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE terminal_postcommit SET status='done', completed_at=? "
+                "WHERE terminal_intent_id=? AND status='pending'",
+                (now, terminal_intent_id),
+            )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE terminal_intents SET status='acknowledged', "
+            "acknowledged_at=COALESCE(acknowledged_at, ?) "
+            "WHERE terminal_intent_id=? AND status IN ('applied','acknowledged')",
+            (int(time.time()), terminal_intent_id),
+        )
+
+
+def apply_terminal_intent(
+    conn: sqlite3.Connection, terminal_intent_id: str, *,
+    summary: Optional[str] = None, block_kind: Optional[str] = None,
+) -> bool:
+    """Apply or replay one terminal intent with exact run/event ownership.
+
+    ``summary`` is accepted for API compatibility but deliberately not persisted:
+    the evidence lane stores only allowlisted structured data. Human prose can be
+    added through the established comment path, where existing redaction policy
+    applies.
+    """
+    del summary
+    row = conn.execute(
+        "SELECT * FROM terminal_intents WHERE terminal_intent_id=?",
+        (terminal_intent_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(terminal_intent_id)
+    if row["status"] in {"applied", "acknowledged"}:
+        _verify_applied_terminal_marker(conn, row)
+        if row["status"] == "applied":
+            _finish_terminal_postcommit(conn, terminal_intent_id)
+        return True
+
+    now = int(time.time())
+    manifest = json.loads(row["manifest_json"])
+    validate_evidence_manifest(
+        manifest, digest=row["provenance_digest"], task_id=row["task_id"],
+        run_id=int(row["run_id"]), terminal_intent_id=terminal_intent_id,
+        action=row["action"], now=now,
+    )
+    evidence_block_kind = manifest["block_kind"]
+    if block_kind is not None and block_kind != evidence_block_kind:
+        raise TerminalIntentConflict("requested block kind does not match terminal evidence")
+    block_kind = evidence_block_kind
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
+            (row["task_id"],),
+        ).fetchone()
+        active_run = conn.execute(
+            "SELECT task_id, claim_lock, ended_at FROM task_runs WHERE id=?",
+            (int(row["run_id"]),),
+        ).fetchone()
+        if (
+            task is None or task["status"] != "running"
+            or task["current_run_id"] != row["run_id"]
+            or task["claim_lock"] != row["claim_lock"]
+            or active_run is None or active_run["task_id"] != row["task_id"]
+            or active_run["claim_lock"] != row["claim_lock"]
+            or active_run["ended_at"] is not None
+        ):
+            # Another connection may have won the same intent after our
+            # pre-transaction read. Re-read under the writer lock: only the
+            # exact event/run/intent marker makes this an idempotent replay.
+            fresh = conn.execute(
+                "SELECT * FROM terminal_intents WHERE terminal_intent_id=?",
+                (terminal_intent_id,),
+            ).fetchone()
+            if fresh is not None and fresh["status"] in {"applied", "acknowledged"}:
+                _verify_applied_terminal_marker(conn, fresh)
+                return True
+            raise TerminalIntentConflict("intent no longer owns the active run and claim")
+        if row["action"] == "complete":
+            status, outcome, event_kind = "done", "completed", "completed"
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
+                "block_recurrences=0 WHERE id=? AND current_run_id=?",
+                (now, row["task_id"], row["run_id"]),
+            )
+        else:
+            if block_kind not in VALID_BLOCK_KINDS - {"dependency"}:
+                raise ValueError("terminal block intent requires a stable non-dependency block_kind")
+            status, outcome, event_kind = "blocked", "blocked", "blocked"
+            conn.execute(
+                "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, block_kind=?, block_recurrences=block_recurrences+1 "
+                "WHERE id=? AND current_run_id=?",
+                (block_kind, row["task_id"], row["run_id"]),
+            )
+        ended_run_id = _end_run(
+            conn, row["task_id"], outcome=outcome, status=status,
+            summary=None, metadata=None,
+        )
+        if ended_run_id != row["run_id"]:
+            raise TerminalIntentConflict("intent ended a different run")
+        event_id = _append_event(
+            conn, row["task_id"], event_kind,
+            {
+                "terminal_intent_id": terminal_intent_id,
+                "provenance_digest": row["provenance_digest"],
+                "decision": row["decision"],
+                "failure_class": row["failure_class"],
+                "block_kind": block_kind,
+            },
+            run_id=int(row["run_id"]),
+        )
+        updated = conn.execute(
+            "UPDATE terminal_intents SET status='applied', applied_at=?, applied_event_id=? "
+            "WHERE terminal_intent_id=? AND status='pending'",
+            (now, event_id, terminal_intent_id),
+        )
+        if updated.rowcount != 1:
+            raise TerminalIntentConflict("terminal intent lost application CAS")
+        conn.execute(
+            "INSERT INTO terminal_postcommit "
+            "(terminal_intent_id, task_id, action, status, created_at) "
+            "VALUES (?, ?, ?, 'pending', ?)",
+            (terminal_intent_id, row["task_id"], row["action"], now),
+        )
+    _finish_terminal_postcommit(conn, terminal_intent_id)
+    return True
+
+
+def replay_terminal_intents(
+    conn: sqlite3.Connection, *, limit: int = 100,
+) -> dict[str, list[str]]:
+    """Replay pending/applied terminal requests without trusting worker prose.
+
+    Each intent is independently validated and exact-run fenced. Invalid or
+    stale rows remain untouched and are reported in ``failed`` so one corrupt
+    row cannot prevent recovery of later valid intents.
+    """
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("terminal intent replay limit must be between 1 and 1000")
+    rows = conn.execute(
+        "SELECT terminal_intent_id FROM terminal_intents "
+        "WHERE status IN ('pending','applied') "
+        "ORDER BY created_at, terminal_intent_id LIMIT ?",
+        (limit,),
+    ).fetchall()
+    replayed: list[str] = []
+    failed: list[str] = []
+    for row in rows:
+        intent_id = str(row["terminal_intent_id"])
+        try:
+            apply_terminal_intent(conn, intent_id)
+        except (KeyError, TypeError, ValueError, TerminalIntentConflict, json.JSONDecodeError) as exc:
+            failed.append(intent_id)
+            _log.warning("terminal intent %s failed closed during replay: %s", intent_id, exc)
+        else:
+            replayed.append(intent_id)
+    return {"replayed": replayed, "failed": failed}
+
+
+def replay_terminal_postcommits(
+    conn: sqlite3.Connection, *, limit: int = 100,
+) -> list[str]:
+    """Replay durable completion side effects left pending by a crash.
+
+    Rows are processed in creation order. Each replay verifies the exact
+    task/run/intent event marker before performing idempotent post-commit work.
+    A malformed or foreign marker fails closed instead of being acknowledged.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+        raise ValueError("terminal postcommit replay limit must be between 1 and 1000")
+    rows = conn.execute(
+        "SELECT terminal_intent_id FROM terminal_postcommit "
+        "WHERE status='pending' ORDER BY created_at, terminal_intent_id LIMIT ?",
+        (limit,),
+    ).fetchall()
+    replayed: list[str] = []
+    for row in rows:
+        terminal_intent_id = str(row["terminal_intent_id"])
+        _finish_terminal_postcommit(conn, terminal_intent_id)
+        replayed.append(terminal_intent_id)
+    return replayed
+
+
+def acquire_correction_lineage(
+    conn: sqlite3.Connection, *, root_cause_id: str,
+    affected_scope_digest: str, policy_or_test_plan_version: str,
+    independent_variant: str, owner_task_id: str,
+) -> dict[str, Any]:
+    identifiers = (root_cause_id, policy_or_test_plan_version, independent_variant, owner_task_id)
+    if any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", v) for v in identifiers):
+        raise ValueError("invalid correction lineage identifier")
+    if not re.fullmatch(r"[0-9a-f]{64}", affected_scope_digest):
+        raise ValueError("affected_scope_digest must be SHA-256")
+    key = (root_cause_id, affected_scope_digest, policy_or_test_plan_version, independent_variant)
+    with write_txn(conn):
+        active = conn.execute(
+            "SELECT id, leader_task_id FROM correction_lineages WHERE "
+            "root_cause_id=? AND affected_scope_digest=? AND "
+            "policy_or_test_plan_version=? AND independent_variant=? AND status='active'",
+            key,
+        ).fetchone()
+        if active:
+            return {"role": "follower", "leader_task_id": active["leader_task_id"], "lineage_id": active["id"]}
+        cur = conn.execute(
+            "INSERT INTO correction_lineages "
+            "(root_cause_id, affected_scope_digest, policy_or_test_plan_version, "
+            "independent_variant, leader_task_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (*key, owner_task_id, int(time.time())),
+        )
+        return {"role": "leader", "leader_task_id": owner_task_id, "lineage_id": int(cur.lastrowid)}
+
+
+def resolve_correction_lineage(
+    conn: sqlite3.Connection, lineage_id: int, *, owner_task_id: str,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE correction_lineages SET status='resolved', resolved_at=? "
+            "WHERE id=? AND leader_task_id=? AND status='active'",
+            (int(time.time()), int(lineage_id), owner_task_id),
+        )
+    return cur.rowcount == 1
 
 
 class HallucinatedCardsError(ValueError):
@@ -7489,6 +7916,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
     """
+    # A worker may have durably written its evidence-bound terminal intent and
+    # exited before applying it. Replay that exact request before classifying the
+    # still-running row as a crash/protocol violation; invalid/stale intents fail
+    # closed and fall through to the established crash path.
+    terminal_recovery = replay_terminal_intents(conn)
+    if terminal_recovery["failed"]:
+        _log.warning(
+            "terminal intent recovery failed closed for %s",
+            ", ".join(terminal_recovery["failed"]),
+        )
+
     crashed: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
