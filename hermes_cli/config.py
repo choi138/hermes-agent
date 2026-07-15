@@ -2890,6 +2890,12 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Skip AGENTS.md / CLAUDE.md and other repository context files for
+        # conversational gateway agents. This is useful when the gateway runs
+        # from a large source checkout but messaging sessions do not need its
+        # developer instructions. CLI and Kanban workers remain unchanged.
+        "skip_context_files": False,
+
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash

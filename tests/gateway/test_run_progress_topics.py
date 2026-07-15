@@ -123,6 +123,8 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
 
 
 class FakeAgent:
+    last_kwargs = None
+
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
         # freeze it — production now assigns tool_progress_callback after
@@ -130,6 +132,7 @@ class FakeAgent:
         # so we must read it at call time, not at init.
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
+        type(self).last_kwargs = kwargs
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         cb = self.tool_progress_callback
@@ -285,6 +288,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
 
     adapter = ProgressCaptureAdapter()
     runner = _make_runner(adapter)
+    runner.config.skip_context_files = True
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
@@ -305,6 +309,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     )
 
     assert result["final_response"] == "done"
+    assert FakeAgent.last_kwargs["skip_context_files"] is True
     assert adapter.sent == [
         {
             "chat_id": "-1001",

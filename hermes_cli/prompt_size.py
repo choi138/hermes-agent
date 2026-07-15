@@ -45,6 +45,19 @@ def _build_inspection_agent(platform: str) -> Any:
     agent_cfg = cfg.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
+    # Match the gateway constructor: gateway.skip_context_files only applies
+    # to actual gateway platforms, never the CLI diagnostic surface itself.
+    skip_context_files = False
+    try:
+        from gateway.config import GatewayConfig, Platform
+
+        Platform(platform)
+        skip_context_files = GatewayConfig.from_dict(
+            {"gateway": cfg.get("gateway") or {}}
+        ).skip_context_files
+    except (TypeError, ValueError):
+        pass
+
     return AIAgent(
         model=model,
         api_key="inspect-only",
@@ -52,6 +65,7 @@ def _build_inspection_agent(platform: str) -> Any:
         quiet_mode=True,
         save_trajectories=False,
         platform=platform,
+        skip_context_files=skip_context_files,
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
     )

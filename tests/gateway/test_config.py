@@ -157,6 +157,23 @@ class TestPlatformConfigMalformedSections:
         assert restored.extra == {}
 
 
+class TestGatewayConfigContextFiles:
+    def test_defaults_to_loading_context_files(self):
+        assert GatewayConfig().skip_context_files is False
+
+    def test_roundtrip_preserves_skip_context_files(self):
+        restored = GatewayConfig.from_dict(
+            GatewayConfig(skip_context_files=True).to_dict()
+        )
+        assert restored.skip_context_files is True
+
+    def test_from_dict_accepts_nested_gateway_setting(self):
+        restored = GatewayConfig.from_dict(
+            {"gateway": {"skip_context_files": "true"}}
+        )
+        assert restored.skip_context_files is True
+
+
 class TestGetConnectedPlatforms:
     def test_returns_enabled_with_token(self):
         config = GatewayConfig(
@@ -477,6 +494,37 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.multiplex_profiles is True
+
+    def test_skip_context_files_from_nested_gateway_section(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n  skip_context_files: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.skip_context_files is True
+
+    def test_top_level_skip_context_files_wins_over_nested(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "skip_context_files: false\n"
+            "gateway:\n  skip_context_files: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.skip_context_files is False
 
     def test_relay_platform_enabled_from_env_url(self, tmp_path, monkeypatch):
         """GATEWAY_RELAY_URL must enable Platform.RELAY in config.platforms so

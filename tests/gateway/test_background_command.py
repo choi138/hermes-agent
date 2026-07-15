@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -233,6 +233,7 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
+        runner.config = GatewayConfig(skip_context_files=True)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -266,6 +267,7 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+        assert MockAgent.call_args.kwargs["skip_context_files"] is True
 
     @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):
@@ -338,13 +340,21 @@ class TestRunBackgroundTask:
             await runner._run_background_task("make stuff", source, "bg_test")
 
             mock_adapter.send_voice.assert_called_once()
-            assert mock_adapter.send_voice.call_args.kwargs["audio_path"] == _ogg
+            assert _os.path.realpath(
+                mock_adapter.send_voice.call_args.kwargs["audio_path"]
+            ) == _os.path.realpath(_ogg)
             mock_adapter.send_video.assert_called_once()
-            assert mock_adapter.send_video.call_args.kwargs["video_path"] == _mp4
+            assert _os.path.realpath(
+                mock_adapter.send_video.call_args.kwargs["video_path"]
+            ) == _os.path.realpath(_mp4)
             mock_adapter.send_image_file.assert_called_once()
-            assert mock_adapter.send_image_file.call_args.kwargs["image_path"] == _png
+            assert _os.path.realpath(
+                mock_adapter.send_image_file.call_args.kwargs["image_path"]
+            ) == _os.path.realpath(_png)
             mock_adapter.send_document.assert_called_once()
-            assert mock_adapter.send_document.call_args.kwargs["file_path"] == _pdf
+            assert _os.path.realpath(
+                mock_adapter.send_document.call_args.kwargs["file_path"]
+            ) == _os.path.realpath(_pdf)
         finally:
             import shutil as _shutil
             _shutil.rmtree(_tmpdir, ignore_errors=True)

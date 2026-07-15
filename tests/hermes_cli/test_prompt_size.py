@@ -103,6 +103,34 @@ def test_inspection_agent_uses_resolved_platform_toolsets(monkeypatch):
     assert captured["platform"] == "cli"
     assert captured["enabled_toolsets"] == ["file", "terminal"]
     assert captured["disabled_toolsets"] == ["memory"]
+    assert captured["skip_context_files"] is False
+
+
+def test_inspection_agent_honors_gateway_skip_context_files(monkeypatch):
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    cfg = {
+        "model": {"default": "test/model"},
+        "gateway": {"skip_context_files": True},
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(AIAgent=FakeAIAgent),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda passed_cfg, platform: {"terminal", "file"},
+    )
+
+    _build_inspection_agent("discord")
+
+    assert captured["skip_context_files"] is True
 
 
 def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
@@ -121,6 +149,26 @@ def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
     data = compute_prompt_breakdown("cli")
 
     assert data["tools"]["count"] == 6
+
+
+def test_gateway_skip_context_files_removes_cwd_context(isolated_home, tmp_path):
+    """The diagnostic follows the real Discord constructor through prompt build."""
+    (tmp_path / "AGENTS.md").write_text(
+        "# Large gateway-irrelevant developer context\n" + ("rule\n" * 2_000),
+        encoding="utf-8",
+    )
+    (isolated_home / "config.yaml").write_text(
+        "gateway:\n  skip_context_files: true\n",
+        encoding="utf-8",
+    )
+
+    data = compute_prompt_breakdown("discord")
+    context_section = next(
+        section for section in data["sections"]
+        if section[0] == "context (AGENTS.md/cwd files)"
+    )
+
+    assert context_section[1:] == (0, 0)
 
 
 def test_skills_index_reflects_installed_skills(isolated_home):

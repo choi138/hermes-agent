@@ -308,6 +308,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
         last_instance = None
 
         def __init__(self, **kwargs):
+            self.kwargs = kwargs
             self.model = kwargs.get("model")
             self.session_id = kwargs.get("session_id", "fake-session")
             self._print_fn = None
@@ -391,6 +392,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     # happens silently with server-side logging only.
     assert len(adapter.sent) == 0
     assert FakeCompressAgent.last_instance is not None
+    assert FakeCompressAgent.last_instance.kwargs["skip_context_files"] is True
     FakeCompressAgent.last_instance.shutdown_memory_provider.assert_called_once()
     FakeCompressAgent.last_instance.close.assert_called_once()
 
