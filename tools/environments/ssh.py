@@ -17,6 +17,7 @@ from tools.environments.file_sync import (
     iter_sync_files,
     quoted_mkdir_command,
     quoted_rm_command,
+    sync_back_remote_roots,
     unique_parent_dirs,
 )
 
@@ -282,7 +283,7 @@ class SSHEnvironment(BaseEnvironment):
     def _ensure_remote_dirs(self) -> None:
         """Create base ~/.hermes directory tree on remote in one SSH call."""
         base = f"{self._remote_home}/.hermes"
-        dirs = [base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]
+        dirs = [base, f"{base}/credentials", *sync_back_remote_roots(base)]
         cmd = self._build_ssh_command()
         cmd.append(quoted_mkdir_command(dirs))
         subprocess.run(
@@ -515,12 +516,21 @@ class SSHEnvironment(BaseEnvironment):
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
     def _ssh_bulk_download(self, dest: Path) -> None:
-        """Download remote .hermes/ as a tar archive."""
-        # Tar from / with the full path so archive entries preserve absolute
-        # paths (e.g. home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
+        """Download writable mirrored roots as one tar archive.
+
+        Credentials are upload-only. Skills, external skills, and cache files
+        are the only trees FileSyncManager can map back to the host, so avoid
+        archiving unrelated remote state such as checkouts, virtualenvs, logs,
+        and session databases under ``.hermes``. Tar from ``/`` with full
+        relative paths so members still match ``_pushed_hashes`` keys.
+        """
+        base = f"{self._remote_home}/.hermes"
+        archive_members = [
+            shlex.quote(path.lstrip("/"))
+            for path in sync_back_remote_roots(base)
+        ]
         ssh_cmd = self._build_ssh_command()
-        ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
+        ssh_cmd.append(f"tar cf - -C / -- {' '.join(archive_members)}")
         with open(dest, "wb") as f:
             result = subprocess.run(
                 ssh_cmd,

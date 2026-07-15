@@ -163,6 +163,20 @@ class TestTerminalToolConfig:
 
 
 class TestSSHPreflight:
+    def test_sync_directories_cover_every_download_archive_root(self, monkeypatch):
+        env = object.__new__(ssh_env.SSHEnvironment)
+        env._remote_home = "/home/alice"
+        env._build_ssh_command = lambda: ["ssh", "alice@example.com"]
+        run = MagicMock(return_value=subprocess.CompletedProcess([], 0))
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        env._ensure_remote_dirs()
+
+        remote_command = run.call_args.args[0][-1]
+        assert "/home/alice/.hermes/skills" in remote_command
+        assert "/home/alice/.hermes/external_skills" in remote_command
+        assert "/home/alice/.hermes/cache" in remote_command
+
     def test_ensure_ssh_available_raises_clear_error_when_missing(self, monkeypatch):
         monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: None)
 

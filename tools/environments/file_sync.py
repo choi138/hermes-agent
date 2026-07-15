@@ -47,6 +47,24 @@ DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
 GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
 
 
+def sync_back_remote_roots(container_base: str = "/root/.hermes") -> list[str]:
+    """Return remote trees whose contents can be mapped back to the host.
+
+    ``iter_sync_files`` uploads credentials, skills, external skills, and
+    cache artifacts. Credential files are intentionally upload-only, while
+    the other three trees may contain agent-created files that should survive
+    sandbox teardown. Downloading the whole remote ``.hermes`` directory is
+    both unnecessary and dangerous for latency: an SSH target may also keep a
+    checkout, virtualenv, logs, and session databases there.
+    """
+    base = container_base.rstrip("/")
+    return [
+        f"{base}/skills",
+        f"{base}/external_skills",
+        f"{base}/cache",
+    ]
+
+
 def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, str]]:
     """Enumerate all files that should be synced to a remote environment.
 

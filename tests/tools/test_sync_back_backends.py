@@ -104,7 +104,7 @@ class TestSSHBulkDownload:
     """Unit tests for _ssh_bulk_download."""
 
     def test_ssh_bulk_download_runs_tar_over_ssh(self, ssh_mock_env, tmp_path):
-        """subprocess.run command should include tar cf - over SSH."""
+        """Sync-back archives only writable mirrored roots, not all of .hermes."""
         dest = tmp_path / "backup.tar"
 
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as mock_run:
@@ -116,7 +116,14 @@ class TestSSHBulkDownload:
         cmd_str = " ".join(cmd)
         assert "tar cf -" in cmd_str
         assert "-C /" in cmd_str
-        assert "home/testuser/.hermes" in cmd_str
+        assert cmd[-1] == (
+            "tar cf - -C / -- "
+            "home/testuser/.hermes/skills "
+            "home/testuser/.hermes/external_skills "
+            "home/testuser/.hermes/cache"
+        )
+        assert "home/testuser/.hermes/logs" not in cmd_str
+        assert "home/testuser/.hermes/hermes-agent" not in cmd_str
         assert "ssh" in cmd_str
         assert "testuser@example.com" in cmd_str
 
