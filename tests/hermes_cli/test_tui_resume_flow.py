@@ -831,10 +831,17 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
+            self._session_messages = ["turn"]
 
         def run_conversation(self, prompt, **_kwargs):
             captured["prompt"] = prompt
             return {"final_response": "ok", "failed": False, "partial": False}
+
+        def shutdown_memory_provider(self, messages):
+            captured["memory_shutdown_messages"] = messages
+
+        def close(self):
+            captured["agent_closed"] = True
 
     class FakeSessionDB:
         def __new__(cls):
@@ -877,6 +884,30 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         "hermes_cli.tools_config",
         mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.async_delegation",
+        mod(
+            "tools.async_delegation",
+            interrupt_all=lambda **_kwargs: captured.update(async_delegations_interrupted=True),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        mod(
+            "tools.mcp_tool",
+            shutdown_mcp_servers=lambda: captured.update(mcp_shutdown=True),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.auxiliary_client",
+        mod(
+            "agent.auxiliary_client",
+            shutdown_cached_clients=lambda: captured.update(aux_clients_shutdown=True),
+        ),
+    )
 
     text, result = _run_agent("recall this")
     assert text == "ok"
@@ -884,6 +915,11 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert captured["memory_shutdown_messages"] == ["turn"]
+    assert captured["agent_closed"] is True
+    assert captured["async_delegations_interrupted"] is True
+    assert captured["mcp_shutdown"] is True
+    assert captured["aux_clients_shutdown"] is True
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

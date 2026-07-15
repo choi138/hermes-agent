@@ -294,6 +294,70 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _cleanup_oneshot_resources(agent: object = None, session_db: object = None) -> None:
+    """Release process-global and agent-owned resources created by ``-z``.
+
+    Normal interactive CLI sessions run ``cli._run_cleanup`` on exit.  Oneshot
+    deliberately bypasses ``cli.py``, so relying on interpreter teardown leaves
+    MCP loops, auxiliary HTTP clients, memory workers, and agent subprocesses
+    alive.  In particular, Python's executor atexit hook can then keep an
+    otherwise-complete ``hermes -z`` process alive indefinitely.
+
+    Every step is best-effort and idempotent.  Keep this local to the oneshot
+    process rather than importing ``cli._run_cleanup``: that routine owns
+    interactive terminal state and a different global active-agent reference.
+    """
+    try:
+        from tools.async_delegation import interrupt_all
+
+        interrupt_all(reason="oneshot shutdown")
+    except Exception:
+        pass
+
+    if agent is not None:
+        try:
+            shutdown_memory = getattr(agent, "shutdown_memory_provider", None)
+            if callable(shutdown_memory):
+                messages = getattr(agent, "_session_messages", None)
+                if isinstance(messages, list):
+                    shutdown_memory(messages)
+                else:
+                    shutdown_memory()
+        except Exception:
+            pass
+
+        try:
+            close_agent = getattr(agent, "close", None)
+            if callable(close_agent):
+                close_agent()
+        except Exception:
+            pass
+
+    try:
+        close_db = getattr(session_db, "close", None)
+        if callable(close_db):
+            close_db()
+    except Exception:
+        pass
+
+    # MCP connections and cached auxiliary clients are process-global.  A
+    # standalone oneshot owns the process, so it must tear them down after its
+    # only turn; otherwise their background loops/executors outlive the agent.
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+
+        shutdown_mcp_servers()
+    except BaseException:  # anyio cancellation can derive outside Exception
+        pass
+
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+
+        shutdown_cached_clients()
+    except Exception:
+        pass
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -384,40 +448,44 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
-    agent = AIAgent(
-        api_key=runtime.get("api_key"),
-        base_url=runtime.get("base_url"),
-        provider=runtime.get("provider"),
-        api_mode=runtime.get("api_mode"),
-        model=effective_model,
-        enabled_toolsets=toolsets_list,
-        quiet_mode=True,
-        platform="cli",
-        session_db=session_db,
-        credential_pool=runtime.get("credential_pool"),
-        fallback_model=_fb or None,
-        # Interactive callbacks are intentionally NOT wired beyond this
-        # one.  In oneshot mode there's no user sitting at a terminal:
-        #   - clarify  → returns a synthetic "pick a default" instruction
-        #                so the agent continues instead of stalling on
-        #                the tool's built-in "not available" error
-        #   - sudo password prompt → terminal_tool gates on
-        #                HERMES_INTERACTIVE which we never set
-        #   - shell-hook approval → auto-approved via HERMES_ACCEPT_HOOKS=1
-        #                (set above); also falls back to deny on non-tty
-        #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
-        #   - skill secret capture → returns gracefully when no callback set
-        clarify_callback=_oneshot_clarify_callback,
-    )
+    agent = None
+    try:
+        agent = AIAgent(
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            model=effective_model,
+            enabled_toolsets=toolsets_list,
+            quiet_mode=True,
+            platform="cli",
+            session_db=session_db,
+            credential_pool=runtime.get("credential_pool"),
+            fallback_model=_fb or None,
+            # Interactive callbacks are intentionally NOT wired beyond this
+            # one.  In oneshot mode there's no user sitting at a terminal:
+            #   - clarify  → returns a synthetic "pick a default" instruction
+            #                so the agent continues instead of stalling on
+            #                the tool's built-in "not available" error
+            #   - sudo password prompt → terminal_tool gates on
+            #                HERMES_INTERACTIVE which we never set
+            #   - shell-hook approval → auto-approved via HERMES_ACCEPT_HOOKS=1
+            #                (set above); also falls back to deny on non-tty
+            #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
+            #   - skill secret capture → returns gracefully when no callback set
+            clarify_callback=_oneshot_clarify_callback,
+        )
 
-    # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
-    # display callbacks that would bypass our stdout capture.
-    agent.suppress_status_output = True
-    agent.stream_delta_callback = None
-    agent.tool_gen_callback = None
+        # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
+        # display callbacks that would bypass our stdout capture.
+        agent.suppress_status_output = True
+        agent.stream_delta_callback = None
+        agent.tool_gen_callback = None
 
-    result = agent.run_conversation(prompt)
-    return (result.get("final_response") or "", result)
+        result = agent.run_conversation(prompt)
+        return (result.get("final_response") or "", result)
+    finally:
+        _cleanup_oneshot_resources(agent, session_db)
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:
