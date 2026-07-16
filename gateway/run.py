@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, Iterable, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -2999,6 +2999,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
         self._kanban_notifier_profile = self._active_profile_name()
+        # Intake can wake the embedded dispatcher immediately instead of
+        # waiting up to dispatch_interval_seconds for its next idle tick.
+        self._kanban_dispatch_wake_event = asyncio.Event()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -5601,6 +5604,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from gateway.display_config import resolve_display_setting
         platform_key = _platform_config_key(event.source.platform)
+        display_config = _load_gateway_config()
+        discord_semantic_ack = platform_key == "discord"
 
         # In steer mode the user's text has already been injected into the
         # active run. Some mobile chat setups want that steering to be silent,
@@ -5613,7 +5618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 steer_ack_enabled = bool(
                     resolve_display_setting(
-                        _load_gateway_config(),
+                        display_config,
                         platform_key,
                         "busy_steer_ack_enabled",
                         True,
@@ -5625,66 +5630,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment. Mobile chat defaults keep this
-        # terse; detailed iteration/tool state is still available in logs and
-        # can be opted in per platform via display.platforms.<platform>.busy_ack_detail.
-        status_parts = []
-        busy_ack_detail_enabled = bool(
-            resolve_display_setting(
-                _load_gateway_config(),
-                _platform_config_key(event.source.platform),
-                "busy_ack_detail",
-                True,
+        if discord_semantic_ack:
+            # Discord progress has one display contract.  Even an explicit
+            # busy_ack_detail opt-in must not reintroduce iteration counters,
+            # tool names, or fixed English templates into that surface.
+            from gateway.progress_snapshot import (
+                render_busy_progress,
+                resolve_progress_language,
             )
-        )
 
-        if busy_ack_detail_enabled and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            try:
-                summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"running: {current_tool}")
-            except Exception:
-                pass
-
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
-            )
-        elif is_queue_mode and demoted_for_subagents:
-            # #30170 — explain the demotion so the user knows their
-            # follow-up didn't accidentally kill the subagent and
-            # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
-            )
-        elif is_queue_mode and demoted_for_compression:
-            message = (
-                f"⏳ Compressing context{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
-            )
-        elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
+            start_ts = self._running_agents_ts.get(session_key, 0)
+            elapsed_min = int((now - start_ts) / 60) if start_ts else 0
+            message = render_busy_progress(
+                elapsed_min,
+                language=resolve_progress_language(display_config),
             )
         else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
+            # Other chat platforms retain their existing opt-in diagnostic
+            # detail. Discord diagnostics remain available in gateway logs.
+            status_parts = []
+            busy_ack_detail_enabled = bool(
+                resolve_display_setting(
+                    display_config,
+                    platform_key,
+                    "busy_ack_detail",
+                    True,
+                )
             )
+            if (
+                busy_ack_detail_enabled
+                and running_agent
+                and running_agent is not _AGENT_PENDING_SENTINEL
+            ):
+                try:
+                    summary = running_agent.get_activity_summary()
+                    iteration = summary.get("api_call_count", 0)
+                    max_iter = summary.get("max_iterations", 0)
+                    current_tool = summary.get("current_tool")
+                    start_ts = self._running_agents_ts.get(session_key, 0)
+                    if start_ts:
+                        elapsed_min = int((now - start_ts) / 60)
+                        if elapsed_min > 0:
+                            status_parts.append(f"{elapsed_min} min elapsed")
+                    if max_iter:
+                        status_parts.append(f"iteration {iteration}/{max_iter}")
+                    if current_tool:
+                        status_parts.append(f"running: {current_tool}")
+                except Exception:
+                    pass
+
+            status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+            if is_steer_mode:
+                message = (
+                    f"⏩ Steered into current run{status_detail}. "
+                    f"Your message arrives after the next tool call."
+                )
+            elif is_queue_mode and demoted_for_subagents:
+                # #30170 — explain the demotion so the user knows their
+                # follow-up didn't accidentally kill the subagent and
+                # discovers `/stop` as the explicit escape hatch.
+                message = (
+                    f"⏳ Subagent working{status_detail} — your message is queued for "
+                    f"when it finishes (use /stop to cancel everything)."
+                )
+            elif is_queue_mode and demoted_for_compression:
+                message = (
+                    f"⏳ Compressing context{status_detail} — your message is queued for "
+                    f"when it finishes (use /stop to cancel everything)."
+                )
+            elif is_queue_mode:
+                message = (
+                    f"⏳ Queued for the next turn{status_detail}. "
+                    f"I'll respond once the current task finishes."
+                )
+            else:
+                message = (
+                    f"⚡ Interrupting current task{status_detail}. "
+                    f"I'll respond to your message shortly."
+                )
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the
@@ -5697,8 +5720,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 is_seen,
                 mark_seen,
             )
-            _user_cfg = _load_gateway_config()
-            if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
+            _user_cfg = display_config
+            if not discord_semantic_ack and not is_seen(_user_cfg, BUSY_INPUT_FLAG):
                 if is_steer_mode:
                     _hint_mode = "steer"
                 elif is_queue_mode:
@@ -10810,9 +10833,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 return None, None
 
-            from gateway.progress_snapshot import SemanticProgressTracker
+            from gateway.progress_snapshot import (
+                SemanticProgressTracker,
+                resolve_progress_language,
+            )
 
-            initial_text = SemanticProgressTracker().snapshot.render()
+            progress_language = resolve_progress_language(user_config)
+            initial_text = SemanticProgressTracker(
+                language=progress_language,
+            ).snapshot.render()
             event_message_id = self._reply_anchor_for_event(event)
             progress_thread_id = _resolve_progress_thread_id(
                 source.platform,
@@ -10849,14 +10878,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not message_id:
             return
         try:
-            from gateway.progress_snapshot import SemanticProgressTracker
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    user_config = _load_gateway_config()
+            else:
+                user_config = _load_gateway_config()
+            from gateway.progress_snapshot import (
+                SemanticProgressTracker,
+                resolve_progress_language,
+            )
 
             adapter = self._adapter_for_source(source)
             if adapter is not None:
                 await adapter.edit_message(
                     chat_id=source.chat_id,
                     message_id=message_id,
-                    content=SemanticProgressTracker().cancelled().render(),
+                    content=SemanticProgressTracker(
+                        language=resolve_progress_language(user_config),
+                    ).cancelled().render(),
                 )
         except Exception as exc:
             logger.debug("Discord semantic progress cancellation edit failed: %s", exc)
@@ -10873,6 +10913,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        # Discord's first progress acknowledgment is gateway-owned and must not
+        # wait for session I/O, prompt construction, the model, or a first tool
+        # call. Internal completion injections stay silent here; their parent
+        # run already owns user-visible lifecycle messaging.
+        _semantic_progress_message_id = None
+        _semantic_progress_text = None
+        if not getattr(event, "internal", False):
+            (
+                _semantic_progress_message_id,
+                _semantic_progress_text,
+            ) = await self._start_discord_semantic_progress(event, source)
+            if _semantic_progress_message_id:
+                _ingress_started = (getattr(event, "metadata", None) or {}).get(
+                    "gateway_ingress_monotonic"
+                )
+                if isinstance(_ingress_started, (int, float)):
+                    logger.info(
+                        "discord semantic progress first_status_ms=%.1f chat=%s",
+                        max(0.0, (time.monotonic() - _ingress_started) * 1000.0),
+                        source.chat_id or "unknown",
+                    )
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -10933,10 +10995,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                 )
         self._cache_session_source(session_key, source)
-        (
-            _semantic_progress_message_id,
-            _semantic_progress_text,
-        ) = await self._start_discord_semantic_progress(event, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -13481,6 +13539,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            tool_policy = self._tool_policy_for_source(
+                user_config,
+                source,
+                enabled_toolsets,
+                disabled_toolsets,
+            )
+            enabled_toolsets = list(tool_policy.enabled_toolsets)
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
@@ -13583,6 +13648,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                self._record_gateway_tool_policy(agent, tool_policy)
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -15125,6 +15191,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    def _wake_kanban_dispatcher(self) -> None:
+        """Thread-safe wake callback bound into trusted gateway context."""
+
+        event = getattr(self, "_kanban_dispatch_wake_event", None)
+        loop = getattr(self, "_gateway_loop", None)
+        if event is None or loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(event.set)
+
+    def _identity_profile_for_source(self, source: SessionSource) -> str:
+        """Return the real receiving bot profile without inventing one."""
+
+        routed = str(getattr(source, "profile", "") or "").strip()
+        return routed or self._active_profile_name()
+
+    def _tool_policy_for_source(
+        self,
+        user_config: dict,
+        source: SessionSource,
+        enabled_toolsets: Iterable[str],
+        disabled_toolsets: Optional[Iterable[str]] = None,
+    ):
+        """Resolve a cache-stable tool policy separately from bot identity."""
+
+        from gateway.tool_policy import resolve_gateway_tool_policy
+
+        return resolve_gateway_tool_policy(
+            user_config,
+            platform=_platform_config_key(source.platform),
+            source=source,
+            identity_profile=self._identity_profile_for_source(source),
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets or (),
+        )
+
+    @staticmethod
+    def _record_gateway_tool_policy(agent: Any, tool_policy: Any):
+        """Attach and log the exact immutable schema selected for an agent."""
+
+        from gateway.tool_policy import (
+            canonical_tool_schema_metrics,
+            schema_budget_bytes,
+            schema_within_budget,
+        )
+
+        metrics = canonical_tool_schema_metrics(agent.tools or ())
+        budget = schema_budget_bytes(tool_policy.name)
+        within_budget = schema_within_budget(tool_policy.name, metrics)
+        log = logger.info if within_budget else logger.warning
+        log(
+            "Gateway tool policy: policy=%s identity_profile=%s tools=%d "
+            "schema_bytes=%d schema_tokens_est=%d schema_hash=%s "
+            "schema_budget_bytes=%s schema_within_budget=%s",
+            tool_policy.name,
+            tool_policy.identity_profile,
+            metrics.count,
+            metrics.json_bytes,
+            metrics.estimated_tokens,
+            metrics.schema_hash,
+            budget if budget is not None else "none",
+            str(within_budget).lower(),
+        )
+        # Conversation-loop footprint logs include these labels without
+        # importing gateway policy code into the core agent.
+        agent._gateway_tool_policy_name = tool_policy.name
+        agent._gateway_identity_profile = tool_policy.identity_profile
+        return metrics
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -15145,6 +15279,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _identity_profile = self._identity_profile_for_source(context.source)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -15153,9 +15288,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=_identity_profile,
             async_delivery=_async_delivery,
+            scope_id=str(context.source.scope_id) if context.source.scope_id else "",
+            parent_chat_id=(
+                str(context.source.parent_chat_id)
+                if context.source.parent_chat_id
+                else ""
+            ),
+            role_authorized=bool(context.source.role_authorized),
+            is_bot=bool(context.source.is_bot),
+            trusted_gateway_source=True,
+            dispatch_wake=self._wake_kanban_dispatcher,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -17200,6 +17346,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        tool_policy = self._tool_policy_for_source(
+            user_config,
+            source,
+            enabled_toolsets,
+            disabled_toolsets,
+        )
+        enabled_toolsets = list(tool_policy.enabled_toolsets)
 
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
@@ -17227,10 +17380,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         progress_mode = _resolve_gateway_tool_progress_mode(user_config, platform_key)
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
-        from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
-        _generic_status_recent: List[str] = []
-        _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
-
         def _display_surface_mode(
             setting: str,
             *,
@@ -17255,19 +17404,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "generic" if allow_generic else "off"
             return "raw" if bool(value) else "off"
 
-        def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
-            try:
-                return choose_status_phrase(
-                    kind,
-                    tool_name=tool_name,
-                    preview=preview,
-                    args=args,
-                    recent=_generic_status_recent,
-                    catalog=_generic_status_catalog,
-                )
-            except Exception as _phrase_err:
-                logger.debug("generic status phrase selection failed: %s", _phrase_err)
-                return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
@@ -17277,10 +17413,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and progress_mode in {"all", "new"}
         )
         semantic_progress_tracker = None
+        progress_language = None
         if semantic_progress_enabled:
-            from gateway.progress_snapshot import SemanticProgressTracker
+            from gateway.progress_snapshot import (
+                SemanticProgressTracker,
+                resolve_progress_language,
+            )
 
-            semantic_progress_tracker = SemanticProgressTracker()
+            progress_language = resolve_progress_language(user_config)
+            semantic_progress_tracker = SemanticProgressTracker(
+                language=progress_language,
+            )
             if semantic_progress_text is None and _interrupt_depth == 0:
                 # Direct callers (tests and internal entry points) do not pass
                 # the early message seed. Start the snapshot before agent
@@ -17289,6 +17432,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             semantic_progress_message_id = None
             semantic_progress_text = None
+            from gateway.progress_snapshot import resolve_progress_language
+
+            progress_language = resolve_progress_language(user_config)
+        # Shared by the semantic progress consumer and the long-running
+        # heartbeat. Both edit the latest semantic bubble instead of creating
+        # independent status messages.
+        semantic_progress_message_id_ref = [semantic_progress_message_id]
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -17734,7 +17884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else []
             )
             progress_msg_id = (
-                semantic_progress_message_id
+                semantic_progress_message_id_ref[0]
                 if semantic_progress_enabled
                 else None
             )
@@ -17835,6 +17985,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if initial_result.success and initial_result.message_id:
                     progress_msg_id = str(initial_result.message_id)
+                    semantic_progress_message_id_ref[0] = progress_msg_id
 
             async def _roll_progress_overflow_if_needed() -> bool:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
@@ -17860,11 +18011,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = await _send_progress_text(first_text)
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
+                        if semantic_progress_enabled:
+                            semantic_progress_message_id_ref[0] = str(progress_msg_id)
 
                 for group in groups[1:]:
                     result = await _send_progress_text(_progress_text(group))
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
+                        if semantic_progress_enabled:
+                            semantic_progress_message_id_ref[0] = str(progress_msg_id)
 
                 # The newest continuation is now the only mutable bubble.  Keep
                 # just its lines so subsequent edits update it instead of
@@ -17920,6 +18075,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
                         progress_msg_id = None
+                        if semantic_progress_enabled:
+                            semantic_progress_message_id_ref[0] = None
                         progress_lines = []
                         last_progress_msg[0] = None
                         repeat_count[0] = 0
@@ -18010,6 +18167,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
+                            if semantic_progress_enabled:
+                                semantic_progress_message_id_ref[0] = str(progress_msg_id)
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(str(result.message_id))
 
@@ -18048,6 +18207,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     except Exception:
                                         pass
                                 progress_msg_id = None
+                                if semantic_progress_enabled:
+                                    semantic_progress_message_id_ref[0] = None
                                 progress_lines = []
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
@@ -18550,6 +18711,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                self._record_gateway_tool_policy(agent, tool_policy)
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for
@@ -19583,11 +19745,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _notify_adapter = self._adapter_for_source(source)
             if not _notify_adapter:
                 return
-            # Track the heartbeat message id so we can edit-in-place on
-            # platforms that support it (Telegram, Discord, Slack, etc.)
-            # instead of spamming a new "Still working" bubble every
-            # interval. Falls back to send-new when edit fails or isn't
-            # supported by the adapter.
+            # Non-semantic platforms keep one heartbeat bubble. Discord's
+            # semantic mode shares the progress bubble via
+            # semantic_progress_message_id_ref.
             _heartbeat_msg_id: Optional[str] = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
@@ -19606,47 +19766,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available. Default
-                # heartbeat is terse: elapsed + current tool. Verbose
-                # iteration counter is gated on busy_ack_detail so users
-                # who want it can opt in per platform.
-                _agent_ref = agent_holder[0]
-                _status_detail = ""
-                _want_iteration_detail = bool(
-                    resolve_display_setting(
-                        user_config,
-                        platform_key,
-                        "busy_ack_detail",
-                        True,
+                # User-facing heartbeats never copy implementation details
+                # from get_activity_summary(). Discord re-renders the same
+                # structured semantic snapshot; other platforms get localized
+                # elapsed-time copy without tool or iteration names.
+                if semantic_progress_enabled and semantic_progress_tracker is not None:
+                    from gateway.progress_snapshot import render_long_running
+
+                    _heartbeat_text = render_long_running(
+                        _elapsed_mins,
+                        language=progress_language,
+                        snapshot=semantic_progress_tracker.snapshot,
                     )
-                )
-                if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
-                    try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
-                    except Exception:
-                        pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-                )
+                    _active_heartbeat_id = semantic_progress_message_id_ref[0]
+                else:
+                    from gateway.progress_snapshot import render_long_running
+
+                    _heartbeat_text = render_long_running(
+                        _elapsed_mins,
+                        language=progress_language,
+                    )
+                    _active_heartbeat_id = _heartbeat_msg_id
                 try:
                     _notify_res = None
-                    if _heartbeat_msg_id:
+                    if _active_heartbeat_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
                                 source.chat_id,
-                                _heartbeat_msg_id,
+                                _active_heartbeat_id,
                                 _heartbeat_text,
                             )
                         except Exception as _ee:
@@ -19661,9 +19808,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
                         ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
+                            if semantic_progress_enabled:
+                                semantic_progress_message_id_ref[0] = str(
+                                    _notify_res.message_id
+                                )
+                            else:
+                                _heartbeat_msg_id = str(_notify_res.message_id)
                             if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
+                                _cleanup_msg_ids.append(str(_notify_res.message_id))
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -19768,16 +19920,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _warn_adapter = self._adapter_for_source(source)
                         if _warn_adapter:
                             _elapsed_warn = int(_agent_warning // 60) or 1
-                            _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
-                                await _warn_adapter.send(
-                                    source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
-                                )
+                                if (
+                                    semantic_progress_enabled
+                                    and semantic_progress_tracker is not None
+                                ):
+                                    from gateway.progress_snapshot import (
+                                        render_inactivity_warning,
+                                    )
+
+                                    warning_text = render_inactivity_warning(
+                                        _elapsed_warn,
+                                        language=progress_language,
+                                        snapshot=semantic_progress_tracker.snapshot,
+                                    )
+                                    warning_result = None
+                                    warning_message_id = (
+                                        semantic_progress_message_id_ref[0]
+                                    )
+                                    if warning_message_id:
+                                        try:
+                                            warning_result = await _warn_adapter.edit_message(
+                                                source.chat_id,
+                                                warning_message_id,
+                                                warning_text,
+                                            )
+                                        except Exception as warning_edit_error:
+                                            logger.debug(
+                                                "Inactivity warning edit failed: %s",
+                                                warning_edit_error,
+                                            )
+                                    if not (
+                                        warning_result
+                                        and getattr(warning_result, "success", False)
+                                    ):
+                                        warning_result = await _warn_adapter.send(
+                                            source.chat_id,
+                                            warning_text,
+                                            metadata=_non_conversational_metadata(
+                                                _status_thread_metadata,
+                                                platform=source.platform,
+                                            ),
+                                        )
+                                    if (
+                                        getattr(warning_result, "success", False)
+                                        and getattr(warning_result, "message_id", None)
+                                    ):
+                                        semantic_progress_message_id_ref[0] = str(
+                                            warning_result.message_id
+                                        )
+                                else:
+                                    _remaining_mins = int(
+                                        (_agent_timeout - _agent_warning) // 60
+                                    ) or 1
+                                    await _warn_adapter.send(
+                                        source.chat_id,
+                                        f"⚠️ No activity for {_elapsed_warn} min. "
+                                        f"If the agent does not respond soon, it will "
+                                        f"be timed out in {_remaining_mins} min. "
+                                        f"You can continue waiting or use /reset.",
+                                        metadata=_status_thread_metadata,
+                                    )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
                     if _idle_secs >= _agent_timeout:
@@ -19832,31 +20035,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
-                # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
-                if _cur_tool:
-                    _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                if semantic_progress_enabled and semantic_progress_tracker is not None:
+                    from gateway.progress_snapshot import render_inactivity_timeout
+
+                    timeout_text = render_inactivity_timeout(
+                        language=progress_language,
+                        snapshot=semantic_progress_tracker.snapshot,
                     )
                 else:
+                    # Other platforms retain the detailed legacy handoff. Raw
+                    # tool/iteration diagnostics stay out of Discord but remain
+                    # available to operators in the error log above.
+                    _diag_lines = [
+                        f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
+                        f"or API responses."
+                    ]
+                    if _cur_tool:
+                        _diag_lines.append(
+                            f"The agent appears stuck on tool `{_cur_tool}` "
+                            f"({_secs_ago:.0f}s since last activity, "
+                            f"iteration {_iter_n}/{_iter_max})."
+                        )
+                    else:
+                        _diag_lines.append(
+                            f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
+                            f"iteration {_iter_n}/{_iter_max}). "
+                            "The agent may have been waiting on an API response."
+                        )
                     _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
+                        "To increase the limit, set agent.gateway_timeout in config.yaml "
+                        "(value in seconds, 0 = no limit) and restart the gateway.\n"
+                        "Try again, or use /reset to start fresh."
                     )
-                _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
-                )
+                    timeout_text = "\n".join(_diag_lines)
 
                 response = {
-                    "final_response": "\n".join(_diag_lines),
+                    "final_response": timeout_text,
                     "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                     "api_calls": _iter_n,
                     "tools": tools_holder[0] or [],

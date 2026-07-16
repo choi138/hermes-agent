@@ -265,6 +265,72 @@ class SemanticLifecycleAgent:
         }
 
 
+class SlowSemanticHeartbeatAgent:
+    """Keeps a Discord run alive across several heartbeat intervals."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def get_activity_summary(self):
+        # These diagnostics must stay in logs and never reach progress copy.
+        return {
+            "api_call_count": 7,
+            "max_iterations": 25,
+            "current_tool": "terminal",
+            "last_activity_desc": "terminal",
+        }
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started",
+            "terminal",
+            "scripts/run_tests.sh tests/gateway -q",
+            {"command": "scripts/run_tests.sh tests/gateway -q"},
+        )
+        time.sleep(0.25)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class InactivitySemanticAgent:
+    """Stays idle long enough to exercise warning and terminal handoff."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        self.interrupted = False
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 7,
+            "max_iterations": 25,
+            "current_tool": "terminal",
+            "last_activity_desc": "terminal",
+            "seconds_since_activity": 999.0,
+        }
+
+    def interrupt(self, _reason):
+        self.interrupted = True
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started",
+            "terminal",
+            "private command password=secret",
+            {"command": "private command password=secret"},
+        )
+        time.sleep(6.0)
+        return {
+            "final_response": "late result",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class ManyProgressLinesAgent:
     """Emits enough tool-progress lines to exceed a single platform bubble."""
 
@@ -810,6 +876,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    runner_setup=None,
 ):
     if config_data:
         import yaml
@@ -829,6 +896,8 @@ async def _run_with_agent(
         agent_cls.adapter_probe = adapter
         agent_cls.initial_visible_before_init = False
     runner = _make_runner(adapter)
+    if runner_setup is not None:
+        runner_setup(runner)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -910,8 +979,110 @@ async def test_discord_semantic_progress_is_early_safe_and_edit_in_place(
         assert raw_value not in rendered
     assert "Inspection completed successfully" in rendered
     # The later failed verification must preserve the last successful evidence.
-    assert "Verification found a problem" in rendered
+    assert "The current step found a problem" in rendered
     assert "**Confirmed:** Inspection completed successfully" in rendered
+
+
+@pytest.mark.asyncio
+async def test_discord_long_running_heartbeat_reuses_korean_semantic_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.05")
+
+    def _setup_runner(runner):
+        runner._should_emit_long_running_notification = lambda *args, **kwargs: True
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowSemanticHeartbeatAgent,
+        session_id="sess-discord-semantic-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "language": "ko",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm-heartbeat",
+        chat_type="dm",
+        thread_id=None,
+        runner_setup=_setup_runner,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.edits
+    assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+    rendered = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert "**현재 단계:**" in rendered
+    assert "**확인:**" in rendered
+    assert "**다음:**" in rendered
+    assert "경과" in rendered
+    for forbidden in (
+        "iteration 7/25",
+        "terminal",
+        "Working —",
+        "Current stage",
+        "Confirmed:",
+        "Next:",
+    ):
+        assert forbidden not in rendered
+
+
+@pytest.mark.asyncio
+async def test_discord_inactivity_warning_and_timeout_use_semantic_handoff(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0.01")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT_WARNING", "0.005")
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InactivitySemanticAgent,
+        session_id="sess-discord-inactivity",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "language": "ko",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm-inactivity",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    rendered = "\n".join(
+        [result["final_response"]]
+        + [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert result["failed"] is True
+    assert "**현재 단계:**" in result["final_response"]
+    assert "**확인:**" in result["final_response"]
+    assert "**다음:**" in result["final_response"]
+    assert "요청이 중지되었습니다" in result["final_response"]
+    assert "경과" in rendered  # staged warning edited the semantic bubble
+    for forbidden in (
+        "iteration 7/25",
+        "terminal",
+        "password=secret",
+        "Working —",
+        "No activity for",
+        "Agent inactive for",
+        "Current stage",
+        "Confirmed:",
+        "Next:",
+    ):
+        assert forbidden not in rendered
 
 
 @pytest.mark.asyncio
@@ -922,7 +1093,7 @@ async def test_discord_handler_seed_is_non_conversational_and_closes_on_cancel(
     import yaml
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_progress": "all"}}),
+        yaml.dump({"display": {"tool_progress": "all", "language": "ko"}}),
         encoding="utf-8",
     )
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
@@ -950,9 +1121,12 @@ async def test_discord_handler_seed_is_non_conversational_and_closes_on_cancel(
     assert message_id == "progress-1"
     assert initial_text == adapter.sent[0]["content"]
     assert adapter.sent[0]["metadata"] == {"non_conversational": True}
+    assert initial_text.startswith("**현재 단계:** 요청을 준비하고 있습니다")
+    assert "**확인:** 요청을 수신했습니다" in initial_text
+    assert "Current stage" not in initial_text
     await runner._cancel_discord_semantic_progress(source, message_id)
     assert adapter.edits[-1]["message_id"] == "progress-1"
-    assert "**Current stage:** Request stopped" in adapter.edits[-1]["content"]
+    assert "**현재 단계:** 요청이 중지되었습니다" in adapter.edits[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -1494,7 +1668,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     } == {
         "**Current stage:** Inspecting the current state\n"
         "**Confirmed:** Request received\n"
-        "**Next:** Use the inspection results to identify the next safe action"
+        "**Next:** Use this step's result to choose the next safe action"
     }
 
 

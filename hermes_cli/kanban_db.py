@@ -1614,6 +1614,20 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable receipt ledger for gateway-owned asynchronous task intake. The
+-- idempotency key and trusted source context are server-generated; model input
+-- never controls actor/profile/channel/message identity. The notification
+-- subscription is inserted in the same transaction as this receipt + task.
+CREATE TABLE IF NOT EXISTS kanban_intake_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash    TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    actor_profile   TEXT NOT NULL,
+    assignee        TEXT NOT NULL,
+    source_context  TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
 -- Durable cross-process handoff for role-authored lifecycle messages. The
 -- dispatch-owning gateway renders and enqueues a delivery; the gateway process
 -- whose immutable profile matches ``sender_profile`` claims it and sends via
@@ -1667,6 +1681,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_lineage_active
     WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_intake_receipt_task   ON kanban_intake_receipts(task_id);
 CREATE INDEX IF NOT EXISTS idx_role_delivery_claim   ON kanban_role_deliveries(sender_profile, platform, status, available_at, id);
 """
 
@@ -2863,6 +2878,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    _manage_transaction: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2886,6 +2902,11 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``_manage_transaction`` is an internal composition hook. Public callers
+    leave it enabled; trusted multi-row writers such as gateway intake may set
+    it to ``False`` only while already holding :func:`write_txn`, so the task,
+    receipt, and notification subscription share one commit boundary.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -3031,7 +3052,12 @@ def create_task(
     for attempt in range(2):
         task_id = _new_task_id()
         try:
-            with write_txn(conn):
+            transaction = (
+                write_txn(conn)
+                if _manage_transaction
+                else contextlib.nullcontext(conn)
+            )
+            with transaction:
                 if idempotency_key:
                     row = conn.execute(
                         "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -10197,6 +10223,185 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+
+class KanbanIntakeConflict(ValueError):
+    """A durable intake key was reused with different immutable content."""
+
+
+def _insert_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> None:
+    """Insert/backfill one subscription inside the caller's transaction."""
+
+    now = int(time.time()) if created_at is None else int(created_at)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+    )
+    if notifier_profile:
+        # Self-heal legacy rows that predate notifier ownership by backfilling
+        # only when the existing value is unset.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (notifier_profile IS NULL OR notifier_profile = '')
+            """,
+            (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+        )
+
+
+def create_intake_task(
+    conn: sqlite3.Connection,
+    *,
+    idempotency_key: str,
+    request_hash: str,
+    actor_profile: str,
+    assignee: str,
+    source_context: dict[str, Any],
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    title: str,
+    body: Optional[str] = None,
+    priority: int = 0,
+    max_runtime_seconds: Optional[int] = None,
+    max_retries: Optional[int] = None,
+    goal_mode: bool = False,
+    goal_max_turns: Optional[int] = None,
+    session_id: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Atomically create a gateway-intake task, receipt, and subscription.
+
+    Returns ``(task_id, created)``. The receipt is permanent even after the
+    task is archived, so a response-loss retry can never create a second card.
+    A key reused with different request/source/actor content fails closed.
+    """
+
+    key = str(idempotency_key or "").strip()
+    digest = str(request_hash or "").strip()
+    actor = str(actor_profile or "").strip()
+    canonical_assignee = _canonical_assignee(assignee)
+    platform_name = str(platform or "").strip()
+    target_chat_id = str(chat_id or "").strip()
+    if not key:
+        raise ValueError("idempotency_key is required")
+    if not digest:
+        raise ValueError("request_hash is required")
+    if not actor:
+        raise ValueError("actor_profile is required")
+    if not canonical_assignee:
+        raise ValueError("assignee is required")
+    if not isinstance(source_context, dict):
+        raise ValueError("source_context must be an object")
+    if not platform_name or not target_chat_id:
+        raise ValueError("notification platform and chat_id are required")
+
+    source_json = json.dumps(
+        source_context,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    now = int(time.time())
+
+    with write_txn(conn):
+        receipt = conn.execute(
+            "SELECT request_hash, task_id, actor_profile, assignee, source_context "
+            "FROM kanban_intake_receipts WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()
+        if receipt is not None:
+            stored = (
+                receipt["request_hash"],
+                receipt["actor_profile"],
+                receipt["assignee"],
+                receipt["source_context"],
+            )
+            expected = (digest, actor, canonical_assignee, source_json)
+            if stored != expected:
+                raise KanbanIntakeConflict(
+                    "idempotency receipt was reused with different immutable content"
+                )
+            task_id = str(receipt["task_id"])
+            if conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone() is None:
+                raise KanbanIntakeConflict(
+                    f"idempotency receipt references missing task {task_id}"
+                )
+            _insert_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=platform_name,
+                chat_id=target_chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                notifier_profile=notifier_profile,
+                created_at=now,
+            )
+            return task_id, False
+
+        task_id = create_task(
+            conn,
+            title=title,
+            body=body,
+            assignee=canonical_assignee,
+            created_by=actor,
+            priority=priority,
+            idempotency_key=key,
+            max_runtime_seconds=max_runtime_seconds,
+            max_retries=max_retries,
+            goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns,
+            session_id=session_id,
+            _manage_transaction=False,
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_intake_receipts (
+                idempotency_key, request_hash, task_id, actor_profile,
+                assignee, source_context, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                digest,
+                task_id,
+                actor,
+                canonical_assignee,
+                source_json,
+                now,
+            ),
+        )
+        _insert_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform_name,
+            chat_id=target_chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            notifier_profile=notifier_profile,
+            created_at=now,
+        )
+        return task_id, True
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -10209,28 +10414,16 @@ def add_notify_sub(
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
-    now = int(time.time())
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+        _insert_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            notifier_profile=notifier_profile,
         )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
 
 
 def list_notify_subs(

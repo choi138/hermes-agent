@@ -1331,6 +1331,9 @@ class TestBuildSystemPrompt:
         assert "SKILLS_PROMPT" in prompt
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
+        from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE, SKILLS_GUIDANCE
+        assert HERMES_AGENT_HELP_GUIDANCE not in prompt
+        assert SKILLS_GUIDANCE not in prompt
 
 
 class TestToolUseEnforcementConfig:
@@ -3940,6 +3943,48 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_first_request_footprint_and_actual_usage_log_once(self, agent, caplog):
+        self._setup_agent(agent)
+        agent.platform = "discord"
+        agent._gateway_tool_policy_name = "discord-core"
+        agent._gateway_identity_profile = "default"
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="First",
+                usage={
+                    "prompt_tokens": 123,
+                    "completion_tokens": 4,
+                    "total_tokens": 127,
+                },
+            ),
+            _mock_response(
+                content="Second",
+                usage={
+                    "prompt_tokens": 130,
+                    "completion_tokens": 3,
+                    "total_tokens": 133,
+                },
+            ),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            caplog.at_level(logging.INFO, logger="agent.conversation_loop"),
+        ):
+            assert agent.run_conversation("first")["completed"] is True
+            assert agent.run_conversation("second")["completed"] is True
+
+        assert caplog.text.count("First request footprint:") == 1
+        assert caplog.text.count("First request usage:") == 1
+        assert "policy=discord-core" in caplog.text
+        assert "identity_profile=default" in caplog.text
+        assert "system_chars=" in caplog.text
+        assert "schema_bytes=" in caplog.text
+        assert "input_tokens_est=" in caplog.text
+        assert "provider_prompt_tokens=123" in caplog.text
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)

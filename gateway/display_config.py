@@ -125,7 +125,13 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Discord has a native "subtext" primitive (-# small grey text) that reads
     # as metadata rather than content, so reasoning summaries default to it
     # here instead of the fenced code block used elsewhere.
-    "discord":     {**_TIER_HIGH, "reasoning_style": "subtext"},
+    "discord":     {
+        **_TIER_HIGH,
+        "reasoning_style": "subtext",
+        # Internal iteration/tool names are diagnostic data, not user-facing
+        # progress. Operators can still inspect them in logs.
+        "busy_ack_detail": False,
+    },
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;

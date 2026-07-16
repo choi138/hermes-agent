@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
+from agent.i18n import get_language, t
+
 
 @dataclass(frozen=True)
 class ProgressSnapshot:
@@ -19,77 +21,41 @@ class ProgressSnapshot:
     stage: str
     confirmed: str
     next_action: str
+    language: str | None = None
 
     def render(self) -> str:
-        return (
-            f"**Current stage:** {self.stage}\n"
-            f"**Confirmed:** {self.confirmed}\n"
-            f"**Next:** {self.next_action}"
+        return t(
+            "gateway.progress.template",
+            lang=self.language,
+            stage=self.stage,
+            confirmed=self.confirmed,
+            next_action=self.next_action,
         )
 
 
-_STARTED_COPY = {
-    "inspect": (
-        "Inspecting the current state",
-        "Use the inspection results to identify the next safe action",
-    ),
-    "diagnose": (
-        "Diagnosing the issue",
-        "Turn the evidence into a specific, testable cause",
-    ),
-    "modify": (
-        "Applying the change",
-        "Verify the changed behavior before deployment",
-    ),
-    "verify": (
-        "Verifying the changes",
-        "Use the verification result to decide whether the change is ready",
-    ),
-    "deploy": (
-        "Deploying the verified change",
-        "Confirm the service restarted and is serving the new version",
-    ),
-    "observe": (
-        "Observing runtime health",
-        "Confirm the target behavior and check for new errors",
-    ),
-}
+_PHASES = frozenset({"inspect", "diagnose", "modify", "verify", "deploy", "observe"})
 
-_SUCCESS_COPY = {
-    "inspect": (
-        "Inspection completed successfully",
-        "Diagnose the issue using the confirmed evidence",
-    ),
-    "diagnose": (
-        "Diagnostic step completed successfully",
-        "Apply the smallest change that addresses the confirmed cause",
-    ),
-    "modify": (
-        "Change applied successfully",
-        "Run focused verification before deployment",
-    ),
-    "verify": (
-        "Verification completed successfully",
-        "Deploy the verified change or continue broader checks",
-    ),
-    "deploy": (
-        "Deployment step completed successfully",
-        "Observe service health and the target behavior",
-    ),
-    "observe": (
-        "Runtime observation completed successfully",
-        "Compare the observed behavior with the acceptance criteria",
-    ),
-}
 
-_FAILURE_STAGE = {
-    "inspect": "Inspection needs another approach",
-    "diagnose": "Diagnosis needs another approach",
-    "modify": "The change could not be applied",
-    "verify": "Verification found a problem",
-    "deploy": "Deployment needs attention",
-    "observe": "Runtime observation found a problem",
-}
+def resolve_progress_language(config: dict[str, Any] | None = None) -> str:
+    """Resolve progress copy from an already profile-scoped config.
+
+    Gateway multiplexing temporarily scopes ``HERMES_HOME`` while loading a
+    profile's config, so resolving the language later through a process-global
+    config lookup can select the wrong bot's language.  Callers pass the config
+    they already loaded; other surfaces retain the normal i18n resolution.
+    """
+
+    if isinstance(config, dict):
+        display = config.get("display")
+        if isinstance(display, dict):
+            language = display.get("language")
+            if isinstance(language, str) and language.strip():
+                return language.strip()
+    return get_language()
+
+
+def _copy(key: str, language: str) -> str:
+    return t(f"gateway.progress.{key}", lang=language)
 
 _DEPLOY_MARKERS = (
     " deploy",
@@ -240,13 +206,15 @@ def classify_progress_phase(
 class SemanticProgressTracker:
     """Track semantic phases and confirmed-success evidence for one run."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, language: str | None = None) -> None:
+        self.language = language or get_language()
         self._lock = Lock()
         self._active_phases: dict[str, list[str]] = {}
         self._snapshot = ProgressSnapshot(
-            stage="Preparing the request",
-            confirmed="Request received",
-            next_action="Inspect the relevant state and gather evidence",
+            stage=_copy("stage.preparing", self.language),
+            confirmed=_copy("confirmed.request_received", self.language),
+            next_action=_copy("next.initial", self.language),
+            language=self.language,
         )
 
     @property
@@ -261,14 +229,16 @@ class SemanticProgressTracker:
         args: dict[str, Any] | None = None,
     ) -> ProgressSnapshot:
         phase = classify_progress_phase(tool_name, preview, args)
+        if phase not in _PHASES:  # defensive if the classifier grows later
+            phase = "inspect"
         key = str(tool_name or "")
         with self._lock:
             self._active_phases.setdefault(key, []).append(phase)
-            stage, next_action = _STARTED_COPY[phase]
             self._snapshot = ProgressSnapshot(
-                stage=stage,
+                stage=_copy(f"stage.{phase}", self.language),
                 confirmed=self._snapshot.confirmed,
-                next_action=next_action,
+                next_action=_copy("next.active", self.language),
+                language=self.language,
             )
             return self._snapshot
 
@@ -291,16 +261,17 @@ class SemanticProgressTracker:
 
             if is_error:
                 self._snapshot = ProgressSnapshot(
-                    stage=_FAILURE_STAGE[phase],
+                    stage=_copy("stage.failure", self.language),
                     confirmed=self._snapshot.confirmed,
-                    next_action="Review the failure and choose a safe retry or alternative",
+                    next_action=_copy("next.failure", self.language),
+                    language=self.language,
                 )
             else:
-                confirmed, next_action = _SUCCESS_COPY[phase]
                 self._snapshot = ProgressSnapshot(
-                    stage=_STARTED_COPY[phase][0],
-                    confirmed=confirmed,
-                    next_action=next_action,
+                    stage=_copy(f"stage.{phase}", self.language),
+                    confirmed=_copy(f"confirmed.{phase}", self.language),
+                    next_action=_copy("next.success", self.language),
+                    language=self.language,
                 )
             return self._snapshot
 
@@ -308,8 +279,97 @@ class SemanticProgressTracker:
         with self._lock:
             self._active_phases.clear()
             self._snapshot = ProgressSnapshot(
-                stage="Request stopped",
-                confirmed="No work was started",
-                next_action="Send the request again when ready",
+                stage=_copy("stage.stopped", self.language),
+                confirmed=_copy("confirmed.no_work_started", self.language),
+                next_action=_copy("next.retry_request", self.language),
+                language=self.language,
             )
             return self._snapshot
+
+
+def render_long_running(
+    minutes: int,
+    *,
+    language: str | None = None,
+    snapshot: ProgressSnapshot | None = None,
+) -> str:
+    """Render a localized heartbeat without internal implementation details.
+
+    Discord passes its current semantic snapshot so the elapsed-time update
+    stays inside the same ``stage / confirmed / next`` display contract. Other
+    platforms retain a compact one-line heartbeat.
+    """
+
+    lang = language or (snapshot.language if snapshot is not None else None)
+    elapsed = t(
+        "gateway.progress.long_running",
+        lang=lang,
+        minutes=max(0, int(minutes)),
+    )
+    if snapshot is None:
+        return elapsed
+    return ProgressSnapshot(
+        stage=snapshot.stage,
+        # Preserve the last confirmed evidence instead of replacing it with a
+        # timer.  The elapsed suffix guarantees a real Discord edit on every
+        # heartbeat while keeping the evidence contract intact.
+        confirmed=f"{snapshot.confirmed} · {elapsed}",
+        next_action=snapshot.next_action,
+        language=lang,
+    ).render()
+
+
+def render_busy_progress(
+    minutes: int,
+    *,
+    language: str | None = None,
+) -> str:
+    """Render a safe busy-session acknowledgment for Discord.
+
+    The active agent's iteration counter and tool name are deliberately not
+    accepted as inputs.  Operators retain those diagnostics in logs, while a
+    user follow-up gets the same localized three-field progress contract as the
+    original run.
+    """
+
+    tracker = SemanticProgressTracker(language=language)
+    active = tracker.tool_started("status")
+    return render_long_running(minutes, language=tracker.language, snapshot=active)
+
+
+def render_inactivity_warning(
+    minutes: int,
+    *,
+    language: str | None = None,
+    snapshot: ProgressSnapshot,
+) -> str:
+    """Render a localized warning without exposing provider/tool internals."""
+
+    lang = language or snapshot.language or get_language()
+    elapsed = t(
+        "gateway.progress.long_running",
+        lang=lang,
+        minutes=max(0, int(minutes)),
+    )
+    return ProgressSnapshot(
+        stage=_copy("stage.failure", lang),
+        confirmed=f"{snapshot.confirmed} · {elapsed}",
+        next_action=_copy("next.failure", lang),
+        language=lang,
+    ).render()
+
+
+def render_inactivity_timeout(
+    *,
+    language: str | None = None,
+    snapshot: ProgressSnapshot,
+) -> str:
+    """Render a localized terminal handoff while preserving known evidence."""
+
+    lang = language or snapshot.language or get_language()
+    return ProgressSnapshot(
+        stage=_copy("stage.stopped", lang),
+        confirmed=snapshot.confirmed,
+        next_action=_copy("next.retry_request", lang),
+        language=lang,
+    ).render()

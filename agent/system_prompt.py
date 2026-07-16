@@ -176,6 +176,42 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # Resolve the skills index before assembling guidance so its compact
+    # preamble can own the Hermes-docs and skill-maintenance contracts.  The
+    # old prompt repeated both contracts in separate blocks, adding roughly a
+    # thousand static characters to every tool-enabled request.
+    has_skills_tools = any(
+        name in agent.valid_tool_names
+        for name in ("skills_list", "skill_view", "skill_manage")
+    )
+    skills_prompt = ""
+    if has_skills_tools:
+        avail_toolsets = {
+            toolset
+            for toolset in (
+                _r.get_toolset_for_tool(tool_name)
+                for tool_name in agent.valid_tool_names
+            )
+            if toolset
+        }
+        # Focus mode (opt-in) demotes non-coding skill categories to
+        # names-only in the index while keeping every skill discoverable.
+        _compact_cats = frozenset()
+        try:
+            from agent.coding_context import coding_compact_skill_categories
+
+            _compact_cats = coding_compact_skill_categories(
+                platform=agent.platform,
+                cwd=resolve_context_cwd(),
+            )
+        except Exception:
+            _compact_cats = frozenset()
+        skills_prompt = _r.build_skills_system_prompt(
+            available_tools=agent.valid_tool_names,
+            available_toolsets=avail_toolsets,
+            compact_categories=_compact_cats or None,
+        )
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -193,8 +229,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # The rendered skills preamble contains the same Hermes skill + docs
+    # contract. Keep the standalone block only when no index is available.
+    if not skills_prompt:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -222,7 +260,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
+    # The skills-index preamble already covers patching and saving reusable
+    # workflows. Preserve this fallback for installations with no skill index.
+    if "skill_manage" in agent.valid_tool_names and not skills_prompt:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -289,35 +329,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    if has_skills_tools:
-        avail_toolsets = {
-            toolset
-            for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
-            )
-            if toolset
-        }
-        # Focus mode (opt-in) demotes non-coding skill categories to
-        # names-only in the index (never hidden — skill_view/skills_list
-        # reach everything, and every name stays visible for recall). The
-        # default coding posture leaves the index untouched.
-        _compact_cats = frozenset()
-        try:
-            from agent.coding_context import coding_compact_skill_categories
-
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
-            )
-        except Exception:
-            _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
-            available_tools=agent.valid_tool_names,
-            available_toolsets=avail_toolsets,
-            compact_categories=_compact_cats or None,
-        )
-    else:
-        skills_prompt = ""
     if skills_prompt:
         stable_parts.append(skills_prompt)
 

@@ -607,6 +607,77 @@ class TestBusySessionAck:
         assert "10 min" in content  # elapsed
 
     @pytest.mark.asyncio
+    async def test_discord_busy_ack_never_exposes_internal_detail_even_when_opted_in(
+        self,
+        monkeypatch,
+    ):
+        """Discord always uses the localized semantic display boundary."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(
+            _gr,
+            "_load_gateway_config",
+            lambda: {
+                "display": {
+                    "language": "ko",
+                    "platforms": {"discord": {"busy_ack_detail": True}},
+                }
+            },
+        )
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="discord")
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="discord-thread-1",
+            chat_type="thread",
+            user_id="user1",
+            thread_id="discord-thread-1",
+            parent_chat_id="discord-channel-1",
+        )
+        event = MessageEvent(
+            text="follow up",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="discord-message-1",
+        )
+        session_key = build_session_key(source)
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 7,
+            "max_iterations": 25,
+            "current_tool": "terminal",
+            "last_activity_desc": "terminal",
+            "seconds_since_activity": 0.5,
+        }
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time() - 180
+        runner.adapters[source.platform] = adapter
+
+        handled = await runner._handle_active_session_busy_message(
+            event,
+            session_key,
+        )
+
+        assert handled is True
+        content = adapter._send_with_retry.call_args.kwargs["content"]
+        assert "**현재 단계:**" in content
+        assert "**확인:**" in content
+        assert "**다음:**" in content
+        assert "3분 경과" in content
+        for forbidden in (
+            "terminal",
+            "iteration",
+            "7/25",
+            "Working —",
+            "Current stage",
+            "Confirmed:",
+            "Next:",
+            "Interrupting current task",
+        ):
+            assert forbidden not in content
+
+    @pytest.mark.asyncio
     async def test_telegram_omits_status_detail_by_default(self):
         """Telegram busy acks stay concise unless busy_ack_detail is enabled."""
         runner, sentinel = _make_runner()

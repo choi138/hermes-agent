@@ -1268,6 +1268,11 @@ def init_agent(
     
     # Cached system prompt -- built once per session, only rebuilt on compression
     agent._cached_system_prompt: Optional[str] = None
+    # Content-free footprint telemetry is emitted once per constructed agent.
+    # Gateway-cached agents therefore report the true first provider request
+    # without adding repeated log noise on later turns/tool iterations.
+    agent._first_request_footprint_logged = False
+    agent._first_request_usage_logged = False
     
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager

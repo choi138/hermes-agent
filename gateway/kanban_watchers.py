@@ -40,6 +40,28 @@ _KANBAN_EXECUTION_EVENT_KINDS = frozenset({
 _KANBAN_ROLE_MESSAGE_LIMIT = 1800
 
 
+async def _wait_for_dispatcher_wake(
+    wake_event: Optional[asyncio.Event],
+    interval: float,
+    keep_running: Callable[[], bool],
+) -> bool:
+    """Wait for intake or timeout; return True only for an intake wake."""
+
+    slept = 0.0
+    while slept < interval and keep_running():
+        wait_for = min(1.0, interval - slept)
+        if wake_event is None:
+            await asyncio.sleep(wait_for)
+            slept += wait_for
+            continue
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=wait_for)
+            return True
+        except asyncio.TimeoutError:
+            slept += wait_for
+    return False
+
+
 def _neutralize_discord_mentions(value: str) -> str:
     """Keep authored text visible without allowing lifecycle updates to ping."""
     return (
@@ -1678,7 +1700,7 @@ class GatewayKanbanWatchersMixin:
                 )
 
     async def _kanban_dispatcher_watcher(self) -> None:
-        """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
+        """Embedded dispatcher — periodic ticks plus immediate intake wakeups.
 
         Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
         When true, the gateway hosts the single dispatcher for this profile:
@@ -2160,7 +2182,13 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
+        wake_event = getattr(self, "_kanban_dispatch_wake_event", None)
         while self._running:
+            # Clear before work, never after it. An intake committed while this
+            # tick is running then leaves the event set and triggers an
+            # immediate follow-up tick instead of being erased by a late clear.
+            if wake_event is not None:
+                wake_event.clear()
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -2224,12 +2252,14 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+            # Wait in 1s slices so shutdown remains snappy, but let a committed
+            # gateway intake break the wait immediately. The timeout preserves
+            # periodic reclaim/health ticks when no new card arrives.
+            await _wait_for_dispatcher_wake(
+                wake_event,
+                interval,
+                lambda: bool(self._running),
+            )
 
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None

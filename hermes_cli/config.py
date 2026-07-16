@@ -2756,6 +2756,16 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Normal Discord conversations use a one-tool asynchronous intake
+        # policy instead of exposing all worker/orchestrator lifecycle tools.
+        # The assignee is server-owned: explicit intake_assignee wins, then
+        # default_assignee, then the receiving bot's real identity profile.
+        "intake_assignee": "",
+        # Full Kanban tools are available in Discord only when BOTH the sender
+        # and the channel/thread match these exact allowlists. Wildcards are
+        # intentionally rejected by gateway.tool_policy.
+        "discord_ops_users": [],
+        "discord_ops_channels": [],
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

@@ -37,7 +37,8 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -92,6 +93,43 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+
+
+@dataclass(frozen=True)
+class TrustedGatewaySource:
+    """Server-authenticated source metadata for privileged gateway tools.
+
+    This object is intentionally kept outside ``_VAR_MAP``: it has no
+    ``os.environ`` fallback and is never serialized into a model-visible tool
+    schema.  Only a gateway adapter that already admitted the inbound event may
+    bind it.  That makes fields such as actor/profile, Discord scope, reply
+    target, and dispatcher wake-up capability authoritative rather than
+    model-supplied.
+    """
+
+    platform: str
+    profile: str
+    chat_id: str
+    thread_id: str
+    user_id: str
+    session_key: str
+    session_id: str
+    message_id: str
+    scope_id: str = ""
+    parent_chat_id: str = ""
+    role_authorized: bool = False
+    is_bot: bool = False
+    dispatch_wake: Optional[Callable[[], None]] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+_TRUSTED_GATEWAY_SOURCE: ContextVar[Optional[TrustedGatewaySource]] = ContextVar(
+    "HERMES_TRUSTED_GATEWAY_SOURCE",
+    default=None,
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -169,6 +207,12 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    scope_id: str = "",
+    parent_chat_id: str = "",
+    role_authorized: bool = False,
+    is_bot: bool = False,
+    trusted_gateway_source: bool = False,
+    dispatch_wake: Optional[Callable[[], None]] = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -204,6 +248,25 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _TRUSTED_GATEWAY_SOURCE.set(
+            TrustedGatewaySource(
+                platform=str(platform or ""),
+                profile=str(profile or ""),
+                chat_id=str(chat_id or ""),
+                thread_id=str(thread_id or ""),
+                user_id=str(user_id or ""),
+                session_key=str(session_key or ""),
+                session_id=str(session_id or ""),
+                message_id=str(message_id or ""),
+                scope_id=str(scope_id or ""),
+                parent_chat_id=str(parent_chat_id or ""),
+                role_authorized=bool(role_authorized),
+                is_bot=bool(is_bot),
+                dispatch_wake=dispatch_wake,
+            )
+            if trusted_gateway_source
+            else None
+        ),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -245,6 +308,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TRUSTED_GATEWAY_SOURCE.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -293,6 +357,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TRUSTED_GATEWAY_SOURCE.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -325,6 +390,18 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_trusted_gateway_source() -> Optional[TrustedGatewaySource]:
+    """Return authenticated gateway source metadata for the current turn.
+
+    Unlike :func:`get_session_env`, this never falls back to process
+    environment variables.  CLI, cron, API-server, and direct tool calls
+    therefore receive ``None`` unless the real gateway explicitly bound an
+    admitted source.
+    """
+
+    return _TRUSTED_GATEWAY_SOURCE.get()
 
 
 def async_delivery_supported() -> bool:

@@ -23,6 +23,35 @@ gateway:
   config_read_failed: "⚠️ 無法讀取 config.yaml：{error}"
   config_save_failed: "⚠️ 無法儲存設定：{error}"
 
+  progress:
+    template: "**Current stage:** {stage}\n**Confirmed:** {confirmed}\n**Next:** {next_action}"
+    long_running: "⏳ Work is still in progress ({minutes} min elapsed)."
+    stage:
+      preparing: "Preparing the request"
+      inspect: "Inspecting the current state"
+      diagnose: "Diagnosing the issue"
+      modify: "Applying the change"
+      verify: "Verifying the changes"
+      deploy: "Deploying the verified change"
+      observe: "Observing runtime health"
+      failure: "The current step found a problem"
+      stopped: "Request stopped"
+    confirmed:
+      request_received: "Request received"
+      inspect: "Inspection completed successfully"
+      diagnose: "Diagnostic step completed successfully"
+      modify: "Change applied successfully"
+      verify: "Verification completed successfully"
+      deploy: "Deployment step completed successfully"
+      observe: "Runtime observation completed successfully"
+      no_work_started: "No work was started"
+    next:
+      initial: "Inspect the relevant state and gather evidence"
+      active: "Use this step's result to choose the next safe action"
+      success: "Continue with the next step using the confirmed result"
+      failure: "Review the failure and choose a safe retry or alternative"
+      retry_request: "Send the request again when ready"
+
   model:
     error_prefix:           "錯誤：{error}"
     switched:               "已切換模型為 `{model}`"

@@ -6120,6 +6120,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _handle_message(self, message: DiscordMessage, role_authorized: bool = False) -> None:
         """Handle incoming Discord messages."""
+        gateway_ingress_monotonic = time.monotonic()
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
         # in a thread where the bot has already participated.
@@ -6587,6 +6588,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata={"gateway_ingress_monotonic": gateway_ingress_monotonic},
         )
 
         # Track thread participation so the bot won't require @mention for

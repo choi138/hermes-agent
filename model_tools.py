@@ -366,13 +366,6 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
-            effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -434,6 +427,20 @@ def _compute_tool_definitions(
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        # Task workers inherit the assignee profile's normal tools, but their
+        # Kanban authority is always the task-scoped lifecycle surface. Apply
+        # this after enabled/disabled resolution so a profile-level `kanban`,
+        # `kanban_submit`, composite toolset, or explicit deny cannot either
+        # restore orchestrator/intake tools or strip completion handoff.
+        worker_tools = set(resolve_toolset("kanban_worker"))
+        non_worker_kanban_tools = (
+            set(resolve_toolset("kanban"))
+            | set(resolve_toolset("kanban_submit"))
+        ) - worker_tools
+        tools_to_include.difference_update(non_worker_kanban_tools)
+        tools_to_include.update(worker_tools)
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()

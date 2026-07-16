@@ -276,6 +276,27 @@ TOOLSETS = {
         "includes": [],
     },
 
+    # Dispatcher-spawned workers receive only task-scoped lifecycle tools.
+    # Board routing stays in the explicit orchestrator policy above.
+    "kanban_worker": {
+        "description": "Task-scoped Kanban worker lifecycle tools",
+        "tools": [
+            "kanban_show", "kanban_complete", "kanban_block",
+            "kanban_heartbeat", "kanban_comment", "kanban_create",
+            "kanban_link",
+        ],
+        "includes": [],
+    },
+
+    # Normal Discord sessions get one asynchronous board intake entry point.
+    # Trusted source/assignee/board fields are injected by the gateway and are
+    # intentionally absent from the model-visible schema.
+    "kanban_submit": {
+        "description": "Submit one durable asynchronous Kanban task",
+        "tools": ["kanban_task"],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

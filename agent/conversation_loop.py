@@ -61,6 +61,7 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.request_footprint import canonical_tool_schema_metrics, text_metrics
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -968,6 +969,30 @@ def run_conversation(
         request_pressure_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
+        if not getattr(agent, "_first_request_footprint_logged", False):
+            system_metrics = text_metrics(effective_system)
+            schema_metrics = canonical_tool_schema_metrics(agent.tools or ())
+            logger.info(
+                "First request footprint: platform=%s policy=%s "
+                "identity_profile=%s messages=%d tools=%d schema_bytes=%d "
+                "schema_tokens_est=%d schema_hash=%s system_chars=%d "
+                "system_bytes=%d system_tokens_est=%d system_hash=%s "
+                "input_tokens_est=%d",
+                agent.platform or "none",
+                getattr(agent, "_gateway_tool_policy_name", "none"),
+                getattr(agent, "_gateway_identity_profile", "none"),
+                len(api_messages),
+                schema_metrics.count,
+                schema_metrics.json_bytes,
+                schema_metrics.estimated_tokens,
+                schema_metrics.schema_hash,
+                system_metrics.chars,
+                system_metrics.utf8_bytes,
+                system_metrics.estimated_tokens,
+                system_metrics.content_hash,
+                request_pressure_tokens,
+            )
+            agent._first_request_footprint_logged = True
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
@@ -2095,6 +2120,19 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
+                    if not getattr(agent, "_first_request_usage_logged", False):
+                        logger.info(
+                            "First request usage: platform=%s policy=%s "
+                            "provider_prompt_tokens=%d billable_input_tokens=%d "
+                            "cache_read_tokens=%d cache_write_tokens=%d",
+                            agent.platform or "none",
+                            getattr(agent, "_gateway_tool_policy_name", "none"),
+                            prompt_tokens,
+                            canonical_usage.input_tokens,
+                            canonical_usage.cache_read_tokens,
+                            canonical_usage.cache_write_tokens,
+                        )
+                        agent._first_request_usage_logged = True
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
