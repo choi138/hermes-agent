@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 from gateway.tool_policy import (
     DISCORD_CORE_SCHEMA_BUDGET_BYTES,
+    apply_gateway_tool_schema_policy,
     canonical_tool_schema_metrics,
     resolve_gateway_tool_policy,
     schema_budget_bytes,
     schema_within_budget,
 )
+
+
+def _without_descriptions(value):
+    if isinstance(value, dict):
+        return {
+            key: _without_descriptions(item)
+            for key, item in value.items()
+            if key != "description"
+        }
+    if isinstance(value, list):
+        return [_without_descriptions(item) for item in value]
+    return value
 
 
 def _source(**overrides):
@@ -172,6 +186,67 @@ def test_schema_budget_is_a_discord_core_runtime_gate_only():
     assert schema_within_budget("discord-core", at_budget)
     assert not schema_within_budget("discord-core", over_budget)
     assert schema_within_budget("discord-ops", over_budget)
+
+
+def test_discord_core_compaction_preserves_every_non_description_contract():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+    from tools.session_search_tool import SESSION_SEARCH_SCHEMA
+    from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
+    from tools.terminal_tool import TERMINAL_SCHEMA
+
+    schemas = [
+        {"type": "function", "function": schema}
+        for schema in (
+            CRONJOB_SCHEMA,
+            TERMINAL_SCHEMA,
+            SESSION_SEARCH_SCHEMA,
+            SKILL_MANAGE_SCHEMA,
+        )
+    ]
+    original = deepcopy(schemas)
+
+    compacted = apply_gateway_tool_schema_policy("discord-core", schemas)
+
+    # Global registry/cache objects are untouched, and all authorization /
+    # validation semantics (names, properties, required, enums, defaults,
+    # bounds) remain byte-equivalent after descriptions are removed.
+    assert schemas == original
+    assert _without_descriptions(compacted) == _without_descriptions(original)
+    assert canonical_tool_schema_metrics(compacted).json_bytes <= 12_000
+
+    # Full schemas remain available to authorized operator sessions.
+    assert apply_gateway_tool_schema_policy("discord-ops", schemas) == schemas
+
+
+def test_gateway_agent_with_cron_active_applies_final_discord_budget(monkeypatch):
+    """Reproduce the Gateway-only 31st-tool path before measuring budget."""
+    import model_tools
+    from gateway.run import GatewayRunner
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+    try:
+        raw_tools = model_tools.get_tool_definitions(
+            enabled_toolsets=["hermes-discord", "kanban_submit"],
+            quiet_mode=True,
+        )
+        assert "cronjob" in {
+            tool["function"]["name"] for tool in raw_tools
+        }
+
+        agent = SimpleNamespace(tools=raw_tools)
+        policy = SimpleNamespace(name="discord-core", identity_profile="default")
+        metrics = GatewayRunner._record_gateway_tool_policy(agent, policy)
+
+        assert metrics == canonical_tool_schema_metrics(agent.tools)
+        assert metrics.json_bytes <= DISCORD_CORE_SCHEMA_BUDGET_BYTES
+    finally:
+        # Availability is process-global and TTL-cached; never leak the
+        # gateway-session verdict into worker-policy tests in this file.
+        invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
 
 
 def test_submit_and_worker_toolsets_have_disjoint_lifecycle_contract(monkeypatch):

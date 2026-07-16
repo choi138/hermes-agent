@@ -9640,6 +9640,36 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _isolate_worker_terminal_env(env: dict[str, str]) -> None:
+    """Drop the gateway profile's terminal location from a worker child.
+
+    The embedded dispatcher lives inside a long-running gateway whose
+    ``terminal.*`` config has already been bridged into process-global
+    ``TERMINAL_*`` variables.  A worker is then reassigned with
+    ``hermes -p <assignee>``.  If that profile intentionally omits a terminal
+    section (meaning the local default), inheriting ``TERMINAL_ENV=ssh`` makes
+    the CLI treat the gateway's remote backend as an explicit override and the
+    worker still runs on the gateway profile's host.
+
+    Start the child with no inherited backend/location bridge so its
+    profile-scoped ``.env`` / ``config.yaml`` is authoritative. Generic timeout
+    ceilings remain as safe fallback limits (and the assignee profile can still
+    override them); task runtime minimums are applied after this function.
+    ``_HERMES_GATEWAY`` is also process-role state, not profile configuration;
+    retaining it would make the ordinary CLI child skip parts of its own
+    terminal config bridge.
+    """
+
+    inherited_limit_fallbacks = {
+        "TERMINAL_TIMEOUT",
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+    }
+    for key in tuple(env):
+        if key.startswith("TERMINAL_") and key not in inherited_limit_fallbacks:
+            env.pop(key, None)
+    env.pop("_HERMES_GATEWAY", None)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -9668,6 +9698,7 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    _isolate_worker_terminal_env(env)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root

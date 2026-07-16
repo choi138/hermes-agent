@@ -62,6 +62,26 @@ def test_terminal_activity_maps_to_semantic_work_phases() -> None:
     ).stage == "Observing runtime health"
 
 
+def test_read_only_remote_transport_never_claims_deployment() -> None:
+    tracker = SemanticProgressTracker(language="ko")
+
+    for command in (
+        "ssh pi 'cat /etc/hosts'",
+        "ssh pi 'test -r /srv/hermes/gateway/tool_policy.py'",
+        "scp pi:/etc/hosts ./hosts.copy",
+        "rsync --dry-run pi:/srv/hermes/ ./snapshot/",
+    ):
+        started = tracker.tool_started(
+            "terminal",
+            preview=command,
+            args={"command": command},
+        )
+        assert started.stage == "현재 상태를 확인하고 있습니다"
+        completed = tracker.tool_completed("terminal", is_error=False)
+        assert completed.confirmed == "상태 확인을 완료했습니다"
+        assert "배포" not in completed.render()
+
+
 def test_only_successful_completion_updates_confirmed_evidence() -> None:
     tracker = SemanticProgressTracker()
     started = tracker.tool_started(

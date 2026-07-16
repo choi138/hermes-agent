@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 import subprocess
+import sys
 
 
 def _make_task(kb, *, assignee: str):
@@ -123,6 +127,117 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
 
     assert "--cli" in captured["cmd"]
     assert "HERMES_TUI" not in captured["env"]
+
+
+def test_default_spawn_drops_gateway_terminal_backend_for_local_default_profile(
+    monkeypatch, tmp_path,
+):
+    """A profile without ``terminal`` must get the local default.
+
+    The embedded dispatcher inherits the gateway profile's bridged SSH values.
+    Passing those into ``hermes -p <assignee>`` prevented a fresh profile from
+    selecting its local default and routed file tools to the gateway's Mac SSH
+    backend instead.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "raiden"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "agent:\n  max_turns: 30\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text(
+        "terminal:\n  backend: ssh\n  ssh_host: mac.example\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "mac.example")
+    monkeypatch.setenv("TERMINAL_SSH_USER", "gateway-user")
+    monkeypatch.setenv("TERMINAL_TIMEOUT", "180")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4244
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(_make_task(kb, assignee="raiden"), str(workspace))
+
+    child_env = captured["env"]
+    assert child_env["HERMES_HOME"] == str(profile)
+    assert child_env["TERMINAL_CWD"] == str(workspace)
+    assert "TERMINAL_ENV" not in child_env
+    assert "TERMINAL_SSH_HOST" not in child_env
+    assert "TERMINAL_SSH_USER" not in child_env
+    # Generic command ceilings may remain as a fallback; they do not select a
+    # host/backend and the assignee profile can override them at CLI startup.
+    assert child_env["TERMINAL_TIMEOUT"] == "180"
+    assert "_HERMES_GATEWAY" not in child_env
+
+
+def test_isolated_worker_env_resolves_local_backend_through_real_cli_import(
+    monkeypatch, tmp_path,
+):
+    """Exercise the real profile config bridge, not only the Popen mock."""
+    profile = tmp_path / "profiles" / "raiden"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "agent:\n  max_turns: 30\n",
+        encoding="utf-8",
+    )
+    # Keep the repository .env in fallback-only mode for this isolated profile.
+    profile.joinpath(".env").write_text("", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    from hermes_cli import kanban_db as kb
+
+    env = dict(os.environ)
+    env.update({
+        "HERMES_HOME": str(profile),
+        "_HERMES_GATEWAY": "1",
+        "TERMINAL_ENV": "ssh",
+        "TERMINAL_SSH_HOST": "mac.example",
+        "TERMINAL_CWD": "/Users/gateway",
+    })
+    kb._isolate_worker_terminal_env(env)
+    env["HERMES_HOME"] = str(profile)
+    env["TERMINAL_CWD"] = str(workspace)
+    repo_root = Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(repo_root)
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os; import cli; "
+                "print(json.dumps({'backend': os.environ.get('TERMINAL_ENV'), "
+                "'cwd': os.environ.get('TERMINAL_CWD')}))"
+            ),
+        ],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    resolved = json.loads(probe.stdout.strip().splitlines()[-1])
+
+    assert resolved == {"backend": "local", "cwd": str(workspace)}
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):

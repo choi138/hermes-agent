@@ -58,8 +58,6 @@ def _copy(key: str, language: str) -> str:
     return t(f"gateway.progress.{key}", lang=language)
 
 _DEPLOY_MARKERS = (
-    " deploy",
-    "deployment",
     "systemctl restart",
     "service restart",
     "gateway restart",
@@ -70,11 +68,7 @@ _DEPLOY_MARKERS = (
     "helm upgrade",
     "git push",
     "git pull",
-    " rsync",
-    " scp",
 )
-
-_REMOTE_EXECUTION_MARKERS = (" ssh",)
 
 _VERIFY_MARKERS = (
     "run_tests.sh",
@@ -183,9 +177,10 @@ def classify_progress_phase(
 
     text = _classification_text(tool_name, preview, args)
 
-    # Strong deployment actions take precedence over everything else. Generic
-    # remote execution is classified later so an SSH test remains verification
-    # and an SSH log read remains observation.
+    # Strong deployment actions take precedence over everything else. SSH,
+    # SCP, and rsync are transports, not proof that a deployment happened; a
+    # read-only remote inspection must never produce "deployment completed".
+    # Nested restart/apply/push commands still match the explicit markers above.
     if _contains_any(text, _DEPLOY_MARKERS):
         return "deploy"
     if _contains_any(text, _VERIFY_MARKERS):
@@ -196,8 +191,6 @@ def classify_progress_phase(
         return "observe"
     if _contains_any(text, _DIAGNOSE_MARKERS):
         return "diagnose"
-    if _contains_any(text, _REMOTE_EXECUTION_MARKERS):
-        return "deploy"
     if any(marker in text for marker in _INSPECT_NAME_MARKERS):
         return "inspect"
     return "inspect"

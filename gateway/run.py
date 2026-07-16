@@ -15231,11 +15231,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Attach and log the exact immutable schema selected for an agent."""
 
         from gateway.tool_policy import (
+            apply_gateway_tool_schema_policy,
             canonical_tool_schema_metrics,
             schema_budget_bytes,
             schema_within_budget,
         )
 
+        agent.tools = apply_gateway_tool_schema_policy(
+            tool_policy.name,
+            agent.tools or (),
+        )
         metrics = canonical_tool_schema_metrics(agent.tools or ())
         budget = schema_budget_bytes(tool_policy.name)
         within_budget = schema_within_budget(tool_policy.name, metrics)
