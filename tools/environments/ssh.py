@@ -186,26 +186,28 @@ class SSHEnvironment(BaseEnvironment):
         self.user = user
         self.port = port
         self.key_path = key_path
+        self._cleanup_lock = threading.Lock()
+        self._cleaned = False
+        self._sync_manager: FileSyncManager | None = None
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
-        # Keep the socket filename short and deterministic so the full path
+        # Keep the socket filename short so the full path
         # stays under the 104-byte sun_path limit that macOS enforces on
         # Unix domain sockets. A raw ``user@host:port`` — especially with an
         # IPv6 host — plus the 16-byte random suffix SSH appends in
         # ControlMaster mode easily exceeds the limit under macOS's
-        # deeply-nested $TMPDIR (e.g. /var/folders/xx/yy/T/). Hashing the
-        # triple keeps the path stable across reconnects so ControlMaster
-        # reuse still works.
-        _socket_id = hashlib.sha256(
-            f"{user}@{host}:{port}".encode()
-        ).hexdigest()[:16]
+        # deeply-nested $TMPDIR (e.g. /var/folders/xx/yy/T/). Include a
+        # per-instance nonce in the digest: commands within this environment
+        # still reuse one master, while cleanup can never terminate another
+        # environment's same-target connection.
+        _socket_seed = f"{user}@{host}:{port}".encode() + os.urandom(16)
+        _socket_id = hashlib.sha256(_socket_seed).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
         self._remote_tar_no_overwrite_dir: bool | None = None
-        self._sync_manager: FileSyncManager | None = None
 
         if sync_files:
             self._ensure_remote_dirs()
@@ -578,27 +580,32 @@ class SSHEnvironment(BaseEnvironment):
         return _popen_bash(cmd, stdin_data)
 
     def cleanup(self):
-        # Detach first so repeated cleanup (including BaseEnvironment.__del__)
-        # cannot download and apply the same remote archive twice.
-        sync_manager = self._sync_manager
-        self._sync_manager = None
-        if sync_manager is not None:
-            logger.info("SSH: syncing files from sandbox...")
-            sync_manager.sync_back()
-
-        if self.control_socket.exists():
+        # Serialize ownership transfer so concurrent cleanup callers (including
+        # BaseEnvironment.__del__) cannot sync back or close this master twice.
+        with self._cleanup_lock:
+            if self._cleaned:
+                return
+            self._cleaned = True
+            sync_manager = self._sync_manager
+            self._sync_manager = None
             try:
-                cmd = ["ssh", "-o", f"ControlPath={self.control_socket}",
-                       "-O", "exit", f"{self.user}@{self.host}"]
-                subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    timeout=5,
-                    stdin=subprocess.DEVNULL,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            try:
-                self.control_socket.unlink()
-            except OSError:
-                pass
+                if sync_manager is not None:
+                    logger.info("SSH: syncing files from sandbox...")
+                    sync_manager.sync_back()
+            finally:
+                if self.control_socket.exists():
+                    try:
+                        cmd = ["ssh", "-o", f"ControlPath={self.control_socket}",
+                               "-O", "exit", f"{self.user}@{self.host}"]
+                        subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            timeout=5,
+                            stdin=subprocess.DEVNULL,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                    try:
+                        self.control_socket.unlink()
+                    except OSError:
+                        pass

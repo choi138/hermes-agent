@@ -120,12 +120,23 @@ class TestControlSocketPath:
             f"{env.control_socket} (+{self._SSH_CONTROLMASTER_SUFFIX} = {total_len})"
         )
 
-    def test_path_is_deterministic_across_instances(self):
-        """Same (user, host, port) must yield the same control socket so
-        ControlMaster reuse works across reconnects."""
+    def test_path_is_isolated_across_instances(self):
+        """Each environment must own its socket, even for the same target."""
         first = SSHEnvironment(host="example.com", user="alice", port=2222)
         second = SSHEnvironment(host="example.com", user="alice", port=2222)
-        assert first.control_socket == second.control_socket
+        assert first.control_socket != second.control_socket
+
+    def test_cleanup_of_one_instance_keeps_peer_socket(self):
+        """Cleaning one environment must not tear down its same-target peer."""
+        first = SSHEnvironment(host="example.com", user="alice", port=2222)
+        second = SSHEnvironment(host="example.com", user="alice", port=2222)
+        first.control_socket.touch(exist_ok=True)
+        second.control_socket.touch(exist_ok=True)
+
+        first.cleanup()
+
+        assert second.control_socket.exists()
+        second.cleanup()
 
     def test_path_differs_for_different_targets(self):
         """Different (user, host, port) triples must produce different paths."""

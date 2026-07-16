@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -263,6 +264,54 @@ class TestSSHCleanup:
             env.cleanup()
 
         assert call_order.index("sync_back") < call_order.index("control_exit")
+
+    def test_concurrent_cleanup_closes_owned_socket_once(
+        self, monkeypatch, ssh_mock_env, tmp_path
+    ):
+        """Two cleanup callers must not both terminate the same master."""
+        socket_path = tmp_path / "control.sock"
+        socket_path.touch()
+        ssh_mock_env.control_socket = socket_path
+
+        # Make both callers observe the pre-cleanup socket when cleanup lacks
+        # lifecycle locking. With the lock in place only the owner reaches
+        # exists(), the rendezvous times out, and the duplicate returns early.
+        exists_barrier = threading.Barrier(2)
+        real_exists = Path.exists
+
+        def coordinated_exists(path):
+            present = real_exists(path)
+            if path == socket_path:
+                try:
+                    exists_barrier.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+            return present
+
+        monkeypatch.setattr(Path, "exists", coordinated_exists)
+        exit_calls = []
+        calls_lock = threading.Lock()
+
+        def track_run(cmd, **kwargs):
+            if "-O" in cmd and "exit" in cmd:
+                with calls_lock:
+                    exit_calls.append(cmd)
+            return subprocess.CompletedProcess([], 0)
+
+        monkeypatch.setattr(ssh_env.subprocess, "run", track_run)
+
+        threads = [
+            threading.Thread(target=ssh_mock_env.cleanup),
+            threading.Thread(target=ssh_mock_env.cleanup),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(exit_calls) == 1
+        assert not real_exists(socket_path)
 
 
 # =====================================================================
