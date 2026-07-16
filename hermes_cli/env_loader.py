@@ -38,6 +38,49 @@ _SECRET_SOURCES: dict[str, str] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
+# Dispatcher-spawned Kanban workers carry a private execution contract in the
+# process environment. Profile .env files intentionally override stale shell
+# exports, but they must never replace these server-injected identity/workspace
+# pins -- doing so can route a trusted local workspace to another backend.
+_KANBAN_EXECUTION_BACKEND_ENV = "_HERMES_KANBAN_EXECUTION_BACKEND"
+_KANBAN_WORKER_IDENTITY_ENV = {
+    "HERMES_HOME",
+    "HERMES_PROFILE",
+    "HERMES_TENANT",
+}
+
+
+def _capture_kanban_worker_runtime_pins() -> dict[str, str]:
+    if not os.environ.get(_KANBAN_EXECUTION_BACKEND_ENV):
+        return {}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if (
+            key == _KANBAN_EXECUTION_BACKEND_ENV
+            or key.startswith("HERMES_KANBAN_")
+            or key in _KANBAN_WORKER_IDENTITY_ENV
+        )
+    }
+
+
+def _restore_kanban_worker_runtime_pins(pins: dict[str, str]) -> None:
+    if not pins:
+        return
+
+    # A profile .env may contain stale process-role variables from a copied
+    # service environment. Remove any it introduced, then restore only the
+    # dispatcher-provided contract captured on entry.
+    for key in tuple(os.environ):
+        if (
+            key == "_HERMES_GATEWAY"
+            or key.startswith("_HERMES_KANBAN_")
+            or key.startswith("HERMES_KANBAN_")
+            or key in _KANBAN_WORKER_IDENTITY_ENV
+        ) and key not in pins:
+            os.environ.pop(key, None)
+    os.environ.update(pins)
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -231,6 +274,7 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
+    kanban_worker_pins = _capture_kanban_worker_runtime_pins()
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -266,6 +310,11 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+
+    # Dotenv and managed env deliberately override ordinary settings. A Kanban
+    # worker's dispatcher-issued runtime contract is not ordinary configuration,
+    # so restore it only after every override source has run.
+    _restore_kanban_worker_runtime_pins(kanban_worker_pins)
 
     return loaded
 

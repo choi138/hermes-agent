@@ -660,6 +660,19 @@ def load_cli_config() -> Dict[str, Any]:
                     os.environ[env_var] = json.dumps(val)
                 else:
                     os.environ[env_var] = str(val)
+
+    # Dispatcher-managed Kanban workspaces live on the dispatcher's host.
+    # Reapply the private worker execution contract only after the assignee
+    # profile's terminal config has been bridged above; otherwise an explicit
+    # profile ``terminal.backend: ssh`` wins and sends this local workspace path
+    # to another machine. Ordinary CLI sessions never carry this marker.
+    if os.environ.get("_HERMES_KANBAN_EXECUTION_BACKEND"):
+        from hermes_cli.kanban_runtime import apply_worker_execution_contract
+
+        apply_worker_execution_contract(
+            os.environ,
+            terminal_config=terminal_config,
+        )
     
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})

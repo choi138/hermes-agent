@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str = "w"):
     return kb.Task(
@@ -77,16 +79,14 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
-def test_nonexistent_workspace_does_not_restore_gateway_profile_cwd(
+def test_nonexistent_workspace_fails_closed_before_spawn(
     monkeypatch, tmp_path,
 ):
-    """A non-directory workspace must not leak the gateway profile's cwd.
+    """A non-directory workspace must not start an unbound worker.
 
-    file_tools rejects relative / sentinel TERMINAL_CWD values, so writing a
-    meaningless (nonexistent) path is unsafe. Keeping the inherited value is
-    also unsafe after assignee reassignment because it belongs to the gateway's
-    backend (for example a Mac SSH cwd). Leave it unset so the assignee CLI
-    resolves its own profile/cwd instead.
+    Falling back to ``cwd=None`` lets the assignee profile silently select a
+    different host/backend. The dispatcher must record this deterministic
+    workspace/backend mismatch instead of spawning ambiguous work.
     """
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
@@ -99,6 +99,5 @@ def test_nonexistent_workspace_does_not_restore_gateway_profile_cwd(
 
     missing = tmp_path / "does-not-exist"
 
-    captured = _capture_spawn_env(kb, monkeypatch, str(missing))
-
-    assert "TERMINAL_CWD" not in captured["env"]
+    with pytest.raises(RuntimeError, match="workspace/backend mismatch"):
+        _capture_spawn_env(kb, monkeypatch, str(missing))

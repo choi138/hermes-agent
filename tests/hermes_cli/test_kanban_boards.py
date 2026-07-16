@@ -418,7 +418,9 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
-        kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
+        workspace = fresh_home / "ws"
+        workspace.mkdir()
+        kb._default_spawn(task, str(workspace), board="spawntest")
 
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
@@ -457,7 +459,9 @@ class TestWorkerSpawnEnv:
             claim_expires=None,
             tenant=None,
         )
-        kb._default_spawn(task, str(fresh_home / "ws"), board=None)
+        workspace = fresh_home / "ws"
+        workspace.mkdir()
+        kb._default_spawn(task, str(workspace), board=None)
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "default"
         assert env["HERMES_KANBAN_DB"] == str(fresh_home / "kanban.db")

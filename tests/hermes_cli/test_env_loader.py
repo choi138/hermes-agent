@@ -103,3 +103,39 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
 
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
     assert os.getenv("HERMES_INFERENCE_PROVIDER") == "custom"
+
+
+def test_kanban_worker_runtime_pins_survive_profile_dotenv(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (home / ".env").write_text(
+        (
+            "_HERMES_KANBAN_EXECUTION_BACKEND=ssh\n"
+            "_HERMES_GATEWAY=1\n"
+            "HERMES_HOME=/wrong/home\n"
+            "HERMES_PROFILE=wrong\n"
+            "HERMES_KANBAN_TASK=t_wrong\n"
+            "HERMES_KANBAN_WORKSPACE=/wrong/workspace\n"
+            "_HERMES_FORCE_OPENAI_API_KEY=dummy-profile-value\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("_HERMES_KANBAN_EXECUTION_BACKEND", "local")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_runtime")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.delenv("_HERMES_FORCE_OPENAI_API_KEY", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["_HERMES_KANBAN_EXECUTION_BACKEND"] == "local"
+    assert os.environ["HERMES_HOME"] == str(home)
+    assert os.environ["HERMES_PROFILE"] == "default"
+    assert os.environ["HERMES_KANBAN_TASK"] == "t_runtime"
+    assert os.environ["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert "_HERMES_GATEWAY" not in os.environ
+    # Provider passthrough markers are profile identity, not process-role state.
+    assert os.environ["_HERMES_FORCE_OPENAI_API_KEY"] == "dummy-profile-value"
