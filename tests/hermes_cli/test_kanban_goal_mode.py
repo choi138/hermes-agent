@@ -389,6 +389,7 @@ def test_cli_goal_loop_shares_iteration_budget_and_emits_progress(
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
 
     class _FakeAgent:
         max_iterations = 5
@@ -429,6 +430,26 @@ def test_cli_goal_loop_shares_iteration_budget_and_emits_progress(
             "iterations_used": 2,
             "iterations_total": 5,
         })
+        # Same semantic verdict inside the three-turn window is kept in logs
+        # but does not multiply chat notifications.
+        kwargs["progress_fn"]({
+            "stage": "judge",
+            "turn": 2,
+            "max_turns": goals.KANBAN_DEFAULT_MAX_TURNS,
+            "verdict": "continue",
+            "reason": "this intermediate note is throttled",
+            "iterations_used": 3,
+            "iterations_total": 5,
+        })
+        kwargs["progress_fn"]({
+            "stage": "judge",
+            "turn": 4,
+            "max_turns": goals.KANBAN_DEFAULT_MAX_TURNS,
+            "verdict": "continue",
+            "reason": "report the periodic milestone",
+            "iterations_used": 4,
+            "iterations_total": 5,
+        })
         kwargs["run_turn"]("continue one")
         assert kwargs["iteration_budget_fn"]() == (4, 5)
         kwargs["run_turn"]("continue two")
@@ -453,9 +474,21 @@ def test_cli_goal_loop_shares_iteration_budget_and_emits_progress(
             for event in kb.list_events(conn, tid)
             if event.kind == "heartbeat" and (event.payload or {}).get("note")
         ]
-    assert len(heartbeats) == 1
-    note = heartbeats[0].payload["note"]
-    assert "**Goal step:** 1/6" in note
-    assert "**Judge:** Continue" in note
-    assert "**Primary calls:** 2/5" in note
-    assert "**Next:** run the deterministic checks" in note
+    assert len(heartbeats) == 2
+    notes = [heartbeat.payload["note"] for heartbeat in heartbeats]
+    assert "**현재 단계:** 작업 완료 조건을 검토하고 있습니다" in notes[0]
+    assert "**확인:** 완료 조건을 아직 충족하지 못했습니다" in notes[0]
+    assert "**다음:** run the deterministic checks" in notes[0]
+    assert "report the periodic milestone" in notes[1]
+    assert all("this intermediate note is throttled" not in note for note in notes)
+    for forbidden in (
+        "Goal step",
+        "Judge:",
+        "Primary calls",
+        "iteration ",
+        "terminal",
+        "**Current stage:**",
+        "**Confirmed:**",
+        "**Next:**",
+    ):
+        assert all(forbidden not in note for note in notes)

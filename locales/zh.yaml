@@ -52,6 +52,40 @@ gateway:
       failure: "Review the failure and choose a safe retry or alternative"
       retry_request: "Send the request again when ready"
 
+  kanban_role:
+    heading:
+      running: "Running"
+      progress: "Progress"
+      completed: "Completed"
+      blocked: "Blocked"
+      stopped: "Stopped"
+      retrying: "Retrying"
+      timed_out: "Timed out"
+    field:
+      current_stage: "Current stage"
+      confirmed: "Confirmed"
+      next: "Next"
+      task: "Task"
+      update: "Update"
+      result: "Result"
+      needs_input: "Needs input"
+      waiting_on: "Waiting on"
+      retry_issue: "Retry issue"
+      limitation: "Limitation"
+      blocked_by: "Blocked by"
+      state: "State"
+      error: "Error"
+    state:
+      repeated_spawn_failures: "The task failed to start repeatedly"
+      worker_crashed_retry: "The task stopped unexpectedly; it will retry automatically."
+      runtime_limit_retry: "Runtime limit {limit_seconds}s exceeded; it will retry automatically."
+    goal:
+      reviewing: "Reviewing the task completion criteria"
+      confirmed_continue: "The completion criteria are not satisfied yet"
+      confirmed_done: "The completion criteria appear satisfied"
+      next_continue: "Continue toward the card's completion criteria"
+      next_done: "Record the verified result and complete the task"
+
   model:
     error_prefix:           "错误：{error}"
     switched:               "已切换模型为 `{model}`"

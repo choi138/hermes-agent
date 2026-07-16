@@ -1101,11 +1101,11 @@ display:
 
   # Per-platform defaults can be quieter than the global setting. Telegram
   # tunes for mobile: tool_progress and busy_ack_detail default off (no
-  # per-tool breadcrumb stream, no "iteration 21/60" debug detail in busy
-  # acks or heartbeats), but interim_assistant_messages and
+  # per-tool breadcrumb stream and no "iteration 21/60" debug detail in busy
+  # acknowledgments), but interim_assistant_messages and
   # long_running_notifications STAY ON so the user has real signal between
   # turn start and final answer (mid-turn assistant commentary + a single
-  # edit-in-place "⏳ Working — N min" heartbeat). Override under
+  # localized edit-in-place semantic heartbeat). Override under
   # display.platforms.telegram.
 
   # Auto-cleanup of temporary progress bubbles after the final response lands.
@@ -1132,7 +1132,7 @@ display:
   interim_assistant_messages: true
 
   # Gateway-only long-running status heartbeats.
-  # When false, the platform does not receive periodic "⏳ Working — N min"
+  # When false, the platform does not receive periodic localized heartbeat
   # notifications even if agent.gateway_notify_interval is non-zero. The
   # heartbeat edits a single message in place (where the adapter supports
   # editing) instead of posting a new bubble each interval.
@@ -1140,11 +1140,10 @@ display:
   # than a single edit-in-place heartbeat).
   long_running_notifications: true
 
-  # Include detailed iteration/tool/status context in busy acknowledgments
-  # and long-running heartbeats. When true, busy acks show "iteration 21/60,
-  # terminal, 10 min" and the heartbeat shows "⏳ Working — 12 min,
-  # iteration 21/60, terminal". When false (Telegram default), both stay
-  # terse: "Interrupting current task" and "⏳ Working — 12 min, terminal".
+  # Include detailed iteration/tool/status context in busy acknowledgments.
+  # Long-running heartbeats never expose iteration counters or tool names;
+  # Discord always uses its localized current-stage / confirmed / next-action
+  # contract. When false (Telegram default), busy acknowledgments stay terse.
   busy_ack_detail: true
 
   # What Enter does when Hermes is already busy (CLI and gateway platforms).

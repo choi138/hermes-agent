@@ -255,6 +255,83 @@ def _render_kanban_role_message(
     return message
 
 
+def _localize_kanban_progress_fields(value: str, language: str) -> str:
+    """Translate standard heartbeat field labels outside fenced code.
+
+    Workers are asked to write milestone notes in the user's language, but an
+    older worker (or a model following the historical examples) may still emit
+    ``Current / Evidence / Next``.  The durable producer knows the subscriber's
+    profile language, so normalize only those fixed labels before staging the
+    immutable outbox message.  Authored prose and fenced code stay untouched.
+    """
+
+    current_stage = t(
+        "gateway.kanban_role.field.current_stage", lang=language,
+    )
+    # Locales that intentionally retain the English baseline keep the worker's
+    # authored field choice (``Current`` vs ``Current stage``, ``Evidence`` vs
+    # ``Confirmed``). Only a genuinely localized target needs normalization.
+    if current_stage == t("gateway.kanban_role.field.current_stage", lang="en"):
+        return str(value or "")
+    replacements = {
+        "Current stage": current_stage,
+        "Current": current_stage,
+        "Evidence": t("gateway.kanban_role.field.confirmed", lang=language),
+        "Confirmed": t("gateway.kanban_role.field.confirmed", lang=language),
+        "Next": t("gateway.kanban_role.field.next", lang=language),
+        "Update": t("gateway.kanban_role.field.update", lang=language),
+    }
+    fixed_value_replacements = {
+        t(f"gateway.kanban_role.goal.{key}", lang="en"): t(
+            f"gateway.kanban_role.goal.{key}", lang=language,
+        )
+        for key in (
+            "reviewing",
+            "confirmed_continue",
+            "confirmed_done",
+            "next_continue",
+            "next_done",
+        )
+    }
+    rendered: list[str] = []
+    open_fence_len = 0
+    for line in str(value or "").splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body):]
+        stripped = body.lstrip(" ")
+        indent = len(body) - len(stripped)
+        tick_count = len(stripped) - len(stripped.lstrip("`"))
+        if indent <= 3 and tick_count >= 3:
+            remainder = stripped[tick_count:]
+            if open_fence_len == 0 and "`" not in remainder:
+                open_fence_len = tick_count
+            elif (
+                open_fence_len
+                and tick_count >= open_fence_len
+                and not remainder.strip(" \t")
+            ):
+                open_fence_len = 0
+            rendered.append(line)
+            continue
+        if open_fence_len == 0:
+            for source_label, localized_label in replacements.items():
+                prefix = f"**{source_label}:**"
+                if stripped.startswith(prefix):
+                    stripped = (
+                        f"**{localized_label}:**" + stripped[len(prefix):]
+                    )
+                    body = (" " * indent) + stripped
+                    break
+            for source_value, localized_value in fixed_value_replacements.items():
+                suffix = f":** {source_value}"
+                if stripped.startswith("**") and stripped.endswith(suffix):
+                    stripped = stripped[: -len(source_value)] + localized_value
+                    body = (" " * indent) + stripped
+                    break
+        rendered.append(body + newline)
+    return "".join(rendered)
+
+
 def _kanban_event_profile(kb, conn, event, task) -> Optional[str]:
     """Return the profile that actually produced a worker execution event.
 
@@ -429,6 +506,44 @@ class GatewayKanbanWatchersMixin:
             )
             return False
 
+    def _kanban_role_delivery_language(self, sub: dict[str, Any]) -> str:
+        """Resolve copy from the subscribing bot profile, never the assignee.
+
+        The dispatch owner renders the immutable outbox row.  In a multiplexed
+        process its ambient config may belong to another bot, so explicitly
+        scope the read to ``notifier_profile`` before choosing the language.
+        The rendered text then survives cross-process delivery without asking
+        the worker-profile sender to reinterpret it.
+        """
+
+        profile = str(sub.get("notifier_profile") or "").strip()
+        if not profile:
+            profile = (
+                (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+                or self._active_profile_name()
+                or "default"
+            )
+        try:
+            from gateway.run import _load_gateway_config, _profile_runtime_scope
+            from hermes_cli.profiles import get_profile_dir
+
+            with _profile_runtime_scope(get_profile_dir(profile)):
+                config = _load_gateway_config()
+            display = config.get("display") if isinstance(config, dict) else None
+            language = display.get("language") if isinstance(display, dict) else None
+            # Missing profile-local configuration means the documented English
+            # default. Do not call the process-global language cache here: in a
+            # multiplexer it may have been populated by another bot profile.
+            return str(language).strip() if str(language or "").strip() else "en"
+        except Exception:
+            logger.warning(
+                "kanban notifier: could not resolve role-message language for "
+                "subscriber profile %s; using English",
+                profile,
+                exc_info=True,
+            )
+            return "en"
+
     @staticmethod
     def _kanban_role_delivery_message(
         sub,
@@ -436,6 +551,8 @@ class GatewayKanbanWatchersMixin:
         task,
         board_name: str,
         who: Optional[str],
+        *,
+        language: str = "en",
     ) -> Optional[str]:
         """Render an immutable execution-event snapshot for durable staging."""
         kind = event.kind
@@ -445,16 +562,23 @@ class GatewayKanbanWatchersMixin:
         board_tag = f" · `[{board_name}]`" if board_name else ""
         if kind == "spawned":
             return _render_kanban_role_message(
-                f"### Running · `{task_id}`{board_tag}",
-                [("Task", title, False)],
+                f"### {t('gateway.kanban_role.heading.running', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [(t("gateway.kanban_role.field.task", lang=language), title, False)],
             )
         if kind == "heartbeat":
             note = str(payload.get("note") or "")
             if not note.strip():
                 return None
-            field = (None, note, True) if "\n" in note else ("Update", note, False)
+            note = _localize_kanban_progress_fields(note, language)
+            field = (
+                (None, note, True)
+                if "\n" in note
+                else (t("gateway.kanban_role.field.update", lang=language), note, False)
+            )
             return _render_kanban_role_message(
-                f"### Progress · `{task_id}`{board_tag}",
+                f"### {t('gateway.kanban_role.heading.progress', lang=language)} "
+                f"· `{task_id}`{board_tag}",
                 [field],
             )
         if kind == "completed":
@@ -462,47 +586,91 @@ class GatewayKanbanWatchersMixin:
             if not summary.strip() and task and task.result:
                 summary = str(task.result)
             return _render_kanban_role_message(
-                f"### Completed · `{task_id}`{board_tag}",
-                [("Task", title, False), ("Result", summary, True)],
+                f"### {t('gateway.kanban_role.heading.completed', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (t("gateway.kanban_role.field.result", lang=language), summary, True),
+                ],
             )
         if kind in {"blocked", "dependency_wait"}:
             reason = str(payload.get("reason") or "")
             block_kind = payload.get("kind")
             label = {
-                "needs_input": "Needs input",
-                "dependency": "Waiting on",
-                "transient": "Retry issue",
-                "capability": "Limitation",
-            }.get(block_kind, "Blocked by")
+                "needs_input": t(
+                    "gateway.kanban_role.field.needs_input", lang=language,
+                ),
+                "dependency": t(
+                    "gateway.kanban_role.field.waiting_on", lang=language,
+                ),
+                "transient": t(
+                    "gateway.kanban_role.field.retry_issue", lang=language,
+                ),
+                "capability": t(
+                    "gateway.kanban_role.field.limitation", lang=language,
+                ),
+            }.get(
+                block_kind,
+                t("gateway.kanban_role.field.blocked_by", lang=language),
+            )
             return _render_kanban_role_message(
-                f"### Blocked · `{task_id}`{board_tag}",
-                [("Task", title, False), (label, reason, False)],
+                f"### {t('gateway.kanban_role.heading.blocked', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (label, reason, False),
+                ],
             )
         if kind == "gave_up":
             error = str(payload.get("error") or "").strip()
             return _render_kanban_role_message(
-                f"### Stopped · `{task_id}`{board_tag}",
+                f"### {t('gateway.kanban_role.heading.stopped', lang=language)} "
+                f"· `{task_id}`{board_tag}",
                 [
-                    ("Task", title, False),
-                    ("State", "Repeated spawn failures", False),
-                    ("Error", error, False),
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (
+                        t("gateway.kanban_role.field.state", lang=language),
+                        t(
+                            "gateway.kanban_role.state.repeated_spawn_failures",
+                            lang=language,
+                        ),
+                        False,
+                    ),
+                    (t("gateway.kanban_role.field.error", lang=language), error, False),
                 ],
             )
         if kind == "crashed":
             return _render_kanban_role_message(
-                f"### Retrying · `{task_id}`{board_tag}",
+                f"### {t('gateway.kanban_role.heading.retrying', lang=language)} "
+                f"· `{task_id}`{board_tag}",
                 [
-                    ("Task", title, False),
-                    ("State", "Worker process exited; dispatcher will retry.", False),
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (
+                        t("gateway.kanban_role.field.state", lang=language),
+                        t(
+                            "gateway.kanban_role.state.worker_crashed_retry",
+                            lang=language,
+                        ),
+                        False,
+                    ),
                 ],
             )
         if kind == "timed_out":
             limit = int(payload.get("limit_seconds") or 0)
             return _render_kanban_role_message(
-                f"### Timed out · `{task_id}`{board_tag}",
+                f"### {t('gateway.kanban_role.heading.timed_out', lang=language)} "
+                f"· `{task_id}`{board_tag}",
                 [
-                    ("Task", title, False),
-                    ("State", f"Runtime limit {limit}s; dispatcher will retry.", False),
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (
+                        t("gateway.kanban_role.field.state", lang=language),
+                        t(
+                            "gateway.kanban_role.state.runtime_limit_retry",
+                            lang=language,
+                            limit_seconds=limit,
+                        ),
+                        False,
+                    ),
                 ],
             )
         return None
@@ -678,6 +846,11 @@ class GatewayKanbanWatchersMixin:
                                 task = _kb.get_task(conn, sub["task_id"])
                                 event_profiles: dict[int, Optional[str]] = {}
                                 staged_role_event_ids: set[int] = set()
+                                role_language = (
+                                    self._kanban_role_delivery_language(sub)
+                                    if platform == _Platform.DISCORD.value
+                                    else "en"
+                                )
 
                                 def _stage_cross_process_rows(events):
                                     rows = []
@@ -698,7 +871,12 @@ class GatewayKanbanWatchersMixin:
                                         if not self._kanban_role_profile_authorized(who):
                                             continue
                                         message = self._kanban_role_delivery_message(
-                                            sub, ev, task, slug, who,
+                                            sub,
+                                            ev,
+                                            task,
+                                            slug,
+                                            who,
+                                            language=role_language,
                                         )
                                         if message is None:
                                             continue

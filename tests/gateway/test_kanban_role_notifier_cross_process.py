@@ -74,6 +74,13 @@ def test_separate_gateway_process_sends_completion_from_run_profile_once(
     tmp_path, monkeypatch,
 ):
     """The dispatch owner and role bot share only SQLite, never adapters."""
+    profile_home = tmp_path / "home"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "display:\n  language: ko\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cross-process.db"))
     monkeypatch.setattr(
         "hermes_cli.profiles.profiles_to_serve",
@@ -116,6 +123,10 @@ def test_separate_gateway_process_sends_completion_from_run_profile_once(
     asyncio.run(_run_one_role_delivery_tick(monkeypatch, sender))
 
     assert len(shinei.sent) == 1
+    assert shinei.sent[0]["text"].startswith("### 완료")
+    assert "**작업:**" in shinei.sent[0]["text"]
+    assert "**결과:**" in shinei.sent[0]["text"]
+    assert "### Completed" not in shinei.sent[0]["text"]
     assert "sent by the real Shinei bot" in shinei.sent[0]["text"]
     assert shinei.sent[0]["metadata"] == {"thread_id": "origin-thread"}
     assert coordinator.sent == []

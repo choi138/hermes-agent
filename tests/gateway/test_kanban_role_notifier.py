@@ -81,6 +81,7 @@ def _role_message(
     task_id="t_123",
     title="Lifecycle formatting",
     result=None,
+    language="en",
 ):
     return GatewayRunner._kanban_role_delivery_message(
         {"task_id": task_id},
@@ -88,6 +89,7 @@ def _role_message(
         SimpleNamespace(title=title, result=result),
         "engineering",
         "shinei",
+        language=language,
     )
 
 
@@ -122,6 +124,71 @@ def test_discord_role_delivery_progress_preserves_structured_markdown_and_legacy
     )
     assert _role_message("heartbeat", {"note": "  "}) is None
     assert "@shinei" not in structured + legacy
+
+
+def test_discord_role_delivery_uses_korean_subscriber_copy_and_normalizes_fields():
+    progress = _role_message(
+        "heartbeat",
+        {
+            "note": (
+                "**Current:** formatter\n"
+                "**Evidence:** 3 tests passed\n"
+                "```text\n**Next:** literal example\n```\n"
+                "**Next:** outbox"
+            )
+        },
+        language="ko",
+    )
+    completed = _role_message(
+        "completed",
+        {"summary": "검증 완료"},
+        title="수명주기 형식",
+        language="ko",
+    )
+
+    assert progress.startswith("### 진행 상황 · `t_123` · `[engineering]`")
+    assert "**현재 단계:** formatter" in progress
+    assert "**확인:** 3 tests passed" in progress
+    assert "**다음:** outbox" in progress
+    assert "```text\n**Next:** literal example\n```" in progress
+    assert completed == (
+        "### 완료 · `t_123` · `[engineering]`\n"
+        "**작업:** 수명주기 형식\n"
+        "**결과:**\n검증 완료"
+    )
+    for forbidden in (
+        "### Progress",
+        "### Completed",
+        "**Current:**",
+        "**Evidence:**",
+        "**Task:**",
+        "**Result:**",
+    ):
+        assert forbidden not in progress + completed
+
+
+def test_korean_role_delivery_translates_goal_mode_fixed_copy_from_worker_profile():
+    message = _role_message(
+        "heartbeat",
+        {
+            "note": (
+                "**Current stage:** Reviewing the task completion criteria\n"
+                "**Confirmed:** The completion criteria are not satisfied yet\n"
+                "**Next:** Continue toward the card's completion criteria"
+            )
+        },
+        language="ko",
+    )
+
+    assert "**현재 단계:** 작업 완료 조건을 검토하고 있습니다" in message
+    assert "**확인:** 완료 조건을 아직 충족하지 못했습니다" in message
+    assert "**다음:** 카드의 완료 조건을 충족할 때까지 계속 진행합니다" in message
+    for english_copy in (
+        "Reviewing the task completion criteria",
+        "The completion criteria are not satisfied yet",
+        "Continue toward the card's completion criteria",
+    ):
+        assert english_copy not in message
 
 
 def test_discord_progress_preserves_indented_code_and_trailing_markdown_spaces():

@@ -15813,26 +15813,77 @@ def _run_kanban_goal_loop_q(
     def _iteration_budget() -> tuple[int, int]:
         return iterations_used, total_iterations
 
+    from agent.i18n import get_language as _get_language, t as _t
+
+    _progress_language = _get_language()
+    _last_progress_turn = 0
+    _last_progress_verdict = ""
+
     def _progress(event: dict) -> None:
+        nonlocal _last_progress_turn, _last_progress_verdict
         if event.get("stage") != "judge":
             return
         from agent.redact import redact_sensitive_text as _redact_sensitive_text
 
-        verdict = str(event.get("verdict") or "continue").capitalize()
+        verdict = str(event.get("verdict") or "continue").strip().casefold()
+        try:
+            turn = max(1, int(event.get("turn") or 1))
+        except (TypeError, ValueError):
+            turn = 1
+        # Goal-mode can judge several continuation turns in quick succession.
+        # Emit the first semantic milestone, a changed verdict, or a periodic
+        # update every three turns; keep every judge decision in logs without
+        # multiplying Discord messages one-for-one.
+        if (
+            _last_progress_turn
+            and verdict == _last_progress_verdict
+            and turn - _last_progress_turn < 3
+        ):
+            return
         reason = _redact_sensitive_text(
             str(event.get("reason") or ""), force=True,
         ).strip()
+        if verdict == "done":
+            confirmed_key = "confirmed_done"
+            next_key = "next_done"
+        else:
+            confirmed_key = "confirmed_continue"
+            next_key = "next_continue"
         note_lines = [
-            f"**Goal step:** {event.get('turn')}/{event.get('max_turns')}",
-            f"**Judge:** {verdict}",
-        ]
-        if event.get("iterations_total") is not None:
-            note_lines.append(
-                "**Primary calls:** "
-                f"{event.get('iterations_used')}/{event.get('iterations_total')}"
+            "**"
+            + _t(
+                "gateway.kanban_role.field.current_stage",
+                lang=_progress_language,
             )
-        if reason:
-            note_lines.append(f"**Next:** {reason[:300]}")
+            + ":** "
+            + _t(
+                "gateway.kanban_role.goal.reviewing",
+                lang=_progress_language,
+            ),
+            "**"
+            + _t(
+                "gateway.kanban_role.field.confirmed",
+                lang=_progress_language,
+            )
+            + ":** "
+            + _t(
+                f"gateway.kanban_role.goal.{confirmed_key}",
+                lang=_progress_language,
+            ),
+            "**"
+            + _t(
+                "gateway.kanban_role.field.next",
+                lang=_progress_language,
+            )
+            + ":** "
+            + (
+                reason[:300]
+                or _t(
+                    f"gateway.kanban_role.goal.{next_key}",
+                    lang=_progress_language,
+                )
+            ),
+        ]
         c = _kb.connect()
         try:
             claim_lock = (_os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
@@ -15843,12 +15894,15 @@ def _run_kanban_goal_loop_q(
                 expected_run_id = int(raw_run_id) if raw_run_id else None
             except ValueError:
                 expected_run_id = None
-            _kb.heartbeat_worker(
+            emitted = _kb.heartbeat_worker(
                 c,
                 task_id,
                 note="\n".join(note_lines),
                 expected_run_id=expected_run_id,
             )
+            if emitted:
+                _last_progress_turn = turn
+                _last_progress_verdict = verdict
         finally:
             try:
                 c.close()
