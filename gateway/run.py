@@ -547,6 +547,37 @@ def _resolve_gateway_display_bool(
     return bool(value)
 
 
+def _resolve_gateway_tool_progress_mode(user_config: dict, platform_key: str) -> str:
+    """Resolve tool progress once so early and in-run paths cannot disagree."""
+    from gateway.display_config import resolve_display_setting
+
+    resolved = resolve_display_setting(user_config, platform_key, "tool_progress")
+    env_value = os.getenv("HERMES_TOOL_PROGRESS_MODE")
+    display = user_config.get("display") if isinstance(user_config, dict) else None
+    if not isinstance(display, dict):
+        display = {}
+    platforms = display.get("platforms") or {}
+    platform_config = platforms.get(platform_key) or {}
+    legacy_overrides = display.get("tool_progress_overrides") or {}
+    configured = (
+        "tool_progress" in display
+        or (
+            isinstance(platform_config, dict)
+            and "tool_progress" in platform_config
+        )
+        or (
+            isinstance(legacy_overrides, dict)
+            and platform_key in legacy_overrides
+        )
+    )
+    mode = (
+        env_value
+        if env_value and not configured
+        else (resolved or env_value or "all")
+    )
+    return str(mode).strip().lower()
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -10747,6 +10778,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _start_discord_semantic_progress(
+        self,
+        event: "MessageEvent",
+        source: "SessionSource",
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Send the first semantic snapshot before prompt/agent preparation.
+
+        This path is intentionally fail-soft. Progress visibility must never
+        block the actual request, and proxy runs retain their existing remote
+        progress contract.
+        """
+        if source.platform != Platform.DISCORD or self._get_proxy_url():
+            return None, None
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    user_config = _load_gateway_config()
+            else:
+                user_config = _load_gateway_config()
+            platform_key = _platform_config_key(source.platform)
+            mode = _resolve_gateway_tool_progress_mode(user_config, platform_key)
+            if mode not in {"all", "new"}:
+                return None, None
+
+            adapter = self._adapter_for_source(source)
+            if (
+                adapter is None
+                or type(adapter).edit_message is BasePlatformAdapter.edit_message
+            ):
+                return None, None
+
+            from gateway.progress_snapshot import SemanticProgressTracker
+
+            initial_text = SemanticProgressTracker().snapshot.render()
+            event_message_id = self._reply_anchor_for_event(event)
+            progress_thread_id = _resolve_progress_thread_id(
+                source.platform,
+                source.thread_id,
+                event_message_id,
+            )
+            metadata = (
+                self._thread_metadata_for_source(source, event_message_id)
+                if progress_thread_id == source.thread_id
+                else {"thread_id": progress_thread_id}
+            ) if progress_thread_id else None
+            metadata = _non_conversational_metadata(
+                metadata,
+                platform=source.platform,
+            )
+            result = await adapter.send(
+                chat_id=source.chat_id,
+                content=initial_text,
+                reply_to=None,
+                metadata=metadata,
+            )
+            if getattr(result, "success", False) and getattr(result, "message_id", None):
+                return str(result.message_id), initial_text
+        except Exception as exc:
+            logger.debug("Early Discord semantic progress failed: %s", exc)
+        return None, None
+
+    async def _cancel_discord_semantic_progress(
+        self,
+        source: "SessionSource",
+        message_id: Optional[str],
+    ) -> None:
+        """Close an early snapshot when preprocessing declines the request."""
+        if not message_id:
+            return
+        try:
+            from gateway.progress_snapshot import SemanticProgressTracker
+
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                await adapter.edit_message(
+                    chat_id=source.chat_id,
+                    message_id=message_id,
+                    content=SemanticProgressTracker().cancelled().render(),
+                )
+        except Exception as exc:
+            logger.debug("Discord semantic progress cancellation edit failed: %s", exc)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -10819,6 +10933,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                 )
         self._cache_session_source(session_key, source)
+        (
+            _semantic_progress_message_id,
+            _semantic_progress_text,
+        ) = await self._start_discord_semantic_progress(event, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -11547,6 +11665,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
         )
         if message_text is None:
+            await self._cancel_discord_semantic_progress(
+                source,
+                _semantic_progress_message_id,
+            )
             return
 
         # Capture the platform event time as message metadata and keep the
@@ -11625,6 +11747,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                semantic_progress_message_id=_semantic_progress_message_id,
+                semantic_progress_text=_semantic_progress_text,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -16966,6 +17090,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        semantic_progress_message_id: Optional[str] = None,
+        semantic_progress_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -16984,6 +17110,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                semantic_progress_message_id=semantic_progress_message_id,
+                semantic_progress_text=semantic_progress_text,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -16995,6 +17123,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                semantic_progress_message_id=semantic_progress_message_id,
+                semantic_progress_text=semantic_progress_text,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -17027,6 +17157,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        semantic_progress_message_id: Optional[str] = None,
+        semantic_progress_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17069,10 +17201,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
-        display_config = user_config.get("display", {})
-        if not isinstance(display_config, dict):
-            display_config = {}
-
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
         # display.<key> global, then built-in platform defaults.
@@ -17094,29 +17222,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
-        _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
-        _display_cfg = display_config if isinstance(display_config, dict) else {}
-        _platforms_cfg = _display_cfg.get("platforms") or {}
-        _platform_cfg = _platforms_cfg.get(platform_key) or {}
-        _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
-        _tool_progress_configured = (
-            "tool_progress" in _display_cfg
-            or (
-                isinstance(_platform_cfg, dict)
-                and "tool_progress" in _platform_cfg
-            )
-            or (
-                isinstance(_legacy_tp_overrides, dict)
-                and platform_key in _legacy_tp_overrides
-            )
-        )
-        progress_mode = (
-            _env_tp
-            if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
-        )
+        # Tool progress mode — resolved per-platform with env var fallback.
+        # The same helper is used by the early Discord snapshot path.
+        progress_mode = _resolve_gateway_tool_progress_mode(user_config, platform_key)
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -17164,6 +17272,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        semantic_progress_enabled = (
+            source.platform == Platform.DISCORD
+            and progress_mode in {"all", "new"}
+        )
+        semantic_progress_tracker = None
+        if semantic_progress_enabled:
+            from gateway.progress_snapshot import SemanticProgressTracker
+
+            semantic_progress_tracker = SemanticProgressTracker()
+            if semantic_progress_text is None and _interrupt_depth == 0:
+                # Direct callers (tests and internal entry points) do not pass
+                # the early message seed. Start the snapshot before agent
+                # construction from the sender task below.
+                semantic_progress_text = semantic_progress_tracker.snapshot.render()
+        else:
+            semantic_progress_message_id = None
+            semantic_progress_text = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -17287,7 +17412,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /verbose.  We only fire when (a) the user hasn't seen the hint
             # before and (b) /verbose is actually usable on this platform
             # (gateway gate must be open).  The CLI has its own trigger.
-            if event_type == "tool.completed" and not long_tool_hint_fired[0]:
+            if (
+                event_type == "tool.completed"
+                and not semantic_progress_enabled
+                and not long_tool_hint_fired[0]
+            ):
                 try:
                     duration = kwargs.get("duration") or 0
                     if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
@@ -17308,7 +17437,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
-                return
 
             # "_thinking" is assistant scratch text between tool calls.  It
             # is never ordinary tool progress: only relay it when the platform
@@ -17329,10 +17457,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not tool_progress_enabled:
                 return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in {"tool.started",}:
-                return
-
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
             # fires N "tool.started" events back-to-back before checking for
@@ -17348,6 +17472,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
             except Exception:
                 pass
+
+            if semantic_progress_enabled:
+                # Discord's default all/new surface is a fixed-vocabulary
+                # snapshot. Raw names, args, previews, and results never reach
+                # the chat; only successful completions advance Confirmed.
+                if event_type == "tool.started":
+                    snapshot = semantic_progress_tracker.tool_started(
+                        tool_name,
+                        preview,
+                        args,
+                    )
+                elif event_type == "tool.completed":
+                    snapshot = semantic_progress_tracker.tool_completed(
+                        tool_name,
+                        is_error=bool(kwargs.get("is_error", False)),
+                    )
+                else:
+                    return
+                progress_queue.put(("__snapshot__", snapshot.render()))
+                return
+
+            # Raw/friendly modes only render tool starts. Completion events are
+            # still consumed above for onboarding but remain invisible here.
+            if event_type != "tool.started":
+                return
 
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
@@ -17579,9 +17728,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                 return
 
-            progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
-            progress_msg_id = None   # ID of the current progress message to edit
-            can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
+            progress_lines = (
+                [semantic_progress_text]
+                if semantic_progress_enabled and semantic_progress_text
+                else []
+            )
+            progress_msg_id = (
+                semantic_progress_message_id
+                if semantic_progress_enabled
+                else None
+            )
+            # Semantic snapshots always coalesce into one editable Discord
+            # bubble, even if the legacy raw progress grouping is "separate".
+            can_edit = semantic_progress_enabled or progress_grouping != "separate"
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
@@ -17665,6 +17824,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _track_progress_result(result)
                 return result
 
+            if progress_msg_id is not None and _cleanup_progress:
+                _cleanup_msg_ids.append(str(progress_msg_id))
+            elif semantic_progress_enabled and progress_lines:
+                # Direct/internal callers have no early handler seed. Send this
+                # before the executor task constructs the agent, then edit the
+                # same message for all later phase changes.
+                initial_result = await _send_progress_text(
+                    _progress_text(progress_lines)
+                )
+                if initial_result.success and initial_result.message_id:
+                    progress_msg_id = str(initial_result.message_id)
+
             async def _roll_progress_overflow_if_needed() -> bool:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
 
@@ -17730,7 +17901,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
                     # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                    if isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__snapshot__":
+                        _, snapshot_text = raw
+                        progress_lines = [snapshot_text]
+                        msg = snapshot_text
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -17852,7 +18027,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__snapshot__":
+                                _, snapshot_text = raw
+                                progress_lines = [snapshot_text]
+                                await _roll_progress_overflow_if_needed()
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"

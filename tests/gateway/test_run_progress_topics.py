@@ -206,6 +206,65 @@ class DelayedProgressAgent:
         }
 
 
+class SemanticLifecycleAgent:
+    """Emits success and failure lifecycle events with sensitive raw data."""
+
+    adapter_probe = None
+    initial_visible_before_init = False
+
+    def __init__(self, **kwargs):
+        adapter = type(self).adapter_probe
+        type(self).initial_visible_before_init = bool(
+            adapter
+            and adapter.sent
+            and "**Current stage:**" in adapter.sent[0]["content"]
+        )
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started",
+            "kanban_show",
+            "private-board token=started-secret",
+            {"board": "private-board", "token": "started-secret"},
+        )
+        time.sleep(0.35)
+        cb(
+            "tool.completed",
+            "kanban_show",
+            None,
+            None,
+            is_error=False,
+            result="board contents token=completed-secret",
+            duration=0.1,
+        )
+        time.sleep(0.35)
+        cb(
+            "tool.started",
+            "terminal",
+            "scripts/run_tests.sh tests/private -q password=test-secret",
+            {"command": "scripts/run_tests.sh tests/private -q password=test-secret"},
+        )
+        cb(
+            "tool.completed",
+            "terminal",
+            None,
+            None,
+            is_error=True,
+            result="failed password=result-secret",
+            duration=0.1,
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class ManyProgressLinesAgent:
     """Emits enough tool-progress lines to exceed a single platform bubble."""
 
@@ -766,6 +825,9 @@ async def _run_with_agent(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = adapter_cls(platform=platform)
+    if hasattr(agent_cls, "adapter_probe"):
+        agent_cls.adapter_probe = adapter
+        agent_cls.initial_visible_before_init = False
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
@@ -798,6 +860,157 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_discord_semantic_progress_is_early_safe_and_edit_in_place(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SemanticLifecycleAgent,
+        session_id="sess-discord-semantic-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm-semantic",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert SemanticLifecycleAgent.initial_visible_before_init is True
+    assert adapter.sent[0]["metadata"] == {"non_conversational": True}
+    assert all(
+        field in adapter.sent[0]["content"]
+        for field in ("**Current stage:**", "**Confirmed:**", "**Next:**")
+    )
+    assert adapter.edits
+    assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+
+    rendered = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    for raw_value in (
+        "kanban_show",
+        "private-board",
+        "started-secret",
+        "completed-secret",
+        "tests/private",
+        "test-secret",
+        "result-secret",
+    ):
+        assert raw_value not in rendered
+    assert "Inspection completed successfully" in rendered
+    # The later failed verification must preserve the last successful evidence.
+    assert "Verification found a problem" in rendered
+    assert "**Confirmed:** Inspection completed successfully" in rendered
+
+
+@pytest.mark.asyncio
+async def test_discord_handler_seed_is_non_conversational_and_closes_on_cancel(
+    monkeypatch,
+    tmp_path,
+):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"tool_progress": "all"}}),
+        encoding="utf-8",
+    )
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="discord-dm-early-seed",
+        chat_type="dm",
+        thread_id=None,
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="discord-user-message",
+    )
+
+    message_id, initial_text = await runner._start_discord_semantic_progress(
+        event,
+        source,
+    )
+
+    assert message_id == "progress-1"
+    assert initial_text == adapter.sent[0]["content"]
+    assert adapter.sent[0]["metadata"] == {"non_conversational": True}
+    await runner._cancel_discord_semantic_progress(source, message_id)
+    assert adapter.edits[-1]["message_id"] == "progress-1"
+    assert "**Current stage:** Request stopped" in adapter.edits[-1]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "log"])
+async def test_discord_semantic_progress_preserves_silent_modes(
+    monkeypatch,
+    tmp_path,
+    mode,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id=f"sess-discord-progress-{mode}",
+        config_data={
+            "display": {
+                "tool_progress": mode,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id=f"discord-dm-{mode}",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_discord_verbose_progress_keeps_existing_raw_contract(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-discord-progress-verbose",
+        config_data={
+            "display": {
+                "tool_progress": "verbose",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm-verbose",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    rendered = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert "terminal" in rendered
+    assert "pwd" in rendered
+    assert "**Current stage:**" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1244,17 +1457,17 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     session_key = "agent:main:discord:dm:dm-1"
     runner._session_run_generation[session_key] = 1
 
-    original_send = adapter.send
+    original_edit = adapter.edit_message
     invalidated = {"done": False}
 
-    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
-        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
-        if "first command" in content and not invalidated["done"]:
+    async def edit_and_invalidate(chat_id, message_id, content):
+        result = await original_edit(chat_id, message_id, content)
+        if "Inspecting the current state" in content and not invalidated["done"]:
             invalidated["done"] = True
             runner._invalidate_session_run_generation(session_key, reason="test_stop")
         return result
 
-    adapter.send = send_and_invalidate
+    adapter.edit_message = edit_and_invalidate
 
     result = await runner._run_agent(
         message="hello",
@@ -1269,8 +1482,20 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     all_progress_text = " ".join(call["content"] for call in adapter.sent)
     all_progress_text += " ".join(call["content"] for call in adapter.edits)
     assert result["final_response"] == "done"
-    assert 'first command' in all_progress_text
-    assert 'second command' not in all_progress_text
+    assert invalidated["done"] is True
+    assert "Preparing the request" in all_progress_text
+    assert "Inspecting the current state" in all_progress_text
+    assert "first command" not in all_progress_text
+    assert "second command" not in all_progress_text
+    # Cancellation may perform one final idempotent flush of the current
+    # snapshot, but no later semantic state may be rendered.
+    assert {
+        call["content"] for call in adapter.edits
+    } == {
+        "**Current stage:** Inspecting the current state\n"
+        "**Confirmed:** Request received\n"
+        "**Next:** Use the inspection results to identify the next safe action"
+    }
 
 
 @pytest.mark.asyncio
