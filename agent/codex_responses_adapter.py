@@ -23,6 +23,34 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 logger = logging.getLogger(__name__)
 
 
+class CodexStreamIncompleteError(RuntimeError):
+    """Typed terminal stream failure with safe-retry diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        status: str,
+        streamed_chars: int,
+        output_item_count: int,
+        has_tool_items: bool,
+        partial_text: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.streamed_chars = max(streamed_chars, 0)
+        self.output_item_count = max(output_item_count, 0)
+        self.has_tool_items = has_tool_items
+        self.partial_text = partial_text
+        self.safe_to_retry = (
+            self.streamed_chars == 0
+            and not self.partial_text
+            and not self.has_tool_items
+        )
+
+
 def _classify_responses_issuer(
     *,
     is_xai_responses: bool = False,
@@ -1064,6 +1092,50 @@ def _format_responses_error(error_obj: Any, response_status: str) -> str:
     return f"Responses API returned status '{response_status}'"
 
 
+def _responses_error_code(error_obj: Any) -> str:
+    """Return a normalized Responses error code from dict/SDK payloads."""
+    if isinstance(error_obj, dict):
+        code = error_obj.get("code")
+    else:
+        code = getattr(error_obj, "code", None) if error_obj is not None else None
+    return str(code).strip().lower() if code is not None else ""
+
+
+def _stream_failure_diagnostics(response: Any, output: Any) -> dict[str, Any]:
+    """Collect only the data needed to decide whether a retry is side-effect safe."""
+    output_items = output if isinstance(output, list) else []
+    partial_text = getattr(response, "output_text", None)
+    if not isinstance(partial_text, str):
+        partial_text = ""
+    if not partial_text:
+        partial_text = "".join(
+            _extract_responses_message_text(item)
+            for item in output_items
+            if getattr(item, "type", None) == "message"
+        )
+
+    streamed_chars = getattr(response, "_hermes_streamed_chars", None)
+    if not isinstance(streamed_chars, int) or isinstance(streamed_chars, bool):
+        streamed_chars = len(partial_text)
+
+    has_tool_items = bool(getattr(response, "_hermes_has_tool_items", False))
+    if not has_tool_items:
+        for item in output_items:
+            item_type = getattr(item, "type", None)
+            if isinstance(item_type, str) and (
+                item_type == "function_call" or item_type.endswith("_call")
+            ):
+                has_tool_items = True
+                break
+
+    return {
+        "streamed_chars": streamed_chars,
+        "output_item_count": len(output_items),
+        "has_tool_items": has_tool_items,
+        "partial_text": partial_text.strip(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Full response normalization
 # ---------------------------------------------------------------------------
@@ -1081,6 +1153,26 @@ def _normalize_codex_response(
     the item instead of triggering HTTP 400 invalid_encrypted_content.
     """
     output = getattr(response, "output", None)
+    response_status = getattr(response, "status", None)
+    if isinstance(response_status, str):
+        response_status = response_status.strip().lower()
+    else:
+        response_status = None
+
+    if response_status in {"failed", "cancelled"}:
+        error_obj = getattr(response, "error", None)
+        error_msg = _format_responses_error(error_obj, response_status)
+        error_code = _responses_error_code(error_obj)
+        if error_code == "stream_incomplete":
+            diagnostics = _stream_failure_diagnostics(response, output)
+            raise CodexStreamIncompleteError(
+                error_msg,
+                code=error_code,
+                status=response_status,
+                **diagnostics,
+            )
+        raise RuntimeError(error_msg)
+
     if not isinstance(output, list) or not output:
         # The Codex backend can return empty output when the answer was
         # delivered entirely via stream events. Check output_text as a
@@ -1098,17 +1190,6 @@ def _normalize_codex_response(
             response.output = output
         else:
             raise RuntimeError("Responses API returned no output items")
-
-    response_status = getattr(response, "status", None)
-    if isinstance(response_status, str):
-        response_status = response_status.strip().lower()
-    else:
-        response_status = None
-
-    if response_status in {"failed", "cancelled"}:
-        error_obj = getattr(response, "error", None)
-        error_msg = _format_responses_error(error_obj, response_status)
-        raise RuntimeError(error_msg)
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []

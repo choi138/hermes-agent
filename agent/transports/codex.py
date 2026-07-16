@@ -433,6 +433,15 @@ class ResponsesApiTransport(ProviderTransport):
         """
         if response is None:
             return False
+        status = str(getattr(response, "status", "") or "").strip().lower()
+        if status in {"failed", "cancelled"}:
+            from agent.codex_responses_adapter import _responses_error_code
+
+            # Let normalization raise the typed interruption so the outer
+            # conversation loop can apply side-effect-aware recovery. Other
+            # terminal failures retain the existing retry/fallback path.
+            if _responses_error_code(getattr(response, "error", None)) == "stream_incomplete":
+                return True
         output = getattr(response, "output", None)
         if not isinstance(output, list) or not output:
             return False

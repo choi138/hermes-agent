@@ -810,6 +810,9 @@ def _consume_codex_event_stream(
         model=model,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
+        _hermes_streamed_chars=len(assembled_text),
+        _hermes_output_item_count=len(output),
+        _hermes_has_tool_items=has_tool_calls,
     )
     return final
 

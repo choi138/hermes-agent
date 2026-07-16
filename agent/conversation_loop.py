@@ -27,7 +27,10 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.codex_responses_adapter import (
+    CodexStreamIncompleteError,
+    _summarize_user_message_for_log,
+)
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -72,6 +75,8 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_CODEX_STREAM_RECOVERY_LIMIT = 2
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -608,6 +613,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    codex_stream_recovery_attempts = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -4229,6 +4235,7 @@ def run_conversation(
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
+            codex_stream_recovery_attempts = 0
             assistant_message = normalized
             finish_reason = normalized.finish_reason
             
@@ -5233,6 +5240,87 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except CodexStreamIncompleteError as e:
+            if e.safe_to_retry and codex_stream_recovery_attempts < _CODEX_STREAM_RECOVERY_LIMIT:
+                codex_stream_recovery_attempts += 1
+                wait_time = jittered_backoff(
+                    codex_stream_recovery_attempts,
+                    base_delay=0.5,
+                    max_delay=2.0,
+                )
+                logger.warning(
+                    "Retryable Codex stream interruption "
+                    "(attempt=%d/%d code=%s status=%s streamed_chars=%d "
+                    "output_items=%d tool_items=%s backoff=%.2fs)",
+                    codex_stream_recovery_attempts,
+                    _CODEX_STREAM_RECOVERY_LIMIT,
+                    e.code,
+                    e.status,
+                    e.streamed_chars,
+                    e.output_item_count,
+                    e.has_tool_items,
+                    wait_time,
+                )
+                agent._buffer_status(
+                    "⚠️ Model stream disconnected before producing output — retrying safely..."
+                )
+                # A zero-output transport retry is one logical model step, like
+                # run_codex_stream's internal connection retry. Preserve the
+                # physical attempt in logs while refunding loop/budget counts.
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                agent.iteration_budget.refund()
+                if not agent._interrupt_requested and wait_time > 0:
+                    agent._touch_activity(
+                        f"Codex stream recovery ({codex_stream_recovery_attempts}/"
+                        f"{_CODEX_STREAM_RECOVERY_LIMIT})"
+                    )
+                    time.sleep(wait_time)
+                continue
+
+            if e.safe_to_retry:
+                failure_text = (
+                    "Codex response stream ended before completion after "
+                    f"{_CODEX_STREAM_RECOVERY_LIMIT} safe retries."
+                )
+                logger.warning(
+                    "Codex stream recovery limit exhausted "
+                    "(code=%s status=%s streamed_chars=%d output_items=%d)",
+                    e.code,
+                    e.status,
+                    e.streamed_chars,
+                    e.output_item_count,
+                )
+            else:
+                failure_text = e.partial_text or (
+                    "Codex response stream ended after partial output; "
+                    "automatic retry was skipped to avoid duplicate actions."
+                )
+                logger.warning(
+                    "Codex stream interruption not retried after partial output "
+                    "(code=%s status=%s streamed_chars=%d output_items=%d "
+                    "tool_items=%s)",
+                    e.code,
+                    e.status,
+                    e.streamed_chars,
+                    e.output_item_count,
+                    e.has_tool_items,
+                )
+
+            agent._emit_status(
+                "⚠️ Model stream ended before completion; no unsafe retry was performed."
+            )
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": failure_text,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "partial": True,
+                "failed": True,
+                "error": str(e),
+            }
+
         except Exception as e:
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
