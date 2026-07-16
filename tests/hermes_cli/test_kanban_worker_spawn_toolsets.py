@@ -335,7 +335,7 @@ def test_default_ssh_profile_uses_local_scratch_for_real_file_and_terminal_tools
             sys.executable,
             "-c",
             (
-                "import json, os; import cli; "
+                "import json, os; import cli; import run_agent; "
                 "from tools.terminal_tool import _get_env_config, terminal_tool; "
                 "from tools.file_tools import write_file_tool; "
                 "cfg = _get_env_config(); "

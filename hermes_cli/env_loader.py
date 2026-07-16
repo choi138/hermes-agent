@@ -66,6 +66,10 @@ def _capture_kanban_worker_runtime_pins() -> dict[str, str]:
 
 def _restore_kanban_worker_runtime_pins(pins: dict[str, str]) -> None:
     if not pins:
+        # The execution marker is a dispatcher-issued process capability, not
+        # profile configuration.  Do not let a copied/user-edited ``.env``
+        # manufacture one for an ordinary CLI session.
+        os.environ.pop(_KANBAN_EXECUTION_BACKEND_ENV, None)
         return
 
     # A profile .env may contain stale process-role variables from a copied
@@ -80,6 +84,17 @@ def _restore_kanban_worker_runtime_pins(pins: dict[str, str]) -> None:
         ) and key not in pins:
             os.environ.pop(key, None)
     os.environ.update(pins)
+
+    # ``load_hermes_dotenv`` is intentionally callable more than once during
+    # startup.  In particular, ``cli`` applies the Kanban execution contract
+    # and the later lazy import of ``run_agent`` loads the same profile .env
+    # again.  That second load used to reactivate TERMINAL_ENV=ssh after the
+    # CLI had correctly selected local execution, so the first real file tool
+    # call still ran on the assignee's remote machine.  Reapply the complete
+    # workspace/backend contract after *every* dotenv/managed-env overlay.
+    from hermes_cli.kanban_runtime import apply_worker_execution_contract
+
+    apply_worker_execution_contract(os.environ)
 
 
 def get_secret_source(env_var: str) -> str | None:

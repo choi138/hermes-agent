@@ -118,6 +118,10 @@ def test_kanban_worker_runtime_pins_survive_profile_dotenv(tmp_path, monkeypatch
             "HERMES_PROFILE=wrong\n"
             "HERMES_KANBAN_TASK=t_wrong\n"
             "HERMES_KANBAN_WORKSPACE=/wrong/workspace\n"
+            "TERMINAL_ENV=ssh\n"
+            "TERMINAL_CWD=/wrong/workspace\n"
+            "TERMINAL_SSH_HOST=mac.example\n"
+            "TERMINAL_SSH_USER=wrong-user\n"
             "_HERMES_FORCE_OPENAI_API_KEY=dummy-profile-value\n"
         ),
         encoding="utf-8",
@@ -128,6 +132,7 @@ def test_kanban_worker_runtime_pins_survive_profile_dotenv(tmp_path, monkeypatch
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_runtime")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     monkeypatch.delenv("_HERMES_FORCE_OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(workspace)
 
     load_hermes_dotenv(hermes_home=home)
 
@@ -136,6 +141,24 @@ def test_kanban_worker_runtime_pins_survive_profile_dotenv(tmp_path, monkeypatch
     assert os.environ["HERMES_PROFILE"] == "default"
     assert os.environ["HERMES_KANBAN_TASK"] == "t_runtime"
     assert os.environ["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert os.environ["TERMINAL_ENV"] == "local"
+    assert os.environ["TERMINAL_CWD"] == str(workspace)
+    assert "TERMINAL_SSH_HOST" not in os.environ
+    assert "TERMINAL_SSH_USER" not in os.environ
     assert "_HERMES_GATEWAY" not in os.environ
     # Provider passthrough markers are profile identity, not process-role state.
     assert os.environ["_HERMES_FORCE_OPENAI_API_KEY"] == "dummy-profile-value"
+
+
+def test_dotenv_cannot_introduce_kanban_execution_capability(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "_HERMES_KANBAN_EXECUTION_BACKEND=local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("_HERMES_KANBAN_EXECUTION_BACKEND", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert "_HERMES_KANBAN_EXECUTION_BACKEND" not in os.environ
