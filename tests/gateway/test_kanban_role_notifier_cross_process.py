@@ -4,6 +4,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -118,6 +119,116 @@ def test_separate_gateway_process_sends_completion_from_run_profile_once(
     assert "sent by the real Shinei bot" in shinei.sent[0]["text"]
     assert shinei.sent[0]["metadata"] == {"thread_id": "origin-thread"}
     assert coordinator.sent == []
+
+
+def test_multiplexer_sends_secondary_profile_delivery_with_owned_adapter(
+    tmp_path, monkeypatch,
+):
+    """One multiplex process consumes rows for each bot it actually owns."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "multiplex.db"))
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [
+            ("default", tmp_path / "default"),
+            ("shinei", tmp_path / "profiles" / "shinei"),
+        ],
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="multiplex role delivery", assignee="shinei",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="guild-channel",
+            thread_id="origin-thread",
+            notifier_profile="default",
+        )
+        kb.claim_task(conn, task_id)
+        kb.complete_task(conn, task_id, summary="sent by multiplexed Shinei")
+    finally:
+        conn.close()
+
+    coordinator = RecordingAdapter()
+    shinei = RecordingAdapter()
+    runner = _make_discord_runner(
+        coordinator,
+        profile_adapters={"shinei": {Platform.DISCORD: shinei}},
+        active_profile="default",
+    )
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_role_delivery_tick(monkeypatch, runner))
+
+    assert coordinator.sent == []
+    assert len(shinei.sent) == 1
+    assert "sent by multiplexed Shinei" in shinei.sent[0]["text"]
+    assert shinei.sent[0]["metadata"] == {"thread_id": "origin-thread"}
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT sender_profile, status, text_delivered "
+            "FROM kanban_role_deliveries"
+        ).fetchone()
+        assert tuple(row) == ("shinei", "delivered", 1)
+    finally:
+        conn.close()
+
+
+def test_non_multiplex_gateway_does_not_consume_injected_secondary_map(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "not-multiplex.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="foreign map stays pending", assignee="shinei",
+        )
+        assert kb.claim_task(conn, task_id) is not None
+        event = conn.execute(
+            "SELECT id, kind FROM task_events WHERE task_id = ? "
+            "AND run_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        kb.enqueue_role_delivery(
+            conn,
+            event_id=event["id"],
+            task_id=task_id,
+            event_kind=event["kind"],
+            platform="discord",
+            chat_id="channel",
+            thread_id=None,
+            sender_profile="shinei",
+            notifier_profile="default",
+            message="must not send",
+        )
+    finally:
+        conn.close()
+
+    shinei = RecordingAdapter()
+    runner = _make_discord_runner(
+        RecordingAdapter(),
+        profile_adapters={"shinei": {Platform.DISCORD: shinei}},
+        active_profile="default",
+    )
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    asyncio.run(_run_one_role_delivery_tick(monkeypatch, runner))
+
+    assert shinei.sent == []
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT status FROM kanban_role_deliveries"
+        ).fetchone()[0] == "pending"
+    finally:
+        conn.close()
 
 
 def test_two_isolated_interpreters_share_only_sqlite_for_role_delivery(

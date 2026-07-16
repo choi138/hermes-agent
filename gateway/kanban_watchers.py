@@ -1129,36 +1129,69 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(1)
 
     async def _kanban_role_delivery_watcher(self, interval: float = 5.0) -> None:
-        """Send durable Discord lifecycle handoffs owned by this process profile.
+        """Send durable Discord lifecycle handoffs through locally-owned bots.
 
         Every gateway may run this lightweight consumer, including named-profile
-        gateways with ``kanban.dispatch_in_gateway=false``. It never dispatches
-        workers or scans task events; it only leases rows addressed to its exact
-        active profile and sends them through that profile's local Discord
-        adapter. The board DB is the sole cross-process handoff.
+        gateways with ``kanban.dispatch_in_gateway=false``. A normal gateway
+        consumes only rows for its exact active profile. The default profile
+        multiplexer may additionally consume rows for profiles whose Discord
+        adapters it started and owns in ``_profile_adapters``. It never resolves
+        an arbitrary foreign adapter, dispatches workers, or scans task events.
+        The board DB is the sole cross-process handoff.
         """
         from gateway.config import Platform as _Platform
         from hermes_cli import kanban_db as _kb
 
-        profile = (
+        boot_profile = (
             (getattr(self, "_kanban_notifier_profile", None) or "").strip()
         )
-        if not profile:
+        if not boot_profile:
             logger.warning(
                 "kanban role sender: boot profile is blank; sender disabled"
             )
             return
-        claimant = f"{profile}:{os.getpid()}:{id(self)}"
 
         await asyncio.sleep(5)
         while self._running:
-            # The outbox consumer is deliberately process-local. The profile
-            # was captured at boot and the only permissible sender is this
-            # gateway's own active Discord adapter map; never consult the
-            # multiplex/authorization resolver for another bot.
-            adapter = (getattr(self, "adapters", None) or {}).get(_Platform.DISCORD)
-            if adapter is not None:
-                def _claim():
+            # Build the sender set only from adapters this process connected
+            # itself. The primary map is bound to the immutable boot profile.
+            # Secondary maps are eligible only when this runner is the explicit
+            # profile multiplexer; never consult the authorization resolver or
+            # any global adapter registry for a requested sender identity.
+            sender_targets: list[tuple[str, Any]] = []
+            primary_adapter = (
+                getattr(self, "adapters", None) or {}
+            ).get(_Platform.DISCORD)
+            if primary_adapter is not None:
+                sender_targets.append((boot_profile, primary_adapter))
+
+            multiplex_enabled = bool(
+                getattr(
+                    getattr(self, "config", None),
+                    "multiplex_profiles",
+                    False,
+                )
+            )
+            if multiplex_enabled:
+                seen_profiles = {boot_profile}
+                profile_adapters = getattr(self, "_profile_adapters", None) or {}
+                for raw_profile, adapter_map in sorted(profile_adapters.items()):
+                    sender_profile = str(raw_profile or "").strip()
+                    if not sender_profile or sender_profile in seen_profiles:
+                        continue
+                    adapter = (adapter_map or {}).get(_Platform.DISCORD)
+                    if adapter is None:
+                        continue
+                    seen_profiles.add(sender_profile)
+                    sender_targets.append((sender_profile, adapter))
+
+            for sender_profile, current_adapter in sender_targets:
+                claimant = f"{sender_profile}:{os.getpid()}:{id(self)}"
+
+                def _claim(
+                    profile: str = sender_profile,
+                    claim_owner: str = claimant,
+                ):
                     claimed: list[dict] = []
                     try:
                         boards = _kb.list_boards(include_archived=False)
@@ -1190,7 +1223,7 @@ class GatewayKanbanWatchersMixin:
                                 conn,
                                 sender_profile=profile,
                                 platform="discord",
-                                claimant=claimant,
+                                claimant=claim_owner,
                                 limit=1,
                             )
                             for row in rows:
@@ -1214,24 +1247,6 @@ class GatewayKanbanWatchersMixin:
                     metadata: dict[str, Any] = {}
                     if delivery.get("thread_id"):
                         metadata["thread_id"] = delivery["thread_id"]
-                    current_adapter = (
-                        getattr(self, "adapters", None) or {}
-                    ).get(_Platform.DISCORD)
-                    if current_adapter is None:
-                        try:
-                            await asyncio.to_thread(
-                                self._kanban_retry_role_delivery,
-                                delivery,
-                                claim_token,
-                                "adapter_unavailable",
-                                board_slug,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "kanban role sender: failed to release unavailable-adapter lease %s: %s",
-                                delivery["id"], exc,
-                            )
-                        break
                     lease_stop = asyncio.Event()
                     lease_lost = asyncio.Event()
                     lease_task = asyncio.create_task(
@@ -1298,7 +1313,8 @@ class GatewayKanbanWatchersMixin:
                     except Exception as exc:
                         logger.warning(
                             "kanban role sender: %s event for %s failed via profile %s: %s",
-                            delivery["event_kind"], delivery["task_id"], profile, exc,
+                            delivery["event_kind"], delivery["task_id"],
+                            sender_profile, exc,
                         )
                         try:
                             await asyncio.to_thread(
@@ -1336,8 +1352,8 @@ class GatewayKanbanWatchersMixin:
                         else:
                             logger.debug(
                                 "kanban role sender: delivered %s event for %s via profile %s on board %s",
-                                delivery["event_kind"], delivery["task_id"], profile,
-                                board_slug,
+                                delivery["event_kind"], delivery["task_id"],
+                                sender_profile, board_slug,
                             )
                     finally:
                         lease_stop.set()
