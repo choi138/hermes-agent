@@ -17,11 +17,22 @@ logger = logging.getLogger(__name__)
 
 KANBAN_TASK_SCHEMA = {
     "name": "kanban_task",
-    "description": "Queue durable work; report results here.",
+    "description": (
+        "Create needs title; status/update/retry need task_id; "
+        "update allows title/body/priority."
+    ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["create", "status", "update", "retry"],
+                "default": "create",
+            },
+            "task_id": {
+                "type": "string",
+            },
             "title": {
                 "type": "string",
             },
@@ -39,20 +50,16 @@ KANBAN_TASK_SCHEMA = {
             "goal_max_turns": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Goal-mode turn cap.",
             },
             "max_retries": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Failures before blocking.",
             },
             "max_runtime_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Attempt timeout in seconds.",
             },
         },
-        "required": ["title"],
     },
 }
 
@@ -118,6 +125,10 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _json_digest(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
 def _resolve_assignee(config: dict[str, Any], source: Any) -> str:
     kanban_cfg = config.get("kanban")
     if not isinstance(kanban_cfg, dict):
@@ -167,6 +178,161 @@ def _handle_kanban_task(args: dict[str, Any], **_kwargs: Any) -> str:
     if not source.profile or not source.chat_id or not source.user_id or not source.message_id:
         return tool_error("kanban_task trusted Discord source is incomplete")
 
+    operation = str(args.get("operation") or "create").strip().lower()
+    if operation not in {"create", "status", "update", "retry"}:
+        return tool_error("operation must be create, status, update, or retry")
+    task_id = str(args.get("task_id") or "").strip()
+    if operation != "create" and not task_id:
+        return tool_error(f"task_id is required for {operation}")
+    if operation == "create" and task_id:
+        return tool_error("create does not accept field(s): task_id")
+
+    unknown = set(args) - set(KANBAN_TASK_SCHEMA["parameters"]["properties"])
+    if unknown:
+        return tool_error(
+            "kanban_task does not accept server-owned field(s): "
+            + ", ".join(sorted(str(name) for name in unknown))
+        )
+
+    source_context = _trusted_source_context(source)
+    idempotency_key = f"gateway-intake:{_json_digest(source_context)}"
+
+    if operation == "status":
+        invalid = set(args) - {"operation", "task_id"}
+        if invalid:
+            return tool_error(
+                "status does not accept field(s): "
+                + ", ".join(sorted(str(name) for name in invalid))
+            )
+        try:
+            config = load_config()
+            if not _kanban_enabled_for_discord(config):
+                return tool_error("Kanban intake is not enabled for Discord")
+
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_intake
+
+            with kb.connect_closing() as conn:
+                payload = kanban_intake.status_task(
+                    conn,
+                    task_id=task_id,
+                    source_context=source_context,
+                    idempotency_key=idempotency_key,
+                    request_hash=_json_digest(
+                        {"operation": "status", "task_id": task_id}
+                    ),
+                )
+            return json.dumps(
+                {"ok": True, "operation": "status", **payload},
+                ensure_ascii=False,
+            )
+        except ValueError as exc:
+            return tool_error(f"kanban_task: {exc}")
+        except Exception as exc:
+            logger.exception("kanban_task status failed")
+            return tool_error(f"kanban_task: {exc}")
+
+    if operation == "update":
+        invalid = set(args) - {"operation", "task_id", "title", "body", "priority"}
+        if invalid:
+            return tool_error(
+                "update does not accept field(s): "
+                + ", ".join(sorted(str(name) for name in invalid))
+            )
+        changes: dict[str, Any] = {}
+        if "title" in args:
+            title = str(args.get("title") or "").strip()
+            if not title:
+                return tool_error("title is required")
+            changes["title"] = title
+        if "body" in args:
+            body = str(args.get("body") or "").strip()
+            changes["body"] = body or None
+        if "priority" in args:
+            priority, error = _priority(args)
+            if error:
+                return tool_error(error)
+            changes["priority"] = priority
+        if not changes:
+            return tool_error("update requires title, body, or priority")
+
+        try:
+            config = load_config()
+            if not _kanban_enabled_for_discord(config):
+                return tool_error("Kanban intake is not enabled for Discord")
+
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_intake
+
+            with kb.connect_closing() as conn:
+                payload = kanban_intake.update_task(
+                    conn,
+                    task_id=task_id,
+                    source_context=source_context,
+                    changes=changes,
+                    idempotency_key=idempotency_key,
+                    request_hash=_json_digest(
+                        {"operation": "update", "task_id": task_id, **changes}
+                    ),
+                )
+            return json.dumps(
+                {"ok": True, "operation": "update", **payload},
+                ensure_ascii=False,
+            )
+        except ValueError as exc:
+            return tool_error(f"kanban_task: {exc}")
+        except Exception as exc:
+            logger.exception("kanban_task update failed")
+            return tool_error(f"kanban_task: {exc}")
+
+    if operation == "retry":
+        invalid = set(args) - {"operation", "task_id"}
+        if invalid:
+            return tool_error(
+                "retry does not accept field(s): "
+                + ", ".join(sorted(str(name) for name in invalid))
+            )
+        try:
+            config = load_config()
+            if not _kanban_enabled_for_discord(config):
+                return tool_error("Kanban intake is not enabled for Discord")
+
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_intake
+
+            with kb.connect_closing() as conn:
+                payload = kanban_intake.retry_task(
+                    conn,
+                    task_id=task_id,
+                    source_context=source_context,
+                    idempotency_key=idempotency_key,
+                    request_hash=_json_digest(
+                        {"operation": "retry", "task_id": task_id}
+                    ),
+                )
+
+            dispatch_woken = False
+            if source.dispatch_wake is not None:
+                try:
+                    source.dispatch_wake()
+                    dispatch_woken = True
+                except Exception:
+                    logger.warning("kanban_task retry dispatcher wake failed", exc_info=True)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "operation": "retry",
+                    **payload,
+                    "dispatcher_woken": dispatch_woken,
+                },
+                ensure_ascii=False,
+            )
+        except ValueError as exc:
+            return tool_error(f"kanban_task: {exc}")
+        except Exception as exc:
+            logger.exception("kanban_task retry failed")
+            return tool_error(f"kanban_task: {exc}")
+
     title = str(args.get("title") or "").strip()
     if not title:
         return tool_error("title is required")
@@ -191,13 +357,6 @@ def _handle_kanban_task(args: dict[str, Any], **_kwargs: Any) -> str:
     if error:
         return tool_error(error)
 
-    unknown = set(args) - set(KANBAN_TASK_SCHEMA["parameters"]["properties"])
-    if unknown:
-        return tool_error(
-            "kanban_task does not accept server-owned field(s): "
-            + ", ".join(sorted(str(name) for name in unknown))
-        )
-
     request = {
         "title": title,
         "body": body,
@@ -207,17 +366,11 @@ def _handle_kanban_task(args: dict[str, Any], **_kwargs: Any) -> str:
         "max_retries": max_retries,
         "max_runtime_seconds": max_runtime_seconds,
     }
-    source_context = _trusted_source_context(source)
-    request_hash = hashlib.sha256(_canonical_json(request).encode("utf-8")).hexdigest()
+    request_hash = _json_digest(request)
     # One admitted Discord message owns at most one intake receipt. Keep the
     # request digest separate so a response-loss retry deduplicates, while a
     # second call from the same message with changed content fails closed
     # instead of silently creating another card.
-    idempotency_hash = hashlib.sha256(
-        _canonical_json(source_context).encode("utf-8")
-    ).hexdigest()
-    idempotency_key = f"gateway-intake:{idempotency_hash}"
-
     try:
         config = load_config()
         if not _kanban_enabled_for_discord(config):

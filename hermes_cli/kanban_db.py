@@ -1628,6 +1628,19 @@ CREATE TABLE IF NOT EXISTS kanban_intake_receipts (
     created_at      INTEGER NOT NULL
 );
 
+-- Idempotent receipts for gateway-owned status/update/retry operations. The
+-- result snapshot shares the mutation's commit boundary so response-loss
+-- replay cannot apply an operation twice.
+CREATE TABLE IF NOT EXISTS kanban_intake_operations (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash    TEXT NOT NULL,
+    operation       TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    source_context  TEXT NOT NULL,
+    result_json     TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
 -- Durable cross-process handoff for role-authored lifecycle messages. The
 -- dispatch-owning gateway renders and enqueues a delivery; the gateway process
 -- whose immutable profile matches ``sender_profile`` claims it and sends via
@@ -1682,6 +1695,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_lineage_active
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_intake_receipt_task   ON kanban_intake_receipts(task_id);
+CREATE INDEX IF NOT EXISTS idx_intake_operation_task ON kanban_intake_operations(task_id);
 CREATE INDEX IF NOT EXISTS idx_role_delivery_claim   ON kanban_role_deliveries(sender_profile, platform, status, available_at, id);
 """
 
@@ -3196,6 +3210,64 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def update_task_fields(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    changes: dict[str, Any],
+    allowed_statuses: Iterable[str],
+    _manage_transaction: bool = True,
+) -> tuple[Task, list[str]]:
+    """Update allowlisted task fields while the task is in an allowed state."""
+
+    unknown = set(changes) - {"title", "body", "priority"}
+    if unknown:
+        raise ValueError(
+            "unsupported task field(s): "
+            + ", ".join(sorted(str(name) for name in unknown))
+        )
+    if not changes:
+        raise ValueError("at least one task field is required")
+
+    allowed = frozenset(str(status) for status in allowed_statuses)
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
+        row = conn.execute(
+            "SELECT title, body, priority, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"task {task_id} not found")
+        if row["status"] not in allowed:
+            raise ValueError(f"cannot update task in {row['status']} state")
+
+        changed_fields = sorted(
+            name for name, value in changes.items() if row[name] != value
+        )
+        if changed_fields:
+            assignments = ", ".join(f"{name} = ?" for name in changed_fields)
+            values = [changes[name] for name in changed_fields]
+            cur = conn.execute(
+                f"UPDATE tasks SET {assignments} WHERE id = ? AND status = ?",
+                (*values, task_id, row["status"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("task state changed during update")
+            _append_event(
+                conn,
+                task_id,
+                "edited",
+                {"fields": changed_fields},
+            )
+
+    task = get_task(conn, task_id)
+    if task is None:  # pragma: no cover - guarded by the transaction above
+        raise ValueError(f"task {task_id} not found")
+    return task, changed_fields
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -4542,12 +4614,16 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    _manage_transaction: bool = True,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
-    Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
+    Returns the number of tasks promoted. By default it opens an IMMEDIATE
+    transaction; transaction-composing callers pass ``_manage_transaction=False``
+    while holding their own write transaction.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -4575,7 +4651,10 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -6772,7 +6851,12 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _manage_transaction: bool = True,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -6783,7 +6867,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6838,6 +6925,66 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def retry_failed_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _manage_transaction: bool = True,
+) -> bool:
+    """Explicitly requeue a task whose latest run ended in failure.
+
+    Modern failure paths leave a below-threshold task in ``ready`` and record
+    the failure on ``task_runs``. A literal ``failed`` task status is accepted
+    for compatibility with older/external boards, but ordinary ready tasks are
+    refused.
+    """
+
+    retryable_outcomes = {"spawn_failed", "crashed", "timed_out", "gave_up"}
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False
+        latest = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE task_id = ? "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        failed_run = latest is not None and (
+            latest["status"] == "failed" or latest["outcome"] in retryable_outcomes
+        )
+        if task_row["status"] != "failed" and not (
+            task_row["status"] == "ready" and failed_run
+        ):
+            return False
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = ?",
+            (task_id, task_row["status"]),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "retried",
+            {
+                "from": "failed",
+                "run_status": latest["status"] if latest is not None else None,
+                "run_outcome": latest["outcome"] if latest is not None else None,
+            },
+        )
+        return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6846,6 +6993,7 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    _manage_transaction: bool = True,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -6866,7 +7014,10 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -6920,12 +7071,12 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
-    # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
-    # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
-    # logic the dispatcher would on its next tick, so a specified task
-    # with no open parents flips straight to 'ready' here instead of
-    # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    # The default path opens a second IMMEDIATE transaction for promotion;
+    # transaction-composing callers keep this pass inside their outer write
+    # transaction. This runs the same logic the dispatcher would on its next
+    # tick, so a specified task with no open parents flips straight to 'ready'
+    # here instead of idling in 'todo' until the next sweep.
+    recompute_ready(conn, _manage_transaction=_manage_transaction)
     return True
 
 
@@ -8834,7 +8985,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'retried') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -10260,6 +10411,111 @@ class KanbanIntakeConflict(ValueError):
     """A durable intake key was reused with different immutable content."""
 
 
+def get_intake_source_context(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    """Return the trusted create provenance for an intake-owned task."""
+
+    row = conn.execute(
+        "SELECT source_context FROM kanban_intake_receipts "
+        "WHERE task_id = ? ORDER BY created_at ASC, idempotency_key ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(row["source_context"])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _canonical_intake_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def replay_intake_operation(
+    conn: sqlite3.Connection,
+    *,
+    idempotency_key: str,
+    request_hash: str,
+    operation: str,
+    task_id: str,
+    source_context: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Return a durable operation result, rejecting key/content conflicts."""
+
+    source_json = _canonical_intake_json(source_context)
+    if conn.execute(
+        "SELECT 1 FROM kanban_intake_receipts WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone() is not None:
+        raise KanbanIntakeConflict(
+            "idempotency receipt was reused with different immutable content"
+        )
+
+    row = conn.execute(
+        "SELECT request_hash, operation, task_id, source_context, result_json "
+        "FROM kanban_intake_operations WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    stored = (
+        row["request_hash"],
+        row["operation"],
+        row["task_id"],
+        row["source_context"],
+    )
+    expected = (request_hash, operation, task_id, source_json)
+    if stored != expected:
+        raise KanbanIntakeConflict(
+            "idempotency receipt was reused with different immutable content"
+        )
+    try:
+        result = json.loads(row["result_json"])
+    except (TypeError, ValueError) as exc:
+        raise KanbanIntakeConflict("idempotency receipt result is invalid") from exc
+    if not isinstance(result, dict):
+        raise KanbanIntakeConflict("idempotency receipt result is invalid")
+    return result
+
+
+def record_intake_operation(
+    conn: sqlite3.Connection,
+    *,
+    idempotency_key: str,
+    request_hash: str,
+    operation: str,
+    task_id: str,
+    source_context: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Record an operation result inside the caller's write transaction."""
+
+    if operation not in {"status", "update", "retry"}:
+        raise ValueError("operation receipt must be status, update, or retry")
+    conn.execute(
+        "INSERT INTO kanban_intake_operations "
+        "(idempotency_key, request_hash, operation, task_id, source_context, "
+        " result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            idempotency_key,
+            request_hash,
+            operation,
+            task_id,
+            _canonical_intake_json(source_context),
+            _canonical_intake_json(result),
+            int(time.time()),
+        ),
+    )
+
+
 def _insert_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -10353,6 +10609,13 @@ def create_intake_task(
     now = int(time.time())
 
     with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM kanban_intake_operations WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone() is not None:
+            raise KanbanIntakeConflict(
+                "idempotency receipt was reused with different immutable content"
+            )
         receipt = conn.execute(
             "SELECT request_hash, task_id, actor_profile, assignee, source_context "
             "FROM kanban_intake_receipts WHERE idempotency_key = ?",

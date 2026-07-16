@@ -311,7 +311,20 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
             "path",
             "content",
         ]
-        assert final_by_name["kanban_task"]["parameters"]["required"] == ["title"]
+        kanban_function = final_by_name["kanban_task"]
+        kanban_parameters = kanban_function["parameters"]
+        # Create and task-targeting operations cannot share an unconditional
+        # required list.  The final Discord schema must retain the concise
+        # operation-aware contract instead of resurrecting create-only shape.
+        assert "required" not in kanban_parameters
+        assert kanban_parameters["properties"]["operation"] == {
+            "type": "string",
+            "enum": ["create", "status", "update", "retry"],
+            "default": "create",
+        }
+        assert "Create needs title" in kanban_function["description"]
+        assert "status/update/retry need task_id" in kanban_function["description"]
+        assert "update allows title/body/priority" in kanban_function["description"]
         assert final_by_name["patch"]["parameters"]["properties"]["mode"][
             "enum"
         ] == ["replace", "patch"]
