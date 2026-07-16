@@ -18,7 +18,7 @@ from agent.request_footprint import (
 )
 
 
-DISCORD_CORE_SCHEMA_BUDGET_BYTES = 50_000
+DISCORD_CORE_SCHEMA_BUDGET_BYTES = 40_000
 
 
 # Descriptions are the only fields compacted here.  Names, properties,
@@ -29,6 +29,246 @@ DISCORD_CORE_SCHEMA_BUDGET_BYTES = 50_000
 _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
     str, dict[tuple[str, ...], str]
 ] = {
+    "delegate_task": {
+        (): (
+            "Delegate one or more reasoning-heavy tasks to isolated subagents. "
+            "Provide goal for one task or tasks for parallel work; each child has "
+            "independent context, terminal state, and tools, and returns an array "
+            "entry asynchronously as a new message. Continue working—do not wait or "
+            "poll. Put all paths, errors, constraints, and requested language/tone in "
+            "context because children cannot see this conversation or ask via clarify. "
+            "Use execute_code for mechanical workflows and direct tools for one call. "
+            "Delegations are not durable: /new or process exit discards unfinished work, "
+            "and /stop cancels it. Treat summaries as unverified self-reports; for "
+            "external side effects require a URL, ID, absolute path, or status and verify "
+            "it before claiming success. Leaf children cannot call delegate_task, "
+            "clarify, memory, send_message, or execute_code; orchestrators may delegate "
+            "only within the limits stated in role and retain the other restrictions. "
+            "Children inherit the parent model/fallback unless globally pinned."
+        ),
+        ("parameters", "properties", "background"): (
+            "Deprecated and ignored. Delegations already run in the background and "
+            "return results as new messages; setting this has no effect."
+        ),
+    },
+    "computer_use": {
+        (): (
+            "Control desktop apps in the background with screenshots, mouse, keyboard, "
+            "scroll, and drag. Prefer capture mode='som', then target element indexes; "
+            "use coordinates only when needed. Works on hidden or minimized windows "
+            "without stealing focus. Requires cua-driver."
+        ),
+        ("parameters", "properties", "action"): (
+            "Action to perform. capture is side-effect-free; every other action requires "
+            "approval unless auto-approved. Use set_value for selects and sliders."
+        ),
+        ("parameters", "properties", "mode"): (
+            "Capture mode: som (default) returns a screenshot, numbered elements, and AX; "
+            "vision returns a screenshot; ax returns only the accessibility tree."
+        ),
+        ("parameters", "properties", "app"): (
+            "Optional app name or bundle ID; omit for the frontmost window. Use screen or "
+            "desktop for the OS shell. Capture one window or display at a time."
+        ),
+        ("parameters", "properties", "max_elements"): (
+            "AX element cap (default 100, max 1000). Truncated results report totals; "
+            "narrow with app or raise this. Applies to ax and image-missing fallbacks."
+        ),
+        ("parameters", "properties", "element"): (
+            "1-based index from the latest capture(mode='som'); prefer it over coordinates."
+        ),
+        ("parameters", "properties", "coordinate"): (
+            "Logical-screen [x,y] from capture; use only when no element index exists."
+        ),
+        ("parameters", "properties", "value"): (
+            "set_value value: option label for selects, or numeric/string value for "
+            "sliders and other AX-settable elements."
+        ),
+        ("parameters", "properties", "raise_window"): (
+            "focus_app only: true raises the window and DISRUPTS the user; default false "
+            "keeps input in the background."
+        ),
+        ("parameters", "properties", "capture_after"): (
+            "Capture after the action to verify its effect in the same response."
+        ),
+    },
+    "browser_navigate": {
+        (): (
+            "Open a URL and return compact snapshot refs. Call before other browser "
+            "tools. Prefer lighter retrieval tools for plain content; use the browser "
+            "for interaction and dynamic pages."
+        ),
+    },
+    "browser_snapshot": {
+        (): (
+            "Refresh accessibility snapshot refs after interactions. full=false is "
+            "compact; full=true includes page content. Requires navigate; long output "
+            "may be truncated or summarized."
+        ),
+        ("parameters", "properties", "full"): (
+            "Return complete page content instead of the compact interactive view."
+        ),
+    },
+    "browser_click": {
+        (): (
+            "Click a snapshot ref such as @e5. Requires navigate and a current snapshot."
+        ),
+    },
+    "browser_type": {
+        (): (
+            "Clear then type text into a snapshot ref. Requires navigate and a current "
+            "snapshot."
+        ),
+    },
+    "browser_scroll": {
+        (): "Scroll up or down; requires navigate.",
+    },
+    "browser_back": {
+        (): "Go back in browser history; requires navigate.",
+    },
+    "browser_press": {
+        (): "Press a key or shortcut; requires navigate.",
+    },
+    "browser_get_images": {
+        (): "List page image URLs and alt text; requires navigate.",
+    },
+    "browser_vision": {
+        (): (
+            "Capture a screenshot for visual inspection of CAPTCHAs, verification, or "
+            "layout. Native-vision models receive it next turn; otherwise an auxiliary "
+            "model analyzes it. Returns screenshot_path for MEDIA sharing. Requires "
+            "navigate."
+        ),
+        ("parameters", "properties", "question"): (
+            "Specific visual question to answer from the page."
+        ),
+        ("parameters", "properties", "annotate"): (
+            "Overlay numbered elements; each label N maps to ref @eN."
+        ),
+    },
+    "browser_console": {
+        (): (
+            "Read console messages and errors, optionally evaluating JavaScript for DOM "
+            "or page-state inspection. Requires navigate."
+        ),
+        ("parameters", "properties", "expression"): (
+            "Optional JavaScript evaluated with full page DOM/window access; the result "
+            "is JSON-serialized."
+        ),
+    },
+    "clarify": {
+        (): (
+            "Ask for clarification, feedback, or a meaningful decision. For selectable "
+            "options, put up to four strings only in choices; never enumerate them in "
+            "question because the UI renders choices as buttons and adds Other. Omit "
+            "choices for open-ended input. Prefer a reasonable default for low-stakes "
+            "decisions. Do not use for dangerous-command confirmation; terminal handles "
+            "approval."
+        ),
+        ("parameters", "properties", "question"): (
+            "Question text only; put selectable answers in choices."
+        ),
+        ("parameters", "properties", "choices"): (
+            "Up to four selectable option strings; the UI adds Other. Omit only for "
+            "open-ended free text."
+        ),
+    },
+    "memory": {
+        (): (
+            "Save compact, stable facts across sessions. Prefer one atomic operations "
+            "batch for multiple add/replace/remove changes; only its final result is "
+            "checked against the character limit, so it can free space and add in one "
+            "call. Use single fields only for one change. target=user stores identity, "
+            "preferences, and style; target=memory stores environment, conventions, and "
+            "lessons. Save durable preferences, corrections, and stable workflow facts; "
+            "skip task progress, raw dumps, rediscoverable facts, and procedures (use "
+            "skills). If full, batch removals or shortening with the new entry. Do not "
+            "repeat a successful batch."
+        ),
+        ("parameters", "properties", "operations"): (
+            "Atomic list of {action, content?, old_text?}; prefer for multiple changes "
+            "or freeing space within the final character budget."
+        ),
+        ("parameters", "properties", "old_text"): (
+            "For replace/remove, a short unique substring identifying the entry."
+        ),
+    },
+    "read_file": {
+        (): (
+            "Read text with numbered lines and pagination; use instead of shell "
+            "readers. Supports notebooks, DOCX, and XLSX; images and binaries require "
+            "vision_analyze. Results over ~100K characters truncate at a line boundary "
+            "and return next_offset; continue with offset."
+        ),
+        ("parameters", "properties", "path"): (
+            "File path (absolute, relative, or ~/path)."
+        ),
+        ("parameters", "properties", "offset"): (
+            "1-based starting line (default 1)."
+        ),
+        ("parameters", "properties", "limit"): (
+            "Line limit (default 500, max 2000)."
+        ),
+    },
+    "write_file": {
+        (): (
+            "Write content to a file, creating parent directories. OVERWRITES the "
+            "entire file; use patch for targeted edits. Runs syntax checks and reports "
+            "only errors introduced by this write."
+        ),
+        ("parameters", "properties", "path"): (
+            "File path to create or overwrite."
+        ),
+        ("parameters", "properties", "content"): "Complete replacement content.",
+    },
+    "patch": {
+        (): (
+            "Edit files with fuzzy unique-string replacement or a V4A multi-file patch; "
+            "returns a diff and runs syntax checks. replace mode needs "
+            "mode/path/old_string/new_string; patch mode needs mode/patch."
+        ),
+        ("parameters", "properties", "mode"): (
+            "replace for targeted text; patch for V4A content."
+        ),
+        ("parameters", "properties", "path"): "File path for replace mode.",
+        ("parameters", "properties", "old_string"): (
+            "Unique text to replace; include context unless replace_all=true."
+        ),
+        ("parameters", "properties", "new_string"): (
+            "Replacement text; empty deletes the match."
+        ),
+        ("parameters", "properties", "replace_all"): (
+            "Replace all matches; otherwise old_string must be unique."
+        ),
+        ("parameters", "properties", "patch"): "V4A content for patch mode.",
+    },
+    "search_files": {
+        (): (
+            "Search contents by regex or find files by glob via ripgrep. "
+            "target=content returns matched lines, files, or counts; target=files lists "
+            "paths by modification time. Use instead of shell grep, find, or ls."
+        ),
+        ("parameters", "properties", "pattern"): (
+            "Regex for content or glob for files."
+        ),
+        ("parameters", "properties", "target"): (
+            "content or files (default content)."
+        ),
+        ("parameters", "properties", "path"): (
+            "Search root (default current directory)."
+        ),
+        ("parameters", "properties", "file_glob"): (
+            "Content-search file filter glob."
+        ),
+        ("parameters", "properties", "limit"): "Result limit (default 50).",
+        ("parameters", "properties", "offset"): "Results to skip (default 0).",
+        ("parameters", "properties", "output_mode"): (
+            "content, files_only, or count for content search."
+        ),
+        ("parameters", "properties", "context"): (
+            "Context lines around content matches."
+        ),
+    },
     "cronjob": {
         (): (
             "Manage scheduled jobs. create requires schedule and prompt, except "

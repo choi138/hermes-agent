@@ -181,7 +181,7 @@ def test_schema_budget_is_a_discord_core_runtime_gate_only():
         [{"padding": "x" * DISCORD_CORE_SCHEMA_BUDGET_BYTES}]
     )
 
-    assert schema_budget_bytes("discord-core") == 50_000
+    assert schema_budget_bytes("discord-core") == 40_000
     assert schema_budget_bytes("discord-ops") is None
     assert schema_within_budget("discord-core", at_budget)
     assert not schema_within_budget("discord-core", over_budget)
@@ -213,17 +213,52 @@ def test_discord_core_compaction_preserves_every_non_description_contract():
     assert schemas == original
     assert _without_descriptions(compacted) == _without_descriptions(original)
     assert canonical_tool_schema_metrics(compacted).json_bytes <= 12_000
+    assert apply_gateway_tool_schema_policy("discord-core", compacted) == compacted
 
     # Full schemas remain available to authorized operator sessions.
     assert apply_gateway_tool_schema_policy("discord-ops", schemas) == schemas
 
 
-def test_gateway_agent_with_cron_active_applies_final_discord_budget(monkeypatch):
-    """Reproduce the Gateway-only 31st-tool path before measuring budget."""
+def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
+    monkeypatch,
+):
+    """Exercise the Gateway-only 31st-tool path and its final policy schema."""
+    import importlib
+
     import model_tools
     from gateway.run import GatewayRunner
+    from tools import discord_tool
     from tools.registry import invalidate_check_fn_cache
 
+    registry_module = importlib.import_module("tools.registry")
+    real_check = registry_module._check_fn_cached
+    representative_available = {
+        "check_browser_requirements",
+        "check_browser_vision_requirements",
+        "check_computer_use_requirements",
+    }
+
+    def representative_check(check_fn):
+        if check_fn.__name__ in representative_available:
+            return True
+        return real_check(check_fn)
+
+    monkeypatch.setattr(registry_module, "_check_fn_cached", representative_check)
+    monkeypatch.setattr(
+        discord_tool,
+        "_get_bot_token",
+        lambda: "representative-token",
+    )
+    monkeypatch.setattr(
+        discord_tool,
+        "_detect_capabilities_nonblocking",
+        lambda _token: {
+            "detected": True,
+            "has_members_intent": True,
+            "has_message_content": False,
+        },
+    )
+    monkeypatch.setattr(discord_tool, "_load_allowed_actions_config", lambda: None)
     monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
     invalidate_check_fn_cache()
     model_tools._clear_tool_defs_cache()
@@ -232,16 +267,94 @@ def test_gateway_agent_with_cron_active_applies_final_discord_budget(monkeypatch
             enabled_toolsets=["hermes-discord", "kanban_submit"],
             quiet_mode=True,
         )
-        assert "cronjob" in {
-            tool["function"]["name"] for tool in raw_tools
-        }
+        raw_names = [tool["function"]["name"] for tool in raw_tools]
+        raw_tools_original = deepcopy(raw_tools)
+        assert len(raw_names) == 31
+        assert raw_names.count("kanban_task") == 1
+        assert {
+            "terminal",
+            "process",
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+            "browser_navigate",
+            "browser_click",
+            "computer_use",
+            "delegate_task",
+            "discord",
+            "discord_admin",
+            "cronjob",
+            "kanban_task",
+        } <= set(raw_names)
 
         agent = SimpleNamespace(tools=raw_tools)
         policy = SimpleNamespace(name="discord-core", identity_profile="default")
         metrics = GatewayRunner._record_gateway_tool_policy(agent, policy)
 
         assert metrics == canonical_tool_schema_metrics(agent.tools)
-        assert metrics.json_bytes <= DISCORD_CORE_SCHEMA_BUDGET_BYTES
+        assert metrics.count == 31
+        assert raw_tools == raw_tools_original
+        assert _without_descriptions(agent.tools) == _without_descriptions(
+            raw_tools_original
+        )
+
+        final_by_name = {
+            tool["function"]["name"]: tool["function"] for tool in agent.tools
+        }
+        raw_by_name = {
+            tool["function"]["name"]: tool["function"]
+            for tool in raw_tools_original
+        }
+        assert final_by_name["terminal"]["parameters"]["required"] == ["command"]
+        assert final_by_name["write_file"]["parameters"]["required"] == [
+            "path",
+            "content",
+        ]
+        assert final_by_name["kanban_task"]["parameters"]["required"] == ["title"]
+        assert final_by_name["patch"]["parameters"]["properties"]["mode"][
+            "enum"
+        ] == ["replace", "patch"]
+        for property_name in ("tasks", "role"):
+            assert final_by_name["delegate_task"]["parameters"]["properties"][
+                property_name
+            ]["description"] == raw_by_name["delegate_task"]["parameters"][
+                "properties"
+            ][property_name]["description"]
+        for tool_name in ("discord", "discord_admin"):
+            assert (
+                final_by_name[tool_name]["description"]
+                == raw_by_name[tool_name]["description"]
+            )
+
+        write_safety = final_by_name["write_file"]["parameters"]["properties"][
+            "cross_profile"
+        ]["description"]
+        write_overwrite_warning = final_by_name["write_file"]["description"]
+        patch_safety = final_by_name["patch"]["parameters"]["properties"][
+            "cross_profile"
+        ]["description"]
+        skill_safety = final_by_name["skill_manage"]["description"]
+        computer_action_safety = final_by_name["computer_use"]["parameters"][
+            "properties"
+        ]["action"]["description"]
+        computer_focus_safety = final_by_name["computer_use"]["parameters"][
+            "properties"
+        ]["raise_window"]["description"]
+        discord_intent_warning = final_by_name["discord"]["description"]
+        discord_permission_warning = final_by_name["discord_admin"]["description"]
+        assert "explicit user direction" in write_safety
+        assert "blocked with a warning" in write_safety
+        assert "OVERWRITES the entire file" in write_overwrite_warning
+        assert "explicit user direction" in patch_safety
+        assert "Confirm before create/delete" in skill_safety
+        assert "requires approval" in computer_action_safety
+        assert "DISRUPTS the user" in computer_focus_safety
+        assert "MESSAGE_CONTENT privileged intent" in discord_intent_warning
+        assert "per-guild permission" in discord_permission_warning
+        assert "MANAGE_ROLES" in discord_permission_warning
+
+        assert metrics.json_bytes <= DISCORD_CORE_SCHEMA_BUDGET_BYTES, metrics
     finally:
         # Availability is process-global and TTL-cached; never leak the
         # gateway-session verdict into worker-policy tests in this file.
