@@ -16,6 +16,7 @@ Phase-2 invariants under test:
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -23,7 +24,7 @@ from pathlib import Path
 import pytest
 
 import agent.ingest_curator as ic
-from agent.memory_journal import PendingTurnWAL
+from agent.memory_journal import _PENDING_GC_MAX_AGE_S, PendingTurnWAL
 
 # Reuse the Phase-0 regression harness: instrumented provider + mock LLM server.
 from tests.agent.test_memory_ingest_disabled import (
@@ -283,22 +284,70 @@ class TestSpansAndWatermark:
         wal, _ = _seed_wal(tmp_path, sid)
         spans, wm = ic.read_unconsumed_spans(sid, wal_dir=tmp_path)
         ic.save_watermark(sid, wm, wal_dir=tmp_path)
-        # The Phase-0 scan globs *.jsonl; the sidecar is .json.
+        # The Phase-0 scan globs *.jsonl; the sidecar is .json (never parsed
+        # as a WAL file) — but the scan DOES consult it as the curator's
+        # consumption marker.
         stats = wal.scan_and_gc()
         assert stats["files"] == 1
+        assert stats["unconsumed_entries"] == 0
+
+    def test_scan_counts_watermark_consumption_and_gcs_sidecar(self, tmp_path):
+        """The curator consumes via watermark, never acks: scan_and_gc must
+        treat watermark-covered spans as consumed (proposal-bearing files
+        can become fully consumed and GC'd) and remove the sidecar with the
+        WAL file."""
+        sid = "sess-wmgc"
+        wal, _ = _seed_wal(tmp_path, sid, n_turns=1, n_proposals=2)
+        assert wal.scan_and_gc()["unconsumed_entries"] == 3
+        spans, wm = ic.read_unconsumed_spans(sid, wal_dir=tmp_path)
+        ic.save_watermark(sid, wm, wal_dir=tmp_path)
+        stats = wal.scan_and_gc()
+        assert stats["unconsumed_entries"] == 0
+        assert stats["files"] == 1  # fresh file: consumed but not GC'd yet
+        # Age it past the GC window → file AND sidecar deleted.
+        path = tmp_path / f"{sid}.jsonl"
+        old = time.time() - (_PENDING_GC_MAX_AGE_S + 60)
+        os.utime(path, (old, old))
+        stats = wal.scan_and_gc()
+        assert stats["gc_deleted_files"] == 1
+        assert not path.exists()
+        assert not (tmp_path / f"{sid}.curator-watermark.json").exists()
+
+    def test_orphaned_watermark_sidecar_swept(self, tmp_path):
+        sid = "sess-orphan"
+        wal, _ = _seed_wal(tmp_path, sid, n_turns=1, n_proposals=0)
+        spans, wm = ic.read_unconsumed_spans(sid, wal_dir=tmp_path)
+        ic.save_watermark(sid, wm, wal_dir=tmp_path)
+        (tmp_path / f"{sid}.jsonl").unlink()  # WAL gone, sidecar orphaned
+        wal.scan_and_gc()
+        assert not (tmp_path / f"{sid}.curator-watermark.json").exists()
 
     def test_format_spans_scrubs_and_tags(self, tmp_path):
+        """Cross-lane taint interface (§①): per-ROLE-record ``taint`` dicts
+        on turn records, record-level ``taint`` dict on proposals — the
+        shapes agent.memory_taint.tag_wal_turn_records/-proposal_record
+        stamp. Labels must land on exactly the tainted role line."""
         sid = "sess-fmt"
         wal = PendingTurnWAL(base_dir=tmp_path)
         entry = wal.append_turn(sid, "질문", "응답")
+        prop = wal.append_proposal(sid, "주입 반복 제안", kind_hint="fact")
         spans, _ = ic.read_unconsumed_spans(sid, wal_dir=tmp_path)
-        spans[0]["record"]["tainted"] = True
-        spans[0]["record"]["records"][0]["content"] = (
+        turn_span = next(s for s in spans if s["type"] == "turn")
+        prop_span = next(s for s in spans if s["type"] == "proposal")
+        turn_span["record"]["records"][1]["taint"] = {
+            "tainted": True, "spans": [[0, 2]], "score": 0.9,
+        }
+        turn_span["record"]["records"][0]["content"] = (
             "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD 를 썼다"
         )
-        text = ic.format_spans(spans)
+        prop_span["record"]["taint"] = {"tainted": True, "spans": [[0, 2]]}
+        text = ic.format_spans(spans, session_id=sid)
         assert f"turn:{entry}" in text
-        assert "[tainted]" in text
+        lines = text.splitlines()
+        assert any(line.startswith("ASSISTANT [tainted]:") for line in lines)
+        # taint is per role record — the clean user row must NOT be labeled
+        assert not any("USER [tainted]" in line for line in lines)
+        assert f"[span proposal:{prop} [tainted]" in text
         assert "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD" not in text
 
     def test_digest_header_cold_mode(self):
@@ -312,6 +361,33 @@ class TestSpansAndWatermark:
         assert "USER: 패치 배포해줘" in header
         assert "ASSISTANT[tools: terminal]" in header
         assert "cold" in header  # the no-full-replay marker line
+
+
+# ---------------------------------------------------------------------------
+# Final-text verdict extraction (warm-mode channel)
+# ---------------------------------------------------------------------------
+
+class TestVerdictTextExtraction:
+    def test_last_fence_wins_over_example_fence(self):
+        text = (
+            "예시 포맷은 이렇다:\n"
+            '```json\n{"spans": [{"span_ref": "turn:example", "verdict": "NOOP"}]}\n```\n'
+            "실제 verdict:\n"
+            '```json\n{"spans": [{"span_ref": "turn:real", "verdict": "raw-only"}]}\n```'
+        )
+        out = ic._extract_verdict_from_text(text)
+        assert out["spans"][0]["span_ref"] == "turn:real"
+
+    def test_bare_json_accepted(self):
+        out = ic._extract_verdict_from_text(
+            '요약. {"spans": [{"span_ref": "turn:a", "verdict": "NOOP"}]} 끝.'
+        )
+        assert out["spans"][0]["span_ref"] == "turn:a"
+
+    def test_no_verdict_shapes_return_none(self):
+        assert ic._extract_verdict_from_text("") is None
+        assert ic._extract_verdict_from_text("no json here") is None
+        assert ic._extract_verdict_from_text('{"not_spans": []}') is None
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +418,45 @@ class TestQuoteDryRun:
         )
         assert bad[0]["ok"] is False
         assert "verbatim" in (bad[0]["detail"] or "")
+
+    def test_taint_only_quote_reported_as_taint_not_confabulation(
+        self, tmp_path, monkeypatch
+    ):
+        """§⑧ metric hygiene: a quote grounded only in taint-marked
+        assistant content is reported checked='taint', separate from
+        confabulation failures."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        sid = "sess-taintq"
+        wal = PendingTurnWAL()
+        entry = wal.append_turn(
+            sid,
+            "무관한 유저 발화가 여기 있습니다",
+            "주입된 메모리 컨텍스트를 그대로 반복한 어시스턴트 발화다",
+        )
+        spans, _ = ic.read_unconsumed_spans(sid)
+        spans[0]["record"]["records"][1]["taint"] = {
+            "tainted": True, "spans": [[0, 40]],
+        }
+        spans_by_ref = {s["ref"]: s for s in spans}
+
+        tainted = ic.dry_run_quote_checks(
+            [{"span_ref": f"turn:{entry}", "verdict": "note-propose",
+              "verbatim_quote": "주입된 메모리 컨텍스트를 그대로 반복한"}],
+            session_id=sid,
+            spans_by_ref=spans_by_ref,
+        )
+        assert tainted[0]["ok"] is False
+        assert tainted[0]["checked"] == "taint"
+
+        # A quote grounded in the CLEAN user row passes normal grounding.
+        clean = ic.dry_run_quote_checks(
+            [{"span_ref": f"turn:{entry}", "verdict": "note-propose",
+              "verbatim_quote": "무관한 유저 발화가 여기 있습니다"}],
+            session_id=sid,
+            spans_by_ref=spans_by_ref,
+        )
+        assert clean[0]["ok"] is True
+        assert clean[0]["checked"] == "wal-quote"
 
     def test_only_propose_verdicts_checked(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -556,6 +671,43 @@ class TestTriggers:
         assert captured["trigger"] == "idle"
         assert captured["mode"] == "cold"
 
+    def test_idle_timer_is_single_instance_per_session(self, monkeypatch):
+        """Hot-path honesty: a turn observed while an idle timer is pending
+        must not create a new Timer thread — it only refreshes activity."""
+        monkeypatch.setattr(ic, "ingest_curator_enabled", lambda: True)
+        monkeypatch.setattr(ic, "_idle_seconds", lambda: 60.0)
+        monkeypatch.setattr(ic, "spawn_curation_thread", lambda *a, **k: None)
+        agent = _FakeLiveAgent("idle-single")
+        ic.observe_turn_completed(agent, _turn_messages())
+        st = ic._state_for("idle-single")
+        first_timer = st.idle_timer
+        assert first_timer is not None
+        ic.observe_turn_completed(agent, _turn_messages())
+        ic.observe_turn_completed(agent, _turn_messages())
+        assert st.idle_timer is first_timer
+
+    def test_idle_timer_rearms_for_refreshed_activity(self, monkeypatch):
+        """A pending timer that wakes early (activity since arming) re-arms
+        for the remaining idle window instead of firing."""
+        monkeypatch.setattr(ic, "ingest_curator_enabled", lambda: True)
+        monkeypatch.setattr(ic, "_idle_seconds", lambda: 0.5)
+        fired = threading.Event()
+        fired_at = {}
+
+        def _capture(agent, **kwargs):
+            fired_at["t"] = time.time()
+            fired.set()
+
+        monkeypatch.setattr(ic, "spawn_curation_thread", _capture)
+        agent = _FakeLiveAgent("idle-refresh")
+        ic.observe_turn_completed(agent, _turn_messages())
+        time.sleep(0.2)
+        refreshed_at = time.time()
+        ic.observe_turn_completed(agent, _turn_messages())
+        assert fired.wait(timeout=5.0), "idle timer never fired"
+        # It fired a full idle window after the REFRESH, not the first arm.
+        assert fired_at["t"] - refreshed_at >= 0.4
+
     def test_observe_never_raises(self, monkeypatch):
         monkeypatch.setattr(
             ic, "ingest_curator_enabled",
@@ -580,15 +732,33 @@ class _StubManager:
 
 
 class TestSubmitCuratedSeam:
+    _GROUNDED_QUOTE = "핵심 인용문은 충분히 길게 서술된 문장이다"
+
     def _verdicts(self):
         return [
             {"span_ref": "turn:a", "verdict": "extract-full",
-             "verbatim_quote": "핵심 인용문", "rationale": "r"},
+             "verbatim_quote": self._GROUNDED_QUOTE, "rationale": "r"},
             {"span_ref": "turn:b", "verdict": "merge-batch"},
             {"span_ref": "turn:c", "verdict": "merge-batch"},
             {"span_ref": "turn:d", "verdict": "raw-only"},
             {"span_ref": "turn:e", "verdict": "NOOP"},
         ]
+
+    def _seed_grounding_wal(self, session_id="s1", entry_id="a",
+                            content=None):
+        """Back the extract-full quote with a real WAL record so the seam's
+        §4.5 grounding gate can pass (it reads HERMES_HOME's WAL dir)."""
+        wal_dir = Path(os.environ["HERMES_HOME"]) / "state" / "memory-pending"
+        wal_dir.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "type": "turn", "id": entry_id, "ts": round(time.time(), 3),
+            "session_id": session_id, "seq": 1,
+            "records": [
+                {"role": "user", "content": content or self._GROUNDED_QUOTE},
+            ],
+        }
+        with open(wal_dir / f"{session_id}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def _spans_by_ref(self):
         return {
@@ -631,12 +801,14 @@ class TestSubmitCuratedSeam:
         stub = _StubManager()
         monkeypatch.setattr(ic, "ingest_curator_enabled", lambda: True)
         monkeypatch.setattr(ic, "shadow_mode_enabled", lambda: False)
+        self._seed_grounding_wal()
         out = ic.submit_curated(
             stub, self._verdicts(), self._spans_by_ref(), session_id="s1"
         )
         assert out["blocked"] is None
         # extract-full digest + ONE coalesced merge-batch episode.
         assert out["submitted"] == 2
+        assert out["grounding_rejected"] == 0
         digest = stub.calls[0]
         assert digest["metadata"]["source_name"] == "hermes-curated"
         assert digest["metadata"]["episode_type"] == "curated_digest"
@@ -647,6 +819,45 @@ class TestSubmitCuratedSeam:
         assert "u-b" in merged["content"] and "u-c" in merged["content"]
         # raw-only re-submits nothing (per-turn ingest already carried it).
         assert all("u-d" not in c["content"] for c in stub.calls)
+
+    def test_extract_full_ungrounded_quote_refused(self, monkeypatch):
+        """§4.5: a quote no WAL record backs (confabulation) never becomes a
+        digest — fail-closed at the seam, span degrades to raw-only."""
+        stub = _StubManager()
+        monkeypatch.setattr(ic, "ingest_curator_enabled", lambda: True)
+        monkeypatch.setattr(ic, "shadow_mode_enabled", lambda: False)
+        verdicts = [{"span_ref": "turn:a", "verdict": "extract-full",
+                     "verbatim_quote": "트랜스크립트 어디에도 존재하지 않는 인용문이다"}]
+        out = ic.submit_curated(
+            stub, verdicts, self._spans_by_ref(), session_id="s1"
+        )
+        assert out["submitted"] == 0
+        assert out["grounding_rejected"] == 1
+        assert stub.calls == []
+
+    def test_secret_quote_refused_and_bodies_scrubbed(self, monkeypatch):
+        """§4.2 site (c): fork output is scrubbed before it reaches the
+        manager, and a secret-bearing quote is refused at the grounding
+        door (admissibility: the redactor would alter it)."""
+        stub = _StubManager()
+        monkeypatch.setattr(ic, "ingest_curator_enabled", lambda: True)
+        monkeypatch.setattr(ic, "shadow_mode_enabled", lambda: False)
+        secret = "ghp_1234567890abcdefghijklmnopqrstuvwxyz12"
+        self._seed_grounding_wal()
+        verdicts = [
+            {"span_ref": "turn:a", "verdict": "extract-full",
+             "verbatim_quote": f"핵심 인용문은 {secret} 을 포함한다"},
+            {"span_ref": "turn:b", "verdict": "merge-batch"},
+        ]
+        spans_by_ref = self._spans_by_ref()
+        spans_by_ref["turn:b"]["record"]["records"][0]["content"] = (
+            f"본문에 {secret} 가 섞여 들어왔다"
+        )
+        out = ic.submit_curated(stub, verdicts, spans_by_ref, session_id="s1")
+        assert out["grounding_rejected"] == 1  # secret quote refused
+        assert out["submitted"] == 1  # merge-batch episode
+        assert secret not in stub.calls[0]["content"]
+        assert "본문에" in stub.calls[0]["content"]
 
     def test_cap_rejected_spans_skipped(self, monkeypatch):
         stub = _StubManager()
@@ -820,6 +1031,18 @@ class TestShadowRunEndToEnd:
         sid = parent.session_id
         PendingTurnWAL().append_turn(sid, "그록 컨텍스트는 500k다", "응 500k 맞아")
 
+        # Spy on the provider call to capture forwarded kwargs: curator
+        # lookups must carry origin=ingest_curator so the plugin-side
+        # retrieval ledger can exclude them from the §⑤ promotion signal.
+        seen_kwargs = {}
+        orig_handle = provider.handle_tool_call
+
+        def _spy(tool_name, args, **kwargs):
+            seen_kwargs.update(kwargs)
+            return orig_handle(tool_name, args)
+
+        provider.handle_tool_call = _spy
+
         handler.response_queue.append(
             _tc_resp("memory_search", '{"query": "context window"}')
         )
@@ -834,6 +1057,8 @@ class TestShadowRunEndToEnd:
         assert record["verdict_distribution"] == {"NOOP": 1}
         # The read went through the rebound parent manager…
         assert provider.read_calls() == [("handle_tool_call", "memory_search")]
+        # …tagged with its machine origin…
+        assert seen_kwargs.get("origin") == "ingest_curator"
         # …and produced zero ingest.
         assert provider.write_calls() == []
 
@@ -855,6 +1080,44 @@ class TestShadowRunEndToEnd:
         )
         assert record["result"] == "verdict"
         assert record["verdict_distribution"] == {"raw-only": 1}
+        assert provider.write_calls() == []
+
+    def test_final_text_verdict_always_validated(self, shadow_run_env):
+        """Provenance, not payload shape, decides validation: a final-text
+        payload that mimics an already-validated shape (carries
+        'distribution') must still pass validate_curator_verdict — the
+        drop-refusal and the note-propose cap hold on the warm channel."""
+        parent, mm, provider, handler, home = shadow_run_env
+        sid = parent.session_id
+        PendingTurnWAL().append_turn(sid, "검증 우회 시도 턴이다", "응답")
+
+        payload = {
+            "spans": (
+                [{"span_ref": "turn:x", "verdict": "drop"}]
+                + [{"span_ref": f"turn:n{i}", "verdict": "note-propose",
+                    "topic_key": f"t.k{i}",
+                    "verbatim_quote": "충분히 길고 구체적인 인용문입니다"}
+                   for i in range(5)]
+            ),
+            "distribution": {"forged": 99},  # shape-sniff bait
+            "errors": [],
+            "caps_hit": [],
+        }
+        handler.response_queue.append(_text_resp(
+            "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+        ))
+        record = ic.run_ingest_curation(
+            parent, session_id=sid, trigger="salience-accumulator",
+            mode="warm",
+            messages_snapshot=[{"role": "user", "content": "검증 우회 시도 턴이다"}],
+        )
+        assert record["result"] == "verdict"
+        assert any("'drop' verdict does not exist" in e
+                   for e in record["verdict_errors"])
+        assert record["caps_hit"] == ["note-propose"]
+        assert record["verdict_distribution"] == {"note-propose": 5}
+        accepted = [s for s in record["verdicts"] if not s.get("cap_rejected")]
+        assert len(accepted) == ic.NOTE_PROPOSE_CAP
         assert provider.write_calls() == []
 
     def test_no_verdict_leaves_watermark_for_retry(self, shadow_run_env):

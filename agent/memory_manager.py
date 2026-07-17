@@ -33,6 +33,7 @@ import inspect
 import threading
 import time
 from concurrent.futures import Future, wait
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_journal import (
@@ -53,6 +54,36 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+# Origin tag for memory READS issued by machinery rather than the live agent
+# (ADR-004 §⑤: the plugin-side retrieval ledger feeds the dream-promotion
+# "explicit memory_search hit" signal, which must exclude curator/prefetch
+# lookups or memory that gets curated gets re-promoted by its own curation —
+# the rich-get-richer loop the ADR excludes prefetch hits for). ContextVar,
+# not thread-local, so tools.thread_context.propagate_context_to_thread
+# carries it onto offloaded tool-dispatch threads.
+_retrieval_origin_var: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("hermes_memory_retrieval_origin", default=None)
+)
+
+
+@contextmanager
+def retrieval_origin(origin: str):
+    """Tag every ``MemoryManager.handle_tool_call`` issued from this context
+    with ``origin=<origin>`` (forwarded as a provider kwarg; every provider's
+    ``handle_tool_call`` accepts ``**kwargs``, so unaware providers ignore
+    it). The graphiti plugin's retrieval ledger consumes the tag to keep
+    non-agent lookups out of the §⑤ promotion signal."""
+    token = _retrieval_origin_var.set(str(origin))
+    try:
+        yield
+    finally:
+        _retrieval_origin_var.reset(token)
+
+
+def current_retrieval_origin() -> Optional[str]:
+    """The origin tag for the current context, or None for live-agent reads."""
+    return _retrieval_origin_var.get()
 
 
 def memory_ingest_allowed(agent: Any) -> bool:
@@ -992,6 +1023,9 @@ class MemoryManager:
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        origin = _retrieval_origin_var.get()
+        if origin and "origin" not in kwargs:
+            kwargs["origin"] = origin
         try:
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:

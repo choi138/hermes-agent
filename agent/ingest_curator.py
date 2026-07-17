@@ -216,6 +216,35 @@ def _scrub_tree(value: Any) -> Any:
     return value
 
 
+def _rotate_ledger_locked(ledger: Path) -> None:
+    """Size-triggered rotation guarded by a cross-process flock.
+
+    The state dir is shared by concurrent writers (CLI + gateway); an
+    unlocked check-then-act lets two processes both rotate and silently
+    drop a ``.1`` generation. The size check re-runs INSIDE the lock so the
+    loser of the race sees the freshly-rotated (small) ledger and does
+    nothing. Where flock is unavailable, the unlocked rotation is kept —
+    losing a telemetry generation beats unbounded growth.
+    """
+
+    def _rotate() -> None:
+        if ledger.exists() and ledger.stat().st_size > _LEDGER_MAX_BYTES:
+            ledger.replace(ledger.with_suffix(ledger.suffix + ".1"))
+
+    try:
+        import fcntl
+    except ImportError:
+        _rotate()
+        return
+    lock_path = ledger.with_suffix(ledger.suffix + ".lock")
+    with open(lock_path, "a", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            _rotate()
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
 def append_ledger(record: Dict[str, Any], *, path: Optional[Path] = None) -> None:
     """Append one scrubbed record to the shadow ledger. Fail-open.
 
@@ -226,7 +255,7 @@ def append_ledger(record: Dict[str, Any], *, path: Optional[Path] = None) -> Non
         ledger = path or _ledger_path()
         try:
             if ledger.exists() and ledger.stat().st_size > _LEDGER_MAX_BYTES:
-                ledger.replace(ledger.with_suffix(ledger.suffix + ".1"))
+                _rotate_ledger_locked(ledger)
         except OSError:
             pass
         _append_jsonl(ledger, {"ts": round(time.time(), 3), **_scrub_tree(record)})
@@ -606,20 +635,70 @@ def read_unconsumed_spans(
 _SPAN_CONTENT_CAP = 1600  # chars per role per span in the assembled input
 
 
-def format_spans(spans: List[Dict[str, Any]]) -> str:
+def _stored_taint(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The mechanical taint tag the §① lane stamps on WAL records.
+
+    ``agent.memory_taint.tag_wal_turn_records`` writes a sparse ``taint``
+    DICT per assistant role record (``record["records"][i]["taint"]``) and
+    ``tag_wal_proposal_record`` writes ``record["taint"]`` on proposals —
+    that per-record dict, NOT a top-level boolean, is the cross-lane
+    interface. Returns the dict when present, else None.
+    """
+    taint = obj.get("taint")
+    return taint if isinstance(taint, dict) else None
+
+
+def _taint_marked(taint: Optional[Dict[str, Any]]) -> bool:
+    """Fail-closed reading of a stored taint tag (corrupt registry counts)."""
+    return bool(
+        taint and (taint.get("tainted") or taint.get("registry") == "corrupt")
+    )
+
+
+def _taint_label(
+    session_id: str, role: str, content: str, holder: Dict[str, Any]
+) -> str:
+    """``" [tainted]"`` marker for one role record / proposal, else ``""``.
+
+    Prefers the §① taint lane's :func:`~agent.memory_taint.curator_taint_label`
+    when that module is available (post-merge: stored tag OR live registry
+    recompute, fail-closed); before the taint lane lands, falls back to the
+    stored per-record tag alone (plus the legacy record-level ``tainted``
+    boolean of the Phase-1 caller-marked seam).
+    """
+    stored = _stored_taint(holder)
+    try:
+        from agent.memory_taint import curator_taint_label
+
+        label = curator_taint_label(session_id, role, content, stored)
+        return f" {label}" if label else ""
+    except ImportError:
+        pass
+    except Exception:
+        return " [tainted]"  # fail closed, matching the taint lane's posture
+    if role != "user" and (_taint_marked(stored) or holder.get("tainted")):
+        return " [tainted]"
+    return ""
+
+
+def format_spans(spans: List[Dict[str, Any]], *, session_id: str = "") -> str:
     """Render WAL spans into the curator input listing.
 
     Scrub site (b): the WAL is scrubbed at write time (Phase 0), but this
-    belt re-scrubs everything assembled into the fork prompt. Records that
-    carry taint tags (the Phase-1 seam: mechanical span tainting marks WAL
-    records) are labeled ``[tainted]`` so the prompt's quote-ineligibility
-    rule has something to bind to.
+    belt re-scrubs everything assembled into the fork prompt. Taint marks
+    consume the §① lane's per-record interface (see :func:`_stored_taint`):
+    turn spans are labeled per ROLE record — taint is a property of one
+    assistant message, not the whole turn — and proposals per record, so the
+    prompt's quote-ineligibility rule binds to exactly the content that is
+    memory-derived.
     """
     lines: List[str] = []
     for span in spans or []:
         rec = span.get("record") or {}
-        taint = " [tainted]" if rec.get("tainted") else ""
         if span.get("type") == "proposal":
+            taint = _taint_label(
+                session_id, "assistant", str(rec.get("content") or ""), rec
+            )
             lines.append(
                 f"[span {span['ref']}{taint} kind_hint="
                 f"{rec.get('kind_hint') or '-'} origin={rec.get('origin') or '-'}]"
@@ -628,15 +707,17 @@ def format_spans(spans: List[Dict[str, Any]]) -> str:
                 "PROPOSAL: " + _scrub(str(rec.get("content") or ""))[:_SPAN_CONTENT_CAP]
             )
         else:
-            lines.append(f"[span {span['ref']}{taint} seq={rec.get('seq')}]")
+            lines.append(f"[span {span['ref']} seq={rec.get('seq')}]")
             for msg in rec.get("records") or []:
                 if not isinstance(msg, dict):
                     continue
-                role = str(msg.get("role") or "?").upper()
-                content = _scrub(str(msg.get("content") or ""))
+                role_raw = str(msg.get("role") or "?")
+                raw_content = str(msg.get("content") or "")
+                taint = _taint_label(session_id, role_raw, raw_content, msg)
+                content = _scrub(raw_content)
                 if len(content) > _SPAN_CONTENT_CAP:
                     content = content[:_SPAN_CONTENT_CAP] + "…"
-                lines.append(f"{role}: {content}")
+                lines.append(f"{role_raw.upper()}{taint}: {content}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -688,18 +769,84 @@ def build_digest_header(
 _REF_PREFIX_RE = re.compile(r"^(turn|proposal):")
 
 
+def _quote_taint_detail(
+    source_span: Optional[Dict[str, Any]], quote: str
+) -> Optional[str]:
+    """Stored-tag taint pre-classification for one quoted span (telemetry).
+
+    Conservative, content-level approximation of the §① occurrence-level
+    check: a quote whose scrubbed text occurs ONLY in taint-marked
+    assistant/proposal content is taint-ineligible. Post-merge the taint
+    lane's rewritten ``_ground_ref`` enforces the precise occurrence-level
+    rule mechanically; this classifier exists so the SHADOW metric reports
+    those as ``checked="taint"`` instead of conflating them with
+    confabulation (§⑧ quote-failure gate hygiene). Returns a detail string
+    when taint-ineligible, else None.
+    """
+    if not source_span:
+        return None
+    q = _scrub(str(quote or "")).strip()
+    if not q:
+        return None
+    rec = source_span.get("record") or {}
+    if source_span.get("type") == "proposal":
+        if (
+            (_taint_marked(_stored_taint(rec)) or rec.get("tainted"))
+            and q in _scrub(str(rec.get("content") or ""))
+        ):
+            return (
+                "quote grounds only in a memory-tainted proposal record "
+                "(ADR-004 §① echo-chamber rule)"
+            )
+        return None
+    clean_hit = False
+    tainted_hit = False
+    rec_tainted = bool(rec.get("tainted"))  # legacy record-level marker
+    for msg in rec.get("records") or []:
+        if not isinstance(msg, dict):
+            continue
+        content = _scrub(str(msg.get("content") or ""))
+        if q not in content:
+            continue
+        role = str(msg.get("role") or "")
+        if role != "user" and (
+            _taint_marked(_stored_taint(msg)) or rec_tainted
+        ):
+            tainted_hit = True
+        else:
+            clean_hit = True
+    if tainted_hit and not clean_hit:
+        return (
+            "quote matches only memory-tainted assistant content "
+            "(ADR-004 §① echo-chamber rule): memory citing injected memory "
+            "is not corroboration"
+        )
+    return None
+
+
 def dry_run_quote_checks(
     verdict_spans: List[Dict[str, Any]],
     *,
     session_id: str,
+    spans_by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run the Phase-1 mechanical quote-grounding check in validate-only mode.
+    """Run the mechanical quote checks in validate-only mode (shadow metric).
 
-    For every note-propose / skill-propose verdict, the verbatim_quote is
-    checked exactly the way :meth:`MemoryWritePipeline._ground_ref` would
-    check it at admission (admissibility + substring match against the
-    scrubbed WAL record). NOTHING is written — the pass/fail result is the
-    shadow-mode confabulation metric recorded in the ledger.
+    For every note-propose / skill-propose verdict:
+
+    * origin-taint — the stored §① WAL taint tags are consulted first
+      (:func:`_quote_taint_detail`); a taint-ineligible quote is reported as
+      ``checked="taint"`` WITHOUT running grounding, so the ledger's
+      quote-failure rate separates taint rejections from confabulation;
+    * grounding — otherwise :func:`~agent.memory_pipeline.dry_run_ground_ref`
+      runs the §③-step-5 check (format + admissibility + verbatim substring
+      match against the scrubbed WAL record).
+
+    NOTHING is written. Note this is a telemetry approximation of admission,
+    not full parity: real admission additionally runs the step-1
+    caller-marked taint rejection (``evidence_ref_is_tainted``) and — once
+    the §① lane is merged — the occurrence-level taint rule inside
+    ``_ground_ref`` itself.
     """
     from agent.memory_pipeline import dry_run_ground_ref
 
@@ -707,17 +854,26 @@ def dry_run_quote_checks(
     for span in verdict_spans or []:
         if span.get("verdict") not in ("note-propose", "skill-propose"):
             continue
-        entry_id = _REF_PREFIX_RE.sub("", str(span.get("span_ref") or ""))
-        ref = {
-            "type": "wal",
-            "session_id": session_id,
-            "entry_id": entry_id,
-            "quote": span.get("verbatim_quote") or "",
-        }
-        try:
-            result = dry_run_ground_ref(ref)
-        except Exception as e:  # pragma: no cover - helper guards internally
-            result = {"ok": False, "checked": "error", "detail": str(e)}
+        span_ref = str(span.get("span_ref") or "")
+        quote = span.get("verbatim_quote") or ""
+        taint_detail = _quote_taint_detail(
+            (spans_by_ref or {}).get(span_ref), quote
+        )
+        if taint_detail:
+            result: Dict[str, Any] = {
+                "ok": False, "checked": "taint", "detail": taint_detail,
+            }
+        else:
+            ref = {
+                "type": "wal",
+                "session_id": session_id,
+                "entry_id": _REF_PREFIX_RE.sub("", span_ref),
+                "quote": quote,
+            }
+            try:
+                result = dry_run_ground_ref(ref)
+            except Exception as e:  # pragma: no cover - helper guards internally
+                result = {"ok": False, "checked": "error", "detail": str(e)}
         checks.append(
             {
                 "span_ref": span.get("span_ref"),
@@ -747,22 +903,28 @@ def _extract_verdict_from_text(text: str) -> Optional[Dict[str, Any]]:
     Warm runs keep ``tools[]`` byte-identical to the parent for prefix-cache
     parity (§4.1), so the curator_verdict schema is not visible there and
     the verdict arrives as the final message instead (the prompt instructs
-    exactly this). Accepts fenced or bare JSON.
+    exactly this). Accepts fenced or bare JSON. Fenced blocks are tried
+    LAST-first: a model that emits an example/explanatory fence before the
+    real verdict must not have the example parsed as the verdict.
     """
     if not text:
         return None
     candidate = text.strip()
-    fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", candidate)
-    if fence:
-        candidate = fence.group(1)
-    else:
-        start = candidate.find("{")
-        end = candidate.rfind("}")
-        if start == -1 or end <= start:
-            return None
-        candidate = candidate[start : end + 1]
+    for block in reversed(
+        re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", candidate)
+    ):
+        try:
+            data = json.loads(block)
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("spans"), list):
+            return data
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end <= start:
+        return None
     try:
-        data = json.loads(candidate)
+        data = json.loads(candidate[start : end + 1])
     except Exception:
         return None
     if isinstance(data, dict) and isinstance(data.get("spans"), list):
@@ -934,7 +1096,9 @@ def run_ingest_curation(
             append_ledger(record)
             return record
 
-        prompt = build_curator_prompt(format_spans(spans))
+        prompt = build_curator_prompt(
+            format_spans(spans, session_id=session_id)
+        )
         history: Optional[List[Dict[str, Any]]] = None
         if mode == "warm" and messages_snapshot:
             history = list(messages_snapshot)
@@ -943,7 +1107,11 @@ def run_ingest_curation(
             if digest:
                 prompt = digest + "\n\n" + prompt
 
-        verdict_payload = _run_curator_fork(
+        # _run_curator_fork returns a VALIDATED payload or None — provenance
+        # (sink entries are validated at dispatch, text extractions are
+        # validated there unconditionally), never payload shape, decides
+        # whether validate_curator_verdict ran.
+        validation = _run_curator_fork(
             agent,
             prompt=prompt,
             history=history,
@@ -952,19 +1120,17 @@ def run_ingest_curation(
             record=record,
         )
 
-        if verdict_payload is None:
+        if validation is None:
             record["result"] = "no-verdict"
             record["duration_ms"] = round((time.time() - started) * 1000.0, 1)
             append_ledger(record)
             return record  # watermark NOT advanced — spans stay buffered
 
-        validation = (
-            verdict_payload
-            if "spans" in verdict_payload and "distribution" in verdict_payload
-            else validate_curator_verdict(verdict_payload)
-        )
+        spans_by_ref = {s["ref"]: s for s in spans}
         quote_checks = dry_run_quote_checks(
-            validation["spans"], session_id=session_id
+            validation["spans"],
+            session_id=session_id,
+            spans_by_ref=spans_by_ref,
         )
         record.update(
             {
@@ -994,7 +1160,6 @@ def run_ingest_curation(
 
         # ---- Cutover seam (Phase-2: unreachable while shadow_mode) --------
         if not shadow_mode_enabled():
-            spans_by_ref = {s["ref"]: s for s in spans}
             manager = getattr(agent, "_memory_manager", None)
             record["submit"] = submit_curated(
                 manager,
@@ -1029,9 +1194,13 @@ def _run_curator_fork(
 ) -> Optional[Dict[str, Any]]:
     """Build the fork, run it under the tool whitelist, collect the verdict.
 
-    Returns the validated verdict payload (the sink's last valid entry), a
-    raw payload parsed from the final text, or None when the run produced
-    nothing usable. All fork teardown is handled here.
+    Returns a VALIDATED verdict payload (``validate_curator_verdict``
+    output) or None when the run produced nothing usable. Validation is
+    decided by provenance, never by payload shape: sink entries were
+    validated at dispatch time; a payload parsed out of the final text is
+    raw model output and is validated here unconditionally (caps and the
+    drop-refusal must hold on the warm-mode channel too). All fork teardown
+    is handled here.
     """
     from agent.thread_scoped_output import thread_scoped_silence
     from hermes_cli.plugins import (
@@ -1091,10 +1260,20 @@ def _run_curator_fork(
                 ),
             )
             try:
-                result = fork.run_conversation(
-                    user_message=prompt,
-                    conversation_history=history,
-                )
+                # Tag every memory_search the fork issues with its origin so
+                # the plugin-side retrieval ledger can exclude curator
+                # neighbor lookups from the §⑤ promotion signal (the ADR
+                # already excludes prefetch hits from "명시적 memory_search
+                # 히트" for the same rich-get-richer reason). ContextVar-based
+                # so propagate_context_to_thread carries it onto offloaded
+                # tool threads (same scoping posture as the whitelist).
+                from agent.memory_manager import retrieval_origin
+
+                with retrieval_origin("ingest_curator"):
+                    result = fork.run_conversation(
+                        user_message=prompt,
+                        conversation_history=history,
+                    )
             finally:
                 clear_thread_tool_whitelist()
             if isinstance(result, dict):
@@ -1142,12 +1321,18 @@ def _run_curator_fork(
         except Exception:
             pass
 
-    # Prefer the last VALID sink entry (structured tool submission)…
+    # Prefer the last VALID sink entry (structured tool submission —
+    # validated by dispatch_curator_verdict_for_agent when it was collected)…
     for validation in reversed(sink):
         if validation.get("spans") or validation.get("errors"):
             return validation
-    # …fall back to final-text JSON (warm-mode contract).
-    return _extract_verdict_from_text(final_text)
+    # …fall back to final-text JSON (warm-mode contract). Text extractions
+    # are RAW model output: validate unconditionally, whatever keys the
+    # model happened to emit.
+    payload = _extract_verdict_from_text(final_text)
+    if payload is None:
+        return None
+    return validate_curator_verdict(payload)
 
 
 def _curator_timeout_s() -> float:
@@ -1201,6 +1386,7 @@ class _SessionTriggerState:
         "last_activity_ts",
         "last_snapshot",
         "idle_timer",
+        "agent_ref",
     )
 
     def __init__(self, session_id: str):
@@ -1214,6 +1400,7 @@ class _SessionTriggerState:
         self.last_activity_ts = 0.0
         self.last_snapshot: Optional[List[Dict[str, Any]]] = None
         self.idle_timer: Optional[threading.Timer] = None
+        self.agent_ref: Any = None
 
 
 _states: Dict[str, _SessionTriggerState] = {}
@@ -1524,30 +1711,47 @@ def observe_pre_compress(
 
 
 def _rearm_idle_timer(agent: Any, st: _SessionTriggerState) -> None:
-    """(Re)arm the per-session idle trigger: idle ≥ N min + dirty buffer.
+    """Arm the per-session idle trigger: idle ≥ N min + dirty buffer.
 
     Reuses the curator.py idle-detection *principle* (idle gate before a
     background pass) but per-session and event-armed rather than a global
-    poll loop: a daemon Timer re-armed on every observed turn."""
+    poll loop. At most ONE live Timer thread per session: a turn observed
+    while a timer is pending just refreshes ``last_activity_ts`` (already
+    done by the caller) and stores the freshest agent ref — the pending
+    timer, on firing, re-arms itself for the remaining idle window instead
+    of firing early. This keeps the per-turn hot-path cost at attribute
+    writes, not thread creation."""
     idle_s = _idle_seconds()
     if idle_s <= 0:
         return
 
     def _idle_fire() -> None:
         try:
-            if not ingest_curator_enabled():
-                return
             with st.lock:
+                st.idle_timer = None
+                if not ingest_curator_enabled():
+                    return
                 idle_for = time.time() - st.last_activity_ts
-                if st.running or not st.dirty or idle_for < idle_s:
+                if st.running or not st.dirty:
+                    return
+                if idle_for < idle_s:
+                    # Activity happened while we slept — re-arm for the
+                    # remainder of the idle window (single-timer discipline).
+                    timer = threading.Timer(
+                        max(idle_s - idle_for, 0.001), _idle_fire
+                    )
+                    timer.daemon = True
+                    st.idle_timer = timer
+                    timer.start()
                     return
                 st.running = True
                 st.dirty = False
                 snapshot = st.last_snapshot
+                fire_agent = st.agent_ref if st.agent_ref is not None else agent
                 st.score = 0
                 st.turns_since_run = 0
             spawn_curation_thread(
-                agent,
+                fire_agent,
                 session_id=st.session_id,
                 trigger="idle",
                 mode="cold",
@@ -1558,11 +1762,9 @@ def _rearm_idle_timer(agent: Any, st: _SessionTriggerState) -> None:
             logger.debug("ingest-curator idle trigger failed (fail-open)", exc_info=True)
 
     with st.lock:
+        st.agent_ref = agent
         if st.idle_timer is not None:
-            try:
-                st.idle_timer.cancel()
-            except Exception:
-                pass
+            return  # pending timer will honor the refreshed activity ts
         timer = threading.Timer(idle_s, _idle_fire)
         timer.daemon = True
         st.idle_timer = timer
@@ -1606,8 +1808,19 @@ def submit_curated(
     preserved) IN ADDITION to raw (digest never replaces raw); ``raw-only``
     re-sends nothing — the per-turn extraction-free ingest already carried
     the span, so it is counted but not re-submitted.
+
+    Output hygiene (§4.2 site (c) + §4.5 grounding): the extract-full quote
+    is FORK OUTPUT — warm-mode forks inherit the unscrubbed parent
+    transcript by design, so nothing upstream guarantees the quote is clean
+    or real. Every extract-full submission is therefore gated on the same
+    mechanical WAL quote-grounding check admission runs (fail-closed:
+    ungroundable → counted in ``grounding_rejected``, the span stays
+    raw-only), and every body — extract-full and merge-batch alike — passes
+    the deterministic secret scrub before it leaves this function.
     """
-    result: Dict[str, Any] = {"submitted": 0, "skipped": 0, "blocked": None}
+    result: Dict[str, Any] = {
+        "submitted": 0, "skipped": 0, "grounding_rejected": 0, "blocked": None,
+    }
     if shadow_mode_enabled() or not ingest_curator_enabled():
         result["blocked"] = "shadow-mode"
         return result
@@ -1624,6 +1837,7 @@ def submit_curated(
         nonlocal submitted
         if submitted >= _MAX_ADD_EPISODES:
             return False
+        body = _scrub(body)  # §4.2 site (c): fork output is never trusted
         try:
             manager.sync_curated_episode(
                 body, session_id=session_id, metadata=metadata
@@ -1632,6 +1846,25 @@ def submit_curated(
             return True
         except Exception:
             logger.warning("curated ingest submit failed (fail-open)", exc_info=True)
+            return False
+
+    def _extract_full_grounded(span_ref: str, quote: str) -> bool:
+        """§4.5: no quote-grounding pass, no digest. Fail-closed."""
+        from agent.memory_pipeline import dry_run_ground_ref
+
+        try:
+            check = dry_run_ground_ref({
+                "type": "wal",
+                "session_id": session_id,
+                "entry_id": _REF_PREFIX_RE.sub("", span_ref),
+                "quote": quote,
+            })
+            return bool(check.get("ok"))
+        except Exception:
+            logger.debug(
+                "curated extract-full grounding errored (fail-closed)",
+                exc_info=True,
+            )
             return False
 
     for span in verdict_spans or []:
@@ -1653,18 +1886,29 @@ def submit_curated(
                 merge_refs.append(ref)
         elif verdict == "extract-full":
             quote = str(span.get("verbatim_quote") or "").strip()
-            body = f"[q:{ref}] {quote}" if quote else ""
-            if body:
-                _send(
-                    body,
-                    {
-                        "source_name": "hermes-curated",
-                        "source_id": ref,
-                        "episode_type": "curated_digest",
-                        "curated_verdict": "extract-full",
-                        "curated_lane": "curated",
-                    },
-                )
+            if not quote:
+                result["skipped"] += 1
+                continue
+            if not _extract_full_grounded(ref, quote):
+                # Confabulated (or inadmissibly short/empty) quote: the
+                # digest is refused at the door. The span itself is not
+                # lost — the per-turn raw ingest already carried it (§②
+                # degrade path). Secret-bearing quotes that DO ground (the
+                # WAL stores the masked form, and _ground_ref scrubs the
+                # quote before matching) are handled by the _send scrub.
+                result["grounding_rejected"] += 1
+                result["skipped"] += 1
+                continue
+            _send(
+                f"[q:{ref}] {quote}",
+                {
+                    "source_name": "hermes-curated",
+                    "source_id": ref,
+                    "episode_type": "curated_digest",
+                    "curated_verdict": "extract-full",
+                    "curated_lane": "curated",
+                },
+            )
         else:
             # raw-only / NOOP / note- & skill-propose: nothing to ingest on
             # this lane (raw already landed per-turn; proposals go through
