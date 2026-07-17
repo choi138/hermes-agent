@@ -1069,6 +1069,25 @@ def apply_notes_plan(
     raise NoteValidationError(f"unknown staged notes verdict {verdict!r}")
 
 
+def dry_run_ground_ref(
+    ref: Dict[str, Any], *, hermes_home: Optional[Path] = None
+) -> Dict[str, Any]:
+    """Validate-only quote-grounding check (ADR-004 Phase 2 shadow metric).
+
+    Runs exactly the mechanical §③-step-5 check a real admission would run
+    (:meth:`MemoryWritePipeline._ground_ref`: format + admissibility +
+    verbatim substring match against the scrubbed local journals) WITHOUT
+    writing anything — no note, no ledger entry, no store mutation. The
+    ingest curator uses this to record a pass/fail confabulation metric for
+    its note-/skill-propose verdicts while in shadow mode.
+
+    Read-only by construction: pipeline/store constructors are
+    allocation-only and ``_ground_ref`` only reads WAL / L0-mirror files.
+    """
+    pipeline = MemoryWritePipeline(hermes_home=hermes_home)
+    return pipeline._ground_ref(dict(ref or {}))
+
+
 def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Replay an approved staged notes write (write-approval pending store).
 

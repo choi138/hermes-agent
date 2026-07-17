@@ -1367,6 +1367,56 @@ class MemoryManager:
 
         self._submit_background(_run)
 
+    def sync_curated_episode(
+        self,
+        content: str,
+        *,
+        session_id: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Send one curator-approved episode to external providers (ADR-004
+        §4.5 cutover seam — Phase 2 ships this UNREACHABLE: the only caller,
+        ``agent.ingest_curator.submit_curated``, is double-gated behind
+        ``curator.ingest_enabled`` (default False) AND ``curator.shadow_mode``
+        (default True)).
+
+        Rides the same single mem-sync worker as every other external write
+        (§4.5 backpressure: curated ingests are an internal allocation of the
+        existing chain — mem-sync worker → plugin breaker/DLQ → daemon
+        bulkhead — never a second writer). The pass-through fields
+        (``source_name``/``source_id``/``episode_type``/``curated_*``) ride
+        the metadata dict exactly like the notes backfill; the daemon-side
+        IngestRequest pass-through consumes them once deployed. Fail-open
+        per provider.
+        """
+        providers = [p for p in self._providers if p.name != "builtin"]
+        if not providers or not content:
+            return
+
+        meta = {
+            "source_name": "hermes-curated",
+            "session_id": session_id,
+            **(metadata or {}),
+        }
+
+        def _run() -> None:
+            for provider in providers:
+                try:
+                    metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                    if metadata_mode == "keyword":
+                        provider.on_memory_write("add", "curated", content, metadata=dict(meta))
+                    elif metadata_mode == "positional":
+                        provider.on_memory_write("add", "curated", content, dict(meta))
+                    else:
+                        provider.on_memory_write("add", "curated", content)
+                except Exception as e:
+                    logger.warning(
+                        "Memory provider '%s' curated ingest failed: %s",
+                        provider.name, e,
+                    )
+
+        self._submit_background(_run)
+
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""

@@ -44,14 +44,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
-    """Resolve provider/model/credentials for the review fork.
+def _resolve_review_runtime(
+    agent: Any, aux_task: str = "background_review"
+) -> Dict[str, Any]:
+    """Resolve provider/model/credentials for a review-style fork.
 
     Default (auto / unset / same as parent): inherit the parent's live runtime
     (with codex_app_server -> codex_responses downgrade). ``routed`` is False —
     the fork uses the main model and the warm cache, exactly as before. When
-    ``auxiliary.background_review.{provider,model}`` names a concrete model
+    ``auxiliary.<aux_task>.{provider,model}`` names a concrete model
     different from the parent's, resolve that runtime and set ``routed=True``.
+
+    ``aux_task`` selects the auxiliary config block: ``background_review``
+    (default, unchanged behavior) or ``ingest_curator`` (the ADR-004 §4.4
+    curator fork, which shares this exact resolution policy by design).
     """
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
@@ -76,7 +82,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     except Exception:
         return parent
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+    task = aux.get(aux_task, {}) if isinstance(aux.get(aux_task), dict) else {}
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
@@ -107,7 +113,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "routed": True,
         }
     except Exception as e:
-        logger.debug("background-review aux routing failed (%s); using main model", e)
+        logger.debug("%s aux routing failed (%s); using main model", aux_task, e)
         return parent
 
 
