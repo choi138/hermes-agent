@@ -188,7 +188,7 @@ def run_oneshot(
             run — even when the run fails — so pipelines can account for
             spend per invocation.
 
-    Returns the exit code.  Caller should sys.exit() with the return.
+    Returns the exit code.  The caller owns process termination.
     """
     # Silence every stdlib logger for the duration.  AIAgent, tools, and
     # provider adapters all log to stderr through the root logger; file
@@ -491,12 +491,17 @@ def _run_agent(
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     session_db = _create_session_db_for_oneshot()
-    # Read the effective fallback chain from profile config so oneshot workers
-    # honour the same merge semantics as interactive CLI and gateway sessions.
-    _fb = get_fallback_chain(cfg)
-
+    # The try spans agent construction (not just ``chat``) so the SQLite store
+    # opened above is always closed — including when ``AIAgent(...)`` itself
+    # raises on a provider/config error. The one-shot exit path hard-exits via
+    # os._exit and skips finalizers, so an un-closed connection here would leak.
     agent = None
     try:
+        # Read the effective fallback chain from profile config so oneshot
+        # workers honour the same merge semantics as interactive CLI and
+        # gateway sessions.
+        _fb = get_fallback_chain(cfg)
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
