@@ -210,6 +210,41 @@ KANBAN_GUIDANCE = (
     "and block with `kind=needs_input` instead of claiming completion."
 )
 
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban orchestrator routing preflight\n"
+    "Before the first tool call for a non-trivial request, classify the requested "
+    "artifact as a direct explanation or inspection, repository mutation, sourced "
+    "research, or an independent verdict. Use the exact named roles and assignees "
+    "defined in SOUL.md or the active team instructions.\n"
+    "An explicit request to review, QA, find defects, verify a fix, or judge release "
+    "readiness creates an independent-review boundary even when the mechanics are "
+    "short or bounded. A generic `delegate_task` leaf can provide parallel reasoning, "
+    "but it does not replace the named independent reviewer or its durable handoff.\n"
+    "Before routing named work, confirm that `kanban_create` is present in the actual "
+    "session tools. If a named role is required and that tool is absent, report a "
+    "capability blocker and stop. Do not silently substitute direct handling or a "
+    "generic delegate.\n"
+    "Use the smallest sufficient route: do not manufacture unrelated specialist, "
+    "correction, re-review, or finalizer cards."
+)
+
+
+def select_kanban_session_guidance(
+    *,
+    enabled_toolsets=None,
+    valid_tool_names=None,
+    task_id=None,
+) -> str:
+    """Return session-static Kanban guidance for workers or orchestrators."""
+    toolsets = set(enabled_toolsets or ())
+    tools = set(valid_tool_names or ())
+
+    if task_id:
+        return KANBAN_GUIDANCE if "kanban_show" in tools else ""
+    if "kanban" in toolsets or "kanban_create" in tools:
+        return KANBAN_ORCHESTRATOR_GUIDANCE
+    return ""
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
