@@ -39,6 +39,27 @@ def test_normalize_usage_openai_subtracts_cached_prompt_tokens():
     assert normalized.output_tokens == 700
 
 
+def test_normalize_usage_codex_accepts_dict_terminal_usage():
+    """Custom Responses relays may leave terminal usage as decoded JSON."""
+    usage = {
+        "input_tokens": 3000,
+        "output_tokens": 700,
+        "input_tokens_details": {
+            "cached_tokens": 1800,
+            "cache_creation_tokens": 200,
+        },
+        "output_tokens_details": {"reasoning_tokens": 400},
+    }
+
+    normalized = normalize_usage(usage, provider="custom", api_mode="codex_responses")
+
+    assert normalized.input_tokens == 1000
+    assert normalized.cache_read_tokens == 1800
+    assert normalized.cache_write_tokens == 200
+    assert normalized.output_tokens == 700
+    assert normalized.reasoning_tokens == 400
+
+
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
     """DeepSeek's native API (api.deepseek.com) reports context-cache hits as
     top-level prompt_cache_hit_tokens / prompt_cache_miss_tokens (with
