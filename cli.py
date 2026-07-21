@@ -7164,11 +7164,77 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self.reasoning_config = _parse_reasoning_config(
+            CLI_CONFIG["agent"].get("reasoning_effort", "")
+        )
+        # /new is a full conversation boundary: session-scoped runtime
+        # overrides (/model --session, /fast, one-turn restores) do not carry
+        # forward.  Re-derive model/provider and service tier from config.yaml
+        # so a session-only switch never leaks into the next session (#48055,
+        # #23131).
+        self._pending_one_turn_model_restore = None
+        self.service_tier = _parse_service_tier_config(
+            CLI_CONFIG["agent"].get("service_tier", "")
+        )
+        _model_config = CLI_CONFIG.get("model", {})
+        _config_model = (
+            (_model_config.get("default") or _model_config.get("model") or "")
+            if isinstance(_model_config, dict)
+            else (_model_config or "")
+        )
+        if _config_model and _config_model != getattr(self, "model", None):
+            _config_provider = (
+                _model_config.get("provider", "")
+                if isinstance(_model_config, dict)
+                else ""
+            )
+            try:
+                from hermes_cli.model_switch import switch_model as _switch_model
+
+                _reset_result = _switch_model(
+                    raw_input=_config_model,
+                    current_provider=self.provider or "",
+                    current_model=self.model or "",
+                    current_base_url=self.base_url or "",
+                    current_api_key=self.api_key or "",
+                    is_global=False,
+                    explicit_provider=_config_provider or "",
+                )
+                if _reset_result.success:
+                    if self.agent:
+                        self.agent.switch_model(
+                            new_model=_reset_result.new_model,
+                            new_provider=_reset_result.target_provider,
+                            api_key=_reset_result.api_key,
+                            base_url=_reset_result.base_url,
+                            api_mode=_reset_result.api_mode,
+                        )
+                    self.model = _reset_result.new_model
+                    self.provider = _reset_result.target_provider
+                    self.requested_provider = _reset_result.target_provider
+                    self._explicit_api_key = _reset_result.api_key
+                    self._explicit_base_url = _reset_result.base_url
+                    if _reset_result.api_key:
+                        self.api_key = _reset_result.api_key
+                    if _reset_result.base_url:
+                        self.base_url = _reset_result.base_url
+                    if _reset_result.api_mode:
+                        self.api_mode = _reset_result.api_mode
+                    if not silent:
+                        _cprint(
+                            f"  (model reset to config default: "
+                            f"{_reset_result.new_model})"
+                        )
+            except Exception:
+                # Best-effort: an unreachable config default must never block
+                # /new. The session keeps the current working model.
+                logger.debug("/new model reset to config default failed", exc_info=True)
         _sync_process_session_id(self.session_id)
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
+            self.agent.reasoning_config = self.reasoning_config
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
@@ -8202,16 +8268,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Supports:
           /model                              — show current model + usage hints
-          /model <name>                       — switch model (persists by default)
+          /model <name>                       — switch model (this session only)
           /model <name> --once                — switch for the next turn only
-          /model <name> --session             — switch for this session only
-          /model <name> --global              — switch and persist (explicit)
+          /model <name> --session             — switch for this session only (explicit)
+          /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
 
-        Persistence defaults to on (``model.persist_switch_by_default`` in
-        config.yaml, default True). Use ``--session`` for this CLI session or
-        ``--once`` for the next turn only.
+        Persistence defaults to off (``model.persist_switch_by_default`` in
+        config.yaml, default False — switches are session-scoped). Use
+        ``--global`` to persist, or ``--once`` for the next turn only.
         """
         from hermes_cli.model_switch import (
             switch_model,
@@ -8238,11 +8304,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if one_turn and not model_input and not explicit_provider:
             _cprint("  ✗ /model --once requires a model or provider.")
             return
-        # Resolve the effective persistence once: --session overrides the
-        # config-gated default, --global forces persist, otherwise defer to
-        # model.persist_switch_by_default (defaults to True so /model survives
-        # across sessions).
-        persist_global = resolve_persist_behavior(is_global_flag, is_session, is_once=one_turn)
+        # Resolve the effective persistence once: --global forces persist,
+        # --session/--once force session-scope, otherwise defer to
+        # model.persist_switch_by_default (defaults to False so /model is
+        # session-scoped unless the user opts in).
+        persist_global = resolve_persist_behavior(
+            is_global_flag, is_session, is_once=one_turn,
+            explicit_provider=explicit_provider,
+        )
 
         # --refresh: wipe the on-disk picker cache before building the
         # provider list. Forces a live re-fetch of every authed provider's
@@ -13196,8 +13265,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # --- /model picker modal ---
             if self._model_picker_state:
                 try:
-                    # Picker selections persist by default (same default as
-                    # /model <name>); honour model.persist_switch_by_default.
+                    # Picker selections follow the same session-scoped default
+                    # as /model <name>; honour model.persist_switch_by_default.
                     from hermes_cli.model_switch import resolve_persist_behavior
 
                     self._handle_model_picker_selection(
