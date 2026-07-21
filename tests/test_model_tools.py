@@ -1,10 +1,12 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
+import copy
 import json
 from unittest.mock import ANY, call, patch
 
 
 from model_tools import (
+    TrustedToolResult,
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
@@ -12,6 +14,23 @@ from model_tools import (
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+# =========================================================================
+# Trusted tool results
+# =========================================================================
+
+class TestTrustedToolResult:
+    def test_deepcopy_preserves_display_text_and_trusted_raw_result(self):
+        raw_result = {"ok": True, "items": ["one"]}
+        result = TrustedToolResult("model-facing text", raw_result)
+
+        cloned = copy.deepcopy(result)
+
+        assert type(cloned) is TrustedToolResult
+        assert cloned == "model-facing text"
+        assert cloned.trusted_raw_result == raw_result
+        assert cloned.trusted_raw_result is not raw_result
 
 
 # =========================================================================

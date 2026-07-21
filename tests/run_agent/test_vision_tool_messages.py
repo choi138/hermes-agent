@@ -114,6 +114,19 @@ class TestToolResultContentProactiveDowngrade:
 
         assert content == "plain text result"
 
+    def test_trusted_string_result_is_normalized_for_model_history(self):
+        """Out-of-band provenance must not leak into canonical messages."""
+        from model_tools import TrustedToolResult
+
+        agent = _make_agent()
+        result = TrustedToolResult("plain text result", {"ok": True})
+
+        content = agent._tool_result_content_for_active_model("some_tool", result)
+
+        assert type(content) is str
+        assert content == "plain text result"
+        assert not hasattr(content, "trusted_raw_result")
+
     def test_openrouter_vision_keeps_list_content(self):
         """OpenRouter with vision: list content preserved."""
         agent = _make_agent("openrouter", "gpt-4o")

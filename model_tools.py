@@ -43,6 +43,10 @@ class TrustedToolResult(str):
         instance.trusted_raw_result = trusted_raw_result
         return instance
 
+    def __getnewargs_ex__(self):
+        """Preserve provenance when copy/pickle reconstructs this immutable value."""
+        return (str(self), self.trusted_raw_result), {}
+
 
 def get_trusted_raw_tool_result(result: Any) -> Any:
     """Return the pre-middleware/plugin registry result when available."""

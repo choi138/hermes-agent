@@ -5562,7 +5562,11 @@ class AIAgent:
         the agent has a chance to recover.
         """
         if not _is_multimodal_tool_result(result):
-            return result
+            # Provenance-bearing string subclasses are only needed while the
+            # executor evaluates trusted control metadata. Canonical model
+            # history must contain plain strings so copy/serialization paths do
+            # not retain out-of-band registry objects.
+            return str(result) if isinstance(result, str) else result
 
         content = result.get("content") or []
         if not self._content_has_image_parts(content):

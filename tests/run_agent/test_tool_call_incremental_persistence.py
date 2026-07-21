@@ -383,6 +383,7 @@ def test_successful_kanban_terminal_call_skips_later_batch_side_effects(monkeypa
 
     assert dispatched == ["kanban_complete"]
     assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert type(messages[0]["content"]) is str
     assert "skipped after successful kanban_complete" in messages[1]["content"]
     assert agent._kanban_terminal_transition["status"] == "done"
 
@@ -547,6 +548,7 @@ def test_concurrent_terminal_control_uses_raw_result_when_display_is_stripped(
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
     tool_call = _mock_tool_call(name="kanban_complete", call_id="c1")
     assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    messages: list[dict] = []
     raw = json.dumps({
         "ok": True,
         "task_id": "t_12345678",
@@ -568,9 +570,11 @@ def test_concurrent_terminal_control_uses_raw_result_when_display_is_stripped(
             side_effect=lambda **kwargs: kwargs["content"],
         ),
     ):
-        agent._execute_tool_calls_concurrent(assistant_message, [], "task-1")
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
 
     assert agent._kanban_terminal_transition["status"] == "done"
+    assert type(messages[0]["content"]) is str
+    assert messages[0]["content"] == "marker stripped"
 
 
 def test_concurrent_terminal_control_rejects_forged_display_marker(monkeypatch):
