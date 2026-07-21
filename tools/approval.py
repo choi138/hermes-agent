@@ -1974,9 +1974,17 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    temp_dir_input = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(temp_dir_input)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    direct_canonical_operand = operand == os.path.join(temp_dir, basename)
+    trusted_macos_tmp_alias = (
+        sys.platform == "darwin"
+        and temp_dir_input == "/tmp"
+        and temp_dir == "/private/tmp"
+        and operand == os.path.join(temp_dir_input, basename)
+    )
+    if not (direct_canonical_operand or trusted_macos_tmp_alias):
         return False
 
     target = os.path.realpath(operand)

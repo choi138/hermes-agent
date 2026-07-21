@@ -106,6 +106,44 @@ def test_decompose_empty_children_returns_none(kanban_home):
     assert result is None
 
 
+def test_decompose_allows_more_than_three_cards_within_three_stages(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[
+                {"title": "specialist A", "parents": []},
+                {"title": "specialist B", "parents": []},
+                {"title": "independent QA", "parents": [0, 1]},
+                {"title": "final owner", "parents": [2]},
+            ],
+            author="me",
+        )
+
+    assert child_ids is not None
+    assert len(child_ids) == 4
+
+
+def test_decompose_rejects_more_than_three_initial_stages(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        with pytest.raises(ValueError, match="at most 3 stages"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[
+                    {"title": "stage 1", "parents": []},
+                    {"title": "stage 2", "parents": [0]},
+                    {"title": "stage 3", "parents": [1]},
+                    {"title": "stage 4", "parents": [2]},
+                ],
+                author="me",
+            )
+
+
 def test_decompose_rejects_self_parent(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
@@ -130,6 +168,31 @@ def test_decompose_rejects_out_of_range_parent(kanban_home):
                 children=[{"title": "x", "parents": [5]}],
                 author="me",
             )
+
+
+@pytest.mark.parametrize("boolean_parent", [False, True])
+def test_decompose_db_rejects_boolean_parent_indices(
+    kanban_home, boolean_parent,
+):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        with pytest.raises(ValueError, match="parent index must be an integer"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[
+                    {"title": "A", "parents": []},
+                    {"title": "B", "parents": []},
+                    {"title": "C", "parents": [boolean_parent]},
+                ],
+                author="me",
+            )
+
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+    assert root is not None
+    assert root.status == "triage"
 
 
 def test_decompose_rejects_cyclic_parents(kanban_home):
@@ -204,6 +267,29 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
         t = kb.get_task(conn, child_ids[0])
     assert t.workspace_kind == "scratch"
     assert t.workspace_path is None
+
+
+def test_decompose_children_default_out_of_root_goal_mode(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="open-ended root",
+            assignee="worker",
+            triage=True,
+            goal_mode=True,
+            goal_max_turns=4,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "bounded deterministic child"}],
+            author="decomposer",
+        )
+        child = kb.get_task(conn, child_ids[0])
+
+    assert child.goal_mode is False
+    assert child.goal_max_turns is None
 
 
 def test_decompose_per_child_workspace_override(kanban_home):

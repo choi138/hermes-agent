@@ -33,35 +33,50 @@
 
 set -euo pipefail
 
-# ── Locate repo root ────────────────────────────────────────────────────────
+# macOS commonly starts shells with a soft open-file limit of 256.  A single
+# aiohttp-heavy pytest file can legitimately exceed that while its event loops
+# overlap during teardown, causing cascading Errno 24 failures unrelated to the
+# code under test.  Raise only the soft limit when the host allows it; child
+# pytest processes inherit the value.  Linux CI limits are left untouched.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  _soft_nofile="$(ulimit -Sn)"
+  if [[ "$_soft_nofile" != "unlimited" ]] && (( _soft_nofile < 4096 )); then
+    ulimit -S -n 4096 2>/dev/null || true
+  fi
+  unset _soft_nofile
+fi
+
+# Canonical repository test entrypoint.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Locate python ───────────────────────────────────────────────────────────
-# Probe local venvs first; fall back to the Nix devShell's editable venv
-# (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
-# pytest, pytest-asyncio, pytest-timeout, ruff, ty).
-VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
-    break
-  fi
-done
-
-if [ -n "$VENV" ]; then
-  PYTHON="$VENV/bin/python"
-elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
+# An explicit HERMES_PYTHON is the most stable choice for worktrees and Nix
+# devShells: unlike a repo-local symlink, its path cannot be removed by venv
+# lifecycle tests while this runner is still spawning per-file subprocesses.
+# Guard it with an import check because wrapped release binaries may export a
+# runtime-only interpreter without pytest. Fall back to the usual local venvs.
+PYTHON=""
+if [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
-  # Guard with an import check: HERMES_PYTHON may point at the RELEASE
-  # venv (no pytest) when inherited from a wrapped `hermes` binary rather
-  # than the devShell hook.
   PYTHON="$HERMES_PYTHON"
-  echo "▶ no local venv — using Nix dev venv via HERMES_PYTHON: $PYTHON"
+  echo "▶ using explicit HERMES_PYTHON: $PYTHON"
 else
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv," >&2
-  echo "       and HERMES_PYTHON is not a python with pytest (enter the Nix devShell or create a venv)" >&2
-  exit 1
+  VENV=""
+  for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+    if [ -f "$candidate/bin/activate" ]; then
+      VENV="$candidate"
+      break
+    fi
+  done
+
+  if [ -n "$VENV" ]; then
+    PYTHON="$VENV/bin/python"
+  else
+    echo "error: no pytest-capable HERMES_PYTHON and no virtualenv found in" >&2
+    echo "       $REPO_ROOT/.venv, $REPO_ROOT/venv, or ~/.hermes/hermes-agent/venv" >&2
+    exit 1
+  fi
 fi
 
 

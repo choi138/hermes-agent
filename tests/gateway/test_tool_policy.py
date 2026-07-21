@@ -222,8 +222,10 @@ def test_discord_core_compaction_preserves_every_non_description_contract():
 def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
     monkeypatch,
 ):
-    """Exercise the Gateway-only 31st-tool path and its final policy schema."""
+    """Exercise a representative 32-tool Discord surface and its final policy."""
     import importlib
+
+    from tools import tts_tool
 
     import model_tools
     from gateway.run import GatewayRunner
@@ -236,6 +238,8 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
         "check_browser_requirements",
         "check_browser_vision_requirements",
         "check_computer_use_requirements",
+        "check_vision_requirements",
+        tts_tool.check_tts_requirements.__name__,
     }
 
     def representative_check(check_fn):
@@ -264,12 +268,12 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
     model_tools._clear_tool_defs_cache()
     try:
         raw_tools = model_tools.get_tool_definitions(
-            enabled_toolsets=["hermes-discord", "kanban_submit"],
+            enabled_toolsets=["hermes-discord", "kanban_submit", "tts"],
             quiet_mode=True,
         )
         raw_names = [tool["function"]["name"] for tool in raw_tools]
         raw_tools_original = deepcopy(raw_tools)
-        assert len(raw_names) == 31
+        assert len(raw_names) == 32
         assert raw_names.count("kanban_task") == 1
         assert {
             "terminal",
@@ -286,6 +290,7 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
             "discord_admin",
             "cronjob",
             "kanban_task",
+            "text_to_speech",
         } <= set(raw_names)
 
         agent = SimpleNamespace(tools=raw_tools)
@@ -293,7 +298,7 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
         metrics = GatewayRunner._record_gateway_tool_policy(agent, policy)
 
         assert metrics == canonical_tool_schema_metrics(agent.tools)
-        assert metrics.count == 31
+        assert metrics.count == 32
         assert raw_tools == raw_tools_original
         assert _without_descriptions(agent.tools) == _without_descriptions(
             raw_tools_original

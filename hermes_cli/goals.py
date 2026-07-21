@@ -45,10 +45,10 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-# Dispatcher workers also share one primary-model iteration budget across the
-# whole run. Six judge turns is enough to recover from short/incomplete turns
-# without allowing the old 20x per-turn amplification.
-KANBAN_DEFAULT_MAX_TURNS = 6
+# Kanban goal mode is explicit and off by default. When a caller opts in,
+# preserve the full goal-loop quality boundary instead of imposing a separate
+# latency cap that can interrupt valid implementation or verification work.
+KANBAN_DEFAULT_MAX_TURNS = DEFAULT_MAX_TURNS
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning

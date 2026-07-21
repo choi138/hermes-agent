@@ -276,6 +276,77 @@ class TestSegmentedDispatchIntegration:
         assert len(search_ends) == 2
         assert all(i < terminal_start for i in search_ends)
 
+    def test_parallel_timeout_with_unknown_effects_skips_later_barrier(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        calls = [
+            _tc("web_search", '{"query":"fast"}', call_id="s1"),
+            _tc(
+                "write_file",
+                '{"path":"slow.txt","content":"x"}',
+                call_id="w1",
+            ),
+            _tc("terminal", '{"command":"must-not-run"}', call_id="t1"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        release_slow_tool = threading.Event()
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            call_id = kwargs["tool_call_id"]
+            executed.append(call_id)
+            if call_id == "w1":
+                release_slow_tool.wait(timeout=5)
+            return json.dumps({"ok": call_id})
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.05")
+        try:
+            with patch("run_agent.handle_function_call", side_effect=fake_handle):
+                agent._execute_tool_calls(msg, messages, "task-1")
+        finally:
+            release_slow_tool.set()
+
+        assert [m["tool_call_id"] for m in messages] == ["s1", "w1", "t1"]
+        assert "t1" not in executed
+        assert messages[1]["effect_disposition"] == "unknown"
+        assert "earlier concurrent tool timed out" in messages[-1]["content"]
+        assert messages[-1]["effect_disposition"] == "none"
+
+    def test_parallel_read_only_timeout_does_not_fence_later_barrier(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        calls = [
+            _tc("web_search", '{"query":"fast"}', call_id="s1"),
+            _tc("web_search", '{"query":"slow"}', call_id="s2"),
+            _tc("terminal", '{"command":"safe-to-run"}', call_id="t1"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        release_slow_tool = threading.Event()
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            call_id = kwargs["tool_call_id"]
+            executed.append(call_id)
+            if call_id == "s2":
+                release_slow_tool.wait(timeout=5)
+            return json.dumps({"ok": call_id})
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.05")
+        try:
+            with patch("run_agent.handle_function_call", side_effect=fake_handle):
+                agent._execute_tool_calls(msg, messages, "task-1")
+        finally:
+            release_slow_tool.set()
+
+        assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1"]
+        assert "t1" in executed
+
     def test_mixed_batch_preserves_order_with_barrier_in_middle(self, agent):
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),

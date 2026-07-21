@@ -2249,11 +2249,15 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
-    details = _get_pre_tool_call_directive_details(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
-    )
+    try:
+        details = _get_pre_tool_call_directive_details(
+            tool_name, args, task_id=task_id, session_id=session_id,
+            tool_call_id=tool_call_id, turn_id=turn_id,
+            api_request_id=api_request_id, middleware_trace=middleware_trace,
+        )
+    except Exception:
+        logger.exception("pre_tool_call policy evaluation failed for %s", tool_name)
+        return f"BLOCKED: pre-tool policy evaluation failed for {tool_name}"
     if details.action == "block":
         return details.message
     if details.action == "approve":

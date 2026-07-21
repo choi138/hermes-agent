@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,24 @@ def test_promote_blocked_task_works(conn):
     )
     assert ok and err is None
     assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_promote_force_cannot_bypass_gave_up_review_gate(conn):
+    tid = kb.create_task(conn, title="tripped")
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, created_at) "
+        "VALUES (?, 'gave_up', ?)",
+        (tid, int(time.time())),
+    )
+    conn.commit()
+
+    ok, err = kb.promote_task(conn, tid, actor="tester", force=True)
+
+    assert ok is False
+    assert err is not None and "unblock" in err.lower()
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert not any(event.kind == "promoted_manual" for event in kb.list_events(conn, tid))
 
 
 # ---------------------------------------------------------------------------

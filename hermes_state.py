@@ -4224,6 +4224,46 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            # A tool result can be replayed after SQLite committed its row but
+            # the caller was interrupted before observing success. Scope the
+            # idempotency key to the latest assistant generation: deterministic
+            # provider fallbacks may legitimately reuse a tool_call_id on a
+            # later turn. Within one generation, only an identical replay is
+            # accepted; conflicting content is data corruption, not success.
+            if role == "tool" and tool_call_id:
+                latest_assistant = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM messages "
+                    "WHERE session_id = ? AND role = 'assistant' AND active = 1",
+                    (session_id,),
+                ).fetchone()[0]
+                existing = conn.execute(
+                    "SELECT id, content, tool_name, effect_disposition, api_content "
+                    "FROM messages "
+                    "WHERE session_id = ? AND role = 'tool' "
+                    "AND tool_call_id = ? AND active = 1 AND id > ? "
+                    "ORDER BY id LIMIT 1",
+                    (session_id, tool_call_id, int(latest_assistant or 0)),
+                ).fetchone()
+                if existing is not None:
+                    expected = (
+                        stored_content,
+                        _scrub_surrogates(tool_name),
+                        effect_disposition,
+                        _scrub_surrogates(api_content)
+                        if isinstance(api_content, str) else None,
+                    )
+                    durable = (
+                        existing["content"],
+                        existing["tool_name"],
+                        existing["effect_disposition"],
+                        existing["api_content"],
+                    )
+                    if durable != expected:
+                        raise ValueError(
+                            "conflicting tool result replay for "
+                            f"tool_call_id {tool_call_id!r}"
+                        )
+                    return existing["id"]
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,

@@ -283,7 +283,23 @@ def _run_execution_chain(
         call_kwargs[payload_key] = payload
         call_kwargs["next_call"] = next_call
         try:
-            return callback(**call_kwargs)
+            result = callback(**call_kwargs)
+            if kind == TOOL_EXECUTION_MIDDLEWARE and isinstance(result, str):
+                # Only a successful next_call can establish tool provenance.
+                # A short-circuiting plugin is explicitly untrusted, while a
+                # replacement display string retains the exact downstream raw
+                # result out of band.
+                from model_tools import TrustedToolResult
+
+                trusted_raw_result = None
+                if next_succeeded:
+                    trusted_raw_result = (
+                        next_result.trusted_raw_result
+                        if isinstance(next_result, TrustedToolResult)
+                        else next_result
+                    )
+                return TrustedToolResult(result, trusted_raw_result)
+            return result
         except _DownstreamExecutionError as exc:
             raise exc.original
         except Exception as exc:

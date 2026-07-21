@@ -151,6 +151,39 @@ def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawna
         assert task.status == "blocked"
         assert task.consecutive_failures >= 2
         assert task.last_failure_error and "no PATH" in task.last_failure_error
+
+        # A tripped breaker is a durable human-review gate.  A later dispatcher
+        # tick must not silently promote the task and create another gave_up run.
+        runs_before = kb.list_runs(conn, tid)
+        res3 = kb.dispatch_once(conn, spawn_fn=_bad_spawn)
+        assert tid not in res3.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_runs(conn, tid) == runs_before
+    finally:
+        conn.close()
+
+
+def test_same_root_breaker_stays_blocked_below_total_limit(
+    kanban_home, all_assignees_spawnable,
+):
+    """A same-root trip cannot reopen merely because total_limit is higher."""
+    def _bad_spawn(task, ws):
+        raise RuntimeError("same deterministic spawn failure")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=5)
+        second = kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=5)
+        assert tid in second.auto_blocked
+        assert kb.get_task(conn, tid).consecutive_failures == 2
+        runs_before = kb.list_runs(conn, tid)
+
+        third = kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=5)
+
+        assert tid not in third.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_runs(conn, tid) == runs_before
     finally:
         conn.close()
 
@@ -166,8 +199,10 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
     calls = [0]
     def _flaky_spawn(task, ws):
         calls[0] += 1
-        if calls[0] <= 2:
-            raise RuntimeError("transient")
+        if calls[0] == 1:
+            raise RuntimeError("transient provider reset")
+        if calls[0] == 2:
+            raise RuntimeError("transient worker signal")
         return 99999  # pid value — harmless; crash detection will clear it
 
     conn = kb.connect()
@@ -387,10 +422,15 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
         assert task.consecutive_failures == 1
         assert task.status == "ready"
         assert task.last_failure_error and "workspace" in task.last_failure_error
-        # Run twice more → auto-blocked.
-        kb.dispatch_once(conn, failure_limit=3)
-        res = kb.dispatch_once(conn, failure_limit=3)
-        assert tid in res.auto_blocked
+        # The same deterministic workspace root trips the faster same-root
+        # breaker on the second observation; later ticks keep the review gate.
+        second = kb.dispatch_once(conn, failure_limit=3)
+        assert tid in second.auto_blocked
+        runs_before = kb.list_runs(conn, tid)
+        third = kb.dispatch_once(conn, failure_limit=3)
+        assert tid not in third.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_runs(conn, tid) == runs_before
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
     finally:
@@ -2037,8 +2077,12 @@ def test_run_on_block_with_reason(kanban_home):
 def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spawnable):
     """Each spawn_failed event closes a run with outcome='spawn_failed',
     and the Nth failure closes a run with outcome='gave_up'."""
+    # Use distinct roots so this test exercises the total failure limit rather
+    # than the intentionally-faster same-root breaker.
+    roots = iter(("alpha", "beta", "gamma", "delta", "epsilon"))
+
     def _bad(task, ws):
-        raise RuntimeError("no PATH")
+        raise RuntimeError(f"no PATH {next(roots)}")
 
     conn = kb.connect()
     try:

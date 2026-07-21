@@ -3228,6 +3228,60 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
 
+    def test_invoke_tool_policy_error_fails_closed(self, agent, monkeypatch):
+        """A broken authorization backend must never authorize execution."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy backend unavailable")),
+        )
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        payload = json.loads(result)
+        assert "policy evaluation failed" in payload["error"].lower()
+
+    def test_sequential_policy_error_fails_closed(self, agent, monkeypatch):
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"test.txt","content":"hello"}',
+            call_id="policy-seq",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy backend unavailable")),
+        )
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert len(messages) == 1
+        assert "policy evaluation failed" in messages[0]["content"].lower()
+        assert messages[0]["effect_disposition"] == "none"
+
+    def test_concurrent_policy_error_fails_closed(self, agent, monkeypatch):
+        calls = [
+            _mock_tool_call(name="web_search", arguments='{"q":"one"}', call_id="policy-c1"),
+            _mock_tool_call(name="web_search", arguments='{"q":"two"}', call_id="policy-c2"),
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+        messages = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy backend unavailable")),
+        )
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert len(messages) == 2
+        assert all(
+            "policy evaluation failed" in msg["content"].lower()
+            for msg in messages
+        )
+        assert all(msg["effect_disposition"] == "none" for msg in messages)
+
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
         tool_call = _mock_tool_call(name="write_file",
@@ -5616,6 +5670,7 @@ class TestRunConversation:
         agent.max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -5660,6 +5715,7 @@ class TestRunConversation:
         assert call.kwargs.get("outcome") == "timed_out"
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
+        assert call.kwargs.get("expected_run_id") == 42
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):

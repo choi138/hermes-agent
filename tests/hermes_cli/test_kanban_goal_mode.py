@@ -57,14 +57,10 @@ def test_goal_mode_persists(kanban_home):
     assert task.goal_max_turns == 7
 
 
-def test_goal_mode_without_max_turns(kanban_home):
+def test_goal_mode_requires_explicit_positive_max_turns(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(
-            conn, title="t", assignee="worker", goal_mode=True
-        )
-        task = kb.get_task(conn, tid)
-    assert task.goal_mode is True
-    assert task.goal_max_turns is None
+        with pytest.raises(ValueError, match="goal_max_turns must be >= 1"):
+            kb.create_task(conn, title="t", assignee="worker", goal_mode=True)
 
 
 def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
@@ -245,8 +241,8 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     assert "turn budget" in blocked["reason"].lower()
 
 
-def test_loop_default_budget_is_bounded_to_six_turns(monkeypatch):
-    _patch_judge(monkeypatch, ["continue"] * 10)
+def test_loop_default_budget_preserves_full_quality_boundary(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 25)
     turns = []
     blocked = {}
 
@@ -260,9 +256,14 @@ def test_loop_default_budget_is_bounded_to_six_turns(monkeypatch):
     )
 
     assert res["outcome"] == "blocked_budget"
-    assert res["turns_used"] == goals.KANBAN_DEFAULT_MAX_TURNS == 6
-    assert len(turns) == 5
-    assert "6/6" in blocked["reason"]
+    assert (
+        res["turns_used"]
+        == goals.KANBAN_DEFAULT_MAX_TURNS
+        == goals.DEFAULT_MAX_TURNS
+        == 20
+    )
+    assert len(turns) == 19
+    assert "20/20" in blocked["reason"]
 
 
 def test_loop_reports_structured_judge_progress(monkeypatch):
@@ -379,6 +380,7 @@ def test_cli_goal_loop_shares_iteration_budget_and_emits_progress(
             title="observable bounded worker",
             assignee="default",
             goal_mode=True,
+            goal_max_turns=goals.KANBAN_DEFAULT_MAX_TURNS,
         )
         kb.claim_task(conn, tid)
         task = kb.get_task(conn, tid)
