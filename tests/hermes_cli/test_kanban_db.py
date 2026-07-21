@@ -5558,6 +5558,115 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     assert "still here" in titles
 
 
+def test_integrity_error_survives_rollback_error_and_quarantines(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(b"non-empty")
+    backup_path = tmp_path / "kanban.db.corrupt.test.bak"
+    executed: list[str] = []
+
+    class FailingProbe:
+        def execute(self, sql):
+            executed.append(sql)
+            if sql == "BEGIN IMMEDIATE":
+                return self
+            if sql == "PRAGMA integrity_check":
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            if sql == "ROLLBACK":
+                raise sqlite3.OperationalError(
+                    "cannot rollback - no transaction is active"
+                )
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            pass
+
+    backups: list[Path] = []
+
+    def backup_corrupt(path: Path) -> Path:
+        backups.append(path)
+        return backup_path
+
+    monkeypatch.setattr(kb, "_sqlite_connect", lambda path: FailingProbe())
+    monkeypatch.setattr(kb, "_backup_corrupt_db", backup_corrupt)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert "database disk image is malformed" in str(excinfo.value)
+    assert executed == ["BEGIN IMMEDIATE", "PRAGMA integrity_check", "ROLLBACK"]
+    assert backups == [db_path.resolve()]
+    assert excinfo.value.backup_path == backup_path
+
+
+def test_integrity_probe_excludes_concurrent_index_writes(tmp_path, monkeypatch):
+    """Validate a stable snapshot while another first-open caller starts work.
+
+    The cross-process init lock serializes ``connect()`` initialization, but it
+    is released before the caller's first task write.  A following process can
+    therefore enter the integrity probe while that write starts.  Reserve the
+    SQLite writer slot for the probe so ``integrity_check`` cannot observe an
+    index while a peer is changing it.
+    """
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(conn, title="before")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    probe_started = threading.Event()
+    writer_update_attempted = threading.Event()
+    writer_finished = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    class CoordinatedProbe(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA integrity_check":
+                probe_started.set()
+                assert writer_update_attempted.wait(timeout=5), (
+                    "concurrent writer did not reach its UPDATE attempt"
+                )
+                assert not writer_finished.wait(timeout=0.2), (
+                    "concurrent indexed write completed during integrity_check"
+                )
+            return super().execute(sql, parameters)
+
+    def probe_connect(path: Path):
+        conn = sqlite3.connect(
+            str(path),
+            isolation_level=None,
+            timeout=5,
+            factory=CoordinatedProbe,
+        )
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def writer() -> None:
+        try:
+            assert probe_started.wait(timeout=5)
+            conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=5)
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                writer_update_attempted.set()
+                conn.execute("UPDATE tasks SET title='after' WHERE id=?", (task_id,))
+            finally:
+                conn.close()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+        finally:
+            writer_finished.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    monkeypatch.setattr(kb, "_sqlite_connect", probe_connect)
+    try:
+        kb._guard_existing_db_is_healthy(db_path)
+    finally:
+        thread.join(timeout=6)
+
+    assert not thread.is_alive()
+    assert writer_errors == []
+    assert writer_finished.is_set()
+
+
 def test_init_db_allows_missing_then_healthy(tmp_path):
     db_path = tmp_path / "fresh.db"
     assert not db_path.exists()

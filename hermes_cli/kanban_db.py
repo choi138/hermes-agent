@@ -2133,10 +2133,11 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
-    Opens the probe in read/write mode so SQLite can recover or
-    checkpoint a healthy WAL/hot-journal DB before we declare it
-    corrupt. If the file is malformed, copy it (and any WAL/SHM
-    sidecars) to a timestamped backup and raise
+    Opens the probe in read/write mode and reserves the SQLite writer slot so
+    the check sees a stable database while a peer starts normal work after its
+    own first-open initialization. SQLite can also recover or checkpoint a
+    healthy WAL/hot-journal DB before we declare it corrupt. If the file is
+    malformed, copy it (and any WAL/SHM sidecars) to a timestamped backup and raise
     :class:`KanbanDbCorruptError` so callers cannot silently recreate
     the schema on top of a damaged DB.
 
@@ -2172,7 +2173,17 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     try:
         probe = _sqlite_connect(resolved)
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            probe.execute("BEGIN IMMEDIATE")
+            try:
+                row = probe.execute("PRAGMA integrity_check").fetchone()
+            except BaseException:
+                try:
+                    probe.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            else:
+                probe.execute("ROLLBACK")
         finally:
             probe.close()
         if not row or (row[0] or "").lower() != "ok":
