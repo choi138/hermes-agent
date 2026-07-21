@@ -257,6 +257,18 @@ def test_success_uses_server_identity_and_wakes_only_after_commit(intake_env):
     assert sub["thread_id"] == "thread-1"
 
 
+def test_goal_mode_requires_explicit_positive_turn_budget(intake_env):
+    tokens = _bind_discord_source()
+    try:
+        result = _call({"title": "Open-ended work", "goal_mode": True})
+    finally:
+        clear_session_vars(tokens)
+
+    assert "goal_max_turns must be >= 1" in result["error"]
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 def test_same_message_and_request_deduplicate_but_new_message_does_not(intake_env):
     tokens = _bind_discord_source(message_id="message-1")
     try:

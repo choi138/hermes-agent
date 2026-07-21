@@ -2919,17 +2919,18 @@
     const defaultWorkspacePath = props.defaultWorkspacePath || "";
     const [workspaceKind, setWorkspaceKind] = useState(defaultWorkspaceKind);
     const [workspacePath, setWorkspacePath] = useState(defaultWorkspacePath);
-    // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
-    // loop — a judge re-checks the card after each turn and the worker keeps
-    // going in the same session until done, or the turn budget runs out
-    // (which blocks the card for review). goalMaxTurns is optional; blank
-    // = backend default.
+    // Goal-mode is opt-in. When enabled, an explicit positive budget is
+    // mandatory so every persisted goal loop is auditable and bounded.
     const [goalMode, setGoalMode] = useState(false);
     const [goalMaxTurns, setGoalMaxTurns] = useState("");
+    const goalBudgetText = goalMaxTurns.trim();
+    const goalBudget = Number(goalBudgetText);
+    const goalBudgetValid = !goalMode || (/^[1-9]\d*$/.test(goalBudgetText) && Number.isSafeInteger(goalBudget));
 
     const submit = function () {
       const trimmed = title.trim();
       if (!trimmed) return;
+      if (!goalBudgetValid) return;
       const body = {
         title: trimmed,
         assignee: assignee.trim() || null,
@@ -2952,12 +2953,11 @@
       }
       const wpTrim = workspacePath.trim();
       if (wpTrim) body.workspace_path = wpTrim;
-      // Goal-mode toggle. Only send the keys when enabled so the request
-      // shape stays small and old dispatchers ignore it cleanly.
+      // Goal mode is omitted when disabled. When enabled, the guarded explicit
+      // budget is sent with it; the backend rejects any caller that omits it.
       if (goalMode) {
         body.goal_mode = true;
-        const gmt = parseInt(goalMaxTurns, 10);
-        if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
+        body.goal_max_turns = goalBudget;
       }
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
@@ -3111,10 +3111,12 @@
               type: "number",
               value: goalMaxTurns,
               onChange: function (e) { setGoalMaxTurns(e.target.value); },
-              placeholder: tx(t, "goalMaxTurns", "max turns (default 20)"),
+              placeholder: tx(t, "goalMaxTurns", "max turns (required)"),
               className: "h-8 text-sm w-44",
-              title: "Turn budget for the goal loop. Blank = backend default (20).",
+              title: "Required positive turn budget for this goal loop.",
               min: 1,
+              required: true,
+              "aria-invalid": !goalBudgetValid,
             }) : null,
           ),
         ),
@@ -3127,7 +3129,7 @@
           h(Button, {
             type: "submit",
             size: "sm",
-            disabled: !title.trim(),
+            disabled: !goalBudgetValid || !title.trim(),
           }, tx(t, "create", "Create")),
         ),
       ),

@@ -463,8 +463,12 @@ hermes kanban create "Translate the docs site to French" \
     --body "Acceptance: every page translated, no English left, links intact." \
     --assignee linguist \
     --goal \
-    --goal-max-turns 15      # optional; default 20
+    --goal-max-turns 15      # required positive budget when --goal is set
 ```
+
+`--goal-max-turns` is required whenever `--goal` is enabled. The tool/API
+contract is the same: set `goal_mode=true` only together with a positive
+`goal_max_turns`. Leaving goal mode off is the default for bounded work.
 
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
 

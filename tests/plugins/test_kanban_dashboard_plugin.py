@@ -270,6 +270,42 @@ def test_dashboard_workspace_picker_explains_persistence_contract():
         "This workspace and any files left in it are deleted when the task completes."
         in bundle
     )
+def test_create_goal_task_requires_explicit_positive_budget(client):
+    missing = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "unbounded goal", "goal_mode": True},
+    )
+    assert missing.status_code == 400
+    assert "goal_max_turns must be >= 1" in missing.json()["detail"]
+
+    valid = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bounded goal", "goal_mode": True, "goal_max_turns": 20},
+    )
+    assert valid.status_code == 200, valid.text
+    task = valid.json()["task"]
+    assert task["goal_mode"] is True
+    assert task["goal_max_turns"] == 20
+
+
+def test_dashboard_goal_mode_blocks_submit_without_positive_budget():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "const goalBudgetText = goalMaxTurns.trim();" in js
+    assert "const goalBudget = Number(goalBudgetText);" in js
+    assert (
+        "const goalBudgetValid = !goalMode || "
+        "(/^[1-9]\\d*$/.test(goalBudgetText) && Number.isSafeInteger(goalBudget));"
+    ) in js
+    assert "parseInt(goalMaxTurns" not in js
+    assert "if (!goalBudgetValid) return;" in js
+    assert "body.goal_max_turns = goalBudget;" in js
+    assert "disabled: !goalBudgetValid || !title.trim()" in js
+    assert "max turns (required)" in js
+    assert "Blank = backend default" not in js
+
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):

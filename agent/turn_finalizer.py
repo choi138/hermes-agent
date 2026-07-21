@@ -155,24 +155,33 @@ def finalize_turn(
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
+                _raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+                _expected_run_id = int(_raw_run_id) if _raw_run_id else None
+                if _expected_run_id is not None and _expected_run_id <= 0:
+                    raise ValueError("invalid HERMES_KANBAN_RUN_ID")
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
+                    _failure_kwargs = {
+                        "error": (
                             f"Iteration budget exhausted "
                             f"({api_call_count}/{agent.max_iterations}) — "
                             "task could not complete within the allowed "
                             "iterations"
                         ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
+                        "outcome": "timed_out",
+                        "release_claim": True,
+                        "end_run": True,
+                        "event_payload_extra": {
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
                         },
+                    }
+                    if _expected_run_id is not None:
+                        _failure_kwargs["expected_run_id"] = _expected_run_id
+                    _kb._record_task_failure(
+                        _conn,
+                        _kanban_task,
+                        **_failure_kwargs,
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",
@@ -192,12 +201,14 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    kanban_terminal_response = _turn_exit_reason == "kanban_terminal"
     completed = (
         final_response is not None
         and not failed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or kanban_terminal_response
         )
     )
 
@@ -547,6 +558,11 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if kanban_terminal_response:
+        result["kanban_terminal"] = True
+        result["kanban_terminal_transition"] = getattr(
+            agent, "_kanban_terminal_transition", None,
+        )
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

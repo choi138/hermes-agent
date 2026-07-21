@@ -51,9 +51,11 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
-A user dropped a rough idea into the Triage column. Your job is to break it
-into a small graph of concrete child tasks and route each one to the best-
-matching profile from the available roster.
+A user dropped a rough idea into the Triage column. First decide whether it
+needs durable coordination at all. One-owner synchronous deterministic work
+without durability, waiting, approval, or independent-role requirements must
+stay direct as one tightened task. Only fan out when the board provides a real
+coordination benefit, then route each card to the best matching profile.
 
 You will be given:
   - The original task title and body
@@ -64,13 +66,17 @@ Output a single JSON object with this exact shape:
 
   {
     "fanout": true,
-    "rationale": "<one sentence on why this decomposition>",
+    "rationale": "<one sentence on why durable coordination is required>",
+    "coordination_reasons": [
+      "<approval|durable_handoff|independent_qa|parallel_specialists|waiting>"
+    ],
     "tasks": [
       {
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "role": "<approval|final_owner|implementation|independent_qa|specialist|waiting>"
       },
       ...
     ]
@@ -80,10 +86,16 @@ Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
-  - Prefer parallelism. If two tasks can be done independently, give
-    them no parents so the dispatcher fans them out at once.
-  - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
-    cram everything into 1 task.
+  - Fanout requires at least one concrete coordination_reasons value and the
+    graph must actually implement every listed reason. Never invent a reason
+    merely to split a direct task.
+  - Keep the initial graph at no more than three dependency STAGES. There is no
+    card-count cap: parallel specialists may share a stage when quality needs it.
+  - Do not pre-create correction, re-QA, fallback, replacement, recovery,
+    observer, or duplicate-final cards. Add remediation only after verified need.
+  - Preserve independent QA when the user explicitly requests it. Mark the
+    cards with implementation/independent_qa roles, make QA depend on the
+    implementation artifact, and assign QA to a distinct profile.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
@@ -122,6 +134,49 @@ Default assignee (used when no profile fits a task): {default_assignee}
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_INDEPENDENT_QA_RE = re.compile(
+    r"(?:\bindependent(?: pre commit)? "
+    r"(?:qa|review|reviewer|verification|verifier)\b|"
+    r"\b(?:review|reviewed|verify|verified) independently\b|"
+    r"\bindependently (?:reviewed|verified)\b|"
+    r"\b(?:separate|different) (?:qa|reviewer)\b|"
+    r"\bhave someone else (?:review|verify)\b|"
+    r"\breviewer must be (?:independent|different)\b|"
+    r"\b(?:review|reviewed|verify|verified|verification) by "
+    r"(?:an? )?(?:(?:independent|different) (?:reviewer|assignee|person)|"
+    r"someone else)\b|독립(?:적인)?\s*(?:qa|검증|리뷰))",
+    re.IGNORECASE,
+)
+_INDEPENDENT_QA_NEGATION_RE = re.compile(
+    r"(?:\bno (?:independent|separate) "
+    r"(?:qa|review|reviewer|verification)(?: is)? "
+    r"(?:required|needed|necessary)\b|"
+    r"\bindependent (?:qa|review|reviewer|verification) is not "
+    r"(?:required|needed|necessary)\b|"
+    r"\bdo not (?:assign|add|request|require|use) "
+    r"(?:an? )?(?:independent|separate|different) "
+    r"(?:qa|review|reviewer|verification)\b)",
+    re.IGNORECASE,
+)
+_COORDINATION_REASONS = frozenset(
+    {
+        "approval",
+        "durable_handoff",
+        "independent_qa",
+        "parallel_specialists",
+        "waiting",
+    }
+)
+_TASK_ROLES = frozenset(
+    {
+        "approval",
+        "final_owner",
+        "implementation",
+        "independent_qa",
+        "specialist",
+        "waiting",
+    }
+)
 
 
 @dataclass
@@ -249,6 +304,18 @@ def _format_roster(roster: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _task_requires_independent_qa(task: kb.Task) -> bool:
+    text = "\n".join(part for part in (task.title, task.body or "") if part)
+    clauses = re.split(r"(?:[.!?;\n]+|\bbut\b)", text, flags=re.IGNORECASE)
+    for clause in clauses:
+        normalized = re.sub(r"[\W_]+", " ", clause.casefold()).strip()
+        if not normalized or _INDEPENDENT_QA_NEGATION_RE.search(normalized):
+            continue
+        if _INDEPENDENT_QA_RE.search(normalized):
+            return True
+    return False
+
+
 def _normalize_assignee_choice(
     assignee: object,
     *,
@@ -341,28 +408,55 @@ def decompose_task(
     if parsed is None:
         return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
 
-    fanout = bool(parsed.get("fanout"))
+    raw_fanout = parsed.get("fanout")
+    if not isinstance(raw_fanout, bool):
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "decomposer field fanout must be a boolean",
+        )
+    fanout = raw_fanout
     audit_author = author or _profile_author()
+    independent_qa_required = _task_requires_independent_qa(task)
 
-    if not fanout:
-        # Fall back to single-task spec promotion (same effect as specify).
-        new_title = parsed.get("title")
-        new_body = parsed.get("body")
-        title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
-        body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
+    def _promote_direct(
+        *,
+        reason: str,
+        use_model_fields: bool,
+    ) -> DecomposeOutcome:
+        if use_model_fields:
+            raw_title = parsed.get("title")
+            raw_body = parsed.get("body")
+            title_val = (
+                raw_title.strip()
+                if isinstance(raw_title, str) and raw_title.strip()
+                else None
+            )
+            body_val = (
+                raw_body
+                if isinstance(raw_body, str) and raw_body.strip()
+                else None
+            )
+            requested_assignee = parsed.get("assignee")
+        else:
+            title_val = task.title
+            body_val = task.body if task.body and task.body.strip() else None
+            requested_assignee = task.assignee
         assignee_val = None
         if not task.assignee:
             assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
+                requested_assignee,
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
-                task_id, False, "decomposer returned fanout=false with no title/body",
+                task_id,
+                False,
+                "decomposer returned a direct task with no title/body",
             )
         with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
+            promoted = kb.specify_triage_task(
                 conn,
                 task_id,
                 title=title_val,
@@ -370,19 +464,69 @@ def decompose_task(
                 assignee=assignee_val,
                 author=audit_author,
             )
-        if not ok:
+        if not promoted:
             return DecomposeOutcome(
-                task_id, False, "task moved out of triage before promotion",
+                task_id,
+                False,
+                "task moved out of triage before promotion",
             )
         return DecomposeOutcome(
-            task_id, True, "single task (no fanout)",
-            fanout=False, new_title=title_val,
+            task_id,
+            True,
+            reason,
+            fanout=False,
+            new_title=title_val,
+        )
+
+    if not fanout:
+        if independent_qa_required:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "explicit independent QA requires implementation and reviewer cards",
+            )
+        return _promote_direct(
+            reason="single task (no fanout)",
+            use_model_fields=True,
         )
 
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
+        )
+
+    raw_reasons = parsed.get("coordination_reasons")
+    reasons_valid = (
+        isinstance(raw_reasons, list)
+        and bool(raw_reasons)
+        and all(
+            isinstance(reason, str) and reason in _COORDINATION_REASONS
+            for reason in raw_reasons
+        )
+    )
+    if not reasons_valid:
+        if independent_qa_required:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "explicit independent QA requires coordination_reasons=independent_qa",
+            )
+        return _promote_direct(
+            reason="direct-first fallback: no valid coordination reason",
+            use_model_fields=False,
+        )
+    coordination_reasons = sorted(set(raw_reasons))
+    if len(raw_tasks) < 2:
+        if independent_qa_required:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "explicit independent QA requires at least two cards",
+            )
+        return _promote_direct(
+            reason="direct-first fallback: fanout requires at least two cards",
+            use_model_fields=False,
         )
 
     # Rewrite invalid assignees to the default fallback. Never leave a
@@ -417,17 +561,148 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
+        role = entry.get("role")
+        if role is not None and (
+            not isinstance(role, str) or role not in _TASK_ROLES
+        ):
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"tasks[{idx}].role is not a supported coordination role",
+            )
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
-            parents = []
-        # Clean parent indices: drop non-int and out-of-range.
-        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"tasks[{idx}].parents must be a list",
+            )
+        clean_parents: list[int] = []
+        for parent in parents:
+            if type(parent) is not int:
+                return DecomposeOutcome(
+                    task_id,
+                    False,
+                    f"tasks[{idx}] parent index must be an integer",
+                )
+            if parent < 0 or parent >= len(raw_tasks):
+                return DecomposeOutcome(
+                    task_id,
+                    False,
+                    f"tasks[{idx}] parent index {parent} is out of range",
+                )
+            if parent == idx:
+                return DecomposeOutcome(
+                    task_id,
+                    False,
+                    f"tasks[{idx}] cannot list itself as a parent",
+                )
+            clean_parents.append(parent)
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "role": role,
         })
+
+    if independent_qa_required and "independent_qa" not in coordination_reasons:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "explicit independent QA must declare coordination_reasons=independent_qa",
+        )
+
+    if "parallel_specialists" in coordination_reasons:
+        root_children = [child for child in children if not child["parents"]]
+        root_assignees = {child["assignee"] for child in root_children}
+        if len(root_children) < 2 or len(root_assignees) < 2:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "parallel_specialists requires parallel roots with distinct assignees",
+            )
+
+    if "durable_handoff" in coordination_reasons:
+        has_cross_assignee_edge = any(
+            child["assignee"] != children[parent]["assignee"]
+            for child in children
+            for parent in child["parents"]
+        )
+        if not has_cross_assignee_edge:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "durable_handoff requires a dependency edge across assignees",
+            )
+
+    for reason, required_role in (("waiting", "waiting"), ("approval", "approval")):
+        if reason in coordination_reasons and not any(
+            child["role"] == required_role for child in children
+        ):
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"{reason} coordination requires a {required_role} role card",
+            )
+
+    if "independent_qa" in coordination_reasons:
+        implementation_indices = {
+            idx
+            for idx, child in enumerate(children)
+            if child["role"] == "implementation"
+        }
+        qa_indices = [
+            idx
+            for idx, child in enumerate(children)
+            if child["role"] == "independent_qa"
+        ]
+        if not implementation_indices or not qa_indices:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "independent QA requires implementation and independent_qa roles",
+            )
+        implementation_assignees = {
+            children[idx]["assignee"] for idx in implementation_indices
+        }
+        if any(
+            children[idx]["assignee"] in implementation_assignees
+            for idx in qa_indices
+        ):
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "independent QA requires a distinct assignee from implementation",
+            )
+        if any(
+            not implementation_indices.intersection(children[idx]["parents"])
+            for idx in qa_indices
+        ):
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "independent QA must depend on an implementation card",
+            )
+        qa_covered_implementations: set[int] = set()
+        for qa_idx in qa_indices:
+            ancestors: set[int] = set()
+            pending = list(children[qa_idx]["parents"])
+            while pending:
+                parent_idx = pending.pop()
+                if parent_idx in ancestors:
+                    continue
+                ancestors.add(parent_idx)
+                pending.extend(children[parent_idx]["parents"])
+            qa_covered_implementations.update(
+                ancestors.intersection(implementation_indices)
+            )
+        if qa_covered_implementations != implementation_indices:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "independent QA must cover every implementation card",
+            )
 
     try:
         with kb.connect_closing() as conn:
@@ -438,6 +713,7 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                coordination_reasons=coordination_reasons,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")

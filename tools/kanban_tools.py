@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+from contextlib import nullcontext
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -422,6 +423,10 @@ def heartbeat_current_worker_from_env() -> bool:
 
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
+
+
+def _terminal_marker(task_id: str, tool: str, status: str) -> dict[str, str]:
+    return {"task_id": task_id, "tool": tool, "status": status}
 
 
 def _normalize_profile(value: Any) -> Optional[str]:
@@ -903,6 +908,9 @@ def _handle_complete(args: dict, **kw) -> str:
             response_fields = {
                 "task_id": tid,
                 "run_id": run.id if run else None,
+                "__hermes_kanban_terminal__": _terminal_marker(
+                    tid, "kanban_complete", "done",
+                ),
             }
             if terminal_intent_id is not None:
                 response_fields["terminal_intent_id"] = terminal_intent_id
@@ -1083,6 +1091,11 @@ def _handle_block(args: dict, **kw) -> str:
                 "run_id": run.id if run else None,
                 "status": landed.status if landed else "blocked",
                 "block_kind": kind,
+                "__hermes_kanban_terminal__": _terminal_marker(
+                    tid,
+                    "kanban_block",
+                    landed.status if landed else "blocked",
+                ),
             }
             if terminal_intent_id is not None:
                 response_fields["terminal_intent_id"] = terminal_intent_id
@@ -1420,7 +1433,17 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
-    tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    requested_tenant = str(args.get("tenant") or "").strip() or None
+    trusted_tenant = str(os.environ.get("HERMES_TENANT") or "").strip() or None
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        if requested_tenant is not None and requested_tenant != trusted_tenant:
+            return tool_error(
+                "tenant override conflicts with the dispatcher's trusted "
+                "HERMES_TENANT worker scope"
+            )
+        tenant = trusted_tenant
+    else:
+        tenant = requested_tenant or trusted_tenant
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1448,6 +1471,28 @@ def _handle_create(args: dict, **kw) -> str:
         if raw_idempotency_key is not None and str(raw_idempotency_key).strip()
         else None
     )
+    correction = args.get("correction")
+    if correction is not None:
+        correction_fields = {
+            "root_cause_id",
+            "affected_scope_digest",
+            "policy_or_test_plan_version",
+            "independent_variant",
+        }
+        if not isinstance(correction, dict):
+            return tool_error("correction must be an object")
+        missing = sorted(correction_fields - set(correction))
+        unknown = sorted(set(correction) - correction_fields)
+        if missing or unknown:
+            return tool_error(
+                "correction fields must match the strict schema; "
+                f"missing={missing}, unknown={unknown}"
+            )
+        if idempotency_key is not None:
+            return tool_error(
+                "idempotency_key cannot be combined with correction; "
+                "the correction identity is the single-flight key"
+            )
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1462,6 +1507,12 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    if goal_max_turns is not None and (
+        isinstance(goal_max_turns, bool)
+        or not isinstance(goal_max_turns, int)
+        or goal_max_turns < 1
+    ):
+        return tool_error("goal_max_turns must be a positive integer")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1519,38 +1570,90 @@ def _handle_create(args: dict, **kw) -> str:
                 idempotency_key = _automatic_create_idempotency_key(
                     _self_tid, normalized_request,
                 )
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-                body=body,
-                assignee=str(assignee),
-                parents=tuple(parents),
-                tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
-                project_id=project_id,
-                triage=triage,
-                idempotency_key=idempotency_key,
-                max_runtime_seconds=(
-                    int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
-                ),
-                skills=skills,
-                goal_mode=goal_mode,
-                goal_max_turns=(
-                    int(goal_max_turns) if goal_max_turns is not None else None
-                ),
-                initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                session_id=session_id,
-            )
+            lineage = None
+            lineage_identity = None
+            if correction:
+                # Validate the caller-facing identity before replacing the root
+                # with an opaque tenant-scoped key for isolation on shared boards.
+                kb._correction_lineage_key(**correction)
+                scoped_root = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "root_cause_id": correction["root_cause_id"],
+                            "tenant": tenant or "",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                lineage_identity = {
+                    **correction,
+                    "root_cause_id": f"scoped:{scoped_root}",
+                }
+            lineage_txn = kb.write_txn(conn) if correction else nullcontext()
+            with lineage_txn:
+                if correction:
+                    lineage = kb.active_correction_lineage(
+                        conn, tenant=tenant, **lineage_identity,
+                    )
+                if lineage is not None:
+                    new_tid = lineage["leader_task_id"]
+                else:
+                    if correction:
+                        # The surrounding BEGIN IMMEDIATE plus the active-lineage
+                        # unique index is the single-flight boundary. Do not pin a
+                        # resolved correction to an old task via idempotency.
+                        idempotency_key = None
+                    new_tid = kb.create_task(
+                        conn,
+                        title=str(title).strip(),
+                        body=body,
+                        assignee=str(assignee),
+                        parents=tuple(parents),
+                        tenant=tenant,
+                        priority=int(priority) if priority is not None else 0,
+                        workspace_kind=str(workspace_kind),
+                        workspace_path=workspace_path,
+                        project_id=project_id,
+                        triage=triage,
+                        idempotency_key=idempotency_key,
+                        max_runtime_seconds=(
+                            int(max_runtime_seconds)
+                            if max_runtime_seconds is not None else None
+                        ),
+                        skills=skills,
+                        goal_mode=goal_mode,
+                        goal_max_turns=(
+                            int(goal_max_turns)
+                            if goal_max_turns is not None else None
+                        ),
+                        initial_status=str(initial_status),
+                        created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                        session_id=session_id,
+                        _manage_transaction=not bool(correction),
+                    )
+                    if correction:
+                        lineage = kb.acquire_correction_lineage(
+                            conn,
+                            owner_task_id=new_tid,
+                            _manage_transaction=False,
+                            **lineage_identity,
+                        )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            response = {
+                "task_id": new_tid,
+                "status": new_task.status if new_task else None,
+                "subscribed": subscribed,
+            }
+            if lineage is not None:
+                response.update(
+                    correction_role=lineage["role"],
+                    correction_lineage_id=lineage["lineage_id"],
+                )
             return _ok(
-                task_id=new_tid,
-                status=new_task.status if new_task else None,
-                subscribed=subscribed,
+                **response,
             )
         finally:
             conn.close()
@@ -1715,19 +1818,9 @@ def _handle_link(args: dict, **kw) -> str:
 # Schemas
 # ---------------------------------------------------------------------------
 
-_DESC_TASK_ID_DEFAULT = (
-    "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env "
-    "(the task the dispatcher spawned you to work on)."
-)
+_DESC_TASK_ID_DEFAULT = "Task id (default: HERMES_KANBAN_TASK)."
 
-_DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
-)
+_DESC_BOARD = "Board slug (default: active board)."
 
 
 def _board_schema_prop() -> dict[str, str]:
@@ -2123,6 +2216,30 @@ KANBAN_CREATE_SCHEMA = {
                     "with the same key. Workers get a deterministic key if omitted."
                 ),
             },
+            "correction": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": (
+                    "Stable correction identity. An active exact match reuses its "
+                    "leader task instead of creating duplicate remediation/QA. "
+                    "Do not combine with idempotency_key."
+                ),
+                "properties": {
+                    "root_cause_id": {"type": "string"},
+                    "affected_scope_digest": {
+                        "type": "string",
+                        "description": "SHA-256 of the exact affected scope/artifact.",
+                    },
+                    "policy_or_test_plan_version": {"type": "string"},
+                    "independent_variant": {"type": "string"},
+                },
+                "required": [
+                    "root_cause_id",
+                    "affected_scope_digest",
+                    "policy_or_test_plan_version",
+                    "independent_variant",
+                ],
+            },
             "max_runtime_seconds": {
                 "type": "integer",
                 "description": "Runtime cap; timeout terminates and requeues the worker.",
@@ -2151,8 +2268,9 @@ KANBAN_CREATE_SCHEMA = {
             },
             "goal_max_turns": {
                 "type": "integer",
+                "minimum": 1,
                 "description": (
-                    "Goal-loop turn cap; ignored unless goal_mode. Defaults to 6."
+                    "Required positive turn cap when goal_mode is true; otherwise ignored."
                 ),
             },
             "board": _board_schema_prop(),

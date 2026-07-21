@@ -236,7 +236,10 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
+        # ``comm`` may contain spaces or parentheses, so split after its final
+        # closing parenthesis rather than indexing a naive whitespace split.
+        tail = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        return int(tail[19])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         pass
 
@@ -253,6 +256,61 @@ def _get_process_start_time(pid: int) -> Optional[int]:
 def get_process_start_time(pid: int) -> Optional[int]:
     """Public wrapper for retrieving a process start time when available."""
     return _get_process_start_time(pid)
+
+
+def _linux_boot_identity() -> Optional[str]:
+    """Return the current Linux boot/container-instantiation identity.
+
+    The kernel boot id changes on host/VM reboot. PID 1's start tick also
+    changes when a container's PID namespace is recreated while the host kernel
+    remains up. Requiring both prevents a durable PID token from colliding
+    across either restart boundary.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        boot_id = (
+            Path("/proc/sys/kernel/random/boot_id")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        pid1_tail = (
+            Path("/proc/1/stat")
+            .read_text(encoding="utf-8")
+            .rsplit(")", 1)[1]
+            .split()
+        )
+        pid1_start = pid1_tail[19]
+    except (FileNotFoundError, IndexError, PermissionError, OSError):
+        return None
+    if not boot_id or not pid1_start:
+        return None
+    return f"{boot_id}:{pid1_start}"
+
+
+def get_process_identity(pid: int) -> Optional[str]:
+    """Return a durable, reboot-safe identity for a live process.
+
+    Linux combines the boot/container instantiation with the process start
+    tick. Other supported platforms use psutil's native process creation time,
+    encoded losslessly as a hexadecimal float. ``None`` means the identity
+    cannot be proven and callers must not signal or replace the process based
+    on its numeric PID alone.
+    """
+    if sys.platform == "linux":
+        boot_identity = _linux_boot_identity()
+        start_time = _get_process_start_time(pid)
+        if boot_identity is None or start_time is None:
+            return None
+        return f"linux:{boot_identity}:{start_time}"
+
+    try:
+        import psutil  # type: ignore
+
+        creation_time = float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+    return f"{sys.platform}:{creation_time.hex()}"
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:

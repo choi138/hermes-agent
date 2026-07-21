@@ -316,6 +316,7 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     task_id = kb.create_task(conn, title=title, assignee=assignee)
     lock = secrets.token_hex(8)
     future = int(time.time()) + 3600
+    worker_identity = f"test:worker:{worker_pid}"
     conn.execute(
         "UPDATE tasks SET status='running', claim_lock=?, "
         "claim_expires=?, worker_pid=? WHERE id=?",
@@ -323,12 +324,18 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     )
     cur = conn.execute(
         "INSERT INTO task_runs "
-        "(task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
-        "VALUES (?, 'running', ?, ?, ?, ?)",
-        (task_id, lock, future, worker_pid, int(time.time())),
+        "(task_id, status, claim_lock, claim_expires, worker_pid, "
+        "worker_identity, started_at) "
+        "VALUES (?, 'running', ?, ?, ?, ?, ?)",
+        (task_id, lock, future, worker_pid, worker_identity, int(time.time())),
+    )
+    run_id = cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET current_run_id=? WHERE id=?",
+        (run_id, task_id),
     )
     conn.commit()
-    return task_id, cur.lastrowid
+    return task_id, run_id
 
 
 def test_terminate_run_404_unknown_id(client):
@@ -373,8 +380,10 @@ def test_terminate_run_ok(client, monkeypatch):
     # Capture signal calls so we don't actually SIGTERM a random PID.
     sent = []
 
-    def _fake_terminate(pid, prev_lock, *, signal_fn=None):
-        sent.append((pid, prev_lock))
+    def _fake_terminate(
+        pid, prev_lock, *, expected_identity=None, signal_fn=None,
+    ):
+        sent.append((pid, prev_lock, expected_identity))
         return {"signal": "SIGTERM", "delivered": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", _fake_terminate)
@@ -386,7 +395,7 @@ def test_terminate_run_ok(client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body == {"ok": True, "run_id": run_id, "task_id": task_id}
-    assert sent == [(33333, sent[0][1])]
+    assert sent == [(33333, sent[0][1], "test:worker:33333")]
     assert sent[0][1] is not None  # claim_lock was non-null
 
     # Task is back to ready, claim cleared.

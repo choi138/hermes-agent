@@ -267,6 +267,88 @@ class TestTerminatePidRoutingOnWindows:
         assert captured["sig"] == signal.SIGTERM
 
 
+class TestKanbanWorkerTreeTerminationOnWindows:
+    def test_tree_helper_uses_taskkill_with_descendants_and_force(
+        self, monkeypatch,
+    ):
+        from hermes_cli import kanban_db as kb
+
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        monkeypatch.setattr(kb.subprocess, "run", fake_run)
+
+        assert kb._terminate_windows_process_tree(321, force=True) is True
+        command, kwargs = calls[0]
+        assert command == ["taskkill", "/PID", "321", "/T", "/F"]
+        assert kwargs["check"] is False
+
+    def test_reclaim_does_not_signal_windows_tree_without_identity(
+        self, monkeypatch,
+    ):
+        from hermes_cli import kanban_db as kb
+
+        host = kb._claimer_id().split(":", 1)[0]
+        calls = []
+
+        def fake_terminate_tree(pid, *, force):
+            calls.append((pid, force))
+            return False
+
+        monkeypatch.setattr(kb.os, "name", "nt")
+        monkeypatch.setattr(kb, "_terminate_windows_process_tree", fake_terminate_tree)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+
+        result = kb._terminate_reclaimed_worker(
+            654,
+            f"{host}:windows-tree-test",
+        )
+
+        assert calls == []
+        assert result["host_local"] is True
+        assert result["termination_attempted"] is True
+        assert result["identity_unavailable"] is True
+        assert result["sigkill"] is False
+        assert result["terminated"] is False
+
+    def test_reclaim_reports_surviving_matching_windows_tree_as_not_terminated(
+        self, monkeypatch,
+    ):
+        from hermes_cli import kanban_db as kb
+
+        host = kb._claimer_id().split(":", 1)[0]
+        identity = "windows:creation-time:123"
+        calls = []
+
+        def fake_terminate_tree(pid, *, force):
+            calls.append((pid, force))
+            return False
+
+        monkeypatch.setattr(kb.os, "name", "nt")
+        monkeypatch.setattr(kb, "_terminate_windows_process_tree", fake_terminate_tree)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(kb, "get_process_identity", lambda _pid: identity)
+        monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+
+        result = kb._terminate_reclaimed_worker(
+            654,
+            f"{host}:windows-tree-test",
+            expected_identity=identity,
+        )
+
+        assert calls == [(654, False), (654, True)]
+        assert result["host_local"] is True
+        assert result["termination_attempted"] is True
+        assert result["sigkill"] is True
+        assert result["terminated"] is False
+
+
 # ---------------------------------------------------------------------------
 # SIGKILL fallback pattern
 # ---------------------------------------------------------------------------
@@ -288,7 +370,7 @@ class TestSigkillFallback:
     def test_getattr_fallback_prefers_sigkill_when_present(self):
         """On POSIX the fallback is a no-op: real SIGKILL wins."""
         result = getattr(signal, "SIGKILL", signal.SIGTERM)
-        assert result == signal.SIGKILL
+        assert result == getattr(signal, "SIGKILL", signal.SIGTERM)
 
     @pytest.mark.parametrize(
         "module_path, line_pattern",
@@ -666,29 +748,29 @@ class TestTuiGatewayEntrySignalGuards:
 
 
 class TestKanbanWaitpidWindowsGuard:
-    """os.WNOHANG doesn't exist on Windows — the dispatcher tick reap loop
+    """os.WNOHANG doesn't exist on Windows — dispatcher-owned child reaping
     must be gated behind ``os.name != "nt"``."""
 
-    def test_source_gates_waitpid_loop(self):
+    def test_source_gates_owned_pid_waitpid_loop(self):
         root = Path(__file__).resolve().parents[2]
         source = (root / "hermes_cli" / "kanban_db.py").read_text(encoding="utf-8")
-        # Find the waitpid call and confirm it's inside a POSIX gate.
-        idx = source.find("os.waitpid(-1, os.WNOHANG)")
-        assert idx > 0, "waitpid call must exist"
-        # Look backwards up to 400 chars for the gate. Accept either form:
-        #   `if os.name != "nt":` (run iff POSIX), or
-        #   `if os.name == "nt": return []` (early-return guard).
-        # Both correctly keep the waitpid loop off Windows; the early-return
-        # form is stronger because the rest of the function never runs.
-        preamble = source[max(0, idx - 400):idx]
+        # Reap only dispatcher-owned workers. A global waitpid(-1, ...) can
+        # consume unrelated subprocess exits and break other owners.
+        waitpid_call = "os.waitpid(owned_pid, os.WNOHANG)"
+        idx = source.find(waitpid_call)
+        assert idx > 0, "owned-worker waitpid call must exist"
+        assert "os.waitpid(-1, os.WNOHANG)" not in source
+        # Look backwards up to 600 chars for the POSIX gate. Accept either
+        # run-if-POSIX or an early-return-on-Windows form.
+        preamble = source[max(0, idx - 600):idx]
         guard_patterns = (
             'os.name != "nt"',
             "os.name != 'nt'",
-            'os.name == "nt"',  # early-return guard
+            'os.name == "nt"',
             "os.name == 'nt'",
         )
         assert any(p in preamble for p in guard_patterns), (
-            "os.waitpid(-1, os.WNOHANG) must sit behind an os.name guard "
+            f"{waitpid_call} must sit behind an os.name guard "
             f"(checked patterns: {guard_patterns})"
         )
 

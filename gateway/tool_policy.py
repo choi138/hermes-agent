@@ -271,77 +271,64 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
     },
     "cronjob": {
         (): (
-            "Manage scheduled jobs. create requires schedule and prompt, except "
-            "no_agent=true requires script. Jobs start fresh without current-chat "
-            "context, so prompts must be self-contained; attached skills load in "
-            "order first. Final output is delivered automatically and cron runs "
-            "cannot ask questions or create more cron jobs. List before remove and "
-            "use the returned job_id; never guess IDs. On update, skills=[] clears "
-            "skills and empty strings clear optional string fields."
+            "Manage scheduled jobs. create requires schedule+prompt; no_agent=true "
+            "requires script. Jobs start fresh without chat context, so prompts must be "
+            "self-contained. Output auto-delivers; jobs cannot ask questions or create "
+            "more jobs. List before remove; never guess IDs. Empty update values clear fields."
         ),
         ("parameters", "properties", "action"): (
-            "create, list, update, pause, resume, remove, or run. create requires "
-            "schedule and prompt unless no_agent=true with script."
+            "Action; create needs schedule+prompt unless no_agent=true with script."
         ),
         ("parameters", "properties", "job_id"): (
-            "Required for update, pause, resume, remove, and run. Obtain it with "
-            "list; never guess."
+            "Required for update/pause/resume/remove/run; get via list."
         ),
         ("parameters", "properties", "prompt"): (
-            "Self-contained task instruction for create. Attached skills run first."
+            "Self-contained create prompt; skills load first."
         ),
         ("parameters", "properties", "schedule"): (
-            "Required for create; optional on update. Accepts durations ('30m'), "
-            "every phrases ('every 2h'), five-field cron ('0 9 * * *'), or an ISO "
-            "timestamp for a one-shot run."
+            "Create schedule: duration, every phrase, 5-field cron, or ISO time."
         ),
         ("parameters", "properties", "deliver"): (
-            "Omit to deliver to the current chat/thread (recommended). Set only when "
-            "the user requests another target: origin, local (store only), all, or "
-            "platform:chat_id:thread_id; comma-combine targets. Omitting thread_id "
-            "loses topic targeting. all resolves connected channels at fire time."
+            "Omit for the current thread. Set only if requested; "
+            "platform:chat_id:thread_id preserves topic targeting."
         ),
         ("parameters", "properties", "skills"): (
-            "Ordered skills loaded before the prompt. On update, [] clears them."
+            "Preloaded skills; [] clears."
         ),
         ("parameters", "properties", "model"): (
-            "Optional per-job model override. If provider is omitted, creation pins "
-            "the current provider."
+            "Optional model override; omitting provider pins the current provider."
         ),
         ("parameters", "properties", "script"): (
-            "Optional script run each tick. Normally stdout becomes prompt context; "
-            "with no_agent=true it is the delivered result. Relative paths use the "
-            "profile scripts directory; .sh/.bash use Bash, others Python. On update, "
-            "an empty string clears it."
+            "Per-tick script: stdout is prompt context, or delivered with no_agent. "
+            "Relative paths use profile scripts; empty clears."
         ),
         ("parameters", "properties", "no_agent"): (
-            "Default false. When true, script is required and prompt, skills, and "
-            "model override are ignored: no LLM runs and stdout is delivered verbatim. "
-            "Empty stdout is intentionally silent; non-zero exit or timeout sends an "
-            "error alert. Use for fixed-output watchdogs/pollers, not work needing "
-            "reasoning or summarization."
+            "True requires script and skips the LLM; stdout is delivered verbatim, empty "
+            "is silent, and failures alert. For deterministic jobs only."
         ),
         ("parameters", "properties", "context_from"): (
-            "Job ID or IDs whose latest completed output is added before this run. "
-            "It does not wait for an upstream job running in the same tick. On update, "
-            "[] clears the chain."
+            "Latest completed outputs from job IDs; no same-tick wait; [] clears."
         ),
         ("parameters", "properties", "enabled_toolsets"): (
-            "Optional toolsets available to this job's agent, such as web, terminal, "
-            "file, or delegation. Omit for defaults; infer the minimum needed from the "
-            "prompt. On update, [] clears the restriction."
+            "Agent toolset restriction; [] clears."
         ),
         ("parameters", "properties", "workdir"): (
-            "Optional existing absolute working directory. Its project instructions "
-            "are loaded and terminal/file/code execution use it. Jobs with workdir run "
-            "sequentially. On update, an empty string clears it."
+            "Existing workdir scopes tools; same-dir jobs serialize; empty clears."
         ),
         ("parameters", "properties", "attach_to_session"): (
-            "Make delivery continuable with run context. Thread-capable platforms use "
-            "a dedicated thread; DM-only platforms mirror into the origin session. "
-            "Only the origin is affected, not fan-out targets; no effect for local "
-            "delivery. Overrides cron.mirror_delivery for this job."
+            "Continuable run context: dedicated thread or origin DM; origin only; "
+            "overrides mirror delivery."
         ),
+    },
+    "text_to_speech": {
+        (): (
+            "Convert text to speech; returns a MEDIA path. Uses the configured "
+            "voice and provider."
+        ),
+        ("parameters", "properties", "text"): (
+            "Text to speak; long input may be truncated."
+        ),
+        ("parameters", "properties", "output_path"): "Optional output path.",
     },
     "terminal": {
         (): (

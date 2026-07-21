@@ -903,6 +903,20 @@ def test_complete_missing_scratch_artifact_stays_in_flight(worker_env):
     assert workspace.exists()
 
 
+@pytest.mark.parametrize("invalid_budget", [1.9, True, "20"])
+def test_create_rejects_non_integer_goal_budget(worker_env, invalid_budget):
+    from tools import kanban_tools as kt
+
+    output = json.loads(kt._handle_create({
+        "title": "bounded goal child",
+        "assignee": "test-worker",
+        "goal_mode": True,
+        "goal_max_turns": invalid_budget,
+    }))
+
+    assert "goal_max_turns must be a positive integer" in output.get("error", "")
+
+
 def test_complete_rejects_no_handoff(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({})
@@ -1030,7 +1044,8 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True,
+            goal_max_turns=5,
         )
         kb.claim_task(conn, goal_task_id)
         task = kb.get_task(conn, goal_task_id)
@@ -1094,7 +1109,8 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True,
+            goal_max_turns=5,
         )
         kb.claim_task(conn, goal_task_id)
         task = kb.get_task(conn, goal_task_id)
@@ -1298,7 +1314,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
+            body="Must achieve X.", goal_mode=True, goal_max_turns=5,
         )
         kb.claim_task(conn, goal_task_id)
         task = kb.get_task(conn, goal_task_id)
@@ -1574,6 +1590,128 @@ def test_worker_create_without_key_is_automatically_idempotent(worker_env):
         assert rows[0]["idempotency_key"].startswith(
             f"worker-create:{worker_env}:"
         )
+
+
+def test_worker_create_correction_identity_reuses_one_active_leader(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    correction = {
+        "root_cause_id": "provider-timeout",
+        "affected_scope_digest": "a" * 64,
+        "policy_or_test_plan_version": "qa-v2",
+        "independent_variant": "primary",
+    }
+    first = json.loads(kt._handle_create({
+        "title": "Fix provider timeout",
+        "assignee": "peer",
+        "body": "first remediation wording",
+        "correction": correction,
+    }))
+    second = json.loads(kt._handle_create({
+        "title": "Retry provider repair",
+        "assignee": "peer",
+        "body": "different wording must not create a second graph",
+        "correction": correction,
+    }))
+
+    assert first["ok"] is True
+    assert first["correction_role"] == "leader"
+    assert second["ok"] is True
+    assert second["correction_role"] == "follower"
+    assert second["task_id"] == first["task_id"]
+    assert second["correction_lineage_id"] == first["correction_lineage_id"]
+
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM correction_lineages WHERE status='active'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title IN (?, ?)",
+            ("Fix provider timeout", "Retry provider repair"),
+        ).fetchone()[0] == 1
+        assert kb.complete_task(conn, first["task_id"], summary="corrected")
+
+    third = json.loads(kt._handle_create({
+        "title": "Correct recurrence after completed remediation",
+        "assignee": "peer",
+        "correction": correction,
+    }))
+    assert third["ok"] is True
+    assert third["correction_role"] == "leader"
+    assert third["task_id"] != first["task_id"]
+    assert third["correction_lineage_id"] != first["correction_lineage_id"]
+
+    with kb.connect() as conn:
+        statuses = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM correction_lineages "
+            "GROUP BY status ORDER BY status"
+        ).fetchall()
+        assert {row["status"]: row["n"] for row in statuses} == {
+            "active": 1,
+            "resolved": 1,
+        }
+
+
+def test_orchestrator_create_correction_identity_is_tenant_scoped(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK")
+
+    correction = {
+        "root_cause_id": "same-visible-root",
+        "affected_scope_digest": "b" * 64,
+        "policy_or_test_plan_version": "qa-v2",
+        "independent_variant": "primary",
+    }
+    tenant_a = json.loads(kt._handle_create({
+        "title": "Tenant A correction",
+        "assignee": "peer",
+        "tenant": "tenant-a",
+        "correction": correction,
+    }))
+    tenant_b = json.loads(kt._handle_create({
+        "title": "Tenant B correction",
+        "assignee": "peer",
+        "tenant": "tenant-b",
+        "correction": correction,
+    }))
+
+    assert tenant_a["ok"] is True and tenant_b["ok"] is True
+    assert tenant_a["task_id"] != tenant_b["task_id"]
+    assert tenant_a["correction_role"] == "leader"
+    assert tenant_b["correction_role"] == "leader"
+
+
+def test_worker_create_rejects_conflicting_tenant_override(
+    monkeypatch, worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_TENANT", "tenant-a")
+    response = json.loads(kt._handle_create({
+        "title": "Cross-tenant correction",
+        "assignee": "peer",
+        "tenant": "tenant-b",
+        "correction": {
+            "root_cause_id": "shared-visible-root",
+            "affected_scope_digest": "c" * 64,
+            "policy_or_test_plan_version": "qa-v2",
+            "independent_variant": "primary",
+        },
+    }))
+
+    assert response.get("ok") is not True
+    assert "tenant" in response["error"].lower()
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE tenant='tenant-b'"
+        ).fetchone()[0] == 0
 
 
 def test_worker_create_explicit_distinct_keys_allow_intentional_duplicates(worker_env):
@@ -2285,6 +2423,11 @@ def test_worker_complete_own_task_still_works(worker_env):
     out = kt._handle_complete({"task_id": worker_env, "summary": "explicit own"})
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == worker_env
+    assert d["__hermes_kanban_terminal__"] == {
+        "task_id": worker_env,
+        "tool": "kanban_complete",
+        "status": "done",
+    }
 
 
 def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):

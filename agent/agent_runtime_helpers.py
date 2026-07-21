@@ -2377,6 +2377,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None
+    policy_evaluation_failed = False
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import resolve_pre_tool_block
@@ -2391,7 +2392,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
-            block_message = None
+            logger.exception("pre-tool policy evaluation failed for %s", function_name)
+            policy_evaluation_failed = True
+            block_message = (
+                f"BLOCKED: pre-tool policy evaluation failed for {function_name}"
+            )
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
@@ -2406,7 +2411,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 status="blocked",
-                error_type="plugin_block",
+                error_type=(
+                    "plugin_policy_error" if policy_evaluation_failed else "plugin_block"
+                ),
                 error_message=block_message,
                 middleware_trace=list(_tool_middleware_trace),
             )

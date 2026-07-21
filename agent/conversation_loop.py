@@ -679,6 +679,9 @@ def run_conversation(
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    # A durable tool-progress failure is fatal only for the current user turn.
+    # A later turn may retry after the session store recovers.
+    agent._tool_persistence_failure = None
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -5082,7 +5085,11 @@ def run_conversation(
                     # side effects run. If a destructive tool restarts or
                     # terminates Hermes mid-turn, resume logic still sees the
                     # exact tool-call block that already executed.
-                    agent._flush_messages_to_session_db(messages, conversation_history)
+                    assistant_block_persisted = agent._flush_messages_to_session_db(
+                        messages, conversation_history,
+                    )
+                    if assistant_block_persisted is False:
+                        agent._tool_persistence_failure = "assistant tool-call block"
                 except Exception as exc:
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
@@ -5090,6 +5097,7 @@ def run_conversation(
                         agent.session_id or "none",
                         exc,
                     )
+                    agent._tool_persistence_failure = "assistant tool-call block"
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may
@@ -5104,6 +5112,31 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                persistence_failure = getattr(
+                    agent, "_tool_persistence_failure", None,
+                )
+                if persistence_failure:
+                    _turn_exit_reason = "tool_persistence_failure"
+                    final_response = (
+                        "Tool execution stopped because session persistence failed "
+                        f"after {persistence_failure}; no further tools were started."
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": final_response,
+                    })
+                    agent._emit_status("⚠️ Tool execution halted: session persistence failed")
+                    break
+
+                kanban_terminal = getattr(agent, "_kanban_terminal_transition", None)
+                if kanban_terminal is not None:
+                    _turn_exit_reason = "kanban_terminal"
+                    final_response = (
+                        f"Kanban task {kanban_terminal['task_id']} "
+                        f"transitioned to {kanban_terminal['status']}."
+                    )
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

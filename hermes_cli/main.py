@@ -5873,14 +5873,16 @@ def cmd_gui(args: argparse.Namespace):
 
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 
-    if source_mode or not skip_build:
+    # Source launches always go through ``npm exec``. Packaged launches only
+    # need npm when the content stamp says a rebuild is required; an up-to-date
+    # packaged executable must remain launchable on machines without Node.
+    npm = None
+    if source_mode:
         npm = _resolve_node_runtime_npm()
         if not npm:
             print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
             print("Install Node.js, then run:  hermes gui")
             sys.exit(1)
-    else:
-        npm = None
 
     if skip_build:
         if source_mode:
@@ -5914,6 +5916,12 @@ def cmd_gui(args: argparse.Namespace):
             build_label = "source build" if source_mode else "packaged app"
             print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
         else:
+            if npm is None:
+                npm = _resolve_node_runtime_npm()
+                if not npm:
+                    print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
+                    print("Install Node.js, then run:  hermes gui")
+                    sys.exit(1)
             print("→ Installing desktop workspace dependencies...")
             # Put the Hermes-managed Node on PATH so npm's child scripts (which
             # shell out to bare `node`, e.g. electron-winstaller's

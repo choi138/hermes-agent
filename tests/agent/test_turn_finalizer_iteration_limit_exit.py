@@ -377,3 +377,22 @@ def test_terminal_verification_failure_is_persisted_as_one_correction(monkeypatc
     persisted_contents = [m.get("content") for m in agent.persisted_messages]
     assert "[System: run tests]" not in persisted_contents
     assert report in persisted_contents
+
+
+def test_pending_response_fences_kanban_timeout_to_worker_run(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+
+    _finalize(
+        _LimitAgent(),
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="composed report",
+    )
+
+    assert record.call_args.kwargs["expected_run_id"] == 42

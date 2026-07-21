@@ -151,6 +151,39 @@ def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawna
         assert task.status == "blocked"
         assert task.consecutive_failures >= 2
         assert task.last_failure_error and "no PATH" in task.last_failure_error
+
+        # A tripped breaker is a durable human-review gate.  A later dispatcher
+        # tick must not silently promote the task and create another gave_up run.
+        runs_before = kb.list_runs(conn, tid)
+        res3 = kb.dispatch_once(conn, spawn_fn=_bad_spawn)
+        assert tid not in res3.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_runs(conn, tid) == runs_before
+    finally:
+        conn.close()
+
+
+def test_same_root_breaker_stays_blocked_below_total_limit(
+    kanban_home, all_assignees_spawnable,
+):
+    """A same-root trip cannot reopen merely because total_limit is higher."""
+    def _bad_spawn(task, ws):
+        raise RuntimeError("same deterministic spawn failure")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=5)
+        second = kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=5)
+        assert tid in second.auto_blocked
+        assert kb.get_task(conn, tid).consecutive_failures == 2
+        runs_before = kb.list_runs(conn, tid)
+
+        third = kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=5)
+
+        assert tid not in third.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_runs(conn, tid) == runs_before
     finally:
         conn.close()
 
@@ -166,8 +199,10 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
     calls = [0]
     def _flaky_spawn(task, ws):
         calls[0] += 1
-        if calls[0] <= 2:
-            raise RuntimeError("transient")
+        if calls[0] == 1:
+            raise RuntimeError("transient provider reset")
+        if calls[0] == 2:
+            raise RuntimeError("transient worker signal")
         return 99999  # pid value — harmless; crash detection will clear it
 
     conn = kb.connect()
@@ -387,10 +422,15 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
         assert task.consecutive_failures == 1
         assert task.status == "ready"
         assert task.last_failure_error and "workspace" in task.last_failure_error
-        # Run twice more → auto-blocked.
-        kb.dispatch_once(conn, failure_limit=3)
-        res = kb.dispatch_once(conn, failure_limit=3)
-        assert tid in res.auto_blocked
+        # The same deterministic workspace root trips the faster same-root
+        # breaker on the second observation; later ticks keep the review gate.
+        second = kb.dispatch_once(conn, failure_limit=3)
+        assert tid in second.auto_blocked
+        runs_before = kb.list_runs(conn, tid)
+        third = kb.dispatch_once(conn, failure_limit=3)
+        assert tid not in third.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_runs(conn, tid) == runs_before
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
     finally:
@@ -1364,60 +1404,62 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home, tmp_path):
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
 
-def test_max_runtime_terminates_overrun_worker(kanban_home):
+def test_max_runtime_terminates_overrun_worker(kanban_home, monkeypatch):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
+    state = {"alive": True}
+    identity = "test:max-runtime-worker"
+    worker_pid = 987654321
+
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
+        state["alive"] = False
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
     import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+    monkeypatch.setattr(_kb, "get_process_identity", lambda _pid: identity)
 
+    conn = kb.connect()
     try:
-        conn = kb.connect()
-        try:
-            tid = kb.create_task(
-                conn, title="long job", assignee="worker",
-                max_runtime_seconds=1,  # one second cap
+        tid = kb.create_task(
+            conn, title="long job", assignee="worker",
+            max_runtime_seconds=1,  # one second cap
+        )
+        # Spawn by hand: claim + set pid + set active run start to the past.
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, worker_pid)
+        # Backdate both the task-level first-start timestamp and the active
+        # run timestamp so elapsed > limit under the per-run runtime model.
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (old_started, tid),
             )
-            # Spawn by hand: claim + set pid + set active run start to the past.
-            kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
-            # Backdate both the task-level first-start timestamp and the active
-            # run timestamp so elapsed > limit under the per-run runtime model.
-            old_started = int(time.time()) - 30
-            with kb.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET started_at = ? WHERE id = ?",
-                    (old_started, tid),
-                )
-                conn.execute(
-                    "UPDATE task_runs SET started_at = ? "
-                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                    (old_started, tid),
-                )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
+            )
 
-            timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
-            assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+        timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
+        assert tid in timed_out
+        assert killed and killed[0][0] == worker_pid
 
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
-            assert task.worker_pid is None
-            assert task.last_heartbeat_at is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", f"timed-out task should reset to ready, got {task.status}"
+        assert task.worker_pid is None
+        assert task.last_heartbeat_at is None
 
-            events = kb.list_events(conn, tid)
-            assert any(e.kind == "timed_out" for e in events)
-            to_event = next(e for e in events if e.kind == "timed_out")
-            assert to_event.payload["limit_seconds"] == 1
-            assert to_event.payload["elapsed_seconds"] >= 30
-        finally:
-            conn.close()
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "timed_out" for e in events)
+        to_event = next(e for e in events if e.kind == "timed_out")
+        assert to_event.payload["limit_seconds"] == 1
+        assert to_event.payload["elapsed_seconds"] >= 30
     finally:
-        _kb._pid_alive = original_alive
+        _kb._discard_owned_worker(worker_pid)
+        conn.close()
 
 
 def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
@@ -2037,8 +2079,12 @@ def test_run_on_block_with_reason(kanban_home):
 def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spawnable):
     """Each spawn_failed event closes a run with outcome='spawn_failed',
     and the Nth failure closes a run with outcome='gave_up'."""
+    # Use distinct roots so this test exercises the total failure limit rather
+    # than the intentionally-faster same-root breaker.
+    roots = iter(("alpha", "beta", "gamma", "delta", "epsilon"))
+
     def _bad(task, ws):
-        raise RuntimeError("no PATH")
+        raise RuntimeError(f"no PATH {next(roots)}")
 
     conn = kb.connect()
     try:
@@ -2949,7 +2995,7 @@ def test_pid_alive_detects_zombie(kanban_home):
         time.sleep(0.3)
         # Verify /proc reports zombie state so the test is actually
         # exercising the zombie path and not some other liveness failure
-        with open(f"/proc/{pid}/status") as f:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
             state_line = next(
                 (l for l in f if l.startswith("State:")), ""
             )
@@ -4553,6 +4599,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         # Simulate a live claim (not expired).
         lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
         future = int(time.time()) + 3600
+        identity = "test:manual-reclaim-worker"
         killed: list[int] = []
         state = {"alive": True}
 
@@ -4562,6 +4609,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        monkeypatch.setattr(_kb, "get_process_identity", lambda _pid: identity)
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -4569,8 +4617,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
+            "worker_pid, worker_identity, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?, ?)",
+            (t, lock, future, 12345, identity, int(time.time())),
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
@@ -4741,6 +4790,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
     the Forbidden-Seeds-reported gap where timeout loops never capped.
     """
     import hermes_cli.kanban_db as _kb
+    identity = "test:repeated-timeout-worker"
     state = {"sent_term": False}
     def _alive(pid):
         return not state["sent_term"]
@@ -4749,6 +4799,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
     monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(_kb, "get_process_identity", lambda _pid: identity)
 
     conn = kb.connect()
     try:
@@ -4776,13 +4827,14 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
                 )
                 conn.execute(
                     "INSERT INTO task_runs (task_id, status, claim_lock, "
-                    "claim_expires, worker_pid, started_at) "
-                    "VALUES (?, 'running', ?, ?, ?, ?)",
+                    "claim_expires, worker_pid, worker_identity, started_at) "
+                    "VALUES (?, 'running', ?, ?, ?, ?, ?)",
                     (
                         tid,
                         f"{_kb._claimer_id().split(':', 1)[0]}:lock",
                         int(time.time()) + 3600,
                         os.getpid(),
+                        identity,
                         int(time.time()) - 30,
                     ),
                 )

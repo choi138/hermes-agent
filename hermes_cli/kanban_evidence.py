@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.metadata
 import json
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -89,7 +92,8 @@ _LOCKFILE_NAMES = (
     "go.sum",
 )
 _MAX_EVIDENCE_FRESHNESS_SECONDS = 604_800
-_PRODUCER_POLICY_VERSION = "runtime-evidence-v1"
+_PRODUCER_POLICY_VERSION = "runtime-evidence-v2"
+_MAX_WORKTREE_HASH_BYTES = 64 * 1024 * 1024
 
 
 def _canonical_json(value: Any) -> str:
@@ -107,6 +111,76 @@ def _canonical_json(value: Any) -> str:
 def _domain_digest(label: str, value: Any) -> str:
     payload = f"{label}\0{_canonical_json(value)}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _toolchain_digest() -> str:
+    """Bind evidence reuse to Python plus the installed package environment."""
+    distributions: list[list[str]] = []
+    try:
+        for distribution in importlib.metadata.distributions():
+            raw_name = distribution.metadata.get("Name")
+            raw_version = getattr(distribution, "version", None)
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+            if not isinstance(raw_version, str) or not raw_version.strip():
+                continue
+            canonical_name = re.sub(r"[-_.]+", "-", raw_name).lower()
+            distributions.append([canonical_name, raw_version.strip()])
+    except Exception:
+        distributions = [["metadata", "unavailable"]]
+    distributions.sort()
+    return _domain_digest(
+        "toolchain",
+        {
+            "distributions": distributions,
+            "implementation": platform.python_implementation(),
+            "machine": platform.machine(),
+            "python": list(sys.version_info[:3]),
+            "system": platform.system(),
+        },
+    )
+
+
+def _runtime_fingerprint() -> dict[str, Any]:
+    """Return non-secret runtime identity used only as backend-digest input."""
+    executable_versions: dict[str, str] = {}
+    for name, command in (
+        ("git", ["git", "--version"]),
+        ("node", ["node", "--version"]),
+    ):
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+            if completed.returncode == 0 and completed.stdout.strip():
+                executable_versions[name] = completed.stdout.strip()[:256]
+        except (OSError, subprocess.SubprocessError):
+            executable_versions[name] = "unavailable"
+    backend_identity = {
+        name: os.environ[name]
+        for name in (
+            "HERMES_BACKEND_VERSION",
+            "HERMES_CONTAINER_IMAGE",
+            "HERMES_CONTAINER_IMAGE_DIGEST",
+        )
+        if os.environ.get(name)
+    }
+    return {
+        "backend_identity": backend_identity,
+        "executables": executable_versions,
+        "implementation": getattr(sys.implementation, "name", "unknown"),
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+        "python_build": list(platform.python_build()),
+        "python_version": platform.python_version(),
+        "system": platform.system(),
+        "system_release": platform.release(),
+    }
 
 
 def _file_set_digest(label: str, paths: list[Path]) -> str:
@@ -132,56 +206,212 @@ def _file_set_digest(label: str, paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def _git_bytes(root: Path, *args: str, max_bytes: int) -> bytes:
+    """Return bounded Git stdout, terminating the producer at the cap."""
+    if max_bytes < 0:
+        raise ValueError("worktree evidence exceeds hashing budget")
+    argv = ["git", "-C", str(root), *args]
+    timeout_seconds = 3.0
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(  # noqa: S603 -- fixed executable + argv
+            argv,
+            stdout=output,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            output_size = os.fstat(output.fileno()).st_size
+            if output_size > max_bytes:
+                process.kill()
+                process.wait(timeout=1)
+                raise ValueError("worktree evidence exceeds hashing budget")
+            returncode = process.poll()
+            if returncode is not None:
+                break
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait(timeout=1)
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+            time.sleep(0.01)
+
+        output_size = os.fstat(output.fileno()).st_size
+        if output_size > max_bytes:
+            raise ValueError("worktree evidence exceeds hashing budget")
+        if returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} failed")
+        output.seek(0)
+        return output.read(max_bytes + 1)
+
+
+def _git_worktree_content_digest(root: Path) -> str:
+    """Hash exact tracked modifications and untracked file contents.
+
+    The digest never leaves raw names or bytes in persisted evidence. Symlinks
+    are not followed, and oversized worktrees fail closed instead of adding
+    unbounded terminal latency.
+    """
+    remaining = _MAX_WORKTREE_HASH_BYTES
+    status_bytes = _git_bytes(
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        max_bytes=remaining,
+    )
+    remaining -= len(status_bytes)
+    diff_bytes = _git_bytes(
+        root, "diff", "--binary", "--no-ext-diff", "HEAD", "--",
+        max_bytes=remaining,
+    )
+    remaining -= len(diff_bytes)
+    untracked_bytes = _git_bytes(
+        root, "ls-files", "--others", "--exclude-standard", "-z",
+        max_bytes=remaining,
+    )
+    consumed = len(status_bytes) + len(diff_bytes) + len(untracked_bytes)
+    if consumed > _MAX_WORKTREE_HASH_BYTES:
+        raise ValueError("worktree evidence exceeds hashing budget")
+
+    digest = hashlib.sha256(b"git-worktree-content-v2\0")
+    for label, payload in (
+        (b"status", status_bytes),
+        (b"diff", diff_bytes),
+        (b"untracked", untracked_bytes),
+    ):
+        digest.update(label + b"\0" + payload + b"\0")
+
+    for raw_name in sorted(name for name in untracked_bytes.split(b"\0") if name):
+        path = root / os.fsdecode(raw_name)
+        info = path.lstat()
+        digest.update(b"path\0" + raw_name + b"\0")
+        if stat.S_ISLNK(info.st_mode):
+            digest.update(b"symlink\0")
+            digest.update(os.fsencode(os.readlink(path)))
+        elif stat.S_ISREG(info.st_mode):
+            consumed += int(info.st_size)
+            if consumed > _MAX_WORKTREE_HASH_BYTES:
+                raise ValueError("worktree evidence exceeds hashing budget")
+            digest.update(b"file\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(128 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            digest.update(f"mode:{stat.S_IFMT(info.st_mode):o}".encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _workspace_directory_identity(root: Path) -> tuple[int, int]:
+    try:
+        root_info = root.stat()
+    except OSError as exc:
+        raise RuntimeError("workspace is unavailable for Git provenance") from exc
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise RuntimeError("workspace is unavailable for Git provenance")
+    return int(root_info.st_dev), int(root_info.st_ino)
+
+
+def _git_workspace_membership(root: Path) -> Optional[bool]:
+    try:
+        membership = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("unable to determine Git workspace membership") from exc
+
+    if membership.returncode != 0:
+        return None
+    membership_value = membership.stdout.decode(
+        "ascii", errors="ignore"
+    ).strip()
+    if membership_value == "true":
+        return True
+    if membership_value == "false":
+        return False
+    raise RuntimeError("Git returned malformed workspace membership")
+
+
+def _git_metadata_present(root: Path) -> bool:
+    for candidate in (root, *root.parents):
+        try:
+            (candidate / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError("unable to inspect Git workspace metadata") from exc
+        return True
+    return False
+
+
+def _resolve_git_workspace(root: Path) -> tuple[str, str]:
+    try:
+        resolved = subprocess.run(
+            [
+                "git", "-C", str(root), "rev-parse",
+                "HEAD^{commit}", "HEAD^{tree}",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("unable to resolve Git workspace provenance") from exc
+    lines = resolved.stdout.decode("ascii", errors="ignore").splitlines()
+    if resolved.returncode != 0:
+        raise RuntimeError("unable to resolve Git workspace provenance")
+    if (
+        len(lines) < 2
+        or not _GIT_OBJECT_RE.fullmatch(lines[0].strip())
+        or not _GIT_OBJECT_RE.fullmatch(lines[1].strip())
+    ):
+        raise RuntimeError("Git returned malformed workspace provenance")
+    return lines[0].strip(), lines[1].strip()
+
+
 def _git_provenance(workspace: Optional[str], fallback_seed: str) -> tuple[str, str, str]:
     """Return commit, committed tree, and a digest of the working-tree state.
 
-    Git metadata is observational only: failure or a non-repository workspace
-    falls back to deterministic object-shaped identifiers. Raw status output is
-    hashed in memory and never crosses the evidence boundary.
+    A confirmed non-repository workspace falls back to deterministic
+    object-shaped identifiers. Once Git identifies a repository, provenance
+    collection is fail-closed: an unreadable, oversized, or changing worktree
+    cannot authorize a terminal transition. Raw status output is hashed in
+    memory and never crosses the evidence boundary.
     """
     root = Path(workspace).expanduser() if workspace else None
-    if root is not None and root.is_dir():
-        try:
-            resolved = subprocess.run(
-                [
-                    "git", "-C", str(root), "rev-parse",
-                    "HEAD^{commit}", "HEAD^{tree}",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-        except (OSError, subprocess.SubprocessError):
-            resolved = None
-        if resolved is not None:
-            lines = resolved.stdout.decode("ascii", errors="ignore").splitlines()
+    if root is not None:
+        root_identity = _workspace_directory_identity(root)
+
+        def _require_same_workspace() -> None:
+            if _workspace_directory_identity(root) != root_identity:
+                raise RuntimeError("workspace is unavailable for Git provenance")
+
+        membership = _git_workspace_membership(root)
+        if membership is False:
+            raise RuntimeError("Git workspace is not a worktree")
+        if membership is None:
+            # A normal non-repository directory has no .git marker in its
+            # ancestry. If metadata is present but Git cannot read it, fail
+            # closed rather than treating a damaged worktree as plain files.
+            if _git_metadata_present(root):
+                raise RuntimeError("unable to determine Git workspace membership")
+            _require_same_workspace()
+            final_membership = _git_workspace_membership(root)
+            if final_membership is not None or _git_metadata_present(root):
+                raise RuntimeError("Git workspace membership changed during provenance collection")
+            _require_same_workspace()
         else:
-            lines = []
-        if (
-            resolved is not None
-            and resolved.returncode == 0
-            and len(lines) >= 2
-            and _GIT_OBJECT_RE.fullmatch(lines[0].strip())
-            and _GIT_OBJECT_RE.fullmatch(lines[1].strip())
-        ):
-            commit, tree = lines[0].strip(), lines[1].strip()
-            try:
-                status = subprocess.run(
-                    [
-                        "git", "-C", str(root), "status", "--porcelain=v1",
-                        "-z", "--untracked-files=normal",
-                    ],
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                )
-                state_digest = hashlib.sha256(status.stdout).hexdigest()
-            except (OSError, subprocess.SubprocessError):
-                state_digest = _domain_digest(
-                    "worktree-state-unavailable", fallback_seed,
-                )
+            commit, tree = _resolve_git_workspace(root)
+            _require_same_workspace()
+            state_digest = _git_worktree_content_digest(root)
+            _require_same_workspace()
+            if _git_workspace_membership(root) is not True:
+                raise RuntimeError("Git workspace membership changed during provenance collection")
+            final_commit, final_tree = _resolve_git_workspace(root)
+            _require_same_workspace()
+            if (final_commit, final_tree) != (commit, tree):
+                raise RuntimeError("Git workspace provenance changed during collection")
             return commit, tree, state_digest
 
     commit = hashlib.sha1(f"fallback-commit\0{fallback_seed}".encode()).hexdigest()
@@ -271,10 +501,18 @@ def produce_terminal_evidence(
 
     metadata = handoff.get("metadata") if isinstance(handoff, Mapping) else None
     test_plan = {}
+    fixture_inputs = {}
+    seed_inputs = {}
     if isinstance(metadata, Mapping):
         for key in ("checks", "tests", "tests_run", "verification"):
             if key in metadata:
                 test_plan[key] = metadata[key]
+        for key in ("dataset", "fixture", "fixtures", "test_data"):
+            if key in metadata:
+                fixture_inputs[key] = metadata[key]
+        for key in ("random_seed", "seed"):
+            if key in metadata:
+                seed_inputs[key] = metadata[key]
 
     observed_at = int(evidence_at if evidence_at is not None else time.time())
     manifest = {
@@ -288,29 +526,26 @@ def produce_terminal_evidence(
         "source_tree": source_tree,
         "config_digest": _file_set_digest("config", config_paths),
         "lockfile_digest": _file_set_digest("lockfiles", lock_paths),
-        "toolchain_digest": _domain_digest(
-            "toolchain",
-            {
-                "implementation": platform.python_implementation(),
-                "machine": platform.machine(),
-                "python": list(sys.version_info[:3]),
-                "system": platform.system(),
-            },
-        ),
+        "toolchain_digest": _toolchain_digest(),
         "backend_kind": normalized_backend,
         "backend_digest": _domain_digest(
             "backend",
             {
                 "kind": normalized_backend,
                 "profile": os.environ.get("HERMES_PROFILE") or "worker",
+                "runtime": _runtime_fingerprint(),
             },
         ),
         "command_digest": _domain_digest(
             "terminal-call", {"action": action, "handoff": canonical_handoff},
         ),
         "test_plan_digest": _domain_digest("test-plan", test_plan),
-        "fixture_digest": _domain_digest("fixtures", {"intent": intent_id}),
-        "seed_digest": _domain_digest("producer-seed", {"intent": intent_id}),
+        "fixture_digest": _domain_digest(
+            "fixtures", fixture_inputs or {"declared": False},
+        ),
+        "seed_digest": _domain_digest(
+            "producer-seed", seed_inputs or {"declared": False},
+        ),
         "policy_version": _PRODUCER_POLICY_VERSION,
         "evidence_at": observed_at,
         "freshness_seconds": _MAX_EVIDENCE_FRESHNESS_SECONDS,
@@ -423,6 +658,8 @@ def validate_evidence_manifest(
 def recovery_decision(
     failure_class: str, *, verified_checkpoint: bool,
     digest_matches: bool, side_effect: str,
+    same_root_observations: int = 1,
+    terminal_recovery_attempts: int = 0,
 ) -> str:
     if not isinstance(failure_class, str) or failure_class not in _FAILURE_CLASSES - {"none"}:
         raise ValueError("invalid recovery failure_class")
@@ -430,12 +667,22 @@ def recovery_decision(
         raise ValueError("checkpoint verification flags must be booleans")
     if not isinstance(side_effect, str) or side_effect not in _SIDE_EFFECTS:
         raise ValueError("invalid recovery side_effect")
+    for name, value in (
+        ("same_root_observations", same_root_observations),
+        ("terminal_recovery_attempts", terminal_recovery_attempts),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
     if failure_class in _STABLE_BLOCK:
         return "stable_block"
     if failure_class in _NO_RETRY:
         return "no_retry"
     if failure_class not in _TRANSIENT:
         return "human_gate"
+    if same_root_observations >= 2:
+        return "no_retry"
+    if failure_class == "terminal_write" and terminal_recovery_attempts >= 1:
+        return "no_retry"
     if not digest_matches or side_effect == "unknown":
         return "human_gate"
     if not verified_checkpoint:

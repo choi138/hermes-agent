@@ -1852,9 +1852,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return
+            return True
         if not self._session_db:
-            return
+            return True
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2047,8 +2047,10 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -6195,11 +6197,15 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+        self._kanban_terminal_transition = None
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if len(tool_calls) <= 1:
+            if len(tool_calls) <= 1 or any(
+                call.function.name in {"kanban_complete", "kanban_block"}
+                for call in tool_calls
+            ):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )

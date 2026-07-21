@@ -718,6 +718,50 @@ class TestGetProcessStartTime:
             p.wait()
 
 
+class TestGetProcessIdentity:
+    def test_linux_identity_is_scoped_to_boot_and_pid1_instantiation(
+        self,
+        monkeypatch,
+    ):
+        boot = {"value": "boot-a:pid1-a"}
+        monkeypatch.setattr(status.sys, "platform", "linux")
+        monkeypatch.setattr(
+            status,
+            "_linux_boot_identity",
+            lambda: boot["value"],
+            raising=False,
+        )
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 123)
+
+        first = status.get_process_identity(42)
+        boot["value"] = "boot-b:pid1-b"
+        second = status.get_process_identity(42)
+
+        assert first == "linux:boot-a:pid1-a:123"
+        assert second == "linux:boot-b:pid1-b:123"
+        assert first != second
+
+    def test_linux_identity_is_unavailable_without_boot_scope(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "linux")
+        monkeypatch.setattr(
+            status, "_linux_boot_identity", lambda: None, raising=False,
+        )
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 123)
+
+        assert status.get_process_identity(42) is None
+
+    def test_non_linux_identity_uses_native_creation_time(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        fake_psutil = SimpleNamespace(
+            Process=lambda _pid: SimpleNamespace(create_time=lambda: 1_700_000_000.125),
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        identity = status.get_process_identity(42)
+
+        assert identity == f"darwin:{float(1_700_000_000.125).hex()}"
+
+
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):
         calls = []

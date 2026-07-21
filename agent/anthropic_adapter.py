@@ -926,6 +926,12 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
         return None
 
+    # ``text=True`` should always produce a string, but keep credential parsing
+    # fail-closed if a platform shim or test double violates that subprocess
+    # contract.  Never feed arbitrary objects into ``json.loads``.
+    if not isinstance(result.stdout, str):
+        logger.debug("Keychain: credentials payload was not text")
+        return None
     raw = result.stdout.strip()
     if not raw:
         return None

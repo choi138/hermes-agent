@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
 import json
 import pytest
@@ -1030,6 +1031,141 @@ class TestMessageStorage:
         db.append_message("s1", role="tool", content="result", tool_name="web_search")
 
         session = db.get_session("s1")
+        assert session["tool_call_count"] == 0
+
+    def test_tool_response_replay_is_idempotent_by_tool_call_id(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        first_id = db.append_message(
+            "s1",
+            role="tool",
+            content="result",
+            tool_call_id="call-1",
+            tool_name="web_search",
+        )
+        replay_id = db.append_message(
+            "s1",
+            role="tool",
+            content="result",
+            tool_call_id="call-1",
+            tool_name="web_search",
+        )
+
+        assert replay_id == first_id
+        rows = db._conn.execute(
+            "SELECT id FROM messages "
+            "WHERE session_id = ? AND role = 'tool' "
+            "AND tool_call_id = ? AND active = 1",
+            ("s1", "call-1"),
+        ).fetchall()
+        assert [row["id"] for row in rows] == [first_id]
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_call_id_reuse_in_later_assistant_turn_is_not_deduplicated(self, db):
+        """Deterministic provider fallbacks may reuse IDs across responses."""
+        db.create_session(session_id="s1", source="cli")
+        tool_calls = [
+            {"id": "fallback-id", "function": {"name": "web_search", "arguments": "{}"}},
+        ]
+
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+        first_result_id = db.append_message(
+            "s1",
+            role="tool",
+            content="first result",
+            tool_call_id="fallback-id",
+            tool_name="web_search",
+        )
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+        second_result_id = db.append_message(
+            "s1",
+            role="tool",
+            content="second result",
+            tool_call_id="fallback-id",
+            tool_name="web_search",
+        )
+
+        assert second_result_id != first_result_id
+        rows = db._conn.execute(
+            "SELECT content FROM messages "
+            "WHERE session_id = ? AND role = 'tool' "
+            "AND tool_call_id = ? AND active = 1 ORDER BY id",
+            ("s1", "fallback-id"),
+        ).fetchall()
+        assert [row["content"] for row in rows] == ["first result", "second result"]
+        session = db.get_session("s1")
+        assert session["message_count"] == 4
+        assert session["tool_call_count"] == 2
+
+    def test_conflicting_tool_result_replay_in_same_turn_is_rejected(self, db):
+        db.create_session(session_id="s1", source="cli")
+        tool_calls = [
+            {"id": "call-conflict", "function": {"name": "web_search", "arguments": "{}"}},
+        ]
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+        db.append_message(
+            "s1",
+            role="tool",
+            content="first result",
+            tool_call_id="call-conflict",
+            tool_name="web_search",
+        )
+
+        with pytest.raises(ValueError, match="conflicting tool result"):
+            db.append_message(
+                "s1",
+                role="tool",
+                content="different result",
+                tool_call_id="call-conflict",
+                tool_name="web_search",
+            )
+
+    def test_concurrent_tool_response_replay_is_exactly_once(self, db):
+        db.create_session(session_id="s1", source="cli")
+        other = SessionDB(db_path=db.db_path)
+        barrier = threading.Barrier(2)
+        result_ids = []
+        errors = []
+
+        def append_result(session_db):
+            try:
+                barrier.wait(timeout=5)
+                result_ids.append(session_db.append_message(
+                    "s1",
+                    role="tool",
+                    content="result",
+                    tool_call_id="call-concurrent",
+                    tool_name="web_search",
+                ))
+            except BaseException as exc:  # pragma: no cover - thread handoff
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=append_result, args=(session_db,))
+            for session_db in (db, other)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        finally:
+            other.close()
+
+        assert not errors
+        assert len(result_ids) == 2
+        assert len(set(result_ids)) == 1
+        rows = db._conn.execute(
+            "SELECT id FROM messages "
+            "WHERE session_id = ? AND role = 'tool' "
+            "AND tool_call_id = ? AND active = 1",
+            ("s1", "call-concurrent"),
+        ).fetchall()
+        assert [row["id"] for row in rows] == [result_ids[0]]
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
         assert session["tool_call_count"] == 0
 
     def test_assistant_tool_calls_increment_by_count(self, db):

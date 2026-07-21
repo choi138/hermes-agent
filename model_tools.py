@@ -34,6 +34,23 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+
+class TrustedToolResult(str):
+    """Model-facing tool text carrying an out-of-band raw registry result."""
+
+    def __new__(cls, value: str, trusted_raw_result: Any):
+        instance = super().__new__(cls, value)
+        instance.trusted_raw_result = trusted_raw_result
+        return instance
+
+
+def get_trusted_raw_tool_result(result: Any) -> Any:
+    """Return the pre-middleware/plugin registry result when available."""
+    if isinstance(result, TrustedToolResult):
+        return result.trusted_raw_result
+    return result
+
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -1264,25 +1281,30 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            trusted_raw_result = None
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    nonlocal trusted_raw_result
+                    trusted_raw_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
+                    return trusted_raw_result
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    nonlocal trusted_raw_result
+                    trusted_raw_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+                    return trusted_raw_result
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(
@@ -1351,7 +1373,11 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
-        return result
+        return (
+            TrustedToolResult(result, trusted_raw_result)
+            if isinstance(result, str)
+            else result
+        )
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"

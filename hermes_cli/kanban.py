@@ -358,7 +358,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "rarely finishes.")
     p_create.add_argument("--goal-max-turns", type=int, default=None,
                           metavar="N", dest="goal_max_turns",
-                          help="Turn budget for --goal workers (default 20). "
+                          help="Required positive turn budget for --goal workers. "
                                "Ignored without --goal.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
@@ -1420,6 +1420,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    goal_mode = bool(getattr(args, "goal_mode", False))
+    goal_max_turns = getattr(args, "goal_max_turns", None)
+    if goal_mode and (goal_max_turns is None or goal_max_turns < 1):
+        print(
+            "kanban: --goal requires --goal-max-turns N with N >= 1",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1439,8 +1447,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
+            goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns,
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)

@@ -98,6 +98,7 @@ from hermes_cli.kanban_evidence import (
     recovery_decision,
     validate_evidence_manifest,
 )
+from gateway.status import get_process_identity
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+MAX_INITIAL_DECOMPOSITION_STAGES = 3
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -881,6 +883,10 @@ class Task:
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
+    # Retry safety and same-root policy are deliberately separate. The total
+    # counter never resets merely because the observed root changes.
+    last_failure_root_cause: Optional[str] = None
+    same_root_failures: int = 0
     max_runtime_seconds: Optional[int] = None
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
@@ -971,6 +977,14 @@ class Task:
                 row["last_failure_error"] if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
                 else (row["last_spawn_error"] if "last_spawn_error" in keys else None)
+            ),
+            last_failure_root_cause=(
+                row["last_failure_root_cause"]
+                if "last_failure_root_cause" in keys else None
+            ),
+            same_root_failures=(
+                int(row["same_root_failures"] or 0)
+                if "same_root_failures" in keys else 0
             ),
             max_runtime_seconds=(
                 row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
@@ -1342,6 +1356,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     worker_pid           INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
+    -- Structured retry identity and consecutive observations for that root.
+    last_failure_root_cause TEXT,
+    same_root_failures   INTEGER NOT NULL DEFAULT 0,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
@@ -1516,6 +1533,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_identity     TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1526,6 +1544,14 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_failure_accounting (
+    task_id TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    PRIMARY KEY(task_id, run_id)
 );
 
 -- Evidence-bound terminal transitions. The manifest is a strict canonical
@@ -1572,6 +1598,7 @@ CREATE TABLE IF NOT EXISTS terminal_handoffs (
 
 CREATE TABLE IF NOT EXISTS correction_lineages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant TEXT NOT NULL DEFAULT '',
     root_cause_id TEXT NOT NULL,
     affected_scope_digest TEXT NOT NULL,
     policy_or_test_plan_version TEXT NOT NULL,
@@ -1581,6 +1608,63 @@ CREATE TABLE IF NOT EXISTS correction_lineages (
     created_at INTEGER NOT NULL,
     resolved_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS run_evidence_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    input_digest TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    toolchain_digest TEXT NOT NULL,
+    environment_digest TEXT NOT NULL,
+    test_plan_digest TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    failure_class TEXT NOT NULL,
+    evidence_at INTEGER NOT NULL,
+    terminal_intent_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    checkpoint_kind TEXT NOT NULL,
+    checkpoint_digest TEXT NOT NULL,
+    side_effect TEXT NOT NULL,
+    reusable_class TEXT NOT NULL,
+    provenance_digest TEXT NOT NULL,
+    UNIQUE(task_id, run_id, attempt, terminal_intent_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_run_evidence_terminal_intent
+ON run_evidence_ledger(terminal_intent_id);
+
+CREATE INDEX IF NOT EXISTS idx_run_evidence_exact_reusable
+ON run_evidence_ledger(
+    input_digest, artifact_digest, toolchain_digest, environment_digest,
+    test_plan_digest, policy_version, reusable_class, evidence_at DESC
+)
+WHERE outcome='passed' AND failure_class='none' AND side_effect='none';
+
+CREATE TABLE IF NOT EXISTS shadow_evidence_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    terminal_intent_id TEXT,
+    decision_digest TEXT NOT NULL UNIQUE,
+    input_digest TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    toolchain_digest TEXT NOT NULL,
+    environment_digest TEXT NOT NULL,
+    test_plan_digest TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    reusable_class TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    verdict_source TEXT NOT NULL,
+    candidate_hit INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    matched_evidence_id INTEGER,
+    verification_skipped INTEGER NOT NULL DEFAULT 0,
+    observed_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_evidence_task
+ON shadow_evidence_audit(task_id, observed_at);
 
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
@@ -1688,11 +1772,12 @@ CREATE INDEX IF NOT EXISTS idx_gjc_sessions_task     ON task_gjc_sessions(task_i
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_terminal_intents_task ON terminal_intents(task_id, run_id, status);
+CREATE INDEX IF NOT EXISTS idx_run_evidence_exact ON run_evidence_ledger(
+    reusable_class, outcome, side_effect, input_digest, artifact_digest,
+    toolchain_digest, environment_digest, test_plan_digest, policy_version
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_evidence_observed ON shadow_evidence_audit(observed_at, id);
 CREATE INDEX IF NOT EXISTS idx_terminal_postcommit_status ON terminal_postcommit(status, created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_lineage_active
-    ON correction_lineages(root_cause_id, affected_scope_digest,
-                           policy_or_test_plan_version, independent_variant)
-    WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_intake_receipt_task   ON kanban_intake_receipts(task_id);
@@ -2274,6 +2359,77 @@ def init_db(
     return path
 
 
+def _migrate_correction_lineage_tenant_scope(
+    conn: sqlite3.Connection,
+) -> None:
+    """Atomically add tenant ownership to legacy correction lineages."""
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='correction_lineages'"
+    ).fetchone()
+    if table_exists is None:
+        return
+
+    conn.execute("SAVEPOINT migrate_correction_lineage_tenant_scope")
+    try:
+        lineage_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(correction_lineages)")
+        }
+        orphan = conn.execute(
+            "SELECT c.id FROM correction_lineages c "
+            "LEFT JOIN tasks t ON t.id=c.leader_task_id "
+            "WHERE t.id IS NULL LIMIT 1"
+        ).fetchone()
+        if orphan is not None:
+            raise sqlite3.IntegrityError(
+                "cannot migrate orphaned correction lineage"
+            )
+        if "tenant" not in lineage_cols:
+            _add_column_if_missing(
+                conn,
+                "correction_lineages",
+                "tenant",
+                "tenant TEXT NOT NULL DEFAULT ''",
+            )
+            conn.execute(
+                "UPDATE correction_lineages SET tenant=COALESCE(("
+                "SELECT t.tenant FROM tasks t "
+                "WHERE t.id=correction_lineages.leader_task_id), '')"
+            )
+        else:
+            mismatch = conn.execute(
+                "SELECT c.id FROM correction_lineages c "
+                "JOIN tasks t ON t.id=c.leader_task_id "
+                "WHERE c.tenant<>COALESCE(t.tenant, '') LIMIT 1"
+            ).fetchone()
+            if mismatch is not None:
+                raise sqlite3.IntegrityError(
+                    "correction lineage tenant does not match leader task"
+                )
+        conn.execute("DROP INDEX IF EXISTS idx_correction_lineage_active")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_correction_lineage_active "
+            "ON correction_lineages(tenant, root_cause_id, "
+            "affected_scope_digest, policy_or_test_plan_version, "
+            "independent_variant) WHERE status='active'"
+        )
+    except Exception:
+        # Preserve the original migration error even if SQLite already rolled
+        # back the savepoint because of an IO or corruption failure.
+        for statement in (
+            "ROLLBACK TO SAVEPOINT migrate_correction_lineage_tenant_scope",
+            "RELEASE SAVEPOINT migrate_correction_lineage_tenant_scope",
+        ):
+            try:
+                conn.execute(statement)
+            except sqlite3.Error:
+                pass
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT migrate_correction_lineage_tenant_scope")
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2336,6 +2492,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE tasks SET last_failure_error = last_spawn_error"
             )
+    if "last_failure_root_cause" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "last_failure_root_cause",
+            "last_failure_root_cause TEXT",
+        )
+    if "same_root_failures" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "same_root_failures",
+            "same_root_failures INTEGER NOT NULL DEFAULT 0",
+        )
     if "max_runtime_seconds" not in cols:
         _add_column_if_missing(
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
@@ -2381,10 +2551,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     if "goal_max_turns" not in cols:
-        # Per-task goal-loop turn budget. NULL = goals-engine default.
+        # Per-task goal-loop turn budget. New goal-mode writes require this to
+        # be explicit; the backfill below preserves the historical implicit
+        # 20-turn budget for rows created before that invariant existed.
         _add_column_if_missing(
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
         )
+
+    conn.execute(
+        "UPDATE tasks SET goal_max_turns=20 "
+        "WHERE goal_mode=1 AND (goal_max_turns IS NULL OR goal_max_turns < 1)"
+    )
 
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
@@ -2425,6 +2602,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    # Correction lineage ownership is a database invariant, not merely a
+    # tool-layer convention. Legacy boards used a board-global active-lineage
+    # key; backfill each row from its leader task before replacing that index
+    # with a tenant-prefixed key. An orphaned or pre-existing mismatched row is
+    # unsafe to guess, so initialization fails closed and leaves the transaction
+    # uncommitted for operator repair.
+    _migrate_correction_lineage_tenant_scope(conn)
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2513,6 +2698,51 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 ),
             )
 
+    # Shadow evidence audits became task-owned so tenant isolation and hard
+    # deletion remain enforceable even for no-hit decisions. Legacy rows stay
+    # nullable because their owner cannot be reconstructed safely.
+    shadow_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='shadow_evidence_audit'"
+    ).fetchone() is not None
+    if shadow_table_exists:
+        shadow_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(shadow_evidence_audit)")
+        }
+        if "task_id" not in shadow_cols:
+            _add_column_if_missing(
+                conn, "shadow_evidence_audit", "task_id", "task_id TEXT",
+            )
+        if "terminal_intent_id" not in shadow_cols:
+            _add_column_if_missing(
+                conn,
+                "shadow_evidence_audit",
+                "terminal_intent_id",
+                "terminal_intent_id TEXT",
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_evidence_task "
+            "ON shadow_evidence_audit(task_id, observed_at)"
+        )
+
+    runs_exist = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "worker_identity" not in run_cols:
+            # Leave legacy rows NULL: probing a persisted PID here could bless
+            # an unrelated process that already reused the number.
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "worker_identity",
+                "worker_identity TEXT",
+            )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2520,9 +2750,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # against any concurrent dispatcher, and the per-row UPDATE uses
     # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
     # produce an orphaned row if it interleaves with the backfill pass.
-    runs_exist = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
-    ).fetchone() is not None
     if runs_exist:
         with write_txn(conn):
             inflight = conn.execute(
@@ -2622,7 +2849,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_identity TEXT,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -2923,6 +3151,14 @@ def create_task(
     it to ``False`` only while already holding :func:`write_txn`, so the task,
     receipt, and notification subscription share one commit boundary.
     """
+    goal_mode = bool(goal_mode)
+    if goal_mode:
+        if isinstance(goal_max_turns, bool) or not isinstance(goal_max_turns, int):
+            raise ValueError("goal_max_turns must be >= 1 when goal_mode is enabled")
+        if goal_max_turns < 1:
+            raise ValueError("goal_max_turns must be >= 1 when goal_mode is enabled")
+    else:
+        goal_max_turns = None
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3359,7 +3595,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
+                "last_failure_error = NULL, last_failure_root_cause = NULL, "
+                "same_root_failures = 0 WHERE id = ?",
                 (profile, task_id),
             )
         else:
@@ -4688,41 +4925,30 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return whether ``task_id`` is behind an explicit review gate.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from three sources:
 
-    * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+    * **Worker/operator block** — ``kanban_block`` emits ``"blocked"`` and
+      must remain gated until an operator unblocks it.
+    * **Circuit breaker** — ``_record_task_failure`` emits ``"gave_up"``.
+      This must also remain gated: same-root and forced trips can happen below
+      the total failure limit, so counter-only recovery would immediately
+      respawn the task on the next dispatcher tick.
+    * **Dependency/legacy block** — no review-gate event; this may be promoted
+      automatically once all parents are done.
 
-    * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
-
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    The durable signal is the most recent ``"blocked"`` / ``"gave_up"`` /
+    ``"unblocked"`` event.  Explicit ``unblock_task`` is the only operation
+    that releases either review gate.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'gave_up', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "gave_up"}
 
 
 def recompute_ready(
@@ -4741,15 +4967,13 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
+    1. The most recent review-gate event was a worker/operator ``blocked`` or
+       circuit-breaker ``gave_up`` event — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
-    2. The task's ``consecutive_failures`` has reached the effective
-       failure limit.  This prevents infinite retry loops when a task
-       repeatedly exhausts its iteration budget: without this guard the
-       counter would reset on every recovery cycle and the circuit
-       breaker could never trip (#35072).
+    2. A legacy task without a gate event has ``consecutive_failures`` at the
+       effective failure limit.  This preserves permanent blocking for older
+       databases that predate the ``gave_up`` event gate.
 
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
@@ -5085,15 +5309,22 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
+        "       t.last_heartbeat_at, r.worker_identity "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r "
+        "  ON r.id = t.current_run_id AND r.worker_pid = t.worker_pid "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
+        expected_identity = row["worker_identity"]
+        worker_state = _worker_pid_state(
+            row["worker_pid"], expected_identity,
+        )
         hb = row["last_heartbeat_at"]
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
@@ -5106,7 +5337,7 @@ def release_stale_claims(
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and worker_state in {"alive", "unavailable"}
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -5146,7 +5377,10 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            expected_identity=expected_identity,
+            signal_fn=signal_fn,
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5216,7 +5450,11 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT t.status, t.claim_lock, t.worker_pid, r.worker_identity "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r "
+        "  ON r.id = t.current_run_id AND r.worker_pid = t.worker_pid "
+        "WHERE t.id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5226,8 +5464,21 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"],
+        prev_lock,
+        expected_identity=row["worker_identity"],
+        signal_fn=signal_fn,
     )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_worker_alive",
+        )
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -5489,6 +5740,99 @@ def _load_terminal_handoff(
     return handoff
 
 
+def _run_evidence_environment_digest(manifest: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "backend_digest": manifest["backend_digest"],
+                "backend_kind": manifest["backend_kind"],
+                "config_digest": manifest["config_digest"],
+                "fixture_digest": manifest["fixture_digest"],
+                "lockfile_digest": manifest["lockfile_digest"],
+                "seed_digest": manifest["seed_digest"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _record_terminal_run_evidence(
+    conn: sqlite3.Connection, *, task_id: str, run_id: int,
+    terminal_intent_id: str, action: str, failure_class: str,
+    manifest: dict, handoff: Optional[dict],
+) -> None:
+    if conn.execute(
+        "SELECT 1 FROM run_evidence_ledger WHERE terminal_intent_id=?",
+        (terminal_intent_id,),
+    ).fetchone() is not None:
+        return
+    metadata = handoff.get("metadata") if isinstance(handoff, dict) else None
+    requested_class = (
+        metadata.get("verification_class") if isinstance(metadata, dict) else None
+    )
+    reusable_class = (
+        requested_class
+        if action == "complete"
+        and failure_class == "none"
+        and manifest["side_effect"] == "none"
+        and requested_class in _RUN_EVIDENCE_REUSABLE_CLASSES - {"prohibited"}
+        else "prohibited"
+    )
+    environment_digest = _run_evidence_environment_digest(manifest)
+    exact = {
+        "input_digest": manifest["command_digest"],
+        "artifact_digest": manifest["checkpoint_digest"],
+        "toolchain_digest": manifest["toolchain_digest"],
+        "environment_digest": environment_digest,
+        "test_plan_digest": manifest["test_plan_digest"],
+        "policy_version": manifest["policy_version"],
+        "reusable_class": reusable_class,
+    }
+    verdict_source = {
+        "lint": "static_analysis",
+        "format": "static_analysis",
+        "static_analysis": "static_analysis",
+        "immutable_build": "deterministic_build",
+        "focused_test": "deterministic_test",
+    }.get(reusable_class, "reviewer")
+    record_shadow_evidence_decision(
+        conn,
+        task_id=task_id,
+        terminal_intent_id=terminal_intent_id,
+        risk="low" if reusable_class != "prohibited" else "high",
+        verdict_source=verdict_source,
+        external_side_effect=manifest["side_effect"] != "none",
+        stale=False,
+        flaky=False,
+        observed_at=manifest["evidence_at"],
+        exclude_terminal_intent_id=terminal_intent_id,
+        _manage_transaction=False,
+        **exact,
+    )
+    attempt = int(conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND id<=?",
+        (task_id, run_id),
+    ).fetchone()[0] or 1)
+    record_run_evidence(
+        conn,
+        task_id=task_id,
+        run_id=run_id,
+        attempt=attempt,
+        failure_class=failure_class,
+        evidence_at=manifest["evidence_at"],
+        terminal_intent_id=terminal_intent_id,
+        outcome="passed" if action == "complete" else "blocked",
+        checkpoint_kind=(
+            "tests_passed" if reusable_class != "prohibited" else "terminal_boundary"
+        ),
+        checkpoint_digest=manifest["checkpoint_digest"],
+        side_effect=manifest["side_effect"],
+        _manage_transaction=False,
+        **exact,
+    )
+
+
 def create_terminal_intent(
     conn: sqlite3.Connection, *, terminal_intent_id: str, task_id: str,
     run_id: int, claim_lock: str, action: str, decision: str,
@@ -5561,6 +5905,16 @@ def create_terminal_intent(
                 raise TerminalIntentConflict(
                     "terminal_intent_id already has a different immutable handoff"
                 )
+            _record_terminal_run_evidence(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                terminal_intent_id=terminal_intent_id,
+                action=action,
+                failure_class=failure_class,
+                manifest=manifest,
+                handoff=handoff,
+            )
             return terminal_intent_id
         owner = conn.execute(
             "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
@@ -5593,6 +5947,16 @@ def create_terminal_intent(
                 "VALUES (?, ?, ?, ?)",
                 (terminal_intent_id, handoff_canonical, handoff_digest, now),
             )
+        _record_terminal_run_evidence(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            terminal_intent_id=terminal_intent_id,
+            action=action,
+            failure_class=failure_class,
+            manifest=manifest,
+            handoff=handoff,
+        )
     return terminal_intent_id
 
 
@@ -5850,7 +6214,50 @@ def apply_terminal_intent(
     if block_kind is not None and block_kind != evidence_block_kind:
         raise TerminalIntentConflict("requested block kind does not match terminal evidence")
     block_kind = evidence_block_kind
+    expected_attestation = _terminal_producer_attestation(
+        terminal_intent_id=terminal_intent_id,
+        task_id=row["task_id"],
+        run_id=int(row["run_id"]),
+        claim_lock=row["claim_lock"],
+        action=row["action"],
+        provenance_digest=row["provenance_digest"],
+        handoff_digest=handoff_digest,
+    )
+    if not row["producer_attestation"] or not hmac.compare_digest(
+        row["producer_attestation"], expected_attestation,
+    ):
+        raise TerminalIntentConflict("terminal producer attestation mismatch")
     with write_txn(conn):
+        fresh_intent = conn.execute(
+            "SELECT * FROM terminal_intents WHERE terminal_intent_id=?",
+            (terminal_intent_id,),
+        ).fetchone()
+        if fresh_intent is None:
+            raise TerminalIntentConflict("terminal intent disappeared before application")
+        if fresh_intent["status"] in {"applied", "acknowledged"}:
+            _verify_applied_terminal_marker(conn, fresh_intent)
+            return True
+        immutable_fields = (
+            "task_id", "run_id", "claim_lock", "action", "decision",
+            "failure_class", "manifest_json", "provenance_digest",
+            "producer_attestation",
+        )
+        if any(fresh_intent[field] != row[field] for field in immutable_fields):
+            raise TerminalIntentConflict("pending terminal intent changed before application")
+        expected_attestation = _terminal_producer_attestation(
+            terminal_intent_id=terminal_intent_id,
+            task_id=fresh_intent["task_id"],
+            run_id=int(fresh_intent["run_id"]),
+            claim_lock=fresh_intent["claim_lock"],
+            action=fresh_intent["action"],
+            provenance_digest=fresh_intent["provenance_digest"],
+            handoff_digest=handoff_digest,
+        )
+        if not fresh_intent["producer_attestation"] or not hmac.compare_digest(
+            fresh_intent["producer_attestation"], expected_attestation,
+        ):
+            raise TerminalIntentConflict("terminal producer attestation mismatch")
+        row = fresh_intent
         task = conn.execute(
             "SELECT status, current_run_id, claim_lock, block_kind, "
             "block_recurrences FROM tasks WHERE id=?",
@@ -5884,9 +6291,33 @@ def apply_terminal_intent(
         if terminal_summary is None:
             terminal_summary = terminal_result
         terminal_metadata = handoff.get("metadata") if handoff else None
+        if isinstance(terminal_metadata, dict):
+            terminal_metadata = dict(terminal_metadata)
         verified_cards = handoff.get("verified_cards", []) if handoff else []
         block_recurrences = None
+        resolved_correction_lineages = 0
         if row["action"] == "complete":
+            terminal_metadata = _merge_completion_prose_artifacts(
+                conn,
+                row["task_id"],
+                terminal_metadata,
+                summary=terminal_summary,
+                result=terminal_result,
+            )
+            if isinstance(terminal_metadata, dict):
+                _persist_scratch_completion_artifacts(
+                    conn, row["task_id"], terminal_metadata,
+                )
+                for stored_path in terminal_metadata.pop("_staged_artifacts", []):
+                    path = Path(stored_path)
+                    _insert_completion_attachment(
+                        conn,
+                        row["task_id"],
+                        filename=path.name,
+                        stored_path=str(path),
+                        size=path.stat().st_size,
+                        created_at=now,
+                    )
             status, outcome, event_kind = "done", "completed", "completed"
             conn.execute(
                 "UPDATE tasks SET status='done', result=?, completed_at=?, "
@@ -5894,6 +6325,9 @@ def apply_terminal_intent(
                 "block_kind=NULL, block_recurrences=0 "
                 "WHERE id=? AND current_run_id=?",
                 (terminal_result, now, row["task_id"], row["run_id"]),
+            )
+            resolved_correction_lineages = _resolve_task_correction_lineages(
+                conn, row["task_id"], resolved_at=now,
             )
         else:
             if block_kind not in VALID_BLOCK_KINDS - {"dependency"}:
@@ -5941,6 +6375,10 @@ def apply_terminal_intent(
                     if event_summary else None
                 ),
             })
+            if resolved_correction_lineages:
+                terminal_payload["correction_lineages_resolved"] = (
+                    resolved_correction_lineages
+                )
             if verified_cards:
                 terminal_payload["verified_cards"] = verified_cards
             if isinstance(terminal_metadata, dict):
@@ -6055,33 +6493,127 @@ def replay_terminal_postcommits(
     return replayed
 
 
-def acquire_correction_lineage(
-    conn: sqlite3.Connection, *, root_cause_id: str,
-    affected_scope_digest: str, policy_or_test_plan_version: str,
-    independent_variant: str, owner_task_id: str,
-) -> dict[str, Any]:
-    identifiers = (root_cause_id, policy_or_test_plan_version, independent_variant, owner_task_id)
+def _correction_lineage_key(
+    *, root_cause_id: str, affected_scope_digest: str,
+    policy_or_test_plan_version: str, independent_variant: str,
+) -> tuple[str, str, str, str]:
+    identifiers = (root_cause_id, policy_or_test_plan_version, independent_variant)
     if any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", v) for v in identifiers):
         raise ValueError("invalid correction lineage identifier")
     if not re.fullmatch(r"[0-9a-f]{64}", affected_scope_digest):
         raise ValueError("affected_scope_digest must be SHA-256")
-    key = (root_cause_id, affected_scope_digest, policy_or_test_plan_version, independent_variant)
-    with write_txn(conn):
-        active = conn.execute(
-            "SELECT id, leader_task_id FROM correction_lineages WHERE "
-            "root_cause_id=? AND affected_scope_digest=? AND "
-            "policy_or_test_plan_version=? AND independent_variant=? AND status='active'",
-            key,
+    return (
+        root_cause_id,
+        affected_scope_digest,
+        policy_or_test_plan_version,
+        independent_variant,
+    )
+
+
+def _canonical_correction_tenant(tenant: Optional[str]) -> str:
+    if tenant is None or tenant == "":
+        return ""
+    if not isinstance(tenant, str):
+        raise ValueError("correction lineage tenant must be a string")
+    return tenant
+
+
+def active_correction_lineage(
+    conn: sqlite3.Connection, *, root_cause_id: str,
+    affected_scope_digest: str, policy_or_test_plan_version: str,
+    independent_variant: str, tenant: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    key = _correction_lineage_key(
+        root_cause_id=root_cause_id,
+        affected_scope_digest=affected_scope_digest,
+        policy_or_test_plan_version=policy_or_test_plan_version,
+        independent_variant=independent_variant,
+    )
+    tenant_key = _canonical_correction_tenant(tenant)
+    active = conn.execute(
+        "SELECT c.id, c.leader_task_id FROM correction_lineages c "
+        "JOIN tasks t ON t.id=c.leader_task_id WHERE "
+        "c.tenant=? AND c.root_cause_id=? AND c.affected_scope_digest=? AND "
+        "c.policy_or_test_plan_version=? AND c.independent_variant=? "
+        "AND c.status='active' AND COALESCE(t.tenant, '')=c.tenant "
+        "AND t.status NOT IN ('done', 'archived')",
+        (tenant_key, *key),
+    ).fetchone()
+    if active is None:
+        return None
+    return {
+        "role": "follower",
+        "leader_task_id": active["leader_task_id"],
+        "lineage_id": active["id"],
+    }
+
+
+def acquire_correction_lineage(
+    conn: sqlite3.Connection, *, root_cause_id: str,
+    affected_scope_digest: str, policy_or_test_plan_version: str,
+    independent_variant: str, owner_task_id: str,
+    _manage_transaction: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(owner_task_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.:-]{1,128}", owner_task_id
+    ):
+        raise ValueError("invalid correction lineage identifier")
+    key = _correction_lineage_key(
+        root_cause_id=root_cause_id,
+        affected_scope_digest=affected_scope_digest,
+        policy_or_test_plan_version=policy_or_test_plan_version,
+        independent_variant=independent_variant,
+    )
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
+        owner = conn.execute(
+            "SELECT status, tenant FROM tasks WHERE id=?", (owner_task_id,),
         ).fetchone()
+        if owner is None:
+            raise ValueError("correction lineage owner task must exist")
+        if owner["status"] in {"done", "archived"}:
+            raise ValueError("correction lineage owner task must be active")
+        owner_tenant = _canonical_correction_tenant(owner["tenant"])
+        conn.execute(
+            "UPDATE correction_lineages SET status='resolved', resolved_at=? "
+            "WHERE tenant=? AND root_cause_id=? AND affected_scope_digest=? AND "
+            "policy_or_test_plan_version=? AND independent_variant=? "
+            "AND status='active' AND NOT EXISTS ("
+            "SELECT 1 FROM tasks t WHERE t.id=correction_lineages.leader_task_id "
+            "AND t.status NOT IN ('done', 'archived'))",
+            (int(time.time()), owner_tenant, *key),
+        )
+        active = active_correction_lineage(
+            conn,
+            root_cause_id=root_cause_id,
+            affected_scope_digest=affected_scope_digest,
+            policy_or_test_plan_version=policy_or_test_plan_version,
+            independent_variant=independent_variant,
+            tenant=owner_tenant,
+        )
         if active:
-            return {"role": "follower", "leader_task_id": active["leader_task_id"], "lineage_id": active["id"]}
+            return active
         cur = conn.execute(
             "INSERT INTO correction_lineages "
-            "(root_cause_id, affected_scope_digest, policy_or_test_plan_version, "
-            "independent_variant, leader_task_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (*key, owner_task_id, int(time.time())),
+            "(tenant, root_cause_id, affected_scope_digest, "
+            "policy_or_test_plan_version, independent_variant, leader_task_id, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (owner_tenant, *key, owner_task_id, int(time.time())),
         )
         return {"role": "leader", "leader_task_id": owner_task_id, "lineage_id": int(cur.lastrowid)}
+
+
+def _resolve_task_correction_lineages(
+    conn: sqlite3.Connection, task_id: str, *, resolved_at: int,
+) -> int:
+    cur = conn.execute(
+        "UPDATE correction_lineages SET status='resolved', resolved_at=? "
+        "WHERE leader_task_id=? AND status='active'",
+        (int(resolved_at), task_id),
+    )
+    return int(cur.rowcount)
 
 
 def resolve_correction_lineage(
@@ -6094,6 +6626,334 @@ def resolve_correction_lineage(
             (int(time.time()), int(lineage_id), owner_task_id),
         )
     return cur.rowcount == 1
+
+
+_RUN_EVIDENCE_FAILURE_CLASSES = {
+    "none", "network", "provider", "worker", "terminal_write",
+    "assertion", "test", "qa", "spec", "policy", "capability",
+    "credential", "approval", "unknown",
+}
+_RUN_EVIDENCE_SIDE_EFFECTS = {"none", "idempotent", "unknown", "external"}
+_RUN_EVIDENCE_REUSABLE_CLASSES = {
+    "lint", "format", "static_analysis", "immutable_build",
+    "focused_test", "prohibited",
+}
+
+
+def _require_sha256(value: str, field_name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"{field_name} must be SHA-256")
+    return value
+
+
+def record_run_evidence(
+    conn: sqlite3.Connection, *, task_id: str, run_id: int,
+    input_digest: str, artifact_digest: str, toolchain_digest: str,
+    environment_digest: str, test_plan_digest: str, policy_version: str,
+    attempt: int, failure_class: str, evidence_at: int,
+    terminal_intent_id: str, outcome: str, checkpoint_kind: str,
+    checkpoint_digest: str, side_effect: str,
+    reusable_class: str = "prohibited",
+    _manage_transaction: bool = True,
+) -> int:
+    for field_name, value in (
+        ("input_digest", input_digest),
+        ("artifact_digest", artifact_digest),
+        ("toolchain_digest", toolchain_digest),
+        ("environment_digest", environment_digest),
+        ("test_plan_digest", test_plan_digest),
+        ("checkpoint_digest", checkpoint_digest),
+    ):
+        _require_sha256(value, field_name)
+    identifiers = (task_id, policy_version, terminal_intent_id, outcome, checkpoint_kind)
+    if any(not isinstance(value, str) or not value.strip() for value in identifiers):
+        raise ValueError("run evidence identifiers must be non-empty strings")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        raise ValueError("run_id must be a positive integer")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise ValueError("attempt must be a positive integer")
+    if isinstance(evidence_at, bool) or not isinstance(evidence_at, int) or evidence_at <= 0:
+        raise ValueError("evidence_at must be a positive integer")
+    if failure_class not in _RUN_EVIDENCE_FAILURE_CLASSES:
+        raise ValueError("invalid run evidence failure_class")
+    if side_effect not in _RUN_EVIDENCE_SIDE_EFFECTS:
+        raise ValueError("invalid run evidence side_effect")
+    if reusable_class not in _RUN_EVIDENCE_REUSABLE_CLASSES:
+        raise ValueError("invalid run evidence reusable_class")
+
+    intent = conn.execute(
+        "SELECT task_id, run_id, action, failure_class, manifest_json, "
+        "provenance_digest FROM terminal_intents WHERE terminal_intent_id=?",
+        (terminal_intent_id,),
+    ).fetchone()
+    if intent is None:
+        raise ValueError("run evidence requires an existing terminal intent")
+    try:
+        manifest = json.loads(intent["manifest_json"])
+        manifest_digest = evidence_manifest_digest(manifest)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("terminal intent has invalid evidence manifest") from exc
+    if manifest_digest != intent["provenance_digest"]:
+        raise ValueError("terminal intent evidence digest mismatch")
+    expected = {
+        "task_id": intent["task_id"],
+        "run_id": int(intent["run_id"]),
+        "input_digest": manifest["command_digest"],
+        "artifact_digest": manifest["checkpoint_digest"],
+        "toolchain_digest": manifest["toolchain_digest"],
+        "environment_digest": _run_evidence_environment_digest(manifest),
+        "test_plan_digest": manifest["test_plan_digest"],
+        "policy_version": manifest["policy_version"],
+        "failure_class": intent["failure_class"],
+        "evidence_at": int(manifest["evidence_at"]),
+        "side_effect": manifest["side_effect"],
+        "outcome": "passed" if intent["action"] == "complete" else "blocked",
+    }
+    observed = {
+        "task_id": task_id,
+        "run_id": run_id,
+        "input_digest": input_digest,
+        "artifact_digest": artifact_digest,
+        "toolchain_digest": toolchain_digest,
+        "environment_digest": environment_digest,
+        "test_plan_digest": test_plan_digest,
+        "policy_version": policy_version,
+        "failure_class": failure_class,
+        "evidence_at": evidence_at,
+        "side_effect": side_effect,
+        "outcome": outcome,
+    }
+    if observed != expected:
+        raise ValueError("run evidence does not match its terminal intent manifest")
+    if reusable_class != "prohibited" and (
+        outcome != "passed" or failure_class != "none" or side_effect != "none"
+    ):
+        raise ValueError("reusable evidence must be a side-effect-free passing result")
+    values = {
+        "task_id": task_id, "run_id": run_id, "input_digest": input_digest,
+        "artifact_digest": artifact_digest, "toolchain_digest": toolchain_digest,
+        "environment_digest": environment_digest,
+        "test_plan_digest": test_plan_digest, "policy_version": policy_version,
+        "attempt": attempt, "failure_class": failure_class,
+        "evidence_at": evidence_at, "terminal_intent_id": terminal_intent_id,
+        "outcome": outcome, "checkpoint_kind": checkpoint_kind,
+        "checkpoint_digest": checkpoint_digest, "side_effect": side_effect,
+        "reusable_class": reusable_class,
+    }
+    provenance_digest = hashlib.sha256(
+        json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO run_evidence_ledger ("
+            "task_id, run_id, input_digest, artifact_digest, toolchain_digest, "
+            "environment_digest, test_plan_digest, policy_version, attempt, "
+            "failure_class, evidence_at, terminal_intent_id, outcome, "
+            "checkpoint_kind, checkpoint_digest, side_effect, reusable_class, "
+            "provenance_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*values.values(), provenance_digest),
+        )
+        if cur.rowcount == 1:
+            return int(cur.lastrowid)
+        row = conn.execute(
+            "SELECT id, provenance_digest FROM run_evidence_ledger WHERE "
+            "task_id=? AND run_id=? AND attempt=? AND terminal_intent_id=?",
+            (task_id, run_id, attempt, terminal_intent_id),
+        ).fetchone()
+        if row is None or row["provenance_digest"] != provenance_digest:
+            raise ValueError("run evidence idempotency conflict")
+        return int(row["id"])
+
+
+def get_run_evidence(conn: sqlite3.Connection, evidence_id: int) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM run_evidence_ledger WHERE id=?", (int(evidence_id),),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def find_exact_reusable_evidence(
+    conn: sqlite3.Connection, *, task_id: str,
+    input_digest: str, artifact_digest: str,
+    toolchain_digest: str, environment_digest: str, test_plan_digest: str,
+    policy_version: str, reusable_class: str, now: Optional[int] = None,
+    exclude_terminal_intent_id: Optional[str] = None,
+) -> dict[str, Any]:
+    for field_name, value in (
+        ("input_digest", input_digest),
+        ("artifact_digest", artifact_digest),
+        ("toolchain_digest", toolchain_digest),
+        ("environment_digest", environment_digest),
+        ("test_plan_digest", test_plan_digest),
+    ):
+        _require_sha256(value, field_name)
+    if reusable_class not in _RUN_EVIDENCE_REUSABLE_CLASSES:
+        raise ValueError("invalid run evidence reusable_class")
+    if exclude_terminal_intent_id is not None and not re.fullmatch(
+        r"ti_[0-9a-f]{16,64}", exclude_terminal_intent_id,
+    ):
+        raise ValueError("invalid excluded terminal_intent_id")
+    target = conn.execute(
+        "SELECT tenant FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if target is None:
+        raise KeyError(task_id)
+    if reusable_class == "prohibited":
+        return {"hit": False, "reason": "prohibited_class"}
+    observed_now = int(time.time()) if now is None else now
+    if isinstance(observed_now, bool) or not isinstance(observed_now, int) or observed_now <= 0:
+        raise ValueError("now must be a positive integer")
+    rows = conn.execute(
+        "SELECT e.id, e.checkpoint_kind, e.checkpoint_digest, "
+        "e.terminal_intent_id, e.evidence_at, i.manifest_json, "
+        "i.provenance_digest FROM run_evidence_ledger e "
+        "JOIN terminal_intents i USING (terminal_intent_id) "
+        "JOIN tasks source_task ON source_task.id=e.task_id "
+        "WHERE e.input_digest=? AND e.artifact_digest=? "
+        "AND e.toolchain_digest=? AND e.environment_digest=? "
+        "AND e.test_plan_digest=? AND e.policy_version=? "
+        "AND e.reusable_class=? AND e.outcome='passed' "
+        "AND e.failure_class='none' AND e.side_effect='none' "
+        "AND source_task.tenant IS ? "
+        "AND (? IS NULL OR e.terminal_intent_id<>?) "
+        "ORDER BY e.evidence_at DESC, e.id DESC LIMIT 50",
+        (
+            input_digest, artifact_digest, toolchain_digest,
+            environment_digest, test_plan_digest, policy_version,
+            reusable_class, target["tenant"], exclude_terminal_intent_id,
+            exclude_terminal_intent_id,
+        ),
+    ).fetchall()
+    stale_match = False
+    for row in rows:
+        try:
+            manifest = json.loads(row["manifest_json"])
+            valid_digest = (
+                evidence_manifest_digest(manifest) == row["provenance_digest"]
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not valid_digest or manifest.get("terminal_intent_id") != row["terminal_intent_id"]:
+            continue
+        expires_at = int(manifest["evidence_at"]) + int(manifest["freshness_seconds"])
+        if observed_now > expires_at:
+            stale_match = True
+            continue
+        return {
+            "hit": True,
+            "reason": "exact_provenance_match",
+            "evidence_id": int(row["id"]),
+            "checkpoint_kind": row["checkpoint_kind"],
+            "checkpoint_digest": row["checkpoint_digest"],
+        }
+    if stale_match:
+        return {"hit": False, "reason": "stale_evidence"}
+    return {"hit": False, "reason": "provenance_mismatch"}
+
+
+def record_shadow_evidence_decision(
+    conn: sqlite3.Connection, *, task_id: str,
+    terminal_intent_id: Optional[str], input_digest: str, artifact_digest: str,
+    toolchain_digest: str, environment_digest: str, test_plan_digest: str,
+    policy_version: str, reusable_class: str, risk: str,
+    verdict_source: str, external_side_effect: bool, stale: bool,
+    flaky: bool, observed_at: int,
+    exclude_terminal_intent_id: Optional[str] = None,
+    _manage_transaction: bool = True,
+) -> dict[str, Any]:
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int) or observed_at <= 0:
+        raise ValueError("observed_at must be a positive integer")
+    if terminal_intent_id is not None:
+        if not re.fullmatch(r"ti_[0-9a-f]{16,64}", terminal_intent_id):
+            raise ValueError("invalid terminal_intent_id")
+        owner = conn.execute(
+            "SELECT task_id FROM terminal_intents WHERE terminal_intent_id=?",
+            (terminal_intent_id,),
+        ).fetchone()
+        if owner is None or owner["task_id"] != task_id:
+            raise ValueError("terminal_intent_id does not belong to task")
+    exact = find_exact_reusable_evidence(
+        conn,
+        task_id=task_id,
+        input_digest=input_digest,
+        artifact_digest=artifact_digest,
+        toolchain_digest=toolchain_digest,
+        environment_digest=environment_digest,
+        test_plan_digest=test_plan_digest,
+        policy_version=policy_version,
+        reusable_class=reusable_class,
+        now=observed_at,
+        exclude_terminal_intent_id=exclude_terminal_intent_id,
+    )
+    classification = evaluate_shadow_verification(
+        provenance_verified=bool(exact["hit"]),
+        risk=risk,
+        verdict_source=verdict_source,
+        external_side_effect=external_side_effect,
+        stale=stale,
+        flaky=flaky,
+    )
+    if not exact["hit"]:
+        candidate_hit = False
+        reason = exact["reason"]
+        matched_evidence_id = None
+    elif classification["eligible"]:
+        candidate_hit = True
+        reason = exact["reason"]
+        matched_evidence_id = exact.get("evidence_id")
+    else:
+        candidate_hit = False
+        reason = classification["reason"]
+        matched_evidence_id = exact.get("evidence_id")
+    audit = {
+        "task_id": task_id,
+        "terminal_intent_id": terminal_intent_id,
+        "input_digest": input_digest,
+        "artifact_digest": artifact_digest,
+        "toolchain_digest": toolchain_digest,
+        "environment_digest": environment_digest,
+        "test_plan_digest": test_plan_digest,
+        "policy_version": policy_version,
+        "reusable_class": reusable_class,
+        "risk": risk,
+        "verdict_source": verdict_source,
+        "candidate_hit": candidate_hit,
+        "reason": reason,
+        "matched_evidence_id": matched_evidence_id,
+        "verification_skipped": False,
+        "observed_at": observed_at,
+    }
+    decision_digest = hashlib.sha256(
+        json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    transaction = (
+        write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    )
+    with transaction:
+        conn.execute(
+            "INSERT OR IGNORE INTO shadow_evidence_audit ("
+            "task_id, terminal_intent_id, decision_digest, input_digest, "
+            "artifact_digest, toolchain_digest, "
+            "environment_digest, test_plan_digest, policy_version, reusable_class, "
+            "risk, verdict_source, candidate_hit, reason, matched_evidence_id, "
+            "verification_skipped, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, terminal_intent_id, decision_digest, input_digest,
+                artifact_digest, toolchain_digest,
+                environment_digest, test_plan_digest, policy_version,
+                reusable_class, risk, verdict_source, int(candidate_hit), reason,
+                matched_evidence_id, 0, observed_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM shadow_evidence_audit WHERE decision_digest=?",
+            (decision_digest,),
+        ).fetchone()
+    return {"audit_id": int(row["id"]), "decision_digest": decision_digest, **audit}
 
 
 class HallucinatedCardsError(ValueError):
@@ -6238,6 +7098,9 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        resolved_correction_lineages = _resolve_task_correction_lineages(
+            conn, task_id, resolved_at=now,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -6265,6 +7128,10 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if resolved_correction_lineages:
+            completed_payload["correction_lineages_resolved"] = (
+                resolved_correction_lineages
+            )
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -7147,6 +8014,11 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+    if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+        return False, (
+            f"task {task_id} is behind an explicit review gate; "
+            "use kanban unblock before promoting it"
+        )
 
     if not force:
         parents = conn.execute(
@@ -7247,7 +8119,8 @@ def unblock_task(
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "last_failure_root_cause = NULL, same_root_failures = 0 "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -7301,7 +8174,8 @@ def retry_failed_task(
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "last_failure_root_cause = NULL, same_root_failures = 0 "
             "WHERE id = ? AND status = ?",
             (task_id, task_row["status"]),
         )
@@ -7423,6 +8297,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    coordination_reasons: Optional[list[str]] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7454,6 +8329,13 @@ def decompose_triage_task(
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
+    coordination_reasons = sorted(
+        {
+            reason.strip()
+            for reason in (coordination_reasons or [])
+            if isinstance(reason, str) and reason.strip()
+        }
+    )
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
@@ -7467,7 +8349,11 @@ def decompose_triage_task(
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
         for p in parents_idx:
-            if not isinstance(p, int) or p < 0 or p >= len(children):
+            if type(p) is not int:
+                raise ValueError(
+                    f"child[{idx}] parent index must be an integer"
+                )
+            if p < 0 or p >= len(children):
                 raise ValueError(
                     f"child[{idx}].parents[{p}] is not a valid index into children"
                 )
@@ -7486,16 +8372,24 @@ def decompose_triage_task(
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
+    _depth = [1] * len(children)
     _seen = 0
     while _queue:
         _node = _queue.pop()
         _seen += 1
         for _nb in _adj[_node]:
+            _depth[_nb] = max(_depth[_nb], _depth[_node] + 1)
             _in_deg[_nb] -= 1
             if _in_deg[_nb] == 0:
                 _queue.append(_nb)
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
+    max_depth = max(_depth)
+    if max_depth > MAX_INITIAL_DECOMPOSITION_STAGES:
+        raise ValueError(
+            "initial decomposition may contain at most "
+            f"{MAX_INITIAL_DECOMPOSITION_STAGES} stages (got {max_depth})"
+        )
 
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
@@ -7562,10 +8456,14 @@ def decompose_triage_task(
                     (author or "decomposer"),
                 ),
             )
-            _append_event(
-                conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
-            )
+            created_payload: dict[str, Any] = {
+                "by": author or "decomposer",
+                "from_decompose_of": task_id,
+            }
+            role = child.get("role")
+            if isinstance(role, str) and role.strip():
+                created_payload["role"] = role.strip()
+            _append_event(conn, new_id, "created", created_payload)
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
@@ -7624,6 +8522,8 @@ def decompose_triage_task(
             conn, task_id, "decomposed",
             {
                 "child_ids": child_ids,
+                "coordination_reasons": coordination_reasons,
+                "initial_graph_stages": max_depth,
                 "root_assignee": root_assignee,
             },
         )
@@ -7648,6 +8548,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        _resolve_task_correction_lineages(
+            conn, task_id, resolved_at=int(time.time()),
+        )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -7664,13 +8567,76 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Permanently remove an already-archived task and its related rows.
+def _delete_task_related_rows(conn: sqlite3.Connection, task_id: str) -> None:
+    """Delete every DB row scoped to a task, in dependency order."""
+    # Rows without task_id must be selected while terminal/evidence parents
+    # still exist. Handoffs may contain model-supplied summaries, and terminal
+    # intents carry live run capabilities, so hard deletion must purge both.
+    conn.execute(
+        "DELETE FROM terminal_handoffs WHERE terminal_intent_id IN "
+        "(SELECT terminal_intent_id FROM terminal_intents WHERE task_id = ?)",
+        (task_id,),
+    )
+    conn.execute(
+        "DELETE FROM terminal_postcommit WHERE task_id = ? OR terminal_intent_id IN "
+        "(SELECT terminal_intent_id FROM terminal_intents WHERE task_id = ?)",
+        (task_id, task_id),
+    )
+    conn.execute(
+        "DELETE FROM shadow_evidence_audit WHERE task_id = ? "
+        "OR terminal_intent_id IN "
+        "(SELECT terminal_intent_id FROM terminal_intents WHERE task_id = ?) "
+        "OR matched_evidence_id IN "
+        "(SELECT id FROM run_evidence_ledger WHERE task_id = ?)",
+        (task_id, task_id, task_id),
+    )
+    conn.execute("DELETE FROM run_evidence_ledger WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM terminal_intents WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_failure_accounting WHERE task_id = ?", (task_id,))
 
-    Safety guard: only archived tasks can be deleted. Active / blocked / done
-    tasks must be explicitly archived first so accidental data loss requires a
-    second deliberate action.
-    """
+    conn.execute("DELETE FROM kanban_role_deliveries WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_intake_operations WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_intake_receipts WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_attachments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_gjc_sessions WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_evidence WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_questions WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_approvals WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_policy_decisions WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+    conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (task_id, task_id),
+    )
+    conn.execute("DELETE FROM correction_lineages WHERE leader_task_id = ?", (task_id,))
+
+
+def _delete_task_attachment_blobs(task_id: str, stored_paths: list[str]) -> None:
+    """Best-effort cleanup matching :func:`delete_attachment` semantics."""
+    parents: set[Path] = set()
+    for stored_path in stored_paths:
+        try:
+            path = Path(stored_path)
+            parents.add(path.parent)
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+    for parent in parents:
+        if parent.name != task_id:
+            continue
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+
+
+def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Permanently remove an already-archived task and all related rows."""
+    stored_paths: list[str] = []
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -7678,37 +8644,49 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
+        stored_paths = [
+            item["stored_path"]
+            for item in conn.execute(
+                "SELECT stored_path FROM task_attachments WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+        ]
+        _resolve_task_correction_lineages(
+            conn, task_id, resolved_at=int(time.time()),
         )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_task_related_rows(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        deleted = cur.rowcount == 1
+    if deleted:
+        _delete_task_attachment_blobs(task_id, stored_paths)
+    return deleted
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and cascade to all related rows.
-
-    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
-
-    Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
-    """
+    """Hard-delete a task and every related row atomically."""
+    stored_paths: list[str] = []
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        stored_paths = [
+            item["stored_path"]
+            for item in conn.execute(
+                "SELECT stored_path FROM task_attachments WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+        ]
+        _resolve_task_correction_lineages(
+            conn, task_id, resolved_at=int(time.time()),
+        )
+        _delete_task_related_rows(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+    _delete_task_attachment_blobs(task_id, stored_paths)
     recompute_ready(conn)
     return True
 
@@ -8191,32 +9169,84 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_returncodes: "dict[int, tuple[int, float]]" = {}
+_recent_worker_exit_identities: dict[int, str] = {}
+_recent_worker_returncode_identities: dict[int, str] = {}
+_owned_worker_pids: set[int] = set()
+_owned_worker_processes: dict[int, Any] = {}
+_owned_worker_process_groups: dict[int, int] = {}
+_owned_worker_identities: dict[int, str] = {}
+_owned_worker_pids_lock = threading.Lock()
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
-    """Record a reaped child's exit status for later classification.
-
-    Called from the reap loop in ``dispatch_once``. Safe to call many
-    times; duplicate pids overwrite (pids can cycle, latest wins).
-    """
+    """Record a reaped child's exit status for later classification."""
     if not pid or pid <= 0:
         return
+    pid = int(pid)
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(raw_status), now)
-    # Age-based trim: drop entries older than the TTL.
+    with _owned_worker_pids_lock:
+        worker_identity = _owned_worker_identities.get(pid)
+    _recent_worker_exits[pid] = (int(raw_status), now)
+    _recent_worker_returncodes.pop(pid, None)
+    _recent_worker_returncode_identities.pop(pid, None)
+    if worker_identity is not None:
+        _recent_worker_exit_identities[pid] = worker_identity
+    else:
+        _recent_worker_exit_identities.pop(pid, None)
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
         cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
-        for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
-            _recent_worker_exits.pop(_pid, None)
-    # Size cap as a final guard.
+        expired = [
+            p for p, (_status, recorded_at) in _recent_worker_exits.items()
+            if recorded_at < cutoff
+        ]
+        for expired_pid in expired:
+            _recent_worker_exits.pop(expired_pid, None)
+            _recent_worker_exit_identities.pop(expired_pid, None)
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
-        # Drop oldest half.
-        ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
-        for _pid, _ in ordered[: len(ordered) // 2]:
-            _recent_worker_exits.pop(_pid, None)
+        ordered = sorted(_recent_worker_exits.items(), key=lambda item: item[1][1])
+        for expired_pid, _ in ordered[: len(ordered) // 2]:
+            _recent_worker_exits.pop(expired_pid, None)
+            _recent_worker_exit_identities.pop(expired_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def _record_worker_returncode(pid: int, returncode: int) -> None:
+    """Record a retained Popen returncode without reconstructing wait status."""
+    if not pid or pid <= 0:
+        return
+    pid = int(pid)
+    now = time.time()
+    with _owned_worker_pids_lock:
+        worker_identity = _owned_worker_identities.get(pid)
+    _recent_worker_returncodes[pid] = (int(returncode), now)
+    _recent_worker_exits.pop(pid, None)
+    _recent_worker_exit_identities.pop(pid, None)
+    if worker_identity is not None:
+        _recent_worker_returncode_identities[pid] = worker_identity
+    else:
+        _recent_worker_returncode_identities.pop(pid, None)
+    if len(_recent_worker_returncodes) > _RECENT_WORKER_EXITS_MAX // 2:
+        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+        expired = [
+            p for p, (_returncode, recorded_at) in _recent_worker_returncodes.items()
+            if recorded_at < cutoff
+        ]
+        for expired_pid in expired:
+            _recent_worker_returncodes.pop(expired_pid, None)
+            _recent_worker_returncode_identities.pop(expired_pid, None)
+    if len(_recent_worker_returncodes) > _RECENT_WORKER_EXITS_MAX:
+        ordered = sorted(
+            _recent_worker_returncodes.items(), key=lambda item: item[1][1]
+        )
+        for expired_pid, _ in ordered[: len(ordered) // 2]:
+            _recent_worker_returncodes.pop(expired_pid, None)
+            _recent_worker_returncode_identities.pop(expired_pid, None)
+
+
+def _classify_worker_exit(
+    pid: int,
+    expected_identity: Optional[str] = None,
+) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
     Returns ``(kind, code)`` where ``kind`` is one of:
@@ -8240,8 +9270,31 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    returncode_entry = _recent_worker_returncodes.get(int(pid))
+    if returncode_entry is not None:
+        if (
+            expected_identity is not None
+            and _recent_worker_returncode_identities.get(int(pid))
+            != str(expected_identity)
+        ):
+            return ("unknown", None)
+        returncode, _ = returncode_entry
+        if returncode < 0:
+            return ("signaled", -returncode)
+        if returncode == 0:
+            return ("clean_exit", 0)
+        if returncode == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", returncode)
+        return ("nonzero_exit", returncode)
+
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
+        return ("unknown", None)
+    if (
+        expected_identity is not None
+        and _recent_worker_exit_identities.get(int(pid))
+        != str(expected_identity)
+    ):
         return ("unknown", None)
     raw, _ = entry
     try:
@@ -8259,26 +9312,79 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
-def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children of this process without blocking.
+def _discard_owned_worker(pid: int) -> None:
+    with _owned_worker_pids_lock:
+        _owned_worker_pids.discard(int(pid))
+        _owned_worker_processes.pop(int(pid), None)
+        _owned_worker_process_groups.pop(int(pid), None)
+        _owned_worker_identities.pop(int(pid), None)
 
-    Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+
+def _terminate_owned_worker_descendants(pid: int) -> bool:
+    """Drain a retained worker group before forgetting an exited leader."""
+    with _owned_worker_pids_lock:
+        process_group = _owned_worker_process_groups.get(int(pid))
+        worker_identity = _owned_worker_identities.get(int(pid))
+    if process_group is None or not _process_group_alive(process_group):
+        return True
+    termination = _terminate_reclaimed_worker(
+        int(pid),
+        _claimer_id(),
+        expected_identity=worker_identity,
+    )
+    if termination.get("terminated"):
+        return True
+    _log.error(
+        "kanban reaper: owned worker pid=%s exited but process group %s "
+        "still has live descendants; retaining it for the next cleanup tick",
+        pid,
+        process_group,
+    )
+    return False
+
+
+def reap_worker_zombies() -> "list[int]":
+    """Reap only dispatcher-spawned workers without blocking.
+
+    Retained Popen handles are authoritative and work cross-platform. Legacy
+    PID-only registrations fall back to exact-PID ``waitpid`` on POSIX; this
+    function never calls ``waitpid(-1, ...)`` or consumes unrelated children.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    with _owned_worker_pids_lock:
+        owned = sorted(_owned_worker_pids)
+        processes = dict(_owned_worker_processes)
+
+    for owned_pid in owned:
+        process = processes.get(owned_pid)
+        if process is not None:
+            try:
+                returncode = process.poll()
+            except (OSError, ValueError):
+                continue
+            if returncode is None:
+                continue
+            _record_worker_returncode(owned_pid, int(returncode))
+            reaped.append(owned_pid)
+            if _terminate_owned_worker_descendants(owned_pid):
+                _discard_owned_worker(owned_pid)
+            continue
+
+        if os.name == "nt":
+            continue
         try:
-            while True:
-                try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if pid == 0:
-                    break
-                _record_worker_exit(pid, status)
-                reaped.append(pid)
-        except Exception:
-            pass
+            pid, status = os.waitpid(owned_pid, os.WNOHANG)
+        except ChildProcessError:
+            _discard_owned_worker(owned_pid)
+            continue
+        except OSError:
+            continue
+        if pid == 0:
+            continue
+        _record_worker_exit(pid, status)
+        reaped.append(pid)
+        if _terminate_owned_worker_descendants(pid):
+            _discard_owned_worker(pid)
     return reaped
 
 
@@ -8346,13 +9452,140 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _worker_pid_state(pid: Optional[int], expected_identity: Optional[str]) -> str:
+    """Return ``dead``, ``alive``, ``unavailable``, or ``reused``.
+
+    ``unavailable`` is treated as alive by reconciliation: if a durable
+    fingerprint exists but the platform cannot re-read it, deferring is safer
+    than spawning a duplicate or signalling an unverified process.
+    """
+    if not _pid_alive(pid):
+        return "dead"
+    if expected_identity is None:
+        return "unavailable"
+    try:
+        current_identity = get_process_identity(int(pid))
+    except Exception:
+        current_identity = None
+    if current_identity is None:
+        return "unavailable"
+    if str(current_identity) != str(expected_identity):
+        return "reused"
+    return "alive"
+
+
+def _worker_pid_alive(
+    pid: Optional[int], expected_identity: Optional[str],
+) -> bool:
+    return _worker_pid_state(pid, expected_identity) in {"alive", "unavailable"}
+
+
+def _owned_worker_process_group(pid: int) -> Optional[int]:
+    with _owned_worker_pids_lock:
+        recorded = _owned_worker_process_groups.get(int(pid))
+    if recorded is not None:
+        return recorded
+    if os.name == "nt" or not hasattr(os, "getpgid"):
+        return None
+    try:
+        candidate = int(os.getpgid(int(pid)))
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+    # Workers are launched with start_new_session=True, so only a group whose
+    # id equals the worker leader PID is safe for this dispatcher to signal.
+    return candidate if candidate == int(pid) else None
+
+
+def _process_group_members(process_group: int) -> Optional[list[int]]:
+    """List non-zombie members of an owned POSIX process group."""
+    members: list[int] = []
+    if sys.platform == "linux":
+        try:
+            for stat_path in Path("/proc").glob("[0-9]*/stat"):
+                try:
+                    remainder = stat_path.read_text(encoding="utf-8").rsplit(
+                        ") ", 1
+                    )[1].split()
+                    state, group = remainder[0], int(remainder[2])
+                    member_pid = int(stat_path.parent.name)
+                except (IndexError, ValueError, OSError):
+                    continue
+                if group == int(process_group) and state != "Z":
+                    members.append(member_pid)
+            return members
+        except OSError:
+            return None
+
+    if sys.platform == "darwin":
+        try:
+            probe = subprocess.run(
+                ["ps", "-axo", "pid=,pgid=,stat="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if probe.returncode != 0:
+                return None
+            for line in (probe.stdout or "").splitlines():
+                parts = line.split(None, 2)
+                if len(parts) != 3:
+                    continue
+                try:
+                    member_pid, group = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                if group == int(process_group) and "Z" not in parts[2]:
+                    members.append(member_pid)
+            return members
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return None
+    return None
+
+
+def _process_group_alive(process_group: int) -> bool:
+    """Return True when a POSIX worker group has any non-zombie member."""
+    kill_process_group = getattr(os, "killpg", None)
+    if kill_process_group is None:
+        return False
+    try:
+        kill_process_group(int(process_group), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    members = _process_group_members(process_group)
+    return bool(members) if members is not None else True
+
+
+def _terminate_windows_process_tree(pid: int, *, force: bool) -> bool:
+    command = ["taskkill", "/PID", str(int(pid)), "/T"]
+    if force:
+        command.append("/F")
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return False
+    return result.returncode == 0 or not _pid_alive(pid)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    expected_identity: Optional[str] = None,
     signal_fn=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Terminate a host-local worker and its owned process tree."""
     import signal
 
     info: dict[str, Any] = {
@@ -8361,6 +9594,8 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "process_group": None,
+        "pid_reused": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -8370,41 +9605,143 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    # Resolve a retained owned process group before classifying the leader.
+    # The leader can already be dead while descendants in its original group
+    # are still alive and must be drained by the reaper.
+    process_group = (
+        None if signal_fn is not None else _owned_worker_process_group(int(pid))
+    )
+    info["process_group"] = process_group
+
+    worker_state = _worker_pid_state(pid, expected_identity)
+    info["worker_identity_state"] = worker_state
+    if worker_state == "reused":
+        # The original worker is gone and this numeric PID now belongs to an
+        # unrelated process.  Release the stale claim without signalling it.
+        info["pid_reused"] = True
+        info["terminated"] = True
+        return info
+    if worker_state == "dead" and (
+        process_group is None or not _process_group_alive(process_group)
+    ):
+        info["terminated"] = True
+        return info
+    if worker_state == "unavailable":
+        # The live PID cannot be matched to a durable identity. Hold the claim
+        # rather than signalling an unverified process or spawning a duplicate
+        # beside a possibly-live worker.
+        info["termination_attempted"] = True
+        info["identity_unavailable"] = True
+        return info
+    info["termination_attempted"] = True
+
+    if os.name == "nt" and signal_fn is None:
+        _terminate_windows_process_tree(int(pid), force=False)
+        for _ in range(10):
+            if not _pid_alive(pid):
+                info["terminated"] = True
+                return info
+            time.sleep(0.5)
+        info["sigkill"] = True
+        _terminate_windows_process_tree(int(pid), force=True)
+        info["terminated"] = not _pid_alive(pid)
+        return info
+
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
     if kill is None:
+        info["termination_attempted"] = False
         return info
 
-    info["termination_attempted"] = True
+    # ``signal_fn`` is an exact-PID test hook.  Do not mix it with live OS
+    # process-group discovery: under per-file test isolation the pytest process
+    # itself can be a session leader (pid == pgid), which would make synthetic
+    # worker PIDs target the test runner's real group and bypass the mocked
+    # ``_pid_alive`` result.  Production calls omit the hook and retain full
+    # process-tree termination.
+    signal_target = -process_group if process_group is not None else int(pid)
+
+    def send_signal(sig: int) -> None:
+        kill_process_group = getattr(os, "killpg", None)
+        if (
+            process_group is not None
+            and signal_fn is None
+            and kill_process_group is not None
+        ):
+            try:
+                kill_process_group(process_group, sig)
+                return
+            except PermissionError as group_error:
+                # macOS may reject the group syscall even though every member
+                # is an owned same-user child. Fall back to the already
+                # validated PGID membership snapshot, never a system-wide scan.
+                members = _process_group_members(process_group)
+                if members is None:
+                    raise group_error
+                delivered = False
+                for member_pid in members:
+                    try:
+                        os.kill(member_pid, sig)
+                        delivered = True
+                    except ProcessLookupError:
+                        continue
+                    except PermissionError:
+                        continue
+                if members and not delivered:
+                    raise group_error
+                return
+        kill(signal_target, sig)
+
+    def still_alive() -> bool:
+        if process_group is not None:
+            return _process_group_alive(process_group)
+        return _pid_alive(pid)
+
     try:
-        kill(int(pid), signal.SIGTERM)
+        send_signal(signal.SIGTERM)
     except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
         return info
-    except OSError:
+    except OSError as exc:
+        info["termination_error"] = f"{type(exc).__name__}: {exc}"
+        # Darwin can report EPERM after delivering a group signal. Ground the
+        # outcome in process-tree liveness instead of the syscall errno alone.
+        for _ in range(10):
+            if not still_alive():
+                info["terminated"] = True
+                return info
+            time.sleep(0.1)
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not still_alive():
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
+    if still_alive():
         try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            send_signal(getattr(signal, "SIGKILL", signal.SIGTERM))
             info["sigkill"] = True
-        except (ProcessLookupError, OSError):
+        except ProcessLookupError:
+            info["terminated"] = True
+            return info
+        except OSError as exc:
+            info["termination_error"] = f"{type(exc).__name__}: {exc}"
+            for _ in range(10):
+                if not still_alive():
+                    info["terminated"] = True
+                    return info
+                time.sleep(0.1)
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    for _ in range(10):
+        if not still_alive():
+            info["terminated"] = True
+            return info
+        time.sleep(0.1)
+    info["terminated"] = not still_alive()
     return info
 
 
@@ -8444,22 +9781,26 @@ def _defer_reclaim_for_live_worker(
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
+            "UPDATE tasks SET claim_expires = "
+            "MAX(COALESCE(claim_expires, 0), ?) "
             "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
             (grace, task_id, claim_lock),
         )
         if cur.rowcount != 1:
             return
+        claim_expires = int(conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()[0])
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
-                (grace, run_id),
+                (claim_expires, run_id),
             )
         payload = {
             "reason": reason,
             "claim_lock": claim_lock,
-            "claim_expires_now": grace,
+            "claim_expires_now": claim_expires,
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
@@ -8533,7 +9874,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8541,7 +9881,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, r.worker_identity "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -8561,31 +9901,22 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid,
+            row["claim_lock"],
+            expected_identity=row["worker_identity"],
+            signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
@@ -8601,8 +9932,8 @@ def enforce_max_runtime(
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -8626,7 +9957,10 @@ def enforce_max_runtime(
                 release_claim=False,
                 end_run=False,
                 event_run_id=run_id,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={
+                    "pid": pid,
+                    "sigkill": bool(termination.get("sigkill")),
+                },
             )
     return timed_out
 
@@ -8676,7 +10010,8 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       r.worker_identity "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -8702,7 +10037,10 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid,
+            lock,
+            expected_identity=row["worker_identity"],
+            signal_fn=signal_fn,
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -8767,15 +10105,67 @@ def detect_stale_running(
     return reclaimed
 
 
-def _error_fingerprint(error_text: str) -> str:
-    """Normalize an error message for grouping identical failures.
+_SAME_ROOT_FAILURE_LIMIT = 2
 
-    Strips host-specific details (PIDs, timestamps) so that errors
-    with the same root cause produce the same fingerprint.
+_FAILURE_CATEGORY_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("rate_limit", ("rate limit", "rate-limit", "quota wall", "too many requests")),
+    ("timeout", ("timed out", "timeout", "deadline exceeded")),
+    ("connection_reset", ("connection reset", "reset by peer", "broken pipe")),
+    ("dns", ("name resolution", "dns", "temporary failure in name")),
+    ("authentication", ("unauthorized", "forbidden", "authentication", "invalid api key")),
+    ("protocol_violation", ("protocol violation", "without calling kanban_")),
+    ("out_of_memory", ("out of memory", "oom", "memoryerror")),
+    ("signal", ("killed by signal", "signal ")),
+    ("nonzero_exit", ("exited with code", "exit code", "rc=")),
+)
+
+_STRUCTURED_FAILURE_CODE_RE = re.compile(
+    r"\b(http(?:\s+status)?|status|errno|exit(?:ed)?(?:\s+with)?(?:\s+code)?|"
+    r"code|signal|rc)\s*[:=]?\s*(-?\d{1,4})\b",
+    re.IGNORECASE,
+)
+
+
+def _failure_root_cause_id(error_text: str, outcome: str) -> str:
+    """Return a stable, non-lossy identity for retry policy decisions.
+
+    Known failure classes tolerate volatile process identifiers while retaining
+    structured status/errno/exit/signal codes. Unknown errors include the full
+    normalized message instead of a prefix, preventing unrelated long messages
+    from collapsing into one breaker bucket.
     """
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
-    return fp.lower().strip()
+    lowered = " ".join(str(error_text or "").lower().split())
+    category = "unknown"
+    for name, needles in _FAILURE_CATEGORY_PATTERNS:
+        if any(needle in lowered for needle in needles):
+            category = name
+            break
+    codes = sorted(
+        {f"{kind.lower().replace(' ', '_')}:{value}" for kind, value in _STRUCTURED_FAILURE_CODE_RE.findall(lowered)}
+    )
+    normalized = re.sub(r"\bpid\s+\d+\b", "pid <volatile>", lowered)
+    normalized = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        "<uuid>",
+        normalized,
+    )
+    normalized = re.sub(r"\b\d{10,}\b", "<timestamp>", normalized)
+    identity = {
+        "outcome": str(outcome or "unknown").lower(),
+        "category": category,
+        "codes": codes,
+        # Category and structured codes support policy, while normalized detail
+        # keeps unrelated provider/database/subsystem failures from collapsing.
+        "detail": normalized,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _error_fingerprint(error_text: str) -> str:
+    """Backward-compatible systemic-crash grouping helper."""
+    return _failure_root_cause_id(error_text, "crashed")
 
 
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
@@ -8864,9 +10254,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``). A bounded violation-only streak
+    allows likely-paperwork retries but eventually trips the circuit breaker
+    when clean exits keep omitting the terminal transition.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -8896,12 +10286,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, run_id)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, t.started_at, "
+            "       r.worker_identity "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r "
+            "  ON r.id = t.current_run_id AND r.worker_pid = t.worker_pid "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8917,11 +10311,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            expected_identity = row["worker_identity"]
+            worker_state = _worker_pid_state(
+                row["worker_pid"], expected_identity,
+            )
+            if worker_state in {"alive", "unavailable"}:
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            kind, code = _classify_worker_exit(pid, expected_identity)
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -8980,6 +10378,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+                if worker_state == "reused":
+                    event_payload["pid_reused"] = True
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
@@ -9143,6 +10543,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -9171,8 +10572,14 @@ def _record_task_failure(
 
     ``event_run_id`` identifies the run already closed by timeout/crash
     callers, so a resulting ``gave_up`` event retains immutable profile
-    attribution. ``event_payload_extra`` merges outcome-specific context
-    (e.g. pid on crash, elapsed on timeout) into that event.
+    attribution. Historical accounting mutates the task only while it is still
+    unclaimed (``ready`` with no current run); if another dispatcher has
+    already claimed a new generation, the immutable ledger is retained but the
+    new run is not changed. ``expected_run_id`` fences worker-originated
+    accounting to its exact active run. A durable ``(task_id, run_id)`` ledger
+    makes counter updates idempotent across watchdog/finalizer races.
+    ``event_payload_extra`` merges outcome-specific context (e.g. pid on crash,
+    elapsed on timeout) into that event.
 
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
@@ -9189,17 +10596,78 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
+    for field_name, value in (
+        ("event_run_id", event_run_id),
+        ("expected_run_id", expected_run_id),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError(f"{field_name} must be a positive integer")
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, "
+            "last_failure_root_cause, same_root_failures, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
-        failures = int(row["consecutive_failures"]) + 1
+        current_run_id = (
+            int(row["current_run_id"]) if row["current_run_id"] else None
+        )
+        if expected_run_id is not None and current_run_id != expected_run_id:
+            return str(row["status"]) == "blocked"
+        if release_claim and current_run_id is None:
+            return str(row["status"]) == "blocked"
+        accounting_run_id = expected_run_id or event_run_id or current_run_id
+        if accounting_run_id is not None:
+            owned_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE id=? AND task_id=?",
+                (accounting_run_id, task_id),
+            ).fetchone()
+            if owned_run is None:
+                return False
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO task_failure_accounting "
+                "(task_id, run_id, outcome, recorded_at) VALUES (?, ?, ?, ?)",
+                (task_id, accounting_run_id, outcome, int(time.time())),
+            )
+            if inserted.rowcount != 1:
+                return str(row["status"]) == "blocked"
+        historical_run_accounting = bool(
+            not release_claim
+            and not end_run
+            and event_run_id is not None
+            and expected_run_id is None
+        )
+        newer_generation = False
+        if historical_run_accounting:
+            newer_generation = conn.execute(
+                "SELECT 1 FROM task_runs WHERE task_id=? AND id>? LIMIT 1",
+                (task_id, int(event_run_id)),
+            ).fetchone() is not None
+        if historical_run_accounting and (
+            str(row["status"]) != "ready"
+            or current_run_id is not None
+            or newer_generation
+        ):
+            # The old run and its failure remain durably attributed in
+            # task_runs/task_failure_accounting, but a newer generation owns
+            # the mutable task row now. Never carry an earlier attempt's
+            # breaker decision, claim clearing, or counters into that run.
+            return str(row["status"]) == "blocked"
+        root_cause_id = _failure_root_cause_id(error, outcome)
+        same_root = bool(
+            row["last_failure_root_cause"]
+            and row["last_failure_root_cause"] == root_cause_id
+        )
+        failures = int(row["consecutive_failures"] or 0) + 1
+        same_root_failures = (
+            int(row["same_root_failures"] or 0) + 1 if same_root else 1
+        )
         cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
@@ -9214,16 +10682,27 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        total_limit_reached = failures >= effective_limit
+        same_root_limit_reached = same_root_failures >= _SAME_ROOT_FAILURE_LIMIT
+        if force_trip or total_limit_reached or same_root_limit_reached:
+            if force_trip:
+                breaker = "forced"
+            elif total_limit_reached and same_root_limit_reached:
+                breaker = "total_and_same_root"
+            elif same_root_limit_reached:
+                breaker = "same_root"
+            else:
+                breaker = "total"
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_root_cause = ?, same_root_failures = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], root_cause_id, same_root_failures, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -9231,9 +10710,10 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_root_cause = ?, same_root_failures = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], root_cause_id, same_root_failures, task_id),
                 )
             run_id = event_run_id
             if end_run:
@@ -9244,6 +10724,9 @@ def _record_task_failure(
                     error=error[:500],
                     metadata={
                         "failures": failures,
+                        "same_root_observations": same_root_failures,
+                        "root_cause_id": root_cause_id,
+                        "breaker": breaker,
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
@@ -9251,6 +10734,9 @@ def _record_task_failure(
                 )
             payload = {
                 "failures": failures,
+                "same_root_observations": same_root_failures,
+                "root_cause_id": root_cause_id,
+                "breaker": breaker,
                 "effective_limit": effective_limit,
                 "limit_source": limit_source,
                 "error": error[:500],
@@ -9269,17 +10755,19 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_root_cause = ?, same_root_failures = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], root_cause_id, same_root_failures, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    "last_failure_error = ?, last_failure_root_cause = ?, "
+                    "same_root_failures = ? WHERE id = ?",
+                    (failures, error[:500], root_cause_id, same_root_failures, task_id),
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
@@ -9287,11 +10775,20 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata={
+                        "failures": failures,
+                        "same_root_observations": same_root_failures,
+                        "root_cause_id": root_cause_id,
+                    },
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {
+                        "error": error[:500],
+                        "failures": failures,
+                        "same_root_observations": same_root_failures,
+                        "root_cause_id": root_cause_id,
+                    },
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
@@ -9316,25 +10813,116 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+def _register_owned_worker_pid(pid: int) -> Optional[str]:
+    pid = int(pid)
+    with _owned_worker_pids_lock:
+        cached_identity = _owned_worker_identities.get(pid)
+    worker_identity = cached_identity
+    if worker_identity is None:
+        try:
+            worker_identity = get_process_identity(pid)
+        except Exception:
+            worker_identity = None
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
-    """
+    process_group: Optional[int] = None
+    if os.name != "nt" and hasattr(os, "getpgid"):
+        try:
+            candidate = int(os.getpgid(pid))
+            if candidate == pid:
+                process_group = candidate
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    with _owned_worker_pids_lock:
+        _owned_worker_pids.add(pid)
+        if worker_identity is not None:
+            _owned_worker_identities[pid] = str(worker_identity)
+        if process_group is not None:
+            _owned_worker_process_groups[pid] = process_group
+    return str(worker_identity) if worker_identity is not None else None
+
+
+def _register_owned_worker_process(process: Any) -> None:
+    """Retain an owned Popen handle so no other subprocess cleanup can reap it."""
+    if not callable(getattr(process, "poll", None)):
+        return
+    pid = int(process.pid)
+    _register_owned_worker_pid(pid)
+    with _owned_worker_pids_lock:
+        _owned_worker_processes[pid] = process
+
+
+def _terminate_spawned_worker_before_requeue(
+    pid: int, claim_lock: Optional[str],
+) -> bool:
+    """Terminate and reap a just-spawned process tree before requeueing."""
+    worker_identity = _register_owned_worker_pid(pid)
+    termination = _terminate_reclaimed_worker(
+        pid,
+        claim_lock,
+        expected_identity=worker_identity,
+    )
+    if not termination.get("terminated"):
+        return False
+    if termination.get("pid_reused"):
+        _discard_owned_worker(int(pid))
+        return True
+
+    with _owned_worker_pids_lock:
+        process = _owned_worker_processes.get(int(pid))
+    if process is not None:
+        try:
+            returncode = process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return False
+        _record_worker_returncode(int(pid), int(returncode))
+        _discard_owned_worker(int(pid))
+        return True
+
+    if os.name == "nt":
+        if _pid_alive(pid):
+            return False
+        _discard_owned_worker(int(pid))
+        return True
+
+    try:
+        waited_pid, status = os.waitpid(int(pid), 0)
+    except ChildProcessError:
+        if _pid_alive(pid):
+            return False
+        _discard_owned_worker(int(pid))
+        return True
+    except OSError:
+        if _pid_alive(pid):
+            return False
+        _discard_owned_worker(int(pid))
+        return True
+    if waited_pid != int(pid):
+        return False
+    _record_worker_exit(int(pid), int(status))
+    _discard_owned_worker(int(pid))
+    return True
+
+
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Record the spawned child's durable process identity and event."""
+    pid = int(pid)
+    worker_identity = _register_owned_worker_pid(pid)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            (pid, task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_identity = ? "
+                "WHERE id = ?",
+                (pid, worker_identity, run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {"pid": pid}
+        if worker_identity is not None:
+            payload["worker_identity"] = worker_identity
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9350,7 +10938,8 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "last_failure_error = NULL, last_failure_root_cause = NULL, "
+            "same_root_failures = 0 WHERE id = ?",
             (task_id,),
         )
 
@@ -9382,13 +10971,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
-        pattern. Retrying immediately is unlikely to help (rate limits
-        reset on a timer; auth needs human action), so we defer to the
-        next tick. The existing ``consecutive_failures`` counter still
-        trips the auto-block circuit breaker after ``failure_limit``
-        consecutive failures, so a persistent auth error eventually
-        blocks via the normal path — but a transient 429 gets a few
-        ticks of recovery first.
+        pattern. Retrying immediately is unlikely to help, so defer for the
+        configured rate-limit cooldown and then allow one probe. A failed
+        probe advances ``consecutive_failures`` and therefore converges on
+        the normal circuit breaker instead of remaining ready forever.
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
@@ -9408,7 +10994,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, created_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9452,10 +11038,22 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: retrying immediately will not help. Bound the
+    #    deferral, however, so a persistent auth failure can be observed again
+    #    and advance the existing circuit breaker. Real failure paths have a
+    #    closed task_run; created_at is a conservative legacy fallback.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        if rl_cooldown <= 0:
+            return None
+        reference_at = (
+            int(latest_run["ended_at"])
+            if latest_run is not None and latest_run["ended_at"] is not None
+            else int(row["created_at"] or 0)
+        )
+        if reference_at > 0 and (now - reference_at) < rl_cooldown:
+            return "blocker_auth"
+        return None
 
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
@@ -9583,22 +11181,10 @@ def dispatch_once(
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-        )
+        # The board DB path is also the cross-process lock identity. Running
+        # without it would bypass tick-level capacity and spawn ordering.
+        _log.exception("cannot resolve dispatch lock identity; skipping tick")
+        return DispatchResult(skipped_locked=True)
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
@@ -9897,6 +11483,7 @@ def _dispatch_once_locked(
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        spawned_pid: Optional[int] = None
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -9905,13 +11492,15 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    raw_pid = _spawn(claimed, str(workspace), board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    raw_pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                raw_pid = _spawn(claimed, str(workspace))
+            if raw_pid:
+                spawned_pid = int(raw_pid)
+                _register_owned_worker_pid(spawned_pid)
+                _set_worker_pid(conn, claimed.id, spawned_pid)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -9929,6 +11518,15 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            if spawned_pid is not None and not _terminate_spawned_worker_before_requeue(
+                spawned_pid, claimed.claim_lock,
+            ):
+                _log.error(
+                    "kanban dispatch: worker pid=%s survived post-spawn "
+                    "bookkeeping failure for task %s; retaining running claim",
+                    spawned_pid, claimed.id, exc_info=True,
+                )
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -9995,21 +11593,33 @@ def _dispatch_once_locked(
         # review agent needs.
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        spawned_pid = None
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    raw_pid = _spawn(claimed, str(workspace), board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    raw_pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                raw_pid = _spawn(claimed, str(workspace))
+            if raw_pid:
+                spawned_pid = int(raw_pid)
+                _register_owned_worker_pid(spawned_pid)
+                _set_worker_pid(conn, claimed.id, spawned_pid)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            if spawned_pid is not None and not _terminate_spawned_worker_before_requeue(
+                spawned_pid, claimed.claim_lock,
+            ):
+                _log.error(
+                    "kanban review dispatch: worker pid=%s survived post-spawn "
+                    "bookkeeping failure for task %s; retaining running claim",
+                    spawned_pid, claimed.id, exc_info=True,
+                )
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -10489,16 +12099,18 @@ def _default_spawn(
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
-        log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    finally:
+        # Popen duplicated/inherited the descriptor for the child. The parent
+        # copy is no longer needed and must not leak one FD per worker spawn.
+        log_f.close()
+    # Retain the Popen object in the dispatcher. Dropping it lets CPython's
+    # subprocess cleanup consume the child's status before our owned reaper,
+    # which destroys rate-limit/protocol-exit provenance.
+    _register_owned_worker_process(proc)
     return proc.pid
 
 
