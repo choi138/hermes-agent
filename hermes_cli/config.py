@@ -3289,6 +3289,14 @@ DEFAULT_CONFIG = {
         #     enforcement is a copy/gating change, not new migration code.
         #   "off": suppress the notice entirely.
         "fts_optimize_notice": "advise",
+        # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
+        # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
+        # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)
+        # get index-speed exact matching instead of LIKE full-table scans.
+        # True (default): use the index when the extension is present; the
+        # setting is inert when it isn't. False: never load the extension or
+        # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
+        "cjk_fts": True,
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
