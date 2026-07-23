@@ -781,13 +781,22 @@ def build_runtime_route_block(agent: Any) -> str:
     except Exception:
         route_info = None
 
+    # Route-language identity (ADR-003 Phase 3c): the model self-identifies as
+    # route + model. Raw provider/endpoint/api-mode identifiers are operator
+    # data -- surfacing them in every prompt invited stale-model bias and
+    # free-form switching requests. They remain in the cache key above (an
+    # endpoint/api-mode change must still re-render) but not in the rendered
+    # text. Route resolution is a pure function of the key tuple given stable
+    # config, so caching stays byte-correct. No catalog means no route field.
+    route_label = ""
+    if isinstance(route_info, dict):
+        route_label = str(route_info.get("current") or "") or "off-catalog"
+
     current = (
         "CurrentRuntime: "
-        f"provider={key_tuple[0]} "
-        f"model={key_tuple[1]} "
+        + (f"route={route_label} " if route_label else "")
+        + f"model={key_tuple[1]} "
         f"reasoning={reasoning_text} "
-        f"api={key_tuple[2]} "
-        f"endpoint={key_tuple[3]} "
         f"source={key_tuple[4]} "
         # Always emitted (default ``default``): a presence-toggling suffix
         # shifts every byte after it and re-keys the provider prompt cache.
