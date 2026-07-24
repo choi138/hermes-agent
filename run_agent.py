@@ -68,16 +68,17 @@ from hermes_constants import get_hermes_home
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
-    Only local CLI sessions get a recorded cwd: the directory the process was
-    launched from is meaningful for ``hermes -c`` / ``--resume`` (relaunch
-    where you left off). Gateway/cron/remote-backend sessions have no stable
-    host cwd to restore, so they record nothing.
+    Only local CLI and dispatcher-spawned Kanban sessions get a recorded cwd:
+    the directory the process was launched from is meaningful for ``hermes
+    -c`` / ``--resume`` and identifies a worker's bound workspace.
+    Gateway/cron/remote-backend sessions have no stable host cwd to restore,
+    so they record nothing.
 
     ``TERMINAL_ENV`` is set by the CLI's config bridge (``load_cli_config``);
     a non-"local" backend (docker/ssh/modal/...) means the host cwd is
     irrelevant to the agent's tools, so we skip it there too.
     """
-    if source != "cli":
+    if source not in {"cli", "kanban"}:
         return None
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     if backend and backend != "local":
@@ -99,6 +100,8 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     source = str(source or "").strip()
     if source:
         return source
+    if str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return "kanban"
     return platform or "cli"
 
 

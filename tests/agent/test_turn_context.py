@@ -451,3 +451,20 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
 
+
+def test_preflight_honors_configured_compression_attempt_cap(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent.max_compression_attempts = 5
+    estimates = iter([1_000_000, 900_000, 810_000, 729_000, 656_100, 590_490])
+
+    with (
+        patch("agent.turn_context._should_run_preflight_estimate", return_value=True),
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            side_effect=lambda *_a, **_k: next(estimates),
+        ),
+    ):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    assert agent._compress_context.call_count == 5

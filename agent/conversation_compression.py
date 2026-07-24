@@ -1241,6 +1241,9 @@ def compress_context(
                     except Exception:
                         pass  # best-effort — don't block compression on a flush error
                     # Propagate title to the new session with auto-numbering
+                    parent_session = (
+                        agent._session_db.get_session(agent.session_id) or {}
+                    )
                     old_title = agent._session_db.get_session_title(agent.session_id)
                     agent._session_db.end_session(agent.session_id, "compression")
                     old_session_id = agent.session_id
@@ -1272,10 +1275,16 @@ def compress_context(
                     try:
                         agent._session_db.create_session(
                             session_id=agent.session_id,
-                            source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            source=(
+                                parent_session.get("source")
+                                or agent.platform
+                                or os.environ.get("HERMES_SESSION_SOURCE", "cli")
+                            ),
                             model=agent.model,
                             model_config=agent._session_init_model_config,
                             parent_session_id=old_session_id,
+                            cwd=parent_session.get("cwd"),
+                            profile_name=parent_session.get("profile_name"),
                         )
                     except Exception as _cs_err:
                         # The child row could not be created (e.g. FK constraint,

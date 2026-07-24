@@ -429,6 +429,17 @@ compression:
   # compression of older turns.
   protect_last_n: 20
 
+  # Compression retry rounds per turn (default: 3; valid range: 1..10).
+  max_attempts: 3
+
+  # Optional deterministic pruning of OLD tool results before full compression.
+  # 0 keeps it disabled. Candidate experiment: 48000 tokens.
+  proactive_prune_tokens: 0
+  # Only summarize old tool results larger than this many characters.
+  proactive_prune_min_result_chars: 8000
+  # Commit only when measured reclaim reaches this many estimated tokens.
+  proactive_prune_min_reclaim_tokens: 4096
+
   # Codex app-server (codex CLI runtime) thread-compaction mode. The codex
   # agent owns the real thread context on this runtime, so Hermes' summarizer
   # cannot shrink it — compaction goes through the app server instead.

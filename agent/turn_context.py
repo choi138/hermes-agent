@@ -263,6 +263,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Full-compression calls already consumed by the turn prologue.
+    compression_attempts: int = 0
 
 
 def build_turn_context(
@@ -565,6 +567,7 @@ def build_turn_context(
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
     _preflight_compressed = False
+    _preflight_compression_attempts = 0
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
@@ -645,9 +648,13 @@ def build_turn_context(
                 f">= {_compressor.threshold_tokens:,} threshold. "
                 "This may take a moment."
             )
-            for _pass in range(3):
+            _max_preflight_passes = max(
+                1, int(getattr(agent, "max_compression_attempts", 3) or 3)
+            )
+            for _pass in range(_max_preflight_passes):
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
+                _preflight_compression_attempts += 1
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
@@ -899,4 +906,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        compression_attempts=_preflight_compression_attempts,
     )

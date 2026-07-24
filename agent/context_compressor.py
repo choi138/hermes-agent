@@ -274,8 +274,165 @@ _SUMMARY_RATIO = 0.20
 # itself a context-pressure source and slows every compaction.
 _SUMMARY_TOKENS_CEILING = 10_000
 
+# Aggregate cap on each serialized block sent to the summary model. Per-message
+# truncation alone still permits very large prompts in long conversations.
+_SUMMARY_INPUT_MAX_CHARS = 160_000
+
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+
+SKILL_PRUNED_MARKER_PREFIX = "[SKILL_PRUNED:"
+_SKILL_VIEW_PRUNE_MIN_CHARS = 5000
+_MAX_PRUNED_SKILL_MARKERS = 20
+
+
+def _skill_pruned_marker(skill_name: str) -> str:
+    """Return the one canonical marker for a compressed-away skill body."""
+    return (
+        f"{SKILL_PRUNED_MARKER_PREFIX} content lost in compression; "
+        f"reload with skill_view(name='{skill_name}')]"
+    )
+
+
+_SKILL_PRUNE_RECENT_WINDOW = 10
+
+
+def _skill_view_call_sites(
+    messages: List[Dict[str, Any]],
+) -> list[tuple[int, str]]:
+    """Return indexes and names for valid skill_view tool calls."""
+    sites: list[tuple[int, str]] = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if isinstance(tool_call, dict):
+                function = tool_call.get("function", {})
+                name = function.get("name", "") if isinstance(function, dict) else ""
+                raw_args = (
+                    function.get("arguments", "")
+                    if isinstance(function, dict)
+                    else ""
+                )
+            else:
+                function = getattr(tool_call, "function", None)
+                name = getattr(function, "name", "") if function else ""
+                raw_args = getattr(function, "arguments", "") if function else ""
+            if name != "skill_view" or not isinstance(raw_args, str):
+                continue
+            try:
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            skill = args.get("name", "") if isinstance(args, dict) else ""
+            if isinstance(skill, str) and skill:
+                sites.append((index, skill))
+    return sites
+
+
+def _collect_protected_skill_names(
+    messages: List[Dict[str, Any]], prune_boundary: int
+) -> set[str]:
+    """Return recently loaded or protected-tail-referenced skill names."""
+    recent_start = max(0, len(messages) - _SKILL_PRUNE_RECENT_WINDOW)
+    tail_start = max(0, prune_boundary)
+    tail_user_text = [
+        str(message.get("content") or "").lower()
+        for message in messages[tail_start:]
+        if message.get("role") == "user"
+    ]
+    protected: set[str] = set()
+    for index, skill in _skill_view_call_sites(messages):
+        key = skill.lower()
+        if (
+            index >= recent_start
+            or index >= tail_start
+            or any(key in text for text in tail_user_text)
+        ):
+            protected.add(key)
+    return protected
+
+
+_SKILL_PRUNED_MARKER_RE = re.compile(
+    re.escape(SKILL_PRUNED_MARKER_PREFIX)
+    + r"[^\]]*?reload with skill_view\(name='([^']+)'\)"
+)
+_PRUNED_SKILLS_SECTION_HEADING = "## Pruned Skills"
+
+
+def _extract_pruned_skill_names(text: str) -> list[str]:
+    """Extract unique skill names from canonical markers in order."""
+    names: list[str] = []
+    for match in _SKILL_PRUNED_MARKER_RE.finditer(text or ""):
+        name = match.group(1)
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _collect_ghosted_skill_names(
+    turns: List[Dict[str, Any]],
+) -> list[str]:
+    """Collect marked or raw skill bodies that summary generation removes."""
+    names: list[str] = []
+
+    def _add(name: str) -> None:
+        if name and name not in names:
+            names.append(name)
+
+    call_id_to_skill: dict[str, str] = {}
+    for message in turns:
+        if message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            call_id = _extract_tool_call_id(tool_call)
+            tool_name, raw_args = _extract_tool_call_name_and_args(tool_call)
+            if not call_id or tool_name != "skill_view":
+                continue
+            try:
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            skill = args.get("name", "") if isinstance(args, dict) else ""
+            if isinstance(skill, str) and skill:
+                call_id_to_skill[call_id] = skill
+
+    for message in turns:
+        content = message.get("content")
+        text = (
+            content
+            if isinstance(content, str)
+            else _content_text_for_contains(content)
+        )
+        for name in _extract_pruned_skill_names(text):
+            _add(name)
+        if (
+            message.get("role") == "tool"
+            and isinstance(content, str)
+            and len(content) > _SKILL_VIEW_PRUNE_MIN_CHARS
+        ):
+            _add(call_id_to_skill.get(str(message.get("tool_call_id") or ""), ""))
+    return names
+
+
+def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
+    """Restore canonical markers that a summarizer omitted or paraphrased."""
+    missing = [
+        name
+        for name in skill_names
+        if _skill_pruned_marker(name) not in summary
+    ]
+    if not missing:
+        return summary
+    block = (
+        "\n\n"
+        + _PRUNED_SKILLS_SECTION_HEADING
+        + "\n"
+        + "\n".join(_skill_pruned_marker(name) for name in missing)
+        + "\nReload each listed skill before relying on it; one reload per skill "
+        "is enough, so ignore older markers for the same skill."
+    )
+    return summary + _redact_compaction_text(block)
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
@@ -305,6 +462,7 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+_PRESSURE_KEEP_RECENT_MESSAGES = 3
 
 # Models with context windows below this get their compression threshold
 # floored at ``_SMALL_CTX_THRESHOLD_PERCENT`` (raise-only — an explicitly
@@ -326,6 +484,15 @@ _MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
 _HISTORICAL_TASK_SECTION_RE = re.compile(
     rf"(?ms)^{re.escape(HISTORICAL_TASK_HEADING)}\s*\n.*?(?=^## |\Z)"
 )
+
+
+def _redact_compaction_text(text: Any) -> str:
+    """Strictly redact text crossing a persistent compaction boundary."""
+    return redact_sensitive_text(
+        str(text or ""),
+        force=True,
+        redact_url_credentials=True,
+    )
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
@@ -817,7 +984,16 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             code_preview += "..."
         return f"[execute_code] `{code_preview}` ({line_count} lines output)"
 
-    if tool_name in {"skill_view", "skills_list", "skill_manage"}:
+    if tool_name == "skill_view":
+        name = args.get("name", "?")
+        if content_len > _SKILL_VIEW_PRUNE_MIN_CHARS:
+            return (
+                f"[skill_view] name={name} ({content_len:,} chars) "
+                + _skill_pruned_marker(str(name))
+            )
+        return f"[skill_view] name={name} ({content_len:,} chars)"
+
+    if tool_name in {"skills_list", "skill_manage"}:
         name = args.get("name", "?")
         return f"[{tool_name}] name={name} ({content_len:,} chars)"
 
@@ -1319,6 +1495,9 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        proactive_prune_tokens: int = 0,
+        proactive_prune_min_result_chars: int = 8000,
+        proactive_prune_min_reclaim_tokens: int = 4096,
     ):
         self.model = model
         self.base_url = base_url
@@ -1328,6 +1507,13 @@ class ContextCompressor(ContextEngine):
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        self.proactive_prune_tokens = max(0, int(proactive_prune_tokens or 0))
+        self.proactive_prune_min_result_chars = max(
+            200, int(proactive_prune_min_result_chars or 8000)
+        )
+        self.proactive_prune_min_reclaim_tokens = max(
+            0, int(proactive_prune_min_reclaim_tokens or 0)
+        )
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
@@ -1649,6 +1835,7 @@ class ContextCompressor(ContextEngine):
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
+        min_prune_chars: int = 200,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -1696,7 +1883,11 @@ class ContextCompressor(ContextEngine):
             # Token-budget approach: walk backward accumulating tokens
             accumulated = 0
             boundary = len(result)
-            min_protect = min(protect_tail_count, len(result))
+            min_protect = min(
+                protect_tail_count,
+                len(result),
+                _MAX_TAIL_MESSAGE_FLOOR,
+            )
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
                 msg_tokens = _estimate_msg_budget_tokens(msg)
@@ -1744,69 +1935,189 @@ class ContextCompressor(ContextEngine):
             else:
                 content_hashes[h] = (i, msg.get("tool_call_id", "?"))
 
-        # Pass 2: Replace old tool results with informative summaries
-        for i in range(prune_boundary):
-            msg = result[i]
-            if msg.get("role") != "tool":
-                continue
-            content = msg.get("content", "")
-            # Multimodal content (base64 screenshots etc.): strip the image
-            # payload — keep a lightweight text placeholder in its place.
-            # Without this, an old computer_use screenshot (~1MB base64 +
-            # ~1500 real tokens) survives every compression pass forever.
+        protected_skills = _collect_protected_skill_names(result, prune_boundary)
+
+        def _demote_tool_result_at(
+            index: int, *, spare_protected_skills: bool = True
+        ) -> bool:
+            nonlocal pruned
+            message = result[index]
+            if message.get("role") != "tool":
+                return False
+            content = message.get("content", "")
             if isinstance(content, list):
                 stripped = _strip_image_parts_from_parts(content)
-                if stripped is not None:
-                    result[i] = {**msg, "content": stripped}
-                    pruned += 1
-                continue
+                if stripped is None:
+                    return False
+                result[index] = {**message, "content": stripped}
+                pruned += 1
+                return True
             if isinstance(content, dict) and content.get("_multimodal"):
-                summary = content.get("text_summary") or "[screenshot removed to save context]"
-                result[i] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
+                summary = content.get("text_summary") or (
+                    "[screenshot removed to save context]"
+                )
+                result[index] = {
+                    **message,
+                    "content": f"[screenshot removed] {summary[:200]}",
+                }
                 pruned += 1
-                continue
+                return True
             if not isinstance(content, str):
-                continue
+                return False
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
-                continue
-            # Skip already-deduplicated or previously-summarized results
-            if content.startswith("[Duplicate tool output"):
-                continue
-            # Only prune if the content is substantial (>200 chars)
-            if len(content) > 200:
-                call_id = msg.get("tool_call_id", "")
-                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                summary = _summarize_tool_result(tool_name, tool_args, content)
-                result[i] = {**msg, "content": summary}
-                pruned += 1
+                return False
+            if content.startswith(("[Duplicate tool output", "[screenshot removed")):
+                return False
+            if content.startswith("[") and " chars)" in content and len(content) < 400:
+                return False
+            if len(content) <= min_prune_chars:
+                return False
 
-        # Pass 3: Truncate large tool_call arguments in assistant messages
-        # outside the protected tail. write_file with 50KB content, for
-        # example, survives pruning entirely without this.
-        #
-        # The shrinking is done inside the parsed JSON structure so the
-        # result remains valid JSON — otherwise downstream providers 400
-        # on every subsequent turn until the broken call falls out of
-        # the window. See ``_truncate_tool_call_args_json`` docstring.
-        for i in range(prune_boundary):
-            msg = result[i]
-            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
-                continue
-            new_tcs = []
+            call_id = message.get("tool_call_id", "")
+            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            if (
+                spare_protected_skills
+                and tool_name == "skill_view"
+                and protected_skills
+            ):
+                try:
+                    parsed_args = json.loads(tool_args) if tool_args else {}
+                except (json.JSONDecodeError, TypeError):
+                    parsed_args = {}
+                skill = (
+                    parsed_args.get("name", "")
+                    if isinstance(parsed_args, dict)
+                    else ""
+                )
+                if isinstance(skill, str) and skill.lower() in protected_skills:
+                    return False
+
+            result[index] = {
+                **message,
+                "content": _summarize_tool_result(tool_name, tool_args, content),
+            }
+            pruned += 1
+            return True
+
+        def _truncate_tool_call_args_at(index: int) -> bool:
+            message = result[index]
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                return False
+            new_tool_calls = []
             modified = False
-            for tc in msg["tool_calls"]:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
+            for tool_call in message["tool_calls"]:
+                if isinstance(tool_call, dict):
+                    args = tool_call.get("function", {}).get("arguments", "")
                     if len(args) > 500:
                         new_args = _truncate_tool_call_args_json(args)
                         if new_args != args:
-                            tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
+                            tool_call = {
+                                **tool_call,
+                                "function": {
+                                    **tool_call["function"],
+                                    "arguments": new_args,
+                                },
+                            }
                             modified = True
-                new_tcs.append(tc)
+                new_tool_calls.append(tool_call)
             if modified:
-                result[i] = {**msg, "tool_calls": new_tcs}
+                result[index] = {**message, "tool_calls": new_tool_calls}
+            return modified
+
+        # Ordinary passes spare recently loaded / actively referenced skills.
+        for index in range(max(0, prune_boundary)):
+            _demote_tool_result_at(index)
+        for index in range(max(0, prune_boundary)):
+            _truncate_tool_call_args_at(index)
+
+        # Under tail-budget pressure, completed tool bodies inside the protected
+        # region may be demoted. Keep the newest interaction where possible.
+        if protect_tail_tokens is not None and protect_tail_tokens > 0 and result:
+            soft_ceiling = int(protect_tail_tokens * 1.5)
+            keep_recent = min(_PRESSURE_KEEP_RECENT_MESSAGES, len(result))
+            demote_end = len(result) - keep_recent
+
+            def _protected_region_tokens() -> int:
+                return sum(
+                    _estimate_msg_budget_tokens(result[index])
+                    for index in range(max(0, prune_boundary), len(result))
+                )
+
+            if (
+                demote_end > prune_boundary
+                and _protected_region_tokens() > soft_ceiling
+            ):
+                for index in range(max(0, prune_boundary), demote_end):
+                    _demote_tool_result_at(index, spare_protected_skills=False)
+                    _truncate_tool_call_args_at(index)
+                    if _protected_region_tokens() <= soft_ceiling:
+                        break
+
+                if _protected_region_tokens() > soft_ceiling:
+                    last_tool_index = next(
+                        (
+                            index
+                            for index in range(len(result) - 1, -1, -1)
+                            if result[index].get("role") == "tool"
+                        ),
+                        None,
+                    )
+                    for index in range(max(0, prune_boundary), len(result)):
+                        if index == last_tool_index:
+                            continue
+                        if result[index].get("role") == "tool":
+                            _demote_tool_result_at(
+                                index, spare_protected_skills=False
+                            )
+                        elif result[index].get("role") == "assistant":
+                            _truncate_tool_call_args_at(index)
+                    if (
+                        last_tool_index is not None
+                        and last_tool_index >= prune_boundary
+                        and _protected_region_tokens() > soft_ceiling
+                    ):
+                        _demote_tool_result_at(
+                            last_tool_index, spare_protected_skills=False
+                        )
 
         return result, pruned
+
+    def prune_tool_results_only(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Deterministically prune stale tool payloads without an LLM call."""
+        if self.proactive_prune_tokens <= 0:
+            return messages, 0
+        if (
+            current_tokens is not None
+            and current_tokens < self.proactive_prune_tokens
+        ):
+            return messages, 0
+        if (
+            len(messages)
+            <= self.protect_last_n + self._protect_head_size(messages) + 1
+        ):
+            return messages, 0
+
+        pruned_messages, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=None,
+            min_prune_chars=self.proactive_prune_min_result_chars,
+        )
+        if not pruned_count:
+            return messages, 0
+
+        if self.proactive_prune_min_reclaim_tokens > 0:
+            before = sum(_estimate_msg_budget_tokens(message) for message in messages)
+            after = sum(
+                _estimate_msg_budget_tokens(message) for message in pruned_messages
+            )
+            if before - after < self.proactive_prune_min_reclaim_tokens:
+                return messages, 0
+        return pruned_messages, pruned_count
 
     # ------------------------------------------------------------------
     # Summarization
@@ -1831,6 +2142,7 @@ class ContextCompressor(ContextEngine):
     _CONTENT_TAIL = 1500      # chars kept from the end
     _TOOL_ARGS_MAX = 1500     # tool call argument chars
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
+    _SUMMARY_INPUT_MAX_CHARS = _SUMMARY_INPUT_MAX_CHARS
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
@@ -2109,10 +2421,35 @@ Continue from the most recent unfulfilled user ask and protected tail messages. 
 
 ## Critical Context
 Summary generation was unavailable, so this is a best-effort deterministic fallback for {len(turns_to_summarize)} compacted message(s).{reason_text}"""
+        pruned_skill_names = _collect_ghosted_skill_names(turns_to_summarize)
+        del pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
         summary = self._with_summary_prefix(redact_sensitive_text(body.strip()))
         if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
+        summary = _reinject_pruned_skill_markers(summary, pruned_skill_names)
         return summary
+
+    @classmethod
+    def _bound_summary_input(cls, content: str) -> str:
+        """Keep a bounded 45% head / 55% tail view for summary input."""
+        if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
+            return content
+
+        marker_template = (
+            "\n\n...[summary input truncated: omitted "
+            "{omitted:,} chars from the middle to keep compression prompt bounded]...\n\n"
+        )
+        marker = marker_template.format(omitted=len(content))
+        remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
+        head_chars = int(remaining * 0.45)
+        tail_chars = remaining - head_chars
+        omitted = max(len(content) - head_chars - tail_chars, 0)
+        marker = marker_template.format(omitted=omitted)
+        remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
+        head_chars = int(remaining * 0.45)
+        tail_chars = remaining - head_chars
+        tail = content[-tail_chars:].lstrip() if tail_chars else ""
+        return content[:head_chars].rstrip() + marker + tail
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -2174,6 +2511,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        pruned_skill_names = _collect_ghosted_skill_names(turns_to_summarize)
+        for name in _extract_pruned_skill_names(self._previous_summary or ""):
+            if name not in pruned_skill_names:
+                pruned_skill_names.append(name)
+        del pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
+        content_to_summarize = self._bound_summary_input(content_to_summarize)
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
             _sanitized_memory_context,
@@ -2315,18 +2658,25 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
+{_PRUNED_SKILLS_SECTION_HEADING}
+[Repeat each canonical [SKILL_PRUNED: ...reload with skill_view(...)] marker
+from the input verbatim. If none appear, omit this section.]
+
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress
+            _bounded_previous_summary = self._bound_summary_input(
+                self._previous_summary
+            )
             prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
 PREVIOUS SUMMARY:
-{self._previous_summary}
+{_bounded_previous_summary}
 
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
@@ -2427,6 +2777,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
+            summary = _reinject_pruned_skill_markers(summary, pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             # Store for iterative updates on next compaction
             self._previous_summary = summary

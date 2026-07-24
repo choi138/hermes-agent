@@ -161,6 +161,31 @@ class TestPlatformForwardedAtBoundary:
         assert kwargs.get("boundary_reason") == "compression"
 
 
+class TestSessionMetadataFollowsRotation:
+    def test_kanban_source_workspace_and_profile_follow_compression_child(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_KANBAN_ROT"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        db.create_session(
+            parent,
+            source="kanban",
+            cwd=str(workspace),
+            profile_name="coder",
+        )
+        agent = _build_agent_with_db(db, parent, platform="cli")
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = db.get_session(agent.session_id)
+        assert child["parent_session_id"] == parent
+        assert child["source"] == "kanban"
+        assert child["cwd"] == str(workspace)
+        assert child["profile_name"] == "coder"
+
+
 class TestFallbackStreakFollowsRotation:
     def test_fallback_boundary_persists_on_child_session(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")

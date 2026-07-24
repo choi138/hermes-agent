@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from gateway.tool_policy import (
     DISCORD_CORE_SCHEMA_BUDGET_BYTES,
@@ -437,3 +440,169 @@ def test_worker_env_narrows_inherited_orchestrator_and_intake_toolsets(monkeypat
         "kanban_create",
         "kanban_link",
     }
+
+
+def _provider_stop_response(text="done"):
+    message = SimpleNamespace(
+        content=text,
+        reasoning_content=None,
+        reasoning=None,
+        tool_calls=None,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        model="test/model",
+        usage=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "platform", "ops_allowed", "worker", "expected_names"),
+    [
+        (
+            "research-equivalent",
+            "discord",
+            False,
+            False,
+            {"kanban_task"},
+        ),
+        (
+            "coordinator-equivalent",
+            "discord",
+            True,
+            False,
+            {
+                "kanban_show",
+                "kanban_list",
+                "kanban_complete",
+                "kanban_block",
+                "kanban_heartbeat",
+                "kanban_comment",
+                "kanban_create",
+                "kanban_link",
+                "kanban_unblock",
+                "kanban_attach",
+                "kanban_attach_url",
+                "kanban_attachments",
+            },
+        ),
+        (
+            "coder-equivalent",
+            "cli",
+            False,
+            True,
+            {
+                "kanban_show",
+                "kanban_complete",
+                "kanban_block",
+                "kanban_heartbeat",
+                "kanban_comment",
+                "kanban_create",
+                "kanban_link",
+            },
+        ),
+    ],
+)
+def test_role_tool_policy_reaches_stable_provider_request_schema(
+    monkeypatch,
+    tmp_path,
+    role,
+    platform,
+    ops_allowed,
+    worker,
+    expected_names,
+):
+    """Cross the real gateway policy -> AIAgent -> provider-request boundary."""
+    import model_tools
+    from gateway.run import GatewayRunner
+    from hermes_cli import config as config_mod
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from tools.registry import invalidate_check_fn_cache
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if worker:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_boundary")
+        monkeypatch.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
+    else:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_STOP_NUDGE", raising=False)
+
+    config = {
+        "toolsets": ["kanban"],
+        "kanban": {
+            "discord_ops_users": ["user-1"] if ops_allowed else [],
+            "discord_ops_channels": ["channel-1"] if ops_allowed else [],
+        },
+        "compression": {"enabled": False},
+        "prompt_caching": {"cache_ttl": "5m"},
+        "sessions": {},
+        "bedrock": {},
+    }
+    monkeypatch.setattr(config_mod, "load_config", lambda: config)
+    policy = resolve_gateway_tool_policy(
+        config,
+        platform=platform,
+        source=_source(),
+        identity_profile=role,
+        enabled_toolsets=(
+            ["kanban", "kanban_submit"] if worker else ["kanban"]
+        ),
+    )
+
+    invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _provider_stop_response("first"),
+        _provider_stop_response("second"),
+    ]
+    try:
+        with patch("run_agent.OpenAI", return_value=client):
+            agent = AIAgent(
+                base_url="https://openrouter.ai/api/v1",
+                api_key="test-key",
+                model="test/model",
+                enabled_toolsets=list(policy.enabled_toolsets),
+                disabled_toolsets=[],
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=SessionDB(db_path=tmp_path / "state.db"),
+                session_id=f"policy-boundary-{role}",
+                platform=platform,
+            )
+        recorded_metrics = GatewayRunner._record_gateway_tool_policy(agent, policy)
+        agent._disable_streaming = True
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.save_trajectories = False
+
+        with (
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            first = agent.run_conversation("first request", conversation_history=[])
+            second = agent.run_conversation("second request", conversation_history=[])
+
+        assert first["completed"] is True
+        assert second["completed"] is True
+        assert client.chat.completions.create.call_count == 2
+        first_request = client.chat.completions.create.call_args_list[0].kwargs
+        second_request = client.chat.completions.create.call_args_list[1].kwargs
+        first_tools = first_request["tools"]
+        second_tools = second_request["tools"]
+        assert {tool["function"]["name"] for tool in first_tools} == expected_names
+        assert first_tools == second_tools == agent.tools
+        assert canonical_tool_schema_metrics(first_tools).schema_hash == (
+            recorded_metrics.schema_hash
+        )
+        assert canonical_tool_schema_metrics(second_tools).schema_hash == (
+            recorded_metrics.schema_hash
+        )
+        assert first_request["messages"][0] == second_request["messages"][0]
+    finally:
+        invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()

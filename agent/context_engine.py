@@ -187,6 +187,14 @@ class ContextEngine(ABC):
         NOT called per-turn — only when the session truly ends.
         """
 
+    def prune_tool_results_only(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Optionally trim old tool payloads without a full compression."""
+        return messages, 0
+
     def on_session_reset(self) -> None:
         """Called on /new or /reset. Reset per-session state.
 

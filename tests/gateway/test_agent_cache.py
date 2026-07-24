@@ -243,6 +243,15 @@ class TestExtractCacheBustingConfig:
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
 
+    def test_reads_compression_max_attempts_for_agent_cache_busting(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {"compression": {"max_attempts": 5}}
+        )
+
+        assert out["compression.max_attempts"] == 5
+
     def test_reads_checkpoint_subkeys(self):
         from gateway.run import GatewayRunner
 

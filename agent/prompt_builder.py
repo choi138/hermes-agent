@@ -177,7 +177,13 @@ SKILLS_GUIDANCE = (
     "skill with skill_manage so you can reuse it next time.\n"
     "When using a skill and finding it outdated, incomplete, or wrong, "
     "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Skills that aren't maintained become liabilities.\n"
+    "\n"
+    "## Skill Safety Rule\n"
+    "1. **UNAVAILABLE** — A marker beginning `[SKILL_PRUNED:` means the skill instructions were lost in compression.\n"
+    "2. **RELOAD** — Before depending on that skill, reload it with the exact `skill_view(name='...')` call in the marker.\n"
+    "3. **WAIT** — Do not act on the skill until the reload result is present.\n"
+    "4. **DEDUP** — After reloading a skill, ignore older prune markers for that same skill."
 )
 
 KANBAN_GUIDANCE = (

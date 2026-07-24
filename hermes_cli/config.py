@@ -1517,6 +1517,10 @@ DEFAULT_CONFIG = {
                                       # set this above 0.75 to override the floor.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        "max_attempts": 3,            # per-turn compression retry rounds; valid 1..10
+        "proactive_prune_tokens": 0,  # opt-in deterministic tool-result prune trigger
+        "proactive_prune_min_result_chars": 8000,
+        "proactive_prune_min_reclaim_tokens": 4096,
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
