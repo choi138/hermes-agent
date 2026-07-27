@@ -2700,6 +2700,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        # Record WHY the fallback activated so plugins (e.g. capability
+        # gates) can distinguish a refusal-driven temporary swap from any
+        # other fallback state.  Only set on the success path — exhaustion
+        # and skip paths must not leave a stale reason behind.
+        agent._fallback_reason = reason.value if reason is not None else None
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2882,6 +2887,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        # Publish the mid-turn swap on the runtime_state hook so guardrail
+        # plugins (skill-gate) see the new model/provider + fallback_reason
+        # immediately.  Best-effort: activation must never fail because a
+        # plugin hook failed.  Local import — runtime_control is core-owned
+        # and pulling it at module scope risks an import cycle.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state fallback event failed: %s", _hook_err)
         activated = True
     except Exception as e:
         if fb_provider == "nous":

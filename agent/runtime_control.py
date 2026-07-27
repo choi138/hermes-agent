@@ -70,6 +70,8 @@ def get_runtime_state(agent: Any) -> Dict[str, Any]:
         "reasoning": _reasoning_state(agent),
         "turn_override_active": hasattr(agent, "_runtime_turn_restore_snapshot"),
         "model_source": getattr(agent, "_runtime_model_source", None) or "agent",
+        "fallback_activated": bool(getattr(agent, "_fallback_activated", False)),
+        "fallback_reason": getattr(agent, "_fallback_reason", None),
     }
 
 
@@ -277,6 +279,7 @@ def snapshot_runtime(agent: Any) -> Dict[str, Any]:
         "fallback_model": copy.deepcopy(getattr(agent, "_fallback_model", None)),
         "fallback_index": getattr(agent, "_fallback_index", None),
         "fallback_activated": getattr(agent, "_fallback_activated", None),
+        "fallback_reason": getattr(agent, "_fallback_reason", None),
     }
 
 
@@ -324,6 +327,7 @@ def restore_runtime(agent: Any, snapshot: Dict[str, Any]) -> None:
         ("_fallback_model", "fallback_model"),
         ("_fallback_index", "fallback_index"),
         ("_fallback_activated", "fallback_activated"),
+        ("_fallback_reason", "fallback_reason"),
     ):
         if key in snapshot:
             setattr(agent, attr, copy.deepcopy(snapshot.get(key)))
@@ -876,6 +880,7 @@ def model_switch(
                     "fallback_model": copy.deepcopy(getattr(agent, "_fallback_model", None)),
                     "fallback_index": getattr(agent, "_fallback_index", None),
                     "fallback_activated": getattr(agent, "_fallback_activated", None),
+                    "fallback_reason": getattr(agent, "_fallback_reason", None),
                 }
             )
         if parsed_reasoning is not None:
