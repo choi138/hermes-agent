@@ -2704,7 +2704,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # gates) can distinguish a refusal-driven temporary swap from any
         # other fallback state.  Only set on the success path — exhaustion
         # and skip paths must not leave a stale reason behind.
-        agent._fallback_reason = reason.value if reason is not None else None
+        agent._fallback_reason = getattr(reason, "value", None)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream

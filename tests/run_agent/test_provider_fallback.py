@@ -979,3 +979,86 @@ class TestEndpointOriginNormalization:
             FailoverReason.server_error,
             FailoverReason.overloaded,
         })
+
+
+# ── Declared api_mode wins over URL heuristics ───────────────────────────
+
+
+class TestDeclaredFallbackApiMode:
+    def test_config_provider_api_mode_wins_over_heuristics(self):
+        """A user config provider (providers.<name>.api_mode) serving
+        anthropic_messages on a private host must not be misrouted to
+        chat_completions by the URL heuristics (claude-lb style proxy)."""
+        fbs = [{"provider": "claude-lb", "model": "claude-opus-5"}]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="http://10.0.0.114:2455"),
+                    "claude-opus-5",
+                ),
+            ),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "providers": {
+                        "claude-lb": {
+                            "base_url": "http://10.0.0.114:2455",
+                            "api_mode": "anthropic_messages",
+                        }
+                    }
+                },
+            ),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.api_mode == "anthropic_messages"
+
+    def test_chain_entry_api_mode_wins_over_provider_config(self):
+        fbs = [
+            {
+                "provider": "claude-lb",
+                "model": "claude-opus-5",
+                "api_mode": "anthropic_messages",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="http://10.0.0.114:2455"),
+                    "claude-opus-5",
+                ),
+            ),
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.api_mode == "anthropic_messages"
+
+    def test_invalid_declared_api_mode_falls_back_to_heuristics(self):
+        """A typo'd api_mode must degrade to the URL heuristics (default
+        chat_completions on an unrecognized host), not a broken transport."""
+        fbs = [
+            {
+                "provider": "claude-lb",
+                "model": "claude-opus-5",
+                "api_mode": "anthropic-messages",  # wrong separator
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="http://10.0.0.114:2455"),
+                    "claude-opus-5",
+                ),
+            ),
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.api_mode == "chat_completions"
