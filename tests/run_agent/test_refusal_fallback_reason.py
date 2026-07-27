@@ -13,14 +13,17 @@ Covers:
 4. The runtime_state hook fires on activation (event="fallback") and
    restoration (event="restore")
 5. switch_model and the transport-recovery reset clear the reason
+6. The conversation-loop refusal branches forward the reason into
+   ``_try_activate_fallback()`` (the wiring skill-gate depends on)
 """
 
-import inspect
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.error_classifier import FailoverReason
 from agent.runtime_control import get_runtime_state
+from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
 from run_agent import AIAgent
 
 
@@ -51,6 +54,13 @@ def _mock_client(base_url="https://api.example.com/v1", api_key="fb-key"):
 
 
 _FB = {"provider": "openai", "model": "gpt-4o"}
+
+
+def _loop_response(content="Recovered on fallback.", finish_reason="stop"):
+    """Minimal OpenAI-style response for driving run_conversation()."""
+    msg = SimpleNamespace(content=content, tool_calls=None)
+    choice = SimpleNamespace(index=0, message=msg, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
 # ── Reason recorded on activation ─────────────────────────────────────────
@@ -266,15 +276,40 @@ class TestOtherResetPaths:
 
     def test_transport_recovery_reset_clears_reason(self):
         """The transport-recovery reset lives inline in run_conversation's
-        retry loop and is not separately callable; assert at the source level
-        that it clears _fallback_reason alongside _fallback_activated."""
-        from agent import conversation_loop
+        retry loop; drive retry exhaustion into a (mocked) successful
+        primary-transport recovery and assert the reset clears
+        _fallback_reason alongside _fallback_activated.  The cleared reason
+        is stale pre-recovery bookkeeping — _try_recover_primary_transport
+        refuses while a fallback is actually live — so seed the stale shape:
+        a burned chain index with a recorded reason but no activation."""
 
-        source = inspect.getsource(conversation_loop)
-        anchor = source.index("Re-open fallback state")
-        block = source[anchor:anchor + 600]
-        assert "agent._fallback_activated = False" in block
-        assert "agent._fallback_reason = None" in block
+        class ReadTimeout(Exception):
+            pass
+
+        agent = _make_agent(fallback_model=[_FB])
+        agent._api_max_retries = 2
+        agent._fallback_index = len(agent._fallback_chain)
+        agent._fallback_reason = "content_policy_blocked"
+
+        responses = [
+            ReadTimeout("read timed out"),
+            ReadTimeout("read timed out"),
+            _loop_response("Recovered on rebuilt primary."),
+        ]
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=responses),
+            patch.object(agent, "_try_recover_primary_transport", return_value=True),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Recovered on rebuilt primary."
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
 
     def test_runtime_snapshot_roundtrip_carries_reason(self):
         """snapshot_runtime/restore_runtime must copy the reason with the flag."""
@@ -292,4 +327,83 @@ class TestOtherResetPaths:
         with patch("run_agent.OpenAI", return_value=MagicMock()):
             restore_runtime(agent, snapshot)
         assert agent._fallback_activated is True
+        assert agent._fallback_reason == "content_policy_blocked"
+
+
+# ── Conversation-loop call sites forward the reason ───────────────────────
+
+
+class TestLoopCallSitesForwardReason:
+    """Drive run_conversation() through each refusal branch and assert the
+    call site forwards the reason into ``_try_activate_fallback()``.  This
+    is the linchpin wiring for skill-gate's refusal-fallback exemption: if
+    a rebase or refactor drops the kwarg, the reason stays None and the
+    exemption goes permanently dead with no other test failing."""
+
+    def _run(self, agent, responses):
+        """Run one turn with ``_interruptible_api_call`` staged and a spy
+        wrapping the real ``_try_activate_fallback`` (activation succeeds
+        via the patched provider resolver)."""
+        real_activate = agent._try_activate_fallback
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=responses),
+            patch.object(agent, "_try_activate_fallback",
+                         side_effect=real_activate) as spy,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+        return result, spy
+
+    def test_http200_content_filter_branch_forwards_reason(self):
+        """HTTP-200 refusal (finish_reason="content_filter") must activate
+        the fallback with reason=content_policy_blocked."""
+        agent = _make_agent(fallback_model=[_FB])
+        refusal = _loop_response(content="", finish_reason="content_filter")
+        result, spy = self._run(agent, [refusal, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_midstream_content_filter_stub_forwards_reason(self):
+        """A content-filter-terminated partial-stream stub (#32421) must
+        activate the fallback with reason=content_policy_blocked."""
+        agent = _make_agent(fallback_model=[_FB])
+        stub = SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(content="partial ", tool_calls=None),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+            _content_filter_terminated=True,
+        )
+        result, spy = self._run(agent, [stub, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_nonretryable_refusal_exception_forwards_classified_reason(self):
+        """A status-less safety refusal raised as an exception (#18028
+        shape) must reach the is_client_error branch and forward
+        classified.reason into the activation."""
+        agent = _make_agent(fallback_model=[_FB])
+        refusal_exc = Exception(
+            "This content was flagged for possible cybersecurity risk."
+        )
+        result, spy = self._run(agent, [refusal_exc, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
         assert agent._fallback_reason == "content_policy_blocked"
