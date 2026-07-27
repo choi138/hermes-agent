@@ -320,8 +320,11 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
         call_order.append("kill_all")
         return 2
 
-    def _fake_cleanup_envs():
+    cleanup_budgets: list[float | None] = []
+
+    def _fake_cleanup_envs(*, shutdown_budget_seconds=None):
         call_order.append("cleanup_environments")
+        cleanup_budgets.append(shutdown_budget_seconds)
 
     def _fake_cleanup_browsers():
         call_order.append("cleanup_browsers")
@@ -357,6 +360,48 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     )
     # Defense-in-depth final cleanup still runs.
     assert call_order.count("kill_all") >= 2
+    # Environment sync-back is deliberately deferred until the final phase so
+    # the eager post-interrupt process kill cannot wedge on remote I/O.
+    assert call_order.count("cleanup_environments") == 1
+    assert call_order.index("cleanup_environments") > first_disconnect
+    assert len(cleanup_budgets) == 1
+    assert cleanup_budgets[0] is not None
+    assert 0 <= cleanup_budgets[0] <= 10.0
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_passes_positive_environment_cleanup_budget(monkeypatch):
+    runner, adapter = make_restart_runner()
+    cleanup_budgets: list[float | None] = []
+
+    import tools.browser_tool as _bt
+    import tools.process_registry as _pr
+    import tools.terminal_tool as _tt
+
+    monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
+    monkeypatch.setattr(
+        _tt,
+        "cleanup_all_environments",
+        lambda *, shutdown_budget_seconds=None: cleanup_budgets.append(
+            shutdown_budget_seconds
+        ),
+    )
+    monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
+
+    async def _disconnect():
+        return None
+
+    adapter.disconnect = _disconnect
+    runner._running_agents = {}
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    assert len(cleanup_budgets) == 1
+    assert cleanup_budgets[0] is not None
+    assert 0 < cleanup_budgets[0] <= 10.0
 
 
 @pytest.mark.asyncio
@@ -378,7 +423,9 @@ async def test_gateway_stop_kills_tool_subprocesses_on_graceful_path(monkeypatch
     import tools.terminal_tool as _tt
     import tools.browser_tool as _bt
     monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
-    monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+    monkeypatch.setattr(
+        _tt, "cleanup_all_environments", lambda **_kwargs: None
+    )
     monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
 
     # No running agents → drain returns immediately, no timeout, no eager cleanup.

@@ -33,7 +33,7 @@ def test_deferred_sigint_redelivered_via_raise_signal(tmp_path, monkeypatch):
 
     # Simulate a Ctrl+C arriving during the sync body: invoke the deferring
     # handler that _sync_back_once installed, so `deferred_sigint` is populated.
-    def fake_locked(lock_path):
+    def fake_locked(lock_path, bulk_download_fn, deadline):
         signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
 
     monkeypatch.setattr(mgr, "_sync_back_locked", fake_locked)
@@ -48,7 +48,7 @@ def test_deferred_sigint_redelivered_via_raise_signal(tmp_path, monkeypatch):
         lambda pid, sig: killed.append((pid, sig)),
     )
 
-    mgr._sync_back_once(tmp_path / "sync.lock")
+    mgr._sync_back_once(tmp_path / "sync.lock", lambda _dest: None, None)
 
     # The deferred Ctrl+C is re-delivered cross-platform via raise_signal,
     assert raised == [signal.SIGINT]

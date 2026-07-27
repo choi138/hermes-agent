@@ -265,7 +265,14 @@ class FileSyncManager:
     # Sync-back: pull remote changes to host on teardown
     # ------------------------------------------------------------------
 
-    def sync_back(self, hermes_home: Path | None = None) -> None:
+    def sync_back(
+        self,
+        hermes_home: Path | None = None,
+        *,
+        max_attempts: int | None = None,
+        bulk_download_fn: BulkDownloadFn | None = None,
+        deadline: float | None = None,
+    ) -> None:
         """Pull remote changes back to the host filesystem.
 
         Downloads the remote ``.hermes/`` directory as a tar archive,
@@ -274,8 +281,19 @@ class FileSyncManager:
 
         Protected against SIGINT (defers the signal until complete) and
         serialized across concurrent gateway sandboxes via file lock.
+
+        The optional controls are used by bounded gateway shutdown cleanup.
+        Normal teardown retains the historical three attempts and backend
+        downloader. A shutdown caller can select one attempt, provide a
+        transport callback with a shorter timeout, and bound lock acquisition
+        with an absolute monotonic *deadline*.
         """
-        if self._bulk_download_fn is None:
+        download_fn = (
+            self._bulk_download_fn
+            if bulk_download_fn is None
+            else bulk_download_fn
+        )
+        if download_fn is None:
             return
 
         # Nothing was ever committed through this manager — the initial
@@ -288,24 +306,51 @@ class FileSyncManager:
         lock_path = (hermes_home or get_hermes_home()) / ".sync.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
+        attempt_limit = (
+            _SYNC_BACK_MAX_RETRIES if max_attempts is None else max_attempts
+        )
+        if attempt_limit < 1:
+            raise ValueError("max_attempts must be at least 1")
+
         last_exc: Exception | None = None
-        for attempt in range(_SYNC_BACK_MAX_RETRIES):
+        attempts_run = 0
+        for attempt in range(attempt_limit):
+            if deadline is not None and _monotonic() >= deadline:
+                last_exc = TimeoutError("sync_back deadline expired")
+                break
             try:
-                self._sync_back_once(lock_path)
+                attempts_run += 1
+                self._sync_back_once(lock_path, download_fn, deadline)
                 return
             except Exception as exc:
                 last_exc = exc
-                if attempt < _SYNC_BACK_MAX_RETRIES - 1:
-                    delay = _SYNC_BACK_BACKOFF[attempt]
+                if attempt < attempt_limit - 1:
+                    delay = _SYNC_BACK_BACKOFF[
+                        min(attempt, len(_SYNC_BACK_BACKOFF) - 1)
+                    ]
+                    if deadline is not None:
+                        remaining = deadline - _monotonic()
+                        if remaining <= 0:
+                            break
+                        delay = min(delay, remaining)
                     logger.warning(
                         "sync_back: attempt %d failed (%s), retrying in %ds",
                         attempt + 1, exc, delay,
                     )
                     _sleep(delay)
 
-        logger.warning("sync_back: all %d attempts failed: %s", _SYNC_BACK_MAX_RETRIES, last_exc)
+        logger.warning(
+            "sync_back: all %d attempts failed: %s",
+            attempts_run,
+            last_exc,
+        )
 
-    def _sync_back_once(self, lock_path: Path) -> None:
+    def _sync_back_once(
+        self,
+        lock_path: Path,
+        bulk_download_fn: BulkDownloadFn,
+        deadline: float | None,
+    ) -> None:
         """Single sync-back attempt with SIGINT protection and file lock."""
         # signal.signal() only works from the main thread. In gateway
         # contexts cleanup() may run from a worker thread — skip SIGINT
@@ -323,7 +368,7 @@ class FileSyncManager:
 
             signal.signal(signal.SIGINT, _defer_sigint)
         try:
-            self._sync_back_locked(lock_path)
+            self._sync_back_locked(lock_path, bulk_download_fn, deadline)
         finally:
             if on_main_thread and original_handler is not None:
                 signal.signal(signal.SIGINT, original_handler)
@@ -340,28 +385,47 @@ class FileSyncManager:
                     # ``raise()`` on every platform.
                     signal.raise_signal(signal.SIGINT)
 
-    def _sync_back_locked(self, lock_path: Path) -> None:
+    def _sync_back_locked(
+        self,
+        lock_path: Path,
+        bulk_download_fn: BulkDownloadFn,
+        deadline: float | None,
+    ) -> None:
         """Sync-back under file lock (serializes concurrent gateways)."""
         if fcntl is None:
             # Windows: no flock — run without serialization
-            self._sync_back_impl()
+            self._sync_back_impl(bulk_download_fn)
             return
         lock_fd = open(lock_path, "w", encoding="utf-8")
+        lock_acquired = False
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            self._sync_back_impl()
+            if deadline is None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                lock_acquired = True
+            else:
+                while True:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lock_acquired = True
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - _monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "sync_back deadline expired waiting for file lock"
+                            )
+                        _sleep(min(0.05, remaining))
+            self._sync_back_impl(bulk_download_fn)
         finally:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except (OSError, IOError):
-                pass
+            if lock_acquired:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
             lock_fd.close()
 
-    def _sync_back_impl(self) -> None:
+    def _sync_back_impl(self, bulk_download_fn: BulkDownloadFn) -> None:
         """Download, diff, and apply remote changes to host."""
-        if self._bulk_download_fn is None:
-            raise RuntimeError("_sync_back_impl called without bulk_download_fn")
-
         # Cache file mapping once to avoid O(n*m) from repeated iteration
         try:
             file_mapping = list(self._get_files_fn())
@@ -369,7 +433,7 @@ class FileSyncManager:
             file_mapping = []
 
         with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
-            self._bulk_download_fn(Path(tf.name))
+            bulk_download_fn(Path(tf.name))
 
             # Defensive size cap: a misbehaving sandbox could produce an
             # arbitrarily large tar. Refuse to extract if it exceeds the cap.

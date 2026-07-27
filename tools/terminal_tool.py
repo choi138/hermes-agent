@@ -48,6 +48,7 @@ from typing import Optional, Dict, Any, List
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
 
 
 # ---------------------------------------------------------------------------
@@ -1762,18 +1763,45 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 
-def cleanup_all_environments():
-    """Clean up ALL active environments. Use with caution."""
-    task_ids = list(_active_environments.keys())
+def cleanup_all_environments(*, shutdown_budget_seconds: float | None = None):
+    """Clean up ALL active environments. Use with caution.
+
+    When *shutdown_budget_seconds* is provided, every environment shares one
+    monotonic deadline. Shutdown-aware backends use their remaining slice
+    rather than each consuming a full transport timeout.
+    """
+    with _env_lock:
+        task_ids = list(_active_environments.keys())
+    shutdown_deadline = None
+    if shutdown_budget_seconds is not None:
+        shutdown_deadline = _monotonic() + max(
+            0.0, float(shutdown_budget_seconds)
+        )
     cleaned = 0
     
     for task_id in task_ids:
         try:
-            cleanup_vm(task_id)
+            remaining = None
+            if shutdown_deadline is not None:
+                remaining = max(0.0, shutdown_deadline - _monotonic())
+            cleanup_vm(task_id, shutdown_timeout_seconds=remaining)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
-    
+
+    # Orphan directory reclamation is not required for process correctness and
+    # can be arbitrarily expensive. Leave it to normal cleanup / next startup
+    # when gateway shutdown is operating under a service-manager deadline.
+    if shutdown_deadline is not None:
+        if _monotonic() >= shutdown_deadline:
+            logger.warning(
+                "Environment shutdown cleanup exhausted its %.1fs budget",
+                max(0.0, float(shutdown_budget_seconds)),
+            )
+        if cleaned > 0:
+            logger.info("Cleaned %d environments", cleaned)
+        return cleaned
+
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
     import glob
@@ -1789,7 +1817,12 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str, *, force_remove: bool = False):
+def cleanup_vm(
+    task_id: str,
+    *,
+    force_remove: bool = False,
+    shutdown_timeout_seconds: float | None = None,
+):
     """Manually clean up a specific environment by task_id.
 
     *force_remove* (default False) is forwarded to backends that accept it
@@ -1838,10 +1871,17 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
             # (DockerEnvironment after issue #20561; other backends don't).
             import inspect
             sig = inspect.signature(env.cleanup)
+            cleanup_kwargs = {}
             if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
-            else:
-                env.cleanup()
+                cleanup_kwargs["force_remove"] = force_remove
+            if (
+                shutdown_timeout_seconds is not None
+                and "shutdown_timeout_seconds" in sig.parameters
+            ):
+                cleanup_kwargs["shutdown_timeout_seconds"] = (
+                    shutdown_timeout_seconds
+                )
+            env.cleanup(**cleanup_kwargs)
         elif hasattr(env, 'stop'):
             env.stop()
         elif hasattr(env, 'terminate'):

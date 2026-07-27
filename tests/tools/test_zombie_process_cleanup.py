@@ -118,6 +118,27 @@ class TestAgentCloseMethod:
                 mock_cleanup_vm.assert_called_once_with("test-close-cleanup")
                 mock_cleanup_browser.assert_called_once_with("test-close-cleanup")
 
+    def test_shutdown_deadline_bounds_terminal_cleanup(self):
+        """Gateway shutdown must not fall back to the normal 120s SSH path."""
+        import time
+        from unittest.mock import patch
+
+        with patch("run_agent.AIAgent.__init__", return_value=None):
+            from run_agent import AIAgent
+
+            agent = AIAgent.__new__(AIAgent)
+            agent.session_id = "test-close-shutdown-budget"
+            agent._active_children = []
+            agent._active_children_lock = threading.Lock()
+            agent.client = None
+
+            deadline = time.monotonic() + 10.0
+            with patch("run_agent.cleanup_vm") as mock_cleanup_vm:
+                agent.close(shutdown_deadline=deadline)
+
+            kwargs = mock_cleanup_vm.call_args.kwargs
+            assert 0 < kwargs["shutdown_timeout_seconds"] <= 10.0
+
     def test_close_is_idempotent(self):
         """close() can be called multiple times without error."""
         from unittest.mock import patch

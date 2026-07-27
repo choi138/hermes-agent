@@ -163,6 +163,18 @@ class TestSSHBulkDownload:
         call_kwargs = mock_run.call_args
         assert call_kwargs.kwargs.get("timeout") == 120 or call_kwargs[1].get("timeout") == 120
 
+    def test_ssh_bulk_download_accepts_shutdown_timeout(self, ssh_mock_env, tmp_path):
+        dest = tmp_path / "backup.tar"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as mock_run:
+            ssh_mock_env._ssh_bulk_download(dest, timeout=3.25)
+
+        assert mock_run.call_args.kwargs["timeout"] == 3.25
+
 
 class TestSSHCleanup:
     """Verify SSH cleanup() calls sync_back() before closing ControlMaster."""
@@ -224,6 +236,22 @@ class TestSSHCleanup:
         env.cleanup()
 
         assert calls == ["sync_back"]
+
+    def test_shutdown_cleanup_uses_one_bounded_sync_attempt(self, ssh_mock_env):
+        sync_manager = MagicMock()
+        ssh_mock_env._sync_manager = sync_manager
+        ssh_mock_env.control_socket = Path("/nonexistent/socket")
+        ssh_mock_env._ssh_bulk_download = MagicMock()
+
+        ssh_mock_env.cleanup(shutdown_timeout_seconds=10.0)
+
+        kwargs = sync_manager.sync_back.call_args.kwargs
+        assert kwargs["max_attempts"] == 1
+        assert kwargs["deadline"] is not None
+        bounded_download = kwargs["bulk_download_fn"]
+        bounded_download(Path("/tmp/shutdown-sync.tar"))
+        timeout = ssh_mock_env._ssh_bulk_download.call_args.kwargs["timeout"]
+        assert 0 < timeout <= 10.0
 
     def test_ssh_cleanup_calls_sync_back_before_control_exit(self, monkeypatch):
         """sync_back() must run before the ControlMaster exit command."""

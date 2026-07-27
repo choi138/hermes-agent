@@ -35,6 +35,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -3614,7 +3615,7 @@ class AIAgent:
         except Exception:
             pass
 
-    def close(self) -> None:
+    def close(self, *, shutdown_deadline: float | None = None) -> None:
         """Release all resources held by this agent instance.
 
         Cleans up subprocess resources that would otherwise become orphans:
@@ -3626,6 +3627,8 @@ class AIAgent:
 
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
+        During gateway shutdown, *shutdown_deadline* bounds terminal sandbox
+        sync-back without changing the normal session-close timeout policy.
         """
         task_id = getattr(self, "session_id", None) or ""
 
@@ -3638,7 +3641,15 @@ class AIAgent:
 
         # 2. Clean terminal sandbox environments
         try:
-            cleanup_vm(task_id)
+            if shutdown_deadline is None:
+                cleanup_vm(task_id)
+            else:
+                cleanup_vm(
+                    task_id,
+                    shutdown_timeout_seconds=max(
+                        0.0, shutdown_deadline - time.monotonic()
+                    ),
+                )
         except Exception:
             pass
 
@@ -3655,7 +3666,20 @@ class AIAgent:
                 self._active_children.clear()
             for child in children:
                 try:
-                    child.close()
+                    close_fn = child.close
+                    supports_shutdown_deadline = False
+                    if shutdown_deadline is not None:
+                        try:
+                            supports_shutdown_deadline = (
+                                "shutdown_deadline"
+                                in inspect.signature(close_fn).parameters
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if supports_shutdown_deadline:
+                        close_fn(shutdown_deadline=shutdown_deadline)
+                    else:
+                        close_fn()
                 except Exception:
                     pass
         except Exception:

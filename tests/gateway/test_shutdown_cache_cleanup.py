@@ -73,10 +73,12 @@ class _FakeGateway:
         # inline in tests so the bounded-cleanup path is exercised.
         return func(*args)
 
-    async def _cleanup_agent_resources_off_loop(self, agent, *, context=""):
+    async def _cleanup_agent_resources_off_loop(
+        self, agent, *, context="", shutdown_deadline=None
+    ):
         # Mirror the real bounded helper, inline (no executor/timeout) so the
         # fake exercises the same call shape stop() now uses.
-        self._cleanup_agent_resources(agent)
+        self._cleanup_agent_resources(agent, shutdown_deadline)
 
     async def _notify_active_sessions_of_shutdown(self):
         pass
@@ -87,11 +89,13 @@ class _FakeGateway:
     async def _drain_active_agents(self, timeout):
         return {}, False
 
-    async def _finalize_shutdown_agents(self, agents):
+    async def _finalize_shutdown_agents(
+        self, agents, *, shutdown_deadline=None
+    ):
         for agent in agents.values():
-            self._cleanup_agent_resources(agent)
+            self._cleanup_agent_resources(agent, shutdown_deadline)
 
-    def _cleanup_agent_resources(self, agent):
+    def _cleanup_agent_resources(self, agent, shutdown_deadline=None):
         if agent is None:
             return
         try:

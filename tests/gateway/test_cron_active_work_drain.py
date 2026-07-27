@@ -143,7 +143,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         sched._running_job_ids.add("job-1")
 
         monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
-        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda **_kwargs: None)
         monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
 
         marked_calls = []
@@ -175,7 +175,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         adapter.disconnect = _make_async_noop()
 
         monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
-        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda **_kwargs: None)
         monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
 
         with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"), \

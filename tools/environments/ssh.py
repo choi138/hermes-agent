@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _popen_bash
@@ -24,9 +25,12 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 _BULK_UPLOAD_TIMEOUT_SECONDS = 120
+_BULK_DOWNLOAD_TIMEOUT_SECONDS = 120
 _LOCAL_TAR_EXIT_TIMEOUT_SECONDS = 10
+_SHUTDOWN_CONTROL_EXIT_RESERVE_SECONDS = 1.0
 _MAX_PROCESS_STDERR_BYTES = 16 * 1024
 _PIPE_READ_BYTES = 8192
+_monotonic = time.monotonic
 
 
 class _BoundedPipeDrain:
@@ -517,7 +521,12 @@ class SSHEnvironment(BaseEnvironment):
 
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
-    def _ssh_bulk_download(self, dest: Path) -> None:
+    def _ssh_bulk_download(
+        self,
+        dest: Path,
+        *,
+        timeout: float = _BULK_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> None:
         """Download writable mirrored roots as one tar archive.
 
         Credentials are upload-only. Skills, external skills, and cache files
@@ -539,7 +548,7 @@ class SSHEnvironment(BaseEnvironment):
                 stdin=subprocess.DEVNULL,
                 stdout=f,
                 stderr=subprocess.PIPE,
-                timeout=120,
+                timeout=timeout,
             )
         if result.returncode != 0:
             raise RuntimeError(f"SSH bulk download failed: {result.stderr.decode(errors='replace').strip()}")
@@ -579,7 +588,7 @@ class SSHEnvironment(BaseEnvironment):
 
         return _popen_bash(cmd, stdin_data)
 
-    def cleanup(self):
+    def cleanup(self, *, shutdown_timeout_seconds: float | None = None):
         # Serialize ownership transfer so concurrent cleanup callers (including
         # BaseEnvironment.__del__) cannot sync back or close this master twice.
         with self._cleanup_lock:
@@ -588,21 +597,60 @@ class SSHEnvironment(BaseEnvironment):
             self._cleaned = True
             sync_manager = self._sync_manager
             self._sync_manager = None
+            shutdown_deadline = None
+            sync_deadline = None
+            if shutdown_timeout_seconds is not None:
+                shutdown_timeout_seconds = max(
+                    0.0, float(shutdown_timeout_seconds)
+                )
+                shutdown_deadline = _monotonic() + shutdown_timeout_seconds
+                control_reserve = min(
+                    _SHUTDOWN_CONTROL_EXIT_RESERVE_SECONDS,
+                    shutdown_timeout_seconds / 2,
+                )
+                sync_deadline = shutdown_deadline - control_reserve
             try:
                 if sync_manager is not None:
                     logger.info("SSH: syncing files from sandbox...")
-                    sync_manager.sync_back()
+                    if sync_deadline is None:
+                        sync_manager.sync_back()
+                    elif sync_deadline > _monotonic():
+                        def _bounded_download(dest: Path) -> None:
+                            remaining = sync_deadline - _monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError(
+                                    "SSH shutdown sync-back deadline expired"
+                                )
+                            self._ssh_bulk_download(dest, timeout=remaining)
+
+                        sync_manager.sync_back(
+                            max_attempts=1,
+                            bulk_download_fn=_bounded_download,
+                            deadline=sync_deadline,
+                        )
+                    else:
+                        logger.warning(
+                            "SSH: shutdown sync-back skipped because its "
+                            "cleanup budget is exhausted"
+                        )
             finally:
                 if self.control_socket.exists():
                     try:
-                        cmd = ["ssh", "-o", f"ControlPath={self.control_socket}",
-                               "-O", "exit", f"{self.user}@{self.host}"]
-                        subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            timeout=5,
-                            stdin=subprocess.DEVNULL,
-                        )
+                        control_timeout = 5.0
+                        if shutdown_deadline is not None:
+                            control_timeout = min(
+                                control_timeout,
+                                max(0.0, shutdown_deadline - _monotonic()),
+                            )
+                        if control_timeout > 0:
+                            cmd = ["ssh", "-o", f"ControlPath={self.control_socket}",
+                                   "-O", "exit", f"{self.user}@{self.host}"]
+                            subprocess.run(
+                                cmd,
+                                capture_output=True,
+                                timeout=control_timeout,
+                                stdin=subprocess.DEVNULL,
+                            )
                     except (OSError, subprocess.SubprocessError):
                         pass
                     try:
