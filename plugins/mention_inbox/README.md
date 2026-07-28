@@ -1,9 +1,10 @@
 # Unified Mention Inbox event contract
 
-This package defines the versioned domain contract shared by the future GitHub,
-Slack, and Notion mention collectors. It is deliberately inert in P3-M1: there
-is no plugin manifest, registration hook, network client, credential lookup,
-prompt builder, or external write path.
+This package defines the versioned domain contract shared by GitHub, Slack, and
+Notion mention collectors. P3-M2 also provides an explicitly invoked,
+read-only GitHub Notifications pilot and a profile-scoped SQLite store. It
+remains unregistered: there is no plugin manifest, scheduler, gateway hook,
+credential lookup, prompt builder, or external write path.
 
 ## Public API
 
@@ -110,7 +111,7 @@ the same value.
 
 ## Expected adapter identity mapping
 
-These are M2-M4 implementation constraints, not live integrations in M1.
+GitHub is implemented by P3-M2; Slack and Notion remain constraints for M3/M4.
 
 | Source | `source.event_id` | `actor.actor_id` | `target.target_id` | Thread/container |
 |---|---|---|---|---|
@@ -182,3 +183,143 @@ Not included:
 - LLM summarization or reply drafting,
 - any acknowledgement, comment, review, message, or external write,
 - deployment, gateway restart, or live canary.
+
+## P3-M2 GitHub Notifications pilot
+
+### Components
+
+- `github_client.py` is a GET-only stdlib client for GitHub REST API version
+  `2026-03-10`.
+- `github_collector.py` filters and normalizes notification fixtures into the
+  v1 contract.
+- `store.py` persists canonical events, source revisions, cursors, and
+  secret-safe collector health.
+- `runtime.py` executes one bounded poll. It does not sleep, schedule itself,
+  register with the gateway, or start a background process.
+
+The public construction sequence is explicit:
+
+```python
+client = GitHubNotificationsClient(token=token_from_trusted_launcher)
+target_id = client.get_authenticated_user_id()
+collector = GitHubNotificationCollector(
+    target_id=target_id,
+    allowed_repositories={"silviahealth/content"},
+)
+store = MentionInboxStore()
+poller = GitHubMentionPoller(client=client, collector=collector, store=store)
+result = poller.poll_once()
+```
+
+The package never reads an environment variable. An operational launcher may
+pass the existing named `GITHUB_PAT_TOKEN` without exposing its value, but token
+selection and secret loading remain outside this package.
+
+### Authentication limitation
+
+The authenticated-user Notifications endpoint currently requires a classic
+personal access token with `notifications` or `repo` scope. GitHub's official
+REST documentation states that this endpoint does not support fine-grained PATs
+or GitHub App user/installation tokens. Subject enrichment can additionally
+require repository access. A future credential change must pass the same live
+read-only gates; it must not silently widen repository or write permissions.
+
+### Read request allowlist
+
+The client can issue only these requests:
+
+- `GET https://api.github.com/user`
+- `GET https://api.github.com/notifications?participating=true&per_page=50`
+- pagination URLs with the exact same HTTPS origin and `/notifications` path
+- subject enrichment for exact
+  `/repos/{owner}/{repo}/issues/{number}` or
+  `/repos/{owner}/{repo}/pulls/{number}` paths
+
+Look-alike hosts, userinfo URLs, HTTP URLs, fragments, other subject paths, and
+subject repositories that do not match the accepted notification repository are
+rejected before transport. `subject.url` 404 uses the no-detail fallback; it
+does not trigger a broader lookup.
+
+There is no method for notification read-state mutation, thread subscription,
+issue/comment creation, PR review submission, reaction, acknowledgement, or any
+other external write.
+
+### Selection and mapping
+
+The collector requires an explicit repository allowlist. An empty allowlist
+collects nothing. P3-M2 selects only:
+
+- `mention` and `team_mention` -> `reply`
+- `review_requested` -> `review`
+- `assign` -> `investigate`
+
+`notification.id` is `source.event_id`. `updated_at` is kept only as the
+out-of-band `source_revision`; it is deliberately absent from the canonical
+content and dedupe input. Issue/PR and repository node IDs provide thread and
+container identities. Missing/deleted subject detail falls back to an unknown
+actor, a notification-derived thread ID, empty body, and no source URL.
+
+Raw title, body, reason, URL, and JSON metadata remain under `untrusted`.
+Neither GitHub response data nor a forged field can set approval state.
+
+### SQLite behavior
+
+The default file is profile-scoped at:
+
+```text
+$HERMES_HOME/mention_inbox/inbox.db
+```
+
+The store enables WAL, a bounded busy timeout, and owner-only `0600` file mode
+where the platform supports POSIX permissions. The dedupe key is the event
+primary key.
+
+- First observation inserts revision 1 in `pending` state.
+- Same content updates source revision and `last_seen` without duplicating the
+  row or overwriting a local approval.
+- Changed canonical content increments the revision and replaces the event in
+  `pending` state, invalidating any prior approval.
+- Older source revisions cannot overwrite newer content or approval.
+- `Last-Modified` is persisted separately as the collector cursor.
+
+The database stores raw external body text for this pilot. Retention, truncation,
+and deletion policy remain an explicit follow-up decision before broader
+production rollout.
+
+### Polling and failure policy
+
+- The first page sends the stored `If-Modified-Since` value exactly.
+- `304 Not Modified` performs no JSON parse and preserves the cursor.
+- `Link: rel="next"` is followed with a default maximum of 20 pages and a hard
+  configurable bound of 100.
+- The greatest observed `X-Poll-Interval` controls the next success delay;
+  missing or invalid values default to 60 seconds.
+- Cursor commit happens only after all pages succeed.
+- 401, forbidden 403, rate-limited 403, transport failure, 5xx, malformed JSON,
+  and pagination-limit failures become bounded category-only status records.
+- Retryable failures use 60-second exponential backoff capped at 3600 seconds.
+  Valid `Retry-After` or `X-RateLimit-Reset` timing takes precedence. Other
+  client/auth failures use a 300-second delay.
+
+Exceptions and persisted status never include the token, response body, title,
+or raw source content.
+
+### P3-M2 boundary
+
+Included:
+
+- read-only `/user`, notification polling, pagination, and issue/PR enrichment,
+- explicit repository/reason filtering,
+- v1 normalization and source revision separation,
+- SQLite dedupe/revision/cursor/status persistence,
+- bounded one-shot poll orchestration,
+- fixture and request-spy tests.
+
+Not included:
+
+- automatic scheduling or a long-running service,
+- plugin/gateway/CLI registration,
+- Discord Approval Inbox,
+- Slack or Notion collection,
+- notification read-state changes or any external write,
+- deployment or gateway restart.

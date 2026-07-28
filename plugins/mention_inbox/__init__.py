@@ -1,4 +1,4 @@
-"""Public types for the Unified Mention Inbox event contract."""
+"""Public types for the Unified Mention Inbox contract and read-only pilots."""
 
 from plugins.mention_inbox.contract import (
     SCHEMA_VERSION,
@@ -21,21 +21,54 @@ from plugins.mention_inbox.contract import (
     restore_event,
     transition_approval,
 )
+from plugins.mention_inbox.github_client import (
+    GITHUB_API_VERSION,
+    GitHubClientError,
+    GitHubHttpResponse,
+    GitHubNotificationPage,
+    GitHubNotificationsClient,
+    GitHubTransport,
+)
+from plugins.mention_inbox.github_collector import (
+    GitHubCollectedEvent,
+    GitHubNotificationCollector,
+)
+from plugins.mention_inbox.runtime import GitHubMentionPoller, GitHubPollResult
+from plugins.mention_inbox.store import (
+    CollectorStatus,
+    MentionInboxStore,
+    StoredMention,
+    UpsertResult,
+)
 
 __all__ = [
+    "GITHUB_API_VERSION",
     "SCHEMA_VERSION",
     "ActorKind",
     "ActorRef",
     "ApprovalState",
+    "CollectorStatus",
+    "GitHubClientError",
+    "GitHubCollectedEvent",
+    "GitHubHttpResponse",
+    "GitHubMentionPoller",
+    "GitHubNotificationCollector",
+    "GitHubNotificationPage",
+    "GitHubNotificationsClient",
+    "GitHubPollResult",
+    "GitHubTransport",
     "JsonValue",
     "MentionEvent",
+    "MentionInboxStore",
     "MentionSource",
     "RequestedAction",
     "SourceRef",
+    "StoredMention",
     "TargetKind",
     "TargetRef",
     "ThreadRef",
     "UntrustedPayload",
+    "UpsertResult",
     "build_dedupe_key",
     "event_to_dict",
     "event_to_json",
