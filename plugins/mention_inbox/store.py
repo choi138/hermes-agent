@@ -23,6 +23,7 @@ from plugins.mention_inbox.contract import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1526407515313668247"
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,12 @@ class MentionInboxStore:
     def _initialize(self) -> None:
         connection = self._connect()
         try:
+            stored_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if stored_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"database schema version {stored_version} is newer than "
+                    f"supported schema version {SCHEMA_VERSION}"
+                )
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS mention_events (
@@ -195,6 +202,7 @@ class MentionInboxStore:
                     revision_number INTEGER NOT NULL,
                     destination TEXT NOT NULL,
                     marker TEXT NOT NULL,
+                    event_json TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     message_id TEXT,
@@ -205,6 +213,71 @@ class MentionInboxStore:
                     UNIQUE(dedupe_key, revision_number, destination)
                 )
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS mention_event_lineage (
+                    dedupe_key TEXT PRIMARY KEY,
+                    latest_revision INTEGER NOT NULL,
+                    latest_source_revision TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            outbox_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(delivery_outbox)")
+            }
+            if "event_json" not in outbox_columns:
+                connection.execute("ALTER TABLE delivery_outbox ADD COLUMN event_json TEXT")
+            connection.execute("""
+                UPDATE delivery_outbox
+                SET event_json = (
+                    SELECT e.event_json FROM mention_events e
+                    WHERE e.dedupe_key = delivery_outbox.dedupe_key
+                      AND e.revision_number = delivery_outbox.revision_number
+                )
+                WHERE event_json IS NULL AND EXISTS (
+                    SELECT 1 FROM mention_events e
+                    WHERE e.dedupe_key = delivery_outbox.dedupe_key
+                      AND e.revision_number = delivery_outbox.revision_number
+                )
+            """)
+            connection.execute("""
+                UPDATE delivery_outbox
+                SET status = 'superseded', lease_until = NULL
+                WHERE status IN ('pending', 'sending') AND event_json IS NULL
+            """)
+            connection.execute("""
+                INSERT OR IGNORE INTO mention_event_lineage (
+                    dedupe_key, latest_revision, latest_source_revision, updated_at
+                )
+                SELECT dedupe_key, revision_number, source_revision, last_seen_at
+                FROM mention_events
+            """)
+            connection.execute("""
+                INSERT OR IGNORE INTO mention_event_lineage (
+                    dedupe_key, latest_revision, latest_source_revision, updated_at
+                )
+                SELECT dedupe_key, MAX(revision_number), NULL, MAX(updated_at)
+                FROM delivery_outbox GROUP BY dedupe_key
+            """)
+            connection.execute("""
+                UPDATE mention_event_lineage
+                SET latest_revision = MAX(
+                    latest_revision,
+                    COALESCE((
+                        SELECT MAX(o.revision_number) FROM delivery_outbox o
+                        WHERE o.dedupe_key = mention_event_lineage.dedupe_key
+                    ), latest_revision),
+                    COALESCE((
+                        SELECT e.revision_number FROM mention_events e
+                        WHERE e.dedupe_key = mention_event_lineage.dedupe_key
+                    ), latest_revision)
+                ),
+                latest_source_revision = COALESCE((
+                    SELECT e.source_revision FROM mention_events e
+                    WHERE e.dedupe_key = mention_event_lineage.dedupe_key
+                ), latest_source_revision)
+            """)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         finally:
             connection.close()
@@ -220,18 +293,49 @@ class MentionInboxStore:
         revision_number: int,
         now: str,
     ) -> None:
+        event_json = event_to_json(event)
         for destination in self._delivery_destinations:
             identity = f"{event.dedupe_key}\0{revision_number}\0{destination}"
             marker = "[hermes-inbox:" + hashlib.sha256(identity.encode()).hexdigest()[:24] + "]"
             connection.execute(
                 """
                 INSERT OR IGNORE INTO delivery_outbox (
-                    dedupe_key, revision_number, destination, marker,
+                    dedupe_key, revision_number, destination, marker, event_json,
                     status, attempts, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
                 """,
-                (event.dedupe_key, revision_number, destination, marker, now, now),
+                (
+                    event.dedupe_key,
+                    revision_number,
+                    destination,
+                    marker,
+                    event_json,
+                    now,
+                    now,
+                ),
             )
+
+    @staticmethod
+    def _record_lineage(
+        connection: sqlite3.Connection,
+        *,
+        dedupe_key: str,
+        revision_number: int,
+        source_revision: str,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO mention_event_lineage (
+                dedupe_key, latest_revision, latest_source_revision, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(dedupe_key) DO UPDATE SET
+                latest_revision = MAX(latest_revision, excluded.latest_revision),
+                latest_source_revision = excluded.latest_source_revision,
+                updated_at = excluded.updated_at
+            """,
+            (dedupe_key, revision_number, source_revision, now),
+        )
 
     def upsert(
         self,
@@ -253,6 +357,13 @@ class MentionInboxStore:
                 existing = connection.execute(
                     "SELECT content_hash, source_revision, revision_number "
                     "FROM mention_events WHERE dedupe_key = ?",
+                    (event.dedupe_key,),
+                ).fetchone()
+                lineage = connection.execute(
+                    """
+                    SELECT latest_revision, latest_source_revision
+                    FROM mention_event_lineage WHERE dedupe_key = ?
+                    """,
                     (event.dedupe_key,),
                 ).fetchone()
                 if existing is not None and incoming_revision < _parse_datetime(
@@ -277,6 +388,13 @@ class MentionInboxStore:
                         """,
                         (source_revision, now, event.dedupe_key),
                     )
+                    self._record_lineage(
+                        connection,
+                        dedupe_key=event.dedupe_key,
+                        revision_number=int(existing["revision_number"]),
+                        source_revision=source_revision,
+                        now=now,
+                    )
                     return UpsertResult(
                         created=False,
                         content_changed=False,
@@ -284,7 +402,10 @@ class MentionInboxStore:
                         revision_number=existing["revision_number"],
                     )
                 if existing is not None:
-                    revision_number = int(existing["revision_number"]) + 1
+                    revision_number = max(
+                        int(existing["revision_number"]),
+                        0 if lineage is None else int(lineage["latest_revision"]),
+                    ) + 1
                     connection.execute(
                         """
                         UPDATE mention_events
@@ -301,6 +422,13 @@ class MentionInboxStore:
                             event.dedupe_key,
                         ),
                     )
+                    self._record_lineage(
+                        connection,
+                        dedupe_key=event.dedupe_key,
+                        revision_number=revision_number,
+                        source_revision=source_revision,
+                        now=now,
+                    )
                     self._enqueue_deliveries(connection, event, revision_number, now)
                     return UpsertResult(
                         created=False,
@@ -309,6 +437,21 @@ class MentionInboxStore:
                         revision_number=revision_number,
                     )
 
+                if (
+                    lineage is not None
+                    and lineage["latest_source_revision"] is not None
+                    and incoming_revision
+                    <= _parse_datetime(str(lineage["latest_source_revision"]))
+                ):
+                    return UpsertResult(
+                        created=False,
+                        content_changed=False,
+                        stale=True,
+                        revision_number=int(lineage["latest_revision"]),
+                    )
+                revision_number = (
+                    1 if lineage is None else int(lineage["latest_revision"]) + 1
+                )
                 connection.execute(
                     """
                     INSERT INTO mention_events (
@@ -321,7 +464,7 @@ class MentionInboxStore:
                         revision_number,
                         first_seen_at,
                         last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.dedupe_key,
@@ -330,16 +473,24 @@ class MentionInboxStore:
                         source_revision,
                         incoming_hash,
                         incoming_json,
+                        revision_number,
                         now,
                         now,
                     ),
                 )
-                self._enqueue_deliveries(connection, event, 1, now)
+                self._record_lineage(
+                    connection,
+                    dedupe_key=event.dedupe_key,
+                    revision_number=revision_number,
+                    source_revision=source_revision,
+                    now=now,
+                )
+                self._enqueue_deliveries(connection, event, revision_number, now)
                 return UpsertResult(
                     created=True,
                     content_changed=True,
                     stale=False,
-                    revision_number=1,
+                    revision_number=revision_number,
                 )
         finally:
             connection.close()
@@ -531,7 +682,8 @@ class MentionInboxStore:
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT COUNT(*) FROM delivery_outbox WHERE status != 'sent'"
+                "SELECT COUNT(*) FROM delivery_outbox "
+                "WHERE status IN ('pending', 'sending')"
             ).fetchone()
             return int(row[0])
         finally:
@@ -548,13 +700,12 @@ class MentionInboxStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT o.*, e.event_json
+                SELECT o.*
                 FROM delivery_outbox o
-                JOIN mention_events e ON e.dedupe_key = o.dedupe_key
                 WHERE o.destination = ? AND (
                     o.status = 'pending' OR
                     (o.status = 'sending' AND o.lease_until <= ?)
-                )
+                ) AND o.event_json IS NOT NULL
                 ORDER BY o.delivery_id LIMIT 1
                 """,
                 (destination, now),
@@ -645,13 +796,29 @@ class MentionInboxStore:
         connection = self._connect()
         try:
             with connection:
+                connection.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET event_json = NULL
+                    WHERE status = 'sent' AND event_json IS NOT NULL
+                      AND dedupe_key IN (
+                        SELECT e.dedupe_key FROM mention_events e
+                        WHERE e.last_seen_at < ? AND NOT EXISTS (
+                            SELECT 1 FROM delivery_outbox pending
+                            WHERE pending.dedupe_key = e.dedupe_key
+                              AND pending.status IN ('pending', 'sending')
+                        )
+                      )
+                    """,
+                    (cutoff,),
+                )
                 cursor = connection.execute(
                     """
                     DELETE FROM mention_events
                     WHERE last_seen_at < ? AND NOT EXISTS (
                         SELECT 1 FROM delivery_outbox o
                         WHERE o.dedupe_key = mention_events.dedupe_key
-                          AND o.status != 'sent'
+                          AND o.status IN ('pending', 'sending')
                     )
                     """,
                     (cutoff,),

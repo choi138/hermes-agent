@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import pytest
 
 from plugins.mention_inbox import MentionInboxStore, ingest_event
+from plugins.mention_inbox.contract import event_to_json
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
 from plugins.mention_inbox.operational import (
     DiscordMentionDelivery,
@@ -241,7 +243,347 @@ def test_retention_prunes_payload_but_preserves_delivery_audit(tmp_path: Path) -
     audit = store.delivery_audit(claim.delivery_id)
     assert audit is not None
     assert audit["status"] == "sent"
+    assert audit["marker"] == claim.marker
+    assert audit["message_id"] == "m1"
+    assert audit["revision_number"] == 1
     assert "event_json" not in audit
+    connection = sqlite3.connect(tmp_path / "inbox.db")
+    assert connection.execute(
+        "SELECT event_json FROM delivery_outbox WHERE delivery_id = ?",
+        (claim.delivery_id,),
+    ).fetchone()[0] is None
+    assert connection.execute(
+        "SELECT latest_revision, latest_source_revision FROM mention_event_lineage "
+        "WHERE dedupe_key = ?",
+        (_event().dedupe_key,),
+    ).fetchone() == (1, "2026-07-29T08:00:00Z")
+    connection.close()
+
+
+def test_outbox_claims_each_queued_revision_from_immutable_snapshot(tmp_path: Path) -> None:
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: NOW)
+    original = _event(body="revision one")
+    revised = _event(body="revision two")
+
+    store.upsert(original, source_revision="2026-07-29T08:00:00Z")
+    store.upsert(revised, source_revision="2026-07-29T08:05:00Z")
+
+    first = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert first is not None
+    assert first.revision_number == 1
+    assert first.event.untrusted.body == "revision one"
+    store.mark_delivery_sent(first.delivery_id, message_id="m1")
+
+    second = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert second is not None
+    assert second.revision_number == 2
+    assert second.event.untrusted.body == "revision two"
+    assert second.delivery_id != first.delivery_id
+    store.mark_delivery_sent(second.delivery_id, message_id="m2")
+    assert store.claim_delivery(DESTINATION, lease_seconds=10) is None
+
+
+def test_prune_then_same_source_revision_is_noop(tmp_path: Path) -> None:
+    now = [NOW]
+    db = tmp_path / "inbox.db"
+    store = MentionInboxStore(db, clock=lambda: now[0])
+    source_revision = "2026-07-29T08:00:00Z"
+    original = _event(body="original")
+    first_result = store.upsert(original, source_revision=source_revision)
+    first = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert first_result.revision_number == 1
+    assert first is not None
+    store.mark_delivery_sent(first.delivery_id, message_id="m1")
+
+    now[0] += timedelta(days=31)
+    assert store.prune(retention_days=30) == 1
+    same_revision = store.upsert(
+        _event(body="changed body must not be trusted"),
+        source_revision=source_revision,
+    )
+
+    assert same_revision.created is False
+    assert same_revision.content_changed is False
+    assert same_revision.stale is True
+    assert same_revision.revision_number == 1
+    assert store.get(original.dedupe_key) is None
+    assert store.pending_delivery_count() == 0
+    assert store.claim_delivery(DESTINATION, lease_seconds=10) is None
+    connection = sqlite3.connect(db)
+    assert connection.execute("SELECT COUNT(*) FROM delivery_outbox").fetchone()[0] == 1
+    assert connection.execute(
+        "SELECT latest_revision, latest_source_revision FROM mention_event_lineage "
+        "WHERE dedupe_key = ?",
+        (original.dedupe_key,),
+    ).fetchone() == (1, source_revision)
+    connection.close()
+
+
+def test_prune_then_newer_source_revision_uses_monotonic_delivery_identity(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: now[0])
+    original = _event(body="original")
+    first_result = store.upsert(original, source_revision="2026-07-29T08:00:00Z")
+    first = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert first_result.revision_number == 1
+    assert first is not None
+    store.mark_delivery_sent(first.delivery_id, message_id="m1")
+    first_audit = store.delivery_audit(first.delivery_id)
+
+    now[0] += timedelta(days=31)
+    assert store.prune(retention_days=30) == 1
+    reingested = store.upsert(
+        _event(body="new after retention"),
+        source_revision="2026-08-29T08:00:00Z",
+    )
+
+    assert reingested.created is True
+    assert reingested.revision_number == 2
+    assert store.pending_delivery_count() == 1
+    assert store.delivery_audit(first.delivery_id) == first_audit
+    second = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert second is not None
+    assert second.delivery_id != first.delivery_id
+    assert second.revision_number == 2
+    assert second.marker != first.marker
+    assert second.event.untrusted.body == "new after retention"
+
+
+def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "inbox.db"
+    pending = _event(event_id="pending", body="pending payload")
+    sending = _event(event_id="sending", body="sending payload")
+    sent = _event(event_id="sent", body="sent payload")
+    timestamp = "2026-07-29T08:00:00Z"
+    connection = sqlite3.connect(db)
+    connection.executescript("""
+        CREATE TABLE mention_events (
+            dedupe_key TEXT PRIMARY KEY,
+            source_platform TEXT NOT NULL,
+            source_event_id TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+        CREATE TABLE collector_cursors (
+            collector_key TEXT PRIMARY KEY,
+            cursor_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE delivery_outbox (
+            delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dedupe_key TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            destination TEXT NOT NULL,
+            marker TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            message_id TEXT,
+            lease_until TEXT,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(dedupe_key, revision_number, destination)
+        );
+    """)
+    for event in (pending, sending, sent):
+        connection.execute(
+            "INSERT INTO mention_events VALUES (?, 'github', ?, ?, 'hash', ?, 1, ?, ?)",
+            (
+                event.dedupe_key,
+                event.source.event_id,
+                timestamp,
+                event_to_json(event),
+                timestamp,
+                timestamp,
+            ),
+        )
+    connection.execute(
+        "INSERT INTO collector_cursors VALUES ('github.notifications', 'cursor-1', ?)",
+        (timestamp,),
+    )
+    rows = (
+        (pending.dedupe_key, "pending", 0, None, None),
+        (sending.dedupe_key, "sending", 2, None, "2026-07-29T10:00:00Z"),
+        (sent.dedupe_key, "sent", 1, "message-sent", None),
+    )
+    for dedupe_key, status, attempts, message_id, lease_until in rows:
+        connection.execute(
+            """INSERT INTO delivery_outbox (
+                dedupe_key, revision_number, destination, marker, status, attempts,
+                message_id, lease_until, created_at, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                dedupe_key,
+                DESTINATION,
+                f"marker-{status}",
+                status,
+                attempts,
+                message_id,
+                lease_until,
+                timestamp,
+                timestamp,
+            ),
+        )
+    connection.commit()
+    connection.close()
+
+    store = MentionInboxStore(db, clock=lambda: NOW)
+    MentionInboxStore(db, clock=lambda: NOW)
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(delivery_outbox)")}
+    assert "event_json" in columns
+    migrated = connection.execute(
+        "SELECT status, attempts, message_id, lease_until, event_json FROM delivery_outbox "
+        "ORDER BY delivery_id"
+    ).fetchall()
+    assert [(row["status"], row["attempts"]) for row in migrated] == [
+        ("pending", 0),
+        ("sending", 2),
+        ("sent", 1),
+    ]
+    assert migrated[1]["lease_until"] == "2026-07-29T10:00:00Z"
+    assert migrated[2]["message_id"] == "message-sent"
+    assert all(row["event_json"] is not None for row in migrated)
+    assert connection.execute("SELECT COUNT(*) FROM mention_event_lineage").fetchone()[0] == 3
+    connection.close()
+    assert store.get_cursor("github.notifications") == "cursor-1"
+    assert store.pending_delivery_count() == 2
+    claim = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert claim is not None
+    assert claim.event.untrusted.body == "pending payload"
+
+
+def test_future_schema_version_fails_closed_without_mutation(tmp_path: Path) -> None:
+    db = tmp_path / "inbox.db"
+    connection = sqlite3.connect(db)
+    connection.executescript("""
+        CREATE TABLE future_data (value TEXT NOT NULL);
+        INSERT INTO future_data VALUES ('preserve-me');
+        PRAGMA user_version = 99;
+    """)
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="newer than supported schema version 2"):
+        MentionInboxStore(db, clock=lambda: NOW)
+
+    connection = sqlite3.connect(db)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 99
+    assert connection.execute("SELECT value FROM future_data").fetchall() == [("preserve-me",)]
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).fetchall() == [("future_data",)]
+    connection.close()
+
+
+def test_migration_supersedes_unreconstructible_older_revision(tmp_path: Path) -> None:
+    db = tmp_path / "inbox.db"
+    revision_two = _event(body="revision two")
+    timestamp = "2026-07-29T08:00:00Z"
+    connection = sqlite3.connect(db)
+    connection.executescript("""
+        CREATE TABLE mention_events (
+            dedupe_key TEXT PRIMARY KEY,
+            source_platform TEXT NOT NULL,
+            source_event_id TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+        CREATE TABLE collector_cursors (
+            collector_key TEXT PRIMARY KEY,
+            cursor_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE delivery_outbox (
+            delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dedupe_key TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            destination TEXT NOT NULL,
+            marker TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            message_id TEXT,
+            lease_until TEXT,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(dedupe_key, revision_number, destination)
+        );
+        PRAGMA user_version = 1;
+    """)
+    connection.execute(
+        "INSERT INTO mention_events VALUES (?, 'github', 'n1', ?, 'hash', ?, 2, ?, ?)",
+        (
+            revision_two.dedupe_key,
+            "2026-07-29T08:05:00Z",
+            event_to_json(revision_two),
+            timestamp,
+            timestamp,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO collector_cursors VALUES ('github.notifications', 'cursor-2', ?)",
+        (timestamp,),
+    )
+    connection.execute(
+        """INSERT INTO delivery_outbox (
+            dedupe_key, revision_number, destination, marker, status, attempts,
+            lease_until, created_at, updated_at
+        ) VALUES (?, 1, ?, 'marker-rev1', 'sending', 3, ?, ?, ?)""",
+        (revision_two.dedupe_key, DESTINATION, "2026-07-29T10:00:00Z", timestamp, timestamp),
+    )
+    connection.execute(
+        """INSERT INTO delivery_outbox (
+            dedupe_key, revision_number, destination, marker, status, attempts,
+            created_at, updated_at
+        ) VALUES (?, 2, ?, 'marker-rev2', 'pending', 0, ?, ?)""",
+        (revision_two.dedupe_key, DESTINATION, timestamp, timestamp),
+    )
+    connection.commit()
+    connection.close()
+
+    store = MentionInboxStore(db, clock=lambda: NOW)
+    MentionInboxStore(db, clock=lambda: NOW)
+
+    connection = sqlite3.connect(db)
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute(
+        "SELECT revision_number, marker, status, attempts, lease_until, event_json "
+        "FROM delivery_outbox ORDER BY revision_number"
+    ).fetchall()
+    assert dict(rows[0]) == {
+        "revision_number": 1,
+        "marker": "marker-rev1",
+        "status": "superseded",
+        "attempts": 3,
+        "lease_until": None,
+        "event_json": None,
+    }
+    assert rows[1]["status"] == "pending"
+    assert rows[1]["event_json"] == event_to_json(revision_two)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    connection.close()
+    assert store.get_cursor("github.notifications") == "cursor-2"
+    assert store.pending_delivery_count() == 1
+    claim = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert claim is not None
+    assert claim.revision_number == 2
+    assert claim.event.untrusted.body == "revision two"
 
 
 @pytest.mark.asyncio
