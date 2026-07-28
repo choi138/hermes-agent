@@ -2889,10 +2889,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs: Dict[str, Any] = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if metadata and metadata.get("mention_inbox_no_mentions"):
+                        send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -2911,10 +2914,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs: Dict[str, Any] = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if metadata and metadata.get("mention_inbox_no_mentions"):
+                            retry_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))

@@ -15,6 +15,13 @@ _ACTION_BY_REASON = {
     "review_requested": "review",
     "team_mention": "reply",
 }
+_MAX_TITLE_CHARS = 500
+_MAX_BODY_CHARS = 4000
+_MAX_URL_CHARS = 500
+
+
+def _bounded(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
 def _source_revision(value: Any) -> str:
@@ -139,9 +146,13 @@ class GitHubNotificationCollector:
                 else f"github-notification:{notification['id']}"
             )
             candidate_body = subject_detail.get("body")
-            body = candidate_body if isinstance(candidate_body, str) else ""
+            body = _bounded(candidate_body, _MAX_BODY_CHARS) if isinstance(candidate_body, str) else ""
             candidate_url = subject_detail.get("html_url")
-            source_url = candidate_url if isinstance(candidate_url, str) else None
+            source_url = (
+                _bounded(candidate_url, _MAX_URL_CHARS)
+                if isinstance(candidate_url, str)
+                else None
+            )
 
         event = ingest_event({
             "schema_version": "1",
@@ -164,7 +175,7 @@ class GitHubNotificationCollector:
             "requested_action": _ACTION_BY_REASON[notification["reason"]],
             "deadline": None,
             "untrusted": {
-                "title": subject["title"],
+                "title": _bounded(subject["title"], _MAX_TITLE_CHARS),
                 "body": body,
                 "action_detail": notification["reason"],
                 "source_url": source_url,

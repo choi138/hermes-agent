@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +22,7 @@ from plugins.mention_inbox.contract import (
 )
 
 Clock = Callable[[], datetime]
+DEFAULT_DESTINATION = "discord:1526407515313668247"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,17 @@ class CollectorStatus:
     last_attempt_at: datetime
     last_success_at: datetime | None
     next_poll_at: datetime
+
+
+@dataclass(frozen=True)
+class DeliveryClaim:
+    delivery_id: int
+    event: MentionEvent
+    revision_number: int
+    destination: str
+    marker: str
+    attempts: int
+    requires_reconciliation: bool
 
 
 def _utc_now() -> datetime:
@@ -127,9 +139,11 @@ class MentionInboxStore:
         db_path: Path | None = None,
         *,
         clock: Clock = _utc_now,
+        delivery_destinations: tuple[str, ...] = (DEFAULT_DESTINATION,),
     ) -> None:
         self.path = Path(db_path or (get_hermes_home() / "mention_inbox" / "inbox.db"))
         self._clock = clock
+        self._delivery_destinations = delivery_destinations
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -174,6 +188,23 @@ class MentionInboxStore:
                     next_poll_at TEXT NOT NULL
                 )
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS delivery_outbox (
+                    delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dedupe_key TEXT NOT NULL,
+                    revision_number INTEGER NOT NULL,
+                    destination TEXT NOT NULL,
+                    marker TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    message_id TEXT,
+                    lease_until TEXT,
+                    error_category TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(dedupe_key, revision_number, destination)
+                )
+            """)
             connection.commit()
         finally:
             connection.close()
@@ -181,6 +212,26 @@ class MentionInboxStore:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    def _enqueue_deliveries(
+        self,
+        connection: sqlite3.Connection,
+        event: MentionEvent,
+        revision_number: int,
+        now: str,
+    ) -> None:
+        for destination in self._delivery_destinations:
+            identity = f"{event.dedupe_key}\0{revision_number}\0{destination}"
+            marker = "[hermes-inbox:" + hashlib.sha256(identity.encode()).hexdigest()[:24] + "]"
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO delivery_outbox (
+                    dedupe_key, revision_number, destination, marker,
+                    status, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (event.dedupe_key, revision_number, destination, marker, now, now),
+            )
 
     def upsert(
         self,
@@ -250,6 +301,7 @@ class MentionInboxStore:
                             event.dedupe_key,
                         ),
                     )
+                    self._enqueue_deliveries(connection, event, revision_number, now)
                     return UpsertResult(
                         created=False,
                         content_changed=True,
@@ -282,6 +334,7 @@ class MentionInboxStore:
                         now,
                     ),
                 )
+                self._enqueue_deliveries(connection, event, 1, now)
                 return UpsertResult(
                     created=True,
                     content_changed=True,
@@ -473,6 +526,155 @@ class MentionInboxStore:
             first_seen_at=_parse_datetime(row["first_seen_at"]),
             last_seen_at=_parse_datetime(row["last_seen_at"]),
         )
+
+    def pending_delivery_count(self) -> int:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE status != 'sent'"
+            ).fetchone()
+            return int(row[0])
+        finally:
+            connection.close()
+
+    def claim_delivery(self, destination: str, *, lease_seconds: int) -> DeliveryClaim | None:
+        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be a positive integer")
+        now_dt = self._clock().astimezone(timezone.utc)
+        now = _iso_datetime(now_dt)
+        lease_until = _iso_datetime(now_dt + timedelta(seconds=lease_seconds))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT o.*, e.event_json
+                FROM delivery_outbox o
+                JOIN mention_events e ON e.dedupe_key = o.dedupe_key
+                WHERE o.destination = ? AND (
+                    o.status = 'pending' OR
+                    (o.status = 'sending' AND o.lease_until <= ?)
+                )
+                ORDER BY o.delivery_id LIMIT 1
+                """,
+                (destination, now),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            uncertain = str(row["status"]) == "sending"
+            attempts = int(row["attempts"]) + 1
+            connection.execute(
+                """
+                UPDATE delivery_outbox
+                SET status = 'sending', attempts = ?, lease_until = ?,
+                    error_category = NULL, updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (attempts, lease_until, now, row["delivery_id"]),
+            )
+            connection.commit()
+            return DeliveryClaim(
+                delivery_id=int(row["delivery_id"]),
+                event=restore_event(json.loads(row["event_json"])),
+                revision_number=int(row["revision_number"]),
+                destination=str(row["destination"]),
+                marker=str(row["marker"]),
+                attempts=attempts,
+                requires_reconciliation=uncertain,
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release_delivery(self, delivery_id: int, *, error_category: str) -> None:
+        category = _require_error_category(error_category)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'pending', lease_until = NULL,
+                        error_category = ?, updated_at = ?
+                    WHERE delivery_id = ? AND status = 'sending'
+                    """,
+                    (category, now, delivery_id),
+                )
+        finally:
+            connection.close()
+
+    def mark_delivery_sent(self, delivery_id: int, *, message_id: str) -> None:
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("message_id must be a non-empty string")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'sent', message_id = ?, lease_until = NULL,
+                        error_category = NULL, updated_at = ?
+                    WHERE delivery_id = ?
+                    """,
+                    (message_id, now, delivery_id),
+                )
+        finally:
+            connection.close()
+
+    def health(self, collector_key: str) -> dict[str, object]:
+        status = self.get_collector_status(collector_key)
+        return {
+            "status": "degraded" if status is None else status.status,
+            "error_category": "not_started" if status is None else status.error_category,
+            "last_attempt_at": None if status is None else status.last_attempt_at,
+            "last_success_at": None if status is None else status.last_success_at,
+            "next_poll_at": None if status is None else status.next_poll_at,
+            "consecutive_failures": 0 if status is None else status.consecutive_failures,
+            "pending_delivery_count": self.pending_delivery_count(),
+        }
+
+    def prune(self, *, retention_days: int) -> int:
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days <= 0:
+            raise ValueError("retention_days must be a positive integer")
+        cutoff = _iso_datetime(self._clock() - timedelta(days=retention_days))
+        connection = self._connect()
+        try:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM mention_events
+                    WHERE last_seen_at < ? AND NOT EXISTS (
+                        SELECT 1 FROM delivery_outbox o
+                        WHERE o.dedupe_key = mention_events.dedupe_key
+                          AND o.status != 'sent'
+                    )
+                    """,
+                    (cutoff,),
+                )
+                return int(cursor.rowcount)
+        finally:
+            connection.close()
+
+    def delivery_audit(self, delivery_id: int) -> dict[str, object] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT delivery_id, dedupe_key, revision_number, destination,
+                       marker, status, attempts, message_id, error_category,
+                       created_at, updated_at
+                FROM delivery_outbox WHERE delivery_id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+            return None if row is None else dict(row)
+        finally:
+            connection.close()
 
     def count(self) -> int:
         connection = self._connect()

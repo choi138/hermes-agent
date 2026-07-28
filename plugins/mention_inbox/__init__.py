@@ -33,9 +33,19 @@ from plugins.mention_inbox.github_collector import (
     GitHubCollectedEvent,
     GitHubNotificationCollector,
 )
+from plugins.mention_inbox.operational import (
+    DiscordMentionDelivery,
+    MentionInboxConfig,
+    MentionInboxGatewayService,
+    MentionInboxRuntime,
+    RenderedDiscordEvent,
+    parse_mention_inbox_config,
+    render_discord_event,
+)
 from plugins.mention_inbox.runtime import GitHubMentionPoller, GitHubPollResult
 from plugins.mention_inbox.store import (
     CollectorStatus,
+    DeliveryClaim,
     MentionInboxStore,
     StoredMention,
     UpsertResult,
@@ -48,6 +58,8 @@ __all__ = [
     "ActorRef",
     "ApprovalState",
     "CollectorStatus",
+    "DeliveryClaim",
+    "DiscordMentionDelivery",
     "GitHubClientError",
     "GitHubCollectedEvent",
     "GitHubHttpResponse",
@@ -59,9 +71,13 @@ __all__ = [
     "GitHubTransport",
     "JsonValue",
     "MentionEvent",
+    "MentionInboxConfig",
+    "MentionInboxGatewayService",
+    "MentionInboxRuntime",
     "MentionInboxStore",
     "MentionSource",
     "RequestedAction",
+    "RenderedDiscordEvent",
     "SourceRef",
     "StoredMention",
     "TargetKind",
@@ -73,6 +89,8 @@ __all__ = [
     "event_to_dict",
     "event_to_json",
     "ingest_event",
+    "parse_mention_inbox_config",
+    "render_discord_event",
     "restore_event",
     "transition_approval",
 ]

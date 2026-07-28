@@ -282,9 +282,10 @@ primary key.
 - Older source revisions cannot overwrite newer content or approval.
 - `Last-Modified` is persisted separately as the collector cursor.
 
-The database stores raw external body text for this pilot. Retention, truncation,
-and deletion policy remain an explicit follow-up decision before broader
-production rollout.
+GitHub title/body/URL fields are bounded before canonical persistence (500/4000/
+500 characters). Sent event payloads are pruned after the configured conservative
+retention period (30 days by default); pending deliveries are retained, and the
+payload-free delivery audit ledger remains after event pruning.
 
 ### Polling and failure policy
 
@@ -304,22 +305,36 @@ production rollout.
 Exceptions and persisted status never include the token, response body, title,
 or raw source content.
 
-### P3-M2 boundary
+### P3-M2.5 operational configuration
 
-Included:
+The gateway lifecycle starts one runtime per served profile and cancels it before
+Discord adapter teardown. Configuration is fail-closed and disabled by default:
 
-- read-only `/user`, notification polling, pagination, and issue/PR enrichment,
-- explicit repository/reason filtering,
-- v1 normalization and source revision separation,
-- SQLite dedupe/revision/cursor/status persistence,
-- bounded one-shot poll orchestration,
-- fixture and request-spy tests.
+```yaml
+mention_inbox:
+  enabled: false
+  credential_env: GITHUB_PAT_TOKEN
+  repositories: [silviahealth/content]
+  destination: discord:1526407515313668247
+  retention_days: 30
+  lease_seconds: 60
+```
 
-Not included:
+Only the launcher resolves `GITHUB_PAT_TOKEN`; status and logs expose category
+labels, never credential or source payload values. Missing credentials and an
+unavailable Discord adapter produce degraded service health without aborting the
+gateway.
 
-- automatic scheduling or a long-running service,
-- plugin/gateway/CLI registration,
-- Discord Approval Inbox,
-- Slack or Notion collection,
-- notification read-state changes or any external write,
-- deployment or gateway restart.
+Each content revision creates one outbox row per destination. Claims use a SQLite
+write transaction and expiring lease. A successful post records its Discord
+message ID. If the process can crash after Discord accepts a post but before the
+DB acknowledgement, the next lease holder searches a bounded window of
+bot-authored channel history for the deterministic marker before retrying. This
+closes normal restart/retry duplication, but is not a mathematical exactly-once
+guarantee: a marker outside Discord's bounded retrievable history can still be
+reposted.
+
+Rendered messages are deterministic, bounded, label title/body as untrusted data,
+neutralize mentions/markdown, include source/repository/action/URL, and force
+Discord `AllowedMentions.none()`. No LLM, approval/reject/draft UI, GitHub mutation,
+or external reply is part of this runtime.

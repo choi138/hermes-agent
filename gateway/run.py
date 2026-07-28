@@ -3152,6 +3152,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        # One cancellation-safe mention-inbox runtime per served profile.
+        self._mention_inbox_services: list = []
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -8236,9 +8238,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
+        # Optional GitHub→Discord mention inbox. Configuration is disabled by
+        # default and startup failures are isolated as degraded service health.
+        await self._start_mention_inbox_services()
+
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _start_mention_inbox_services(self) -> None:
+        from plugins.mention_inbox.operational import (
+            MentionInboxGatewayService,
+            parse_mention_inbox_config,
+        )
+
+        async def _start_one(raw_config, adapter, home, profile_label):
+            try:
+                inbox_config = parse_mention_inbox_config(raw_config)
+                service = MentionInboxGatewayService(
+                    inbox_config,
+                    adapter,
+                    db_path=home / "mention_inbox" / "inbox.db",
+                )
+                await service.start()
+                self._mention_inbox_services.append(service)
+                health = service.health()
+                logger.info(
+                    "Mention inbox profile=%s status=%s category=%s",
+                    profile_label,
+                    health.get("status"),
+                    health.get("error_category"),
+                )
+            except Exception:
+                # Invalid config, missing credentials, or source transport
+                # failures must not take down unrelated gateway platforms.
+                logger.warning(
+                    "Mention inbox profile=%s entered degraded startup state",
+                    profile_label,
+                    exc_info=True,
+                )
+
+        active_home = get_hermes_home()
+        with _profile_runtime_scope(active_home):
+            await _start_one(
+                _load_gateway_config(),
+                self.adapters.get(Platform.DISCORD),
+                active_home,
+                "active",
+            )
+
+        if not getattr(self.config, "multiplex_profiles", False):
+            return
+        try:
+            from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
+            active = get_active_profile_name() or "default"
+            for profile_name, profile_home in profiles_to_serve(multiplex=True):
+                if profile_name == active:
+                    continue
+                adapter = self._profile_adapters.get(profile_name, {}).get(Platform.DISCORD)
+                with _profile_runtime_scope(profile_home):
+                    await _start_one(
+                        _load_gateway_config(), adapter, profile_home, profile_name
+                    )
+        except Exception:
+            logger.warning("Secondary-profile mention inbox startup failed", exc_info=True)
+
+    async def _stop_mention_inbox_services(self) -> None:
+        # Some startup-race paths use a partially initialized runner; shutdown
+        # must remain safe even before __init__ establishes the service list.
+        services = getattr(self, "_mention_inbox_services", [])
+        self._mention_inbox_services = []
+        if services:
+            await asyncio.gather(
+                *(service.stop() for service in services),
+                return_exceptions=True,
+            )
 
     _MAX_SUPERVISED_RESTARTS = 5
     # A task that ran at least this long before crashing is treated as having
@@ -9351,6 +9425,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         context="shutdown idle-cache",
                         shutdown_deadline=_environment_cleanup_deadline,
                     )
+
+            # Stop poll/send loops before Discord adapters disappear. Runtime
+            # stop is idempotent and cancellation-safe across restart/reload.
+            _stop_mention_inbox = getattr(self, "_stop_mention_inbox_services", None)
+            if callable(_stop_mention_inbox):
+                await _stop_mention_inbox()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)

@@ -84,6 +84,29 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
 
 
 @pytest.mark.asyncio
+async def test_mention_inbox_send_forces_allowed_mentions_none():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    expected = object()
+    sys.modules["discord"].AllowedMentions.none.return_value = expected
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=1234)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "555",
+        "@everyone untrusted",
+        metadata={"mention_inbox_no_mentions": True},
+    )
+
+    assert result.success is True
+    assert channel.send.await_args.kwargs["allowed_mentions"] is expected
+
+
+@pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_deleted():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
 
