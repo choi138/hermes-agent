@@ -163,3 +163,61 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     )
 
     assert response == text
+
+
+@pytest.mark.asyncio
+async def test_approved_execution_finalization_suppresses_model_success_claim(
+    monkeypatch, tmp_path
+):
+    runner = _runner(monkeypatch, tmp_path)
+    observer = MagicMock()
+    observer.run_completed = AsyncMock(return_value="blocked")
+    observer.run_failed = AsyncMock()
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=MagicMock(success=True))
+    adapter._mention_inbox_execution_observer = observer
+    runner.adapters[Platform.TELEGRAM] = adapter
+    execution_id = "wx_" + "a" * 24
+    event = MessageEvent(
+        text="approved envelope",
+        source=_source(),
+        message_id="approval-42",
+        internal=True,
+        metadata={
+            "mention_inbox_execution": {
+                "execution_id": execution_id,
+                "proposal_hash": "b" * 64,
+                "mode": "direct",
+            }
+        },
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "완료했습니다.",
+            "messages": [
+                {"role": "user", "content": "approved envelope"},
+                {"role": "assistant", "content": "완료했습니다."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+            "completed": True,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+    observer.run_completed.assert_awaited_once()
+    assert observer.run_completed.await_args.args[0] == execution_id
+    observer.run_failed.assert_not_awaited()
+    assert runner._run_agent.await_args.kwargs[
+        "mention_inbox_execution_id"
+    ] == execution_id
+    assert runner._run_agent.await_args.kwargs[
+        "mention_inbox_execution_observer"
+    ] is observer

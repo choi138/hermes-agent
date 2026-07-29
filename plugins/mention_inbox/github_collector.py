@@ -1,19 +1,35 @@
 """Normalize GitHub notification payloads into the shared mention contract."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from plugins.mention_inbox.actionable import (
+    GitHubActionKind,
+    GitHubHydrationContext,
+    classify_actionable,
+)
 from plugins.mention_inbox.contract import MentionEvent, ingest_event
 
-_SELECTED_REASONS = frozenset({"assign", "mention", "review_requested", "team_mention"})
-_ACTION_BY_REASON = {
+_CANDIDATE_REASONS = frozenset(
+    {"assign", "mention", "review_requested", "team_mention", "author", "comment"}
+)
+_LEGACY_ACTION_BY_REASON = {
     "assign": "investigate",
     "mention": "reply",
     "review_requested": "review",
     "team_mention": "reply",
+}
+_ACTION_BY_KIND = {
+    GitHubActionKind.DIRECT_MENTION: "reply",
+    GitHubActionKind.TEAM_MENTION: "reply",
+    GitHubActionKind.REVIEW_REQUESTED: "review",
+    GitHubActionKind.TEAM_REVIEW_REQUESTED: "review",
+    GitHubActionKind.ASSIGNED: "investigate",
+    GitHubActionKind.OWN_PR_COMMENT: "reply",
+    GitHubActionKind.OWN_PR_REVIEW_COMMENT: "reply",
+    GitHubActionKind.OWN_PR_CHANGES_REQUESTED: "investigate",
 }
 _MAX_TITLE_CHARS = 500
 _MAX_BODY_CHARS = 4000
@@ -57,8 +73,16 @@ class GitHubNotificationCollector:
         *,
         target_id: str,
         allowed_repositories: Iterable[str],
+        target_login: str | None = None,
+        include_owned_pr_activity: bool = False,
     ) -> None:
         self._target_id = target_id
+        self._target_login = target_login
+        self._candidate_reasons = (
+            _CANDIDATE_REASONS
+            if include_owned_pr_activity
+            else frozenset({"assign", "mention", "review_requested", "team_mention"})
+        )
         self._allowed_repositories = frozenset(allowed_repositories)
 
     def _is_selected(self, notification: Mapping[str, Any]) -> bool:
@@ -66,7 +90,7 @@ class GitHubNotificationCollector:
             return False
         reason = notification.get("reason")
         repository = notification.get("repository")
-        if reason not in _SELECTED_REASONS or not isinstance(repository, Mapping):
+        if reason not in self._candidate_reasons or not isinstance(repository, Mapping):
             return False
         full_name = repository.get("full_name")
         return isinstance(full_name, str) and full_name in self._allowed_repositories
@@ -111,12 +135,90 @@ class GitHubNotificationCollector:
     def normalize(
         self,
         notification: Mapping[str, Any],
-        subject_detail: Mapping[str, Any] | None,
+        subject_detail: Mapping[str, Any] | GitHubHydrationContext | None,
     ) -> GitHubCollectedEvent | None:
         if not self._is_selected(notification):
             return None
         self._validate_notification(notification)
+        if isinstance(subject_detail, GitHubHydrationContext):
+            return self._normalize_actionable(notification, subject_detail)
+        return self._normalize_legacy(notification, subject_detail)
 
+    def _normalize_actionable(
+        self,
+        notification: Mapping[str, Any],
+        context: GitHubHydrationContext,
+    ) -> GitHubCollectedEvent | None:
+        if context.target_node_id != self._target_id:
+            raise ValueError("hydration target does not match collector target")
+        if self._target_login is not None and (
+            context.target_login.casefold() != self._target_login.casefold()
+        ):
+            raise ValueError("hydration login does not match collector target")
+        decision = classify_actionable(notification, context)
+        actionable = decision.event
+        if actionable is None:
+            return None
+
+        latest = context.latest_event or {}
+        actor = latest.get("user") or latest.get("actor")
+        actor_id = "github:unknown"
+        actor_kind = actionable.actor_kind
+        if isinstance(actor, Mapping):
+            node_id = actor.get("node_id")
+            if isinstance(node_id, str) and node_id:
+                actor_id = node_id
+        if actor_kind not in {"user", "bot", "app", "unknown"}:
+            actor_kind = "unknown"
+
+        repository = notification["repository"]
+        metadata: dict[str, Any] = {
+            "actionable_kind": actionable.kind.value,
+            "candidate_reason": notification["reason"],
+            "repository": actionable.repository,
+            "subject_type": actionable.subject_type,
+            "subject_number": actionable.number,
+            "subject_key": actionable.subject_key,
+            "subject_head_sha": actionable.subject_head_sha,
+            "subject_api_url": actionable.subject_url,
+            "actor_login": actionable.actor_login,
+            "source_revision": actionable.source_revision,
+        }
+        metadata.update(actionable.metadata)
+        event = ingest_event(
+            {
+                "schema_version": "1",
+                "source": {
+                    "platform": "github",
+                    "event_id": actionable.source_event_id,
+                },
+                "actor": {"actor_id": actor_id, "kind": actor_kind},
+                "target": {"target_id": self._target_id, "kind": "user"},
+                "thread": {
+                    "thread_id": actionable.subject_key,
+                    "container_id": repository["node_id"],
+                },
+                "requested_action": _ACTION_BY_KIND[actionable.kind],
+                "deadline": None,
+                "untrusted": {
+                    "title": _bounded(actionable.title, _MAX_TITLE_CHARS),
+                    "body": _bounded(actionable.excerpt, _MAX_BODY_CHARS),
+                    "action_detail": actionable.kind.value,
+                    "source_url": _bounded(actionable.source_url, _MAX_URL_CHARS),
+                    "metadata": metadata,
+                },
+            }
+        )
+        return GitHubCollectedEvent(event=event, source_revision=actionable.source_revision)
+
+    def _normalize_legacy(
+        self,
+        notification: Mapping[str, Any],
+        subject_detail: Mapping[str, Any] | None,
+    ) -> GitHubCollectedEvent | None:
+        reason = notification["reason"]
+        if reason not in _LEGACY_ACTION_BY_REASON:
+            return None
         repository = notification["repository"]
         subject = notification["subject"]
         source_revision = _source_revision(notification["updated_at"])
@@ -146,7 +248,11 @@ class GitHubNotificationCollector:
                 else f"github-notification:{notification['id']}"
             )
             candidate_body = subject_detail.get("body")
-            body = _bounded(candidate_body, _MAX_BODY_CHARS) if isinstance(candidate_body, str) else ""
+            body = (
+                _bounded(candidate_body, _MAX_BODY_CHARS)
+                if isinstance(candidate_body, str)
+                else ""
+            )
             candidate_url = subject_detail.get("html_url")
             source_url = (
                 _bounded(candidate_url, _MAX_URL_CHARS)
@@ -154,37 +260,30 @@ class GitHubNotificationCollector:
                 else None
             )
 
-        event = ingest_event({
-            "schema_version": "1",
-            "source": {
-                "platform": "github",
-                "event_id": notification["id"],
-            },
-            "actor": {
-                "actor_id": actor_id,
-                "kind": actor_kind,
-            },
-            "target": {
-                "target_id": self._target_id,
-                "kind": "user",
-            },
-            "thread": {
-                "thread_id": thread_id,
-                "container_id": repository["node_id"],
-            },
-            "requested_action": _ACTION_BY_REASON[notification["reason"]],
-            "deadline": None,
-            "untrusted": {
-                "title": _bounded(subject["title"], _MAX_TITLE_CHARS),
-                "body": body,
-                "action_detail": notification["reason"],
-                "source_url": source_url,
-                "metadata": {
-                    "reason": notification["reason"],
-                    "repository": repository["full_name"],
-                    "subject_type": subject["type"],
-                    "unread": notification["unread"],
+        event = ingest_event(
+            {
+                "schema_version": "1",
+                "source": {"platform": "github", "event_id": notification["id"]},
+                "actor": {"actor_id": actor_id, "kind": actor_kind},
+                "target": {"target_id": self._target_id, "kind": "user"},
+                "thread": {
+                    "thread_id": thread_id,
+                    "container_id": repository["node_id"],
                 },
-            },
-        })
+                "requested_action": _LEGACY_ACTION_BY_REASON[reason],
+                "deadline": None,
+                "untrusted": {
+                    "title": _bounded(subject["title"], _MAX_TITLE_CHARS),
+                    "body": body,
+                    "action_detail": reason,
+                    "source_url": source_url,
+                    "metadata": {
+                        "reason": reason,
+                        "repository": repository["full_name"],
+                        "subject_type": subject["type"],
+                        "unread": notification["unread"],
+                    },
+                },
+            }
+        )
         return GitHubCollectedEvent(event=event, source_revision=source_revision)

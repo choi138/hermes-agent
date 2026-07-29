@@ -15,11 +15,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
-from plugins.mention_inbox.contract import MentionEvent
+from plugins.mention_inbox.actionable import GitHubHydrationContext
+from plugins.mention_inbox.approval import (
+    ApprovalHandler,
+    ExecutionLifecycleObserver,
+    GatewayExecutionDispatcher,
+    GitHubSubjectStateResolver,
+)
 from plugins.mention_inbox.github_client import GitHubNotificationsClient
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
 from plugins.mention_inbox.runtime import GitHubMentionPoller
 from plugins.mention_inbox.store import DEFAULT_DESTINATION, MentionInboxStore
+from plugins.mention_inbox.voice import RenderedDiscordEvent, render_action_alert
 
 _ALLOWED_REPOSITORY = "silviahealth/content"
 _ALLOWED_ENV = "GITHUB_PAT_TOKEN"
@@ -37,13 +44,14 @@ class MentionInboxConfig:
     destination: str = DEFAULT_DESTINATION
     retention_days: int = 30
     lease_seconds: int = 60
-
-
-@dataclass(frozen=True)
-class RenderedDiscordEvent:
-    content: str
-    marker: str
-    allowed_mentions: dict[str, Any]
+    team_mentions: bool = False
+    team_review_requests: bool = False
+    action_sessions_enabled: bool = False
+    proposal_bot_mention: str | None = None
+    authorized_approver_ids: tuple[str, ...] = ()
+    thread_auto_archive_minutes: int = 1440
+    execution_enabled: bool = False
+    execution_mode: str = "direct"
 
 
 class DiscordDeliveryTransport(Protocol):
@@ -80,6 +88,48 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         raise ValueError("mention_inbox.repositories contains a repository outside the allowlist")
     if not isinstance(destination, str) or re.fullmatch(r"discord:[1-9][0-9]{5,24}", destination) is None:
         raise ValueError("mention_inbox.destination must be a Discord channel destination")
+    team_mentions = raw.get("team_mentions", False)
+    team_review_requests = raw.get("team_review_requests", False)
+    if not isinstance(team_mentions, bool) or not isinstance(team_review_requests, bool):
+        raise ValueError("mention_inbox team switches must be booleans")
+    action_sessions = raw.get("action_sessions", {})
+    if action_sessions is None:
+        action_sessions = {}
+    if not isinstance(action_sessions, Mapping):
+        raise ValueError("mention_inbox.action_sessions must be an object")
+    action_sessions_enabled = action_sessions.get("enabled", False)
+    execution_enabled = action_sessions.get("execution_enabled", False)
+    if not isinstance(action_sessions_enabled, bool) or not isinstance(execution_enabled, bool):
+        raise ValueError("mention_inbox action-session switches must be booleans")
+    bot_mention = action_sessions.get("bot_mention")
+    if bot_mention is not None and (
+        not isinstance(bot_mention, str)
+        or re.fullmatch(r"<@[1-9][0-9]{5,24}>", bot_mention) is None
+    ):
+        raise ValueError("mention_inbox.action_sessions.bot_mention is invalid")
+    approver_ids = action_sessions.get("authorized_approver_ids", [])
+    if not isinstance(approver_ids, list) or any(
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{5,24}", value) is None
+        for value in approver_ids
+    ):
+        raise ValueError("mention_inbox.action_sessions.authorized_approver_ids is invalid")
+    if len(set(approver_ids)) != len(approver_ids):
+        raise ValueError("mention_inbox action-session approver IDs must be unique")
+    archive_minutes = _positive_int(
+        action_sessions.get("thread_auto_archive_minutes"),
+        "action_sessions.thread_auto_archive_minutes",
+        1440,
+    )
+    if archive_minutes not in {60, 1440, 4320, 10080}:
+        raise ValueError("mention_inbox action-session archive duration is unsupported")
+    execution_mode = action_sessions.get("execution_mode", "direct")
+    if execution_mode not in {"direct", "kanban"}:
+        raise ValueError("mention_inbox action-session execution_mode is invalid")
+    if action_sessions_enabled and (bot_mention is None or not approver_ids):
+        raise ValueError("enabled action sessions require bot mention and approvers")
+    if execution_enabled and not action_sessions_enabled:
+        raise ValueError("execution cannot be enabled while action sessions are disabled")
     return MentionInboxConfig(
         enabled=enabled,
         credential_env=credential_env,
@@ -87,6 +137,14 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         destination=destination,
         retention_days=_positive_int(raw.get("retention_days"), "retention_days", 30),
         lease_seconds=_positive_int(raw.get("lease_seconds"), "lease_seconds", 60),
+        team_mentions=team_mentions,
+        team_review_requests=team_review_requests,
+        action_sessions_enabled=action_sessions_enabled,
+        proposal_bot_mention=bot_mention,
+        authorized_approver_ids=tuple(approver_ids),
+        thread_auto_archive_minutes=archive_minutes,
+        execution_enabled=execution_enabled,
+        execution_mode=execution_mode,
     )
 
 
@@ -108,6 +166,14 @@ def render_discord_event(
     event: MentionEvent, *, revision_number: int, destination: str
 ) -> RenderedDiscordEvent:
     metadata = event.untrusted.metadata
+    if isinstance(metadata, Mapping) and isinstance(
+        metadata.get("actionable_kind"), str
+    ):
+        return render_action_alert(
+            event,
+            revision_number=revision_number,
+            destination=destination,
+        )
     repository = metadata.get("repository") if isinstance(metadata, Mapping) else None
     repository = repository if isinstance(repository, str) else "unknown"
     marker = _marker(event, revision_number, destination)
@@ -134,13 +200,21 @@ def render_discord_event(
 
 
 class DiscordMentionDelivery:
-    def __init__(self, *, store: MentionInboxStore, discord: DiscordDeliveryTransport,
-                 destination: str, lease_seconds: int) -> None:
+    def __init__(
+        self,
+        *,
+        store: MentionInboxStore,
+        discord: DiscordDeliveryTransport,
+        destination: str,
+        lease_seconds: int,
+        thread_coordinator: Any | None = None,
+    ) -> None:
         self._store = store
         self._discord = discord
         self._destination = destination
         self._channel_id = destination.split(":", 1)[1]
         self._lease_seconds = lease_seconds
+        self._thread_coordinator = thread_coordinator
 
     async def deliver_once(self) -> str:
         claim = self._store.claim_delivery(
@@ -153,23 +227,40 @@ class DiscordMentionDelivery:
             revision_number=claim.revision_number,
             destination=claim.destination,
         )
+        confirmed_message_id: str | None = None
         try:
             if claim.requires_reconciliation:
                 existing = await self._discord.find_marker(
                     self._channel_id, claim.marker, limit=100
                 )
                 if existing is not None:
-                    self._store.mark_delivery_sent(claim.delivery_id, message_id=existing)
+                    confirmed_message_id = existing
+                    if self._thread_coordinator is not None:
+                        await self._thread_coordinator.ensure_thread(
+                            claim.event, parent_message_id=existing
+                        )
+                    self._store.mark_delivery_sent(
+                        claim.delivery_id, message_id=existing
+                    )
                     return "reconciled"
             message_id = await self._discord.send(
                 self._channel_id,
                 rendered.content,
                 allowed_mentions=rendered.allowed_mentions,
             )
+            confirmed_message_id = message_id
+            if self._thread_coordinator is not None:
+                await self._thread_coordinator.ensure_thread(
+                    claim.event, parent_message_id=message_id
+                )
         except Exception:
-            self._store.release_delivery(
-                claim.delivery_id, error_category="discord_send"
-            )
+            if confirmed_message_id is None:
+                self._store.release_delivery(
+                    claim.delivery_id, error_category="discord_send"
+                )
+            # A returned/reconciled message ID proves the parent alert exists.
+            # Keep the sending lease intact so the next expired claim performs
+            # bounded marker reconciliation instead of posting a duplicate.
             return "error"
         self._store.mark_delivery_sent(claim.delivery_id, message_id=message_id)
         return "sent"
@@ -243,7 +334,9 @@ class GatewayDiscordTransport:
         bot_id = getattr(getattr(self._adapter._client, "user", None), "id", None)
         async for message in channel.history(limit=limit):
             if getattr(getattr(message, "author", None), "id", None) == bot_id and marker in str(getattr(message, "content", "")):
-                return str(message.id)
+                message_id = str(message.id)
+                self._adapter.remember_mention_inbox_parent(message_id, channel_id)
+                return message_id
         return None
 
     async def send(self, channel_id: str, content: str, *, allowed_mentions: dict[str, Any]) -> str:
@@ -253,31 +346,232 @@ class GatewayDiscordTransport:
         )
         if not result.success or not result.message_id:
             raise RuntimeError("discord_send_failed")
+        message_id = str(result.message_id)
+        self._adapter.remember_mention_inbox_parent(message_id, channel_id)
+        return message_id
+
+    async def find_anchored_thread(self, parent_message_id: str) -> str | None:
+        return await self._adapter.find_anchored_thread(parent_message_id)
+
+    async def create_anchored_thread(
+        self, parent_message_id: str, name: str, auto_archive_duration: int
+    ) -> str:
+        return await self._adapter.create_anchored_thread(
+            parent_message_id,
+            name,
+            auto_archive_duration,
+        )
+
+    def mark_thread_participation(self, thread_id: str) -> None:
+        self._adapter.mark_mention_inbox_thread_participation(thread_id)
+
+    async def find_message_content(
+        self, thread_id: str, content: str, *, limit: int
+    ) -> str | None:
+        channel = await self._channel(thread_id)
+        bot_id = getattr(getattr(self._adapter._client, "user", None), "id", None)
+        formatter = getattr(self._adapter, "format_message", None)
+        expected = formatter(content) if callable(formatter) else content
+        async for message in channel.history(limit=limit):
+            if (
+                getattr(getattr(message, "author", None), "id", None) == bot_id
+                and str(getattr(message, "content", "")) == expected
+            ):
+                return str(message.id)
+        return None
+
+    async def send_to_thread(self, thread_id: str, content: str) -> str:
+        result = await self._adapter.send(
+            thread_id,
+            content,
+            metadata={
+                "thread_id": thread_id,
+                "nonconversational": True,
+                "mention_inbox_no_mentions": True,
+            },
+        )
+        if not result.success or not result.message_id:
+            raise RuntimeError("discord_thread_send_failed")
         return str(result.message_id)
 
 
 class _LazyGitHubNotificationCollector:
-    """Resolve the authenticated stable target ID inside poller error handling."""
-    def __init__(self, client: GitHubNotificationsClient, repositories: tuple[str, ...]) -> None:
+    """Hydrate candidates after resolving the authenticated stable identity."""
+
+    _TEAM_MENTION_RE = re.compile(
+        r"(?<![A-Za-z0-9-])@([A-Za-z0-9-]+)/([A-Za-z0-9_-]+)(?![A-Za-z0-9_-])"
+    )
+
+    def __init__(
+        self,
+        client: GitHubNotificationsClient,
+        repositories: tuple[str, ...],
+        *,
+        team_mentions: bool = False,
+        team_review_requests: bool = False,
+    ) -> None:
+        if not isinstance(team_mentions, bool) or not isinstance(
+            team_review_requests, bool
+        ):
+            raise ValueError("team switches must be boolean")
         self._client = client
         self._repositories = repositories
+        self._team_mentions = team_mentions
+        self._team_review_requests = team_review_requests
         self._collector = GitHubNotificationCollector(
             target_id="github:authenticated-user",
             allowed_repositories=repositories,
+            include_owned_pr_activity=True,
         )
-        self._resolved = False
+        self._target_login: str | None = None
+        self._target_id: str | None = None
+
+    def _resolve(self) -> None:
+        if self._target_id is not None:
+            return
+        user = self._client.get_authenticated_user()
+        self._target_login = user.login
+        self._target_id = user.node_id
+        self._collector = GitHubNotificationCollector(
+            target_id=user.node_id,
+            target_login=user.login,
+            allowed_repositories=self._repositories,
+            include_owned_pr_activity=True,
+        )
 
     def accepts(self, notification: Mapping[str, Any]) -> bool:
+        if notification.get("reason") == "team_mention" and not self._team_mentions:
+            return False
         return self._collector.accepts(notification)
 
-    def normalize(self, notification: Mapping[str, Any], detail: Mapping[str, Any] | None):
-        if not self._resolved:
-            target_id = self._client.get_authenticated_user_id()
-            self._collector = GitHubNotificationCollector(
-                target_id=target_id,
-                allowed_repositories=self._repositories,
+    @staticmethod
+    def _timestamp(event: Mapping[str, Any]) -> str:
+        for key in ("updated_at", "submitted_at", "created_at"):
+            value = event.get(key)
+            if isinstance(value, str):
+                return value
+        return ""
+
+    @classmethod
+    def _latest(cls, events: tuple[Mapping[str, Any], ...]) -> Mapping[str, Any] | None:
+        if not events:
+            return None
+        return max(events, key=cls._timestamp)
+
+    @classmethod
+    def _mentioned_teams(cls, body: object) -> set[str]:
+        if not isinstance(body, str):
+            return set()
+        return {
+            f"{match.group(1)}/{match.group(2)}".casefold()
+            for match in cls._TEAM_MENTION_RE.finditer(body)
+        }
+
+    @staticmethod
+    def _requested_teams(subject: Mapping[str, Any]) -> set[str]:
+        result: set[str] = set()
+        raw = subject.get("requested_teams")
+        if not isinstance(raw, list):
+            return result
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            slug = item.get("slug")
+            organization = item.get("organization")
+            login = organization.get("login") if isinstance(organization, Mapping) else None
+            if isinstance(slug, str) and isinstance(login, str):
+                result.add(f"{login}/{slug}".casefold())
+        return result
+
+    def hydrate(self, notification: Mapping[str, Any]) -> GitHubHydrationContext | None:
+        self._resolve()
+        repository_payload = notification.get("repository")
+        subject_payload = notification.get("subject")
+        if not isinstance(repository_payload, Mapping) or not isinstance(subject_payload, Mapping):
+            return None
+        repository = repository_payload.get("full_name")
+        subject_url = subject_payload.get("url")
+        if not isinstance(repository, str) or not isinstance(subject_url, str):
+            return None
+        subject = self._client.fetch_subject(subject_url)
+        if subject is None:
+            return None
+
+        latest_event = None
+        latest_url = subject_payload.get("latest_comment_url")
+        if isinstance(latest_url, str) and latest_url:
+            latest_event = self._client.fetch_latest_event(latest_url, repository=repository)
+
+        timeline: tuple[Mapping[str, Any], ...] = ()
+        reviews: tuple[Mapping[str, Any], ...] = ()
+        review_comments: tuple[Mapping[str, Any], ...] = ()
+        if subject_payload.get("type") == "PullRequest":
+            timeline = self._client.fetch_pull_timeline(
+                subject_url, repository=repository, limit=50
             )
-            self._resolved = True
+            reviews = self._client.fetch_pull_reviews(
+                subject_url, repository=repository, limit=50
+            )
+            review_comments = self._client.fetch_pull_review_comments(
+                subject_url, repository=repository, limit=50
+            )
+
+        reason = notification.get("reason")
+        all_events = tuple(
+            event
+            for event in ((latest_event,) + timeline + reviews + review_comments)
+            if isinstance(event, Mapping)
+        )
+        if reason == "review_requested":
+            relevant = tuple(
+                event
+                for event in timeline
+                if event.get("event_type") == "review_requested"
+            )
+            selected_event = self._latest(relevant) or latest_event or self._latest(all_events)
+        elif reason == "assign":
+            relevant = tuple(
+                event for event in timeline if event.get("event_type") == "assigned"
+            )
+            selected_event = self._latest(relevant) or latest_event or self._latest(all_events)
+        else:
+            selected_event = self._latest(all_events)
+
+        teams: set[str] = set()
+        if self._team_review_requests and reason == "review_requested":
+            teams.update(self._requested_teams(subject))
+        if (
+            self._team_mentions
+            and reason == "team_mention"
+            and selected_event is not None
+        ):
+            teams.update(self._mentioned_teams(selected_event.get("body")))
+        verified: set[str] = set()
+        assert self._target_login is not None
+        assert self._target_id is not None
+        for team in sorted(teams):
+            if self._client.is_active_team_member(team, self._target_login):
+                verified.add(team)
+
+        return GitHubHydrationContext(
+            target_login=self._target_login,
+            target_node_id=self._target_id,
+            subject=subject,
+            latest_event=selected_event,
+            timeline=timeline,
+            reviews=reviews,
+            review_comments=review_comments,
+            verified_team_slugs=frozenset(verified),
+        )
+
+    def normalize(
+        self,
+        notification: Mapping[str, Any],
+        detail: Mapping[str, Any] | GitHubHydrationContext | None,
+    ):
+        self._resolve()
+        if not isinstance(detail, GitHubHydrationContext):
+            return None
         return self._collector.normalize(notification, detail)
 
 
@@ -291,6 +585,8 @@ class MentionInboxGatewayService:
         self._environ = environ
         self._db_path = db_path
         self._runtime: MentionInboxRuntime | None = None
+        self._router_installed = False
+        self._execution_observer_installed = False
         self._degraded_category: str | None = "disabled" if not config.enabled else None
 
     async def start(self) -> None:
@@ -316,13 +612,71 @@ class MentionInboxGatewayService:
             collector = _LazyGitHubNotificationCollector(
                 client,
                 self.config.repositories,
+                team_mentions=self.config.team_mentions,
+                team_review_requests=self.config.team_review_requests,
             )
             poller = GitHubMentionPoller(client=client, collector=collector, store=store)
+            discord_transport = GatewayDiscordTransport(self._discord_adapter)
+            thread_coordinator = None
+            if self.config.action_sessions_enabled:
+                from plugins.mention_inbox.thread_session import (
+                    MentionInboxThreadCoordinator,
+                )
+
+                if self.config.proposal_bot_mention is None:
+                    raise ValueError("action session bot mention is required")
+                thread_coordinator = MentionInboxThreadCoordinator(
+                    store=store,
+                    discord=discord_transport,
+                    bot_mention=self.config.proposal_bot_mention,
+                    executor_hint=self.config.execution_mode,
+                    auto_archive_duration=self.config.thread_auto_archive_minutes,
+                )
+                from plugins.mention_inbox.router import InboxProposalRouter
+
+                approval_handler = None
+                if self.config.execution_enabled:
+                    execution_observer = ExecutionLifecycleObserver(
+                        store=store,
+                        discord=discord_transport,
+                    )
+                    self._discord_adapter.set_mention_inbox_execution_observer(
+                        execution_observer
+                    )
+                    self._execution_observer_installed = True
+                    approval_handler = ApprovalHandler(
+                        store=store,
+                        source_resolver=GitHubSubjectStateResolver(
+                            store=store,
+                            client=client,
+                            allowed_repositories=frozenset(self.config.repositories),
+                        ),
+                        dispatcher=GatewayExecutionDispatcher(self._discord_adapter),
+                        discord=discord_transport,
+                        bot_mention=self.config.proposal_bot_mention,
+                        authorized_approver_ids=frozenset(
+                            self.config.authorized_approver_ids
+                        ),
+                    )
+                router = InboxProposalRouter(
+                    store=store,
+                    discord=discord_transport,
+                    bot_mention=self.config.proposal_bot_mention,
+                    authorized_approver_ids=frozenset(
+                        self.config.authorized_approver_ids
+                    ),
+                    approval_handler=approval_handler,
+                )
+                self._discord_adapter.set_mention_inbox_router(router)
+                self._router_installed = True
+                if approval_handler is not None:
+                    await approval_handler.recover_queued()
             delivery = DiscordMentionDelivery(
                 store=store,
-                discord=GatewayDiscordTransport(self._discord_adapter),
+                discord=discord_transport,
                 destination=self.config.destination,
                 lease_seconds=self.config.lease_seconds,
+                thread_coordinator=thread_coordinator,
             )
             self._runtime = MentionInboxRuntime(
                 config=self.config, store=store, poller=poller, delivery=delivery
@@ -335,6 +689,12 @@ class MentionInboxGatewayService:
     async def stop(self) -> None:
         if self._runtime is not None:
             await self._runtime.stop()
+        if self._router_installed and self._discord_adapter is not None:
+            self._discord_adapter.set_mention_inbox_router(None)
+            self._router_installed = False
+        if self._execution_observer_installed and self._discord_adapter is not None:
+            self._discord_adapter.set_mention_inbox_execution_observer(None)
+            self._execution_observer_installed = False
 
     def health(self) -> dict[str, object]:
         if self._runtime is not None:

@@ -2991,6 +2991,153 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _mention_inbox_execution_context(
+    event: Any,
+) -> Optional[tuple[str, str, str]]:
+    """Return validated code-owned execution metadata for an internal event."""
+    if getattr(event, "internal", False) is not True:
+        return None
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    context = metadata.get("mention_inbox_execution")
+    if not isinstance(context, dict):
+        return None
+    execution_id = context.get("execution_id")
+    if not isinstance(execution_id, str) or re.fullmatch(
+        r"wx_[0-9a-f]{24}", execution_id
+    ) is None:
+        return None
+    proposal_hash = context.get("proposal_hash")
+    if not isinstance(proposal_hash, str) or re.fullmatch(
+        r"[0-9a-f]{64}", proposal_hash
+    ) is None:
+        return None
+    mode = context.get("mode")
+    if mode not in {"direct", "kanban"}:
+        return None
+    return execution_id, proposal_hash, mode
+
+
+def _mention_inbox_execution_id(event: Any) -> Optional[str]:
+    """Return a trusted approved-execution id only for code-owned internal events."""
+    context = _mention_inbox_execution_context(event)
+    return None if context is None else context[0]
+
+
+def _compose_mention_inbox_execution_callbacks(
+    *, execution_id: str, observer: Any, voice_callback: Any = None
+) -> tuple[Any, Any]:
+    """Compose existing voice ack with execution evidence callbacks."""
+    if re.fullmatch(r"wx_[0-9a-f]{24}", execution_id) is None:
+        raise ValueError("invalid mention-inbox execution id")
+
+    def on_start(call_id: str, tool_name: str, args: Any) -> None:
+        if callable(voice_callback):
+            try:
+                voice_callback(call_id, tool_name, args)
+            except Exception:
+                logger.debug("mention-inbox voice callback failed", exc_info=True)
+
+    def on_complete(call_id: str, tool_name: str, args: Any, result: Any) -> None:
+        del call_id, args
+        try:
+            observer.tool_completed(execution_id, tool_name, result)
+        except Exception:
+            logger.exception("mention-inbox tool-complete receipt failed")
+
+    return on_start, on_complete
+
+
+def _mention_inbox_session_source(event: Any, source: Any) -> Any:
+    """Return an isolated transcript lane for one approved execution.
+
+    Delivery still uses the original Discord source. Only gateway session state,
+    cached agents, and transcript history use this synthetic thread lane so
+    untrusted work-thread conversation cannot steer an approved execution.
+    """
+    execution_id = _mention_inbox_execution_id(event)
+    if execution_id is None:
+        return source
+    lane = str(
+        getattr(source, "thread_id", None)
+        or getattr(source, "chat_id", None)
+        or "root"
+    )
+    return dataclasses.replace(
+        source,
+        thread_id=f"{lane}:approved:{execution_id}",
+    )
+
+
+def _constrain_mention_inbox_toolsets(
+    *, configured: Any, disabled: Any, approved: Any
+) -> list[str]:
+    configured_set = {
+        str(value).strip()
+        for value in (configured or ())
+        if isinstance(value, str) and value.strip()
+    }
+    disabled_set = {
+        str(value).strip()
+        for value in (disabled or ())
+        if isinstance(value, str) and value.strip()
+    }
+    approved_set = {
+        str(value).strip()
+        for value in (approved or ())
+        if isinstance(value, str) and value.strip()
+    }
+    if not approved_set:
+        raise RuntimeError("approved execution toolsets unavailable")
+    effective = (configured_set - disabled_set) & approved_set
+    if effective != approved_set:
+        raise RuntimeError("approved execution toolsets unavailable")
+    return sorted(effective)
+
+
+def _install_mention_inbox_pretool_guard(
+    agent: Any, execution_id: str, observer: Any
+) -> None:
+    if re.fullmatch(r"wx_[0-9a-f]{24}", execution_id) is None:
+        raise ValueError("invalid mention-inbox execution id")
+    base = getattr(
+        agent,
+        "_mention_inbox_base_tool_guardrails",
+        getattr(agent, "_tool_guardrails", None),
+    )
+    if base is None or not callable(getattr(base, "before_call", None)):
+        raise RuntimeError("agent tool guardrails are unavailable")
+    agent._mention_inbox_base_tool_guardrails = base
+
+    class _ReceiptGuard:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(base, name)
+
+        def before_call(self, tool_name: str, args: Any) -> Any:
+            decision = base.before_call(tool_name, args)
+            if not getattr(decision, "allows_execution", False):
+                return decision
+            try:
+                authorizer = getattr(observer, "authorize_tool_start", None)
+                if callable(authorizer):
+                    authorizer(execution_id, tool_name, args)
+                else:
+                    observer.tool_started(execution_id, tool_name)
+            except Exception:
+                from agent.tool_guardrails import ToolGuardrailDecision
+
+                return ToolGuardrailDecision(
+                    action="block",
+                    code="mention_inbox_receipt_failed",
+                    message="approved execution receipt could not be committed",
+                    tool_name=tool_name,
+                )
+            return decision
+
+    agent._tool_guardrails = _ReceiptGuard()
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -10419,7 +10566,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _quick_key = self._session_key_for_source(source)
+        # Approved mention-inbox executions use an isolated transcript/cache lane;
+        # their original source is retained for Discord delivery.
+        _quick_session_source = _mention_inbox_session_source(event, source)
+        _quick_key = self._session_key_for_source(_quick_session_source)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -12424,7 +12574,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        _session_source = _mention_inbox_session_source(event, source)
+        session_entry = await self.async_session_store.get_or_create_session(
+            _session_source
+        )
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
@@ -13340,6 +13493,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation,
         )
 
+        _mention_execution_context = _mention_inbox_execution_context(event)
+        _mention_execution_id = (
+            None
+            if _mention_execution_context is None
+            else _mention_execution_context[0]
+        )
+        _mention_execution_observer = None
+        if _mention_execution_id is not None:
+            _mention_adapter = self._adapter_for_source(source)
+            _mention_execution_observer = getattr(
+                _mention_adapter, "_mention_inbox_execution_observer", None
+            )
+            if _mention_execution_observer is None:
+                raise RuntimeError(
+                    "approved mention-inbox execution observer is unavailable"
+                )
+            _mention_execution_observer.validate_execution_context(
+                _mention_execution_id,
+                proposal_hash=_mention_execution_context[1],
+                mode=_mention_execution_context[2],
+            )
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -13358,22 +13533,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                semantic_progress_message_id=_semantic_progress_message_id,
-                semantic_progress_text=_semantic_progress_text,
-            )
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    semantic_progress_message_id=_semantic_progress_message_id,
+                    semantic_progress_text=_semantic_progress_text,
+                    mention_inbox_execution_id=_mention_execution_id,
+                    mention_inbox_execution_observer=_mention_execution_observer,
+                )
+            except BaseException:
+                if _mention_execution_observer is not None:
+                    try:
+                        await _mention_execution_observer.run_failed(
+                            _mention_execution_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "mention-inbox execution failure receipt failed"
+                        )
+                raise
+            if _mention_execution_observer is not None:
+                try:
+                    await _mention_execution_observer.run_completed(
+                        _mention_execution_id, agent_result
+                    )
+                except Exception:
+                    logger.exception(
+                        "mention-inbox execution finalization failed"
+                    )
+                    try:
+                        await _mention_execution_observer.run_failed(
+                            _mention_execution_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "mention-inbox fallback failure receipt failed"
+                        )
+                if isinstance(agent_result, dict):
+                    agent_result["final_response"] = "NO_REPLY"
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -19348,6 +19556,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         semantic_progress_message_id: Optional[str] = None,
         semantic_progress_text: Optional[str] = None,
+        mention_inbox_execution_id: Optional[str] = None,
+        mention_inbox_execution_observer: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19368,6 +19578,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 semantic_progress_message_id=semantic_progress_message_id,
                 semantic_progress_text=semantic_progress_text,
+                mention_inbox_execution_id=mention_inbox_execution_id,
+                mention_inbox_execution_observer=mention_inbox_execution_observer,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19381,6 +19593,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 semantic_progress_message_id=semantic_progress_message_id,
                 semantic_progress_text=semantic_progress_text,
+                mention_inbox_execution_id=mention_inbox_execution_id,
+                mention_inbox_execution_observer=mention_inbox_execution_observer,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19504,6 +19718,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         semantic_progress_message_id: Optional[str] = None,
         semantic_progress_text: Optional[str] = None,
+        mention_inbox_execution_id: Optional[str] = None,
+        mention_inbox_execution_observer: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19519,6 +19735,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if mention_inbox_execution_id is not None:
+                raise RuntimeError(
+                    "approved mention-inbox execution requires local tool receipts"
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -19552,6 +19772,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets,
         )
         enabled_toolsets = list(tool_policy.enabled_toolsets)
+        if mention_inbox_execution_id is not None:
+            if mention_inbox_execution_observer is None:
+                raise RuntimeError(
+                    "approved mention-inbox execution observer is unavailable"
+                )
+            approved_toolsets = mention_inbox_execution_observer.enabled_toolsets(
+                mention_inbox_execution_id
+            )
+            enabled_toolsets = _constrain_mention_inbox_toolsets(
+                configured=enabled_toolsets,
+                disabled=(),
+                approved=approved_toolsets,
+            )
+            disabled_toolsets = sorted(
+                set(disabled_toolsets or ()) - set(enabled_toolsets)
+            ) or None
 
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
@@ -20662,8 +20898,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if mention_inbox_execution_id is not None:
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            _want_interim_messages = (
+                interim_assistant_messages_enabled
+                and mention_inbox_execution_id is None
+            )
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -21045,6 +21286,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            _base_execution_guardrails = getattr(
+                agent, "_mention_inbox_base_tool_guardrails", None
+            )
+            if _base_execution_guardrails is not None:
+                agent._tool_guardrails = _base_execution_guardrails
+            if mention_inbox_execution_id is not None:
+                _install_mention_inbox_pretool_guard(
+                    agent,
+                    mention_inbox_execution_id,
+                    mention_inbox_execution_observer,
+                )
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -21064,11 +21317,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 else None
             )
-            # Discord voice verbal-ack hook (fires once per turn on first tool
-            # call; armed only when in a voice channel with the mixer running).
-            agent.tool_start_callback = (
+            # Discord voice verbal-ack and approved-execution lifecycle hooks.
+            _voice_tool_start = (
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
+            _execution_tool_complete = None
+            if mention_inbox_execution_id is not None:
+                if mention_inbox_execution_observer is None:
+                    raise RuntimeError(
+                        "approved mention-inbox execution observer is unavailable"
+                    )
+                _execution_tool_start, _execution_tool_complete = (
+                    _compose_mention_inbox_execution_callbacks(
+                        execution_id=mention_inbox_execution_id,
+                        observer=mention_inbox_execution_observer,
+                        voice_callback=_voice_tool_start,
+                    )
+                )
+                agent.tool_start_callback = _execution_tool_start
+            else:
+                agent.tool_start_callback = _voice_tool_start
+            agent.tool_complete_callback = _execution_tool_complete
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
