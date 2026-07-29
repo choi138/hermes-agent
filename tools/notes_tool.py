@@ -60,6 +60,7 @@ def notes_write_tool(
     token: Optional[str] = None,
     verdict: Optional[str] = None,
     target: Optional[str] = None,
+    evidence_overrides: Optional[Dict[Any, str]] = None,
     session_id: str = "",
     memory_manager: Any = None,
 ) -> str:
@@ -91,6 +92,7 @@ def notes_write_tool(
             topic_key=topic_key or "",
             kind=kind or "",
             target=target or "",
+            evidence_overrides=evidence_overrides,
             session_id=session_id,
             caller="agent-tool",
         )
@@ -254,6 +256,7 @@ def handle_notes_tool(
             token=args.get("token"),
             verdict=args.get("verdict"),
             target=args.get("target"),
+            evidence_overrides=args.get("evidence_overrides"),
             session_id=session_id,
             memory_manager=memory_manager,
         )
@@ -330,7 +333,7 @@ NOTES_WRITE_SCHEMA = {
         "decisions, incidents, preferences, relationships, project facts) as "
         "a curated note with cited evidence. Two mandatory steps:\n"
         "1. step='propose' with content + kind + evidence → returns existing "
-        "NEIGHBOR notes and a short-lived token.\n"
+        "NEIGHBOR notes, a grounding_preview, and a short-lived token.\n"
         "2. step='confirm' with token + verdict: NOOP if a neighbor already "
         "covers the fact (this should be your most common verdict), UPDATE/"
         "SUPERSEDE a listed neighbor (target='kind/topic.key'), or ADD with a "
@@ -338,7 +341,11 @@ NOTES_WRITE_SCHEMA = {
         "Notes are NOT for: instructions to yourself (memory tool), "
         "procedures/workflows (skills — separately gated), raw logs or task "
         "progress (session_search/graph). Every write must cite evidence; "
-        "quotes are machine-checked verbatim against local journals."
+        "quotes are machine-checked verbatim against local journals. If a "
+        "grounding_preview item fails but offers candidates, either select "
+        "one at confirm with evidence_overrides={ref_index:candidate_id}, or "
+        "fix the quote and propose again. Confirming without resolving a "
+        "failed preview is rejected."
     ),
     "parameters": {
         "type": "object",
@@ -386,6 +393,17 @@ NOTES_WRITE_SCHEMA = {
                     "confirm UPDATE/SUPERSEDE: the neighbor to act on, as "
                     "'kind/topic.key' — must be one of the proposed neighbors."
                 ),
+            },
+            "evidence_overrides": {
+                "type": "object",
+                "description": (
+                    "confirm: map a zero-based evidence-ref index to a "
+                    "candidate_id returned in that ref's grounding_preview. "
+                    "The server substitutes its cached exact journal excerpt "
+                    "and source coordinates; caller-provided quote text is "
+                    "never accepted here."
+                ),
+                "additionalProperties": {"type": "string"},
             },
         },
         "required": ["step"],
@@ -466,6 +484,7 @@ registry.register(
         token=args.get("token"),
         verdict=args.get("verdict"),
         target=args.get("target"),
+        evidence_overrides=args.get("evidence_overrides"),
         session_id=kw.get("session_id") or "",
         memory_manager=kw.get("memory_manager"),
     ),

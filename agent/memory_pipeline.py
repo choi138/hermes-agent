@@ -57,6 +57,7 @@ results (or paraphrases thereof). Tainted refs are quote-ineligible.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import logging
 import re
@@ -243,7 +244,7 @@ class _Proposal:
     __slots__ = (
         "token", "content", "content_sha", "kind", "evidence_refs",
         "neighbor_refs", "session_id", "origin", "caller", "created_ts",
-        "expires_ts",
+        "expires_ts", "candidates",
     )
 
     def __init__(
@@ -256,6 +257,7 @@ class _Proposal:
         session_id: str,
         origin: str,
         caller: str,
+        candidates: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self.token = _uuid.uuid4().hex
         self.content = content
@@ -266,6 +268,7 @@ class _Proposal:
         self.session_id = session_id
         self.origin = origin
         self.caller = caller
+        self.candidates = candidates or {}
         self.created_ts = time.time()
         self.expires_ts = self.created_ts + PROPOSAL_TTL_S
 
@@ -364,6 +367,25 @@ class MemoryWritePipeline:
             if err:
                 return self._reject("propose", err, caller=caller, check="grounding")
 
+        # Recognition assist: admission remains exact/verbatim, but the
+        # caller sees whether each ref will ground before spending the token.
+        # Failed quote refs may carry exact, taint-clean journal excerpts the
+        # caller can select at confirm by opaque id.
+        grounding_preview: List[Dict[str, Any]] = []
+        issued_candidates: Dict[str, Dict[str, Any]] = {}
+        for ref_index, ref in enumerate(evidence_refs):
+            check = self._ground_ref(ref)
+            preview = dict(check)
+            if self._candidate_search_eligible(ref, check):
+                candidates = self._find_grounding_candidates(
+                    ref, session_id=session_id or "", ref_index=ref_index
+                )
+                if candidates:
+                    preview["candidates"] = [c["public"] for c in candidates]
+                    for candidate in candidates:
+                        issued_candidates[candidate["public"]["candidate_id"]] = candidate
+            grounding_preview.append(preview)
+
         # Step 2 — kind routing. Only declarative kinds proceed to notes.
         kind = (kind_hint or "").strip().lower()
         if kind == KIND_INSTRUCTION:
@@ -428,6 +450,7 @@ class MemoryWritePipeline:
             session_id=session_id or "",
             origin=origin,
             caller=caller,
+            candidates=issued_candidates,
         )
         with self._proposals_lock:
             self._prune_expired_locked()
@@ -449,6 +472,7 @@ class MemoryWritePipeline:
             "token": proposal.token,
             "token_ttl_seconds": PROPOSAL_TTL_S,
             "kind": kind,
+            "grounding_preview": grounding_preview,
             "neighbors": [
                 {
                     "ref": note_ref(n["kind"], n["topic_key"]),
@@ -465,7 +489,11 @@ class MemoryWritePipeline:
                 "notes_write(step='confirm', token=..., verdict=...). "
                 "NOOP is the expected most-frequent verdict — if a neighbor "
                 "already covers this fact, confirm NOOP. Use UPDATE/SUPERSEDE "
-                "on a listed neighbor instead of ADD when the topic matches."
+                "on a listed neighbor instead of ADD when the topic matches. "
+                "If grounding_preview contains a failed ref with candidates, "
+                "select one by passing evidence_overrides={ref_index: "
+                "candidate_id} at confirm, or fix the quote and propose again. "
+                "Ignoring a failed preview will still be rejected."
             ),
         }
 
@@ -479,6 +507,7 @@ class MemoryWritePipeline:
         topic_key: str = "",
         kind: str = "",
         target: str = "",
+        evidence_overrides: Optional[Dict[Any, str]] = None,
         session_id: str = "",
         caller: str = "agent",
     ) -> Dict[str, Any]:
@@ -517,6 +546,15 @@ class MemoryWritePipeline:
                 "this session.",
                 caller=caller,
                 check="token",
+            )
+
+        effective_refs, override_error = self._apply_evidence_overrides(
+            proposal, evidence_overrides
+        )
+        if override_error:
+            return self._reject(
+                "confirm", override_error, caller=caller,
+                check="grounding-overrides",
             )
 
         if verdict == "NOOP":
@@ -575,7 +613,7 @@ class MemoryWritePipeline:
 
         # Step 5 — grounded admission (mechanical, zero LLM calls).
         grounding: List[Dict[str, Any]] = []
-        for ref in proposal.evidence_refs:
+        for ref in effective_refs:
             check = self._ground_ref(ref)
             grounding.append(check)
             if not check["ok"]:
@@ -595,7 +633,7 @@ class MemoryWritePipeline:
                     "error": f"grounding failed: {check['detail']}",
                     "grounding": grounding,
                 }
-        evidence_strs = [serialize_evidence_ref(r) for r in proposal.evidence_refs]
+        evidence_strs = [serialize_evidence_ref(r) for r in effective_refs]
 
         # Step 4 verdict application (the caller decided; we enforce the
         # neighbor-snapshot contract). First resolve the full write plan —
@@ -732,6 +770,290 @@ class MemoryWritePipeline:
         }
 
     # -- grounding helpers -------------------------------------------------------
+
+    @staticmethod
+    def _candidate_search_eligible(
+        ref: Dict[str, Any], check: Dict[str, Any]
+    ) -> bool:
+        """Only quote-resolution failures get recognition candidates.
+
+        Format/admissibility and taint failures are security decisions, not
+        recall problems, and must never be papered over with a suggestion.
+        """
+        return (
+            not check.get("ok")
+            and ref.get("type") in ("wal", "l0")
+            and check.get("checked") in ("wal", "wal-quote", "l0", "l0-quote")
+            and "read failed" not in str(check.get("detail") or "")
+        )
+
+    @staticmethod
+    def _wal_record_spans(
+        rec: Dict[str, Any], *, session_id: str
+    ) -> List[Dict[str, Any]]:
+        if rec.get("type") == "turn":
+            return [
+                {
+                    "source": "wal",
+                    "session_id": session_id,
+                    "wal_entry_id": str(rec.get("id") or ""),
+                    "role": str(item.get("role") or ""),
+                    "content": str(item.get("content") or ""),
+                    "taint": item.get("taint") if isinstance(item.get("taint"), dict) else None,
+                    "ts": rec.get("ts"),
+                }
+                for item in (rec.get("records") or [])
+                if isinstance(item, dict) and item.get("content")
+            ]
+        if rec.get("type") == "proposal" and rec.get("content"):
+            return [{
+                "source": "wal",
+                "session_id": session_id,
+                "wal_entry_id": str(rec.get("id") or ""),
+                "role": "proposal",
+                "content": str(rec.get("content") or ""),
+                "taint": rec.get("taint") if isinstance(rec.get("taint"), dict) else None,
+                "ts": rec.get("ts"),
+            }]
+        return []
+
+    @staticmethod
+    def _l0_record_spans(
+        rec: Dict[str, Any], *, month: str
+    ) -> List[Dict[str, Any]]:
+        body = rec.get("body") or {}
+        rec_taint = rec.get("taint") if isinstance(rec.get("taint"), dict) else {}
+        if isinstance(body, dict):
+            return [
+                {
+                    "source": "l0",
+                    "month": month,
+                    "session_id": str(rec.get("session_id") or ""),
+                    "wal_entry_id": str(rec.get("wal_entry_id") or ""),
+                    "role": str(role),
+                    "content": str(content),
+                    "taint": rec_taint.get(role) if isinstance(rec_taint.get(role), dict) else None,
+                    "ts": rec.get("ts"),
+                }
+                for role, content in body.items()
+                if content
+            ]
+        if body:
+            return [{
+                "source": "l0",
+                "month": month,
+                "session_id": str(rec.get("session_id") or ""),
+                "wal_entry_id": str(rec.get("wal_entry_id") or ""),
+                "role": "",
+                "content": str(body),
+                "taint": None,
+                "ts": rec.get("ts"),
+            }]
+        return []
+
+    @staticmethod
+    def _candidate_excerpt(quote: str, content: str) -> Optional[tuple]:
+        """Return ``(score, exact_excerpt)`` for a fuzzy recognition match."""
+        if not quote or not content:
+            return None
+        matcher = difflib.SequenceMatcher(
+            None, quote.casefold(), content.casefold(), autojunk=False
+        )
+        block = max(matcher.get_matching_blocks(), key=lambda b: b.size)
+        quote_terms = {t.casefold() for t in _TERM_SPLIT_RE.split(quote) if len(t) >= 2}
+        content_terms = {
+            t.casefold() for t in _TERM_SPLIT_RE.split(content) if len(t) >= 2
+        }
+        token_overlap = (
+            len(quote_terms & content_terms) / len(quote_terms)
+            if quote_terms else 0.0
+        )
+        contiguous = block.size / max(len(quote), 1)
+        score = max(matcher.ratio(), (0.7 * contiguous) + (0.3 * token_overlap))
+        if score < 0.18 or (block.size < 4 and token_overlap == 0.0):
+            return None
+
+        # Center a 160-char window on the strongest contiguous match, then
+        # expand modestly to whitespace boundaries. Slicing preserves exact
+        # journal bytes; strip only removes boundary whitespace and therefore
+        # still yields a substring.
+        target = 160
+        center = block.b + (block.size // 2)
+        start = max(0, center - target // 2)
+        end = min(len(content), start + target)
+        start = max(0, end - target)
+        if start:
+            boundary = content.rfind(" ", max(0, start - 30), start + 1)
+            if boundary >= 0:
+                start = boundary + 1
+        if end < len(content):
+            boundary = content.find(" ", end, min(len(content), end + 31))
+            if boundary >= 0:
+                end = boundary
+        excerpt = content[start:end].strip()
+        if not excerpt or len(excerpt) > 160:
+            excerpt = excerpt[:160].rstrip()
+        return score, excerpt
+
+    def _find_grounding_candidates(
+        self,
+        ref: Dict[str, Any],
+        *,
+        session_id: str,
+        ref_index: int,
+    ) -> List[Dict[str, Any]]:
+        """Find up to three exact, taint-clean journal excerpts for ``ref``."""
+        spans: List[Dict[str, Any]] = []
+        rtype = ref.get("type")
+        ref_session = str(ref.get("session_id") or "")
+        ref_month = str(ref.get("month") or "")
+        want_entry = str(ref.get("entry_id") or ref.get("wal_entry_id") or "")
+
+        def add_wal(sid: str, only_entry: str = "") -> None:
+            if not sid:
+                return
+            path = self._wal_dir / _safe_session_filename(sid)
+            if not path.exists():
+                return
+            try:
+                for record in _iter_jsonl_records(path):
+                    if only_entry and str(record.get("id") or "") != only_entry:
+                        continue
+                    spans.extend(self._wal_record_spans(record, session_id=sid))
+            except Exception:
+                logger.debug("candidate WAL scan failed", exc_info=True)
+
+        def add_l0(month: str, only_entry: str = "") -> None:
+            if not month:
+                return
+            path = self._mirror_dir / f"{month}.jsonl"
+            if not path.exists():
+                return
+            try:
+                for record in _iter_jsonl_records(path):
+                    if only_entry and str(record.get("wal_entry_id") or "") != only_entry:
+                        continue
+                    spans.extend(self._l0_record_spans(record, month=month))
+            except Exception:
+                logger.debug("candidate L0 scan failed", exc_info=True)
+
+        # Referenced record first when it resolves, then the session WAL and
+        # current mirror. Duplicate spans are removed below.
+        if rtype == "wal":
+            add_wal(ref_session, want_entry)
+        else:
+            add_l0(ref_month, want_entry)
+        search_session = ref_session or session_id
+        add_wal(search_session)
+        current_month = time.strftime("%Y-%m", time.localtime())
+        add_l0(current_month)
+
+        from agent.memory_taint import matched_quote_taint
+
+        quote = str(ref.get("quote") or "").strip()
+        ranked: List[tuple] = []
+        seen = set()
+        for order, span in enumerate(spans):
+            key = (
+                span.get("source"), span.get("session_id"), span.get("month"),
+                span.get("wal_entry_id"), span.get("role"), span.get("content"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            match = self._candidate_excerpt(quote, str(span.get("content") or ""))
+            if match is None:
+                continue
+            score, excerpt = match
+            excerpt = _scrub(excerpt)
+            content = str(span.get("content") or "")
+            if excerpt not in content or _quote_admissibility_error(excerpt):
+                continue
+            matched = [(
+                str(span.get("role") or ""), content,
+                span.get("taint") if isinstance(span.get("taint"), dict) else None,
+                span.get("ts"),
+            )]
+            if matched_quote_taint(str(span.get("session_id") or ""), matched, excerpt):
+                continue
+            ranked.append((
+                -score,
+                0 if span.get("role") == "user" else 1,
+                order,
+                span,
+                excerpt,
+            ))
+
+        issued: List[Dict[str, Any]] = []
+        for _, _, _, span, excerpt in sorted(ranked)[:3]:
+            candidate_id = _uuid.uuid4().hex[:8]
+            if span["source"] == "wal":
+                evidence_ref = {
+                    "type": "wal",
+                    "session_id": span["session_id"],
+                    "entry_id": span["wal_entry_id"],
+                    "quote": excerpt,
+                }
+                public = {
+                    "candidate_id": candidate_id,
+                    "source": "wal",
+                    "session_id": span["session_id"],
+                    "wal_entry_id": span["wal_entry_id"],
+                    "role": span["role"],
+                    "excerpt": excerpt,
+                }
+            else:
+                evidence_ref = {
+                    "type": "l0",
+                    "month": span["month"],
+                    "session_id": span["session_id"],
+                    "wal_entry_id": span["wal_entry_id"],
+                    "quote": excerpt,
+                }
+                public = {
+                    "candidate_id": candidate_id,
+                    "source": "l0",
+                    "month": span["month"],
+                    "wal_entry_id": span["wal_entry_id"],
+                    "role": span["role"],
+                    "excerpt": excerpt,
+                }
+            issued.append({
+                "ref_index": ref_index,
+                "evidence_ref": evidence_ref,
+                "public": public,
+            })
+        return issued
+
+    @staticmethod
+    def _apply_evidence_overrides(
+        proposal: _Proposal, overrides: Optional[Dict[Any, str]]
+    ) -> tuple:
+        refs = [dict(ref) for ref in proposal.evidence_refs]
+        if overrides is None:
+            return refs, None
+        if not isinstance(overrides, dict):
+            return refs, "evidence_overrides must be an object mapping ref index to candidate_id"
+        for raw_index, raw_candidate_id in overrides.items():
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                return refs, f"invalid evidence override index {raw_index!r}"
+            if str(index) != str(raw_index) and not isinstance(raw_index, int):
+                return refs, f"invalid evidence override index {raw_index!r}"
+            if index < 0 or index >= len(refs):
+                return refs, f"evidence override index {index} is out of range"
+            candidate_id = str(raw_candidate_id or "")
+            candidate = proposal.candidates.get(candidate_id)
+            if candidate is None:
+                return refs, f"unknown or expired grounding candidate {candidate_id!r}"
+            if candidate["ref_index"] != index:
+                return refs, (
+                    f"grounding candidate {candidate_id!r} was not issued for "
+                    f"evidence ref index {index}"
+                )
+            refs[index] = dict(candidate["evidence_ref"])
+        return refs, None
 
     @staticmethod
     def _ref_format_error(ref: Any) -> Optional[str]:

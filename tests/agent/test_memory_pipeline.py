@@ -333,6 +333,135 @@ class TestGrounding:
         assert written[-1]["caller"] == "agent"
 
 
+class TestGroundingRecognition:
+    def test_propose_previews_a_good_quote_as_grounded(self, tmp_path):
+        wal = PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
+        entry_id = wal.append_turn(
+            SESSION,
+            "The production API is deployed in europe-west1.",
+            "Acknowledged.",
+        )
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal",
+            "session_id": SESSION,
+            "entry_id": entry_id,
+            "quote": "production API is deployed in europe-west1",
+        }
+
+        proposed = _propose(pipeline, evidence_refs=[ref])
+
+        assert proposed["success"] is True
+        assert proposed["grounding_preview"] == [pipeline._ground_ref(ref)]
+        assert proposed["grounding_preview"][0]["ok"] is True
+
+    def test_near_miss_gets_exact_candidates_but_tainted_assistant_does_not(
+        self, tmp_path
+    ):
+        import agent.memory_taint as mt
+        from agent.memory_taint import TaintRegistry
+
+        registry = TaintRegistry(
+            base_dir=tmp_path / "state" / "memory-pending" / "taint"
+        )
+        mt.set_registry(registry)
+        try:
+            injected = (
+                "The remembered deployment region for the billing API is "
+                "europe-west1 and that region must remain primary."
+            )
+            mt.record_injected_text(SESSION, injected, source="prefetch")
+            wal = PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
+            entry_id = wal.append_turn(
+                SESSION,
+                "For the billing API deployment, use europe-west1 as the "
+                "primary region during the migration.",
+                injected,
+            )
+            pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+            ref = {
+                "type": "wal",
+                "session_id": SESSION,
+                "entry_id": entry_id,
+                "quote": (
+                    "Deploy the billing API primarily in the Europe west one "
+                    "region during migration"
+                ),
+            }
+
+            proposed = _propose(pipeline, evidence_refs=[ref])
+
+            preview = proposed["grounding_preview"][0]
+            assert preview["ok"] is False
+            assert preview["candidates"]
+            record = next(
+                rec
+                for rec in mp._iter_jsonl_records(
+                    tmp_path / "state" / "memory-pending" / f"{SESSION}.jsonl"
+                )
+                if rec.get("id") == entry_id
+            )
+            journal_spans = [item["content"] for item in record["records"]]
+            assert all(
+                candidate["excerpt"] in journal_spans
+                for candidate in preview["candidates"]
+            )
+            assert all(
+                candidate["role"] != "assistant"
+                for candidate in preview["candidates"]
+            )
+        finally:
+            mt.set_registry(None)
+
+    def test_confirm_override_uses_cached_exact_ref_and_unknown_id_fails_closed(
+        self, tmp_path
+    ):
+        wal = PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
+        entry_id = wal.append_turn(
+            SESSION,
+            "The NAS array lost its eight terabyte data disk during detach.",
+            "Acknowledged.",
+        )
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        failed_ref = {
+            "type": "wal",
+            "session_id": SESSION,
+            "entry_id": "invented-entry-format#seq=3",
+            "quote": "The NAS array lost the 8TB disk during a detach event.",
+        }
+        proposed = _propose(pipeline, evidence_refs=[failed_ref])
+        candidate = next(
+            item
+            for item in proposed["grounding_preview"][0]["candidates"]
+            if item["source"] == "wal" and item["wal_entry_id"] == entry_id
+        )
+
+        confirmed = pipeline.confirm(
+            proposed["token"],
+            "ADD",
+            topic_key="nas.disk.detach",
+            evidence_overrides={0: candidate["candidate_id"]},
+            session_id=SESSION,
+        )
+
+        assert confirmed["success"] is True
+        note = pipeline.store.read("preference", "nas.disk.detach")
+        assert note["evidence"] == [
+            f"wal:{SESSION}:{entry_id} :: {candidate['excerpt']}"
+        ]
+
+        proposed_again = _propose(pipeline, evidence_refs=[failed_ref])
+        rejected = pipeline.confirm(
+            proposed_again["token"],
+            "ADD",
+            topic_key="nas.disk.other",
+            evidence_overrides={0: "deadbeef"},
+            session_id=SESSION,
+        )
+        assert rejected["success"] is False
+        assert "unknown or expired grounding candidate" in rejected["error"]
+
+
 # ---------------------------------------------------------------------------
 # Quote admissibility (secret-bypass + gameable-grounding fixes)
 # ---------------------------------------------------------------------------
