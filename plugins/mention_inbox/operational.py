@@ -462,7 +462,9 @@ class _LazyGitHubNotificationCollector:
 
     def accepts(self, notification: Mapping[str, Any]) -> bool:
         if notification.get("reason") == "team_mention" and not self._team_mentions:
-            return False
+            subject = notification.get("subject")
+            if not isinstance(subject, Mapping) or subject.get("type") != "PullRequest":
+                return False
         return self._collector.accepts(notification)
 
     @staticmethod
@@ -540,7 +542,7 @@ class _LazyGitHubNotificationCollector:
         reason = notification.get("reason")
         all_events = tuple(
             event
-            for event in ((latest_event,) + timeline + reviews + review_comments)
+            for event in ((latest_event,) + reviews + review_comments + timeline)
             if isinstance(event, Mapping)
         )
         if reason == "review_requested":

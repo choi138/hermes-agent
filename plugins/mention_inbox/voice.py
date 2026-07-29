@@ -110,6 +110,7 @@ def _action_phrase(kind: str, actor: str) -> str:
         "direct_assigned": "담당자로 지정했어요.",
         "own_pr_comment": "작성한 PR에 의견을 남겼어요.",
         "own_pr_review_comment": "작성한 PR에 review 의견을 남겼어요.",
+        "own_pr_review_summary": "작성한 PR에 review 요약을 남겼어요.",
         "own_pr_changes_requested": "작성한 PR에 변경을 요청했어요.",
     }
     return actor_name + phrases.get(kind, "확인이 필요한 요청을 남겼어요.")

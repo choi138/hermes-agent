@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from plugins.mention_inbox.github_client import (
     AuthenticatedGitHubUser,
@@ -170,15 +173,17 @@ def test_runtime_hydrates_only_candidate_and_uses_actual_event_id(
     connection.close()
 
 
-def test_runtime_team_mention_is_suppressed_before_hydration_by_default(
+def test_runtime_pr_team_mention_is_hydrated_but_suppressed_by_default(
     tmp_path: Path,
 ) -> None:
     client = _Client(team_mention=True)
     result, store = _poll(tmp_path, client)
 
     assert result.created == 0
+    assert result.selected == 1
     assert result.skipped == 2
-    assert "subject" not in client.calls
+    assert client.calls.count("subject") == 1
+    assert client.calls.count("latest") == 1
     assert not any(call.startswith("team:") for call in client.calls)
     connection = sqlite3.connect(store.path)
     assert connection.execute("SELECT COUNT(*) FROM mention_events").fetchone()[0] == 0
@@ -227,3 +232,161 @@ def test_runtime_team_review_request_requires_verified_active_membership(
     ]
     connection.close()
     assert '"actionable_kind":"team_review_requested"' in event_json
+
+
+class _AIReviewClient(_Client):
+    def __init__(
+        self,
+        event_type: str,
+        *,
+        reason: str = "author",
+        timeline_review_tie: bool = False,
+    ) -> None:
+        if event_type not in {"review", "review_comment"}:
+            raise ValueError("unsupported AI review event type")
+        super().__init__()
+        self.event_type = event_type
+        self.reason = reason
+        self.timeline_review_tie = timeline_review_tie
+
+    def list_notifications(self, **kwargs: Any) -> GitHubNotificationPage:
+        self.calls.append("notifications")
+        return GitHubNotificationPage(
+            items=(
+                _notification(notification_id="ai-review", reason=self.reason),
+                _notification(notification_id="ignored", reason="subscribed"),
+            ),
+            next_url=None,
+            last_modified="Wed, 29 Jul 2026 10:00:00 GMT",
+            poll_interval_seconds=60,
+        )
+
+    def fetch_subject(self, url: str) -> dict[str, Any]:
+        subject = super().fetch_subject(url)
+        subject["user"] = {
+            "login": "recent-won",
+            "node_id": "U_recent",
+            "type": "User",
+        }
+        return subject
+
+    def fetch_latest_event(self, url: str, *, repository: str) -> dict[str, Any]:
+        event = super().fetch_latest_event(url, repository=repository)
+        event["body"] = "이전 human 댓글"
+        return event
+
+    def fetch_pull_timeline(
+        self, url: str, *, repository: str, limit: int = 50
+    ) -> tuple[dict[str, Any], ...]:
+        self.calls.append("timeline")
+        if not self.timeline_review_tie or self.event_type != "review":
+            return ()
+        event = self._ai_event()
+        event["node_id"] = "TL_REVIEW_404"
+        event["event_type"] = "reviewed"
+        event["submitted_at"] = "2026-07-29T10:03:00Z"
+        event.pop("created_at")
+        event.pop("updated_at")
+        return (event,)
+
+    def _ai_event(self) -> dict[str, Any]:
+        event = {
+            "id": 404,
+            "node_id": "PRR_404" if self.event_type == "review" else "PRRC_404",
+            "event_type": self.event_type,
+            "body": "경계 조건을 확인해 주세요.",
+            "html_url": "https://github.com/silviahealth/content/pull/7#pullrequestreview-404",
+            "created_at": "2026-07-29T10:03:00Z",
+            "updated_at": "2026-07-29T10:03:00Z",
+            "user": {
+                "login": "coderabbitai[bot]",
+                "node_id": "B_coderabbit",
+                "type": "Bot",
+            },
+        }
+        if self.event_type == "review":
+            event["state"] = "COMMENTED"
+        return event
+
+    def fetch_pull_reviews(self, url: str, *, repository: str, limit: int = 50):
+        self.calls.append("reviews")
+        return (self._ai_event(),) if self.event_type == "review" else ()
+
+    def fetch_pull_review_comments(self, url: str, *, repository: str, limit: int = 50):
+        self.calls.append("review_comments")
+        return (self._ai_event(),) if self.event_type == "review_comment" else ()
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_event_id", "expected_kind"),
+    (
+        ("review_comment", "PRRC_404", "own_pr_review_comment"),
+        ("review", "PRR_404", "own_pr_review_summary"),
+    ),
+)
+def test_runtime_hydrates_allowlisted_ai_review_activity_on_owned_pr(
+    tmp_path: Path,
+    event_type: str,
+    expected_event_id: str,
+    expected_kind: str,
+) -> None:
+    result, store = _poll(tmp_path, _AIReviewClient(event_type))
+
+    assert result.created == 1
+    assert result.skipped == 1
+    connection = sqlite3.connect(store.path)
+    source_event_id, event_json = connection.execute(
+        "SELECT source_event_id, event_json FROM mention_events"
+    ).fetchone()
+    connection.close()
+    payload = json.loads(event_json)
+    assert source_event_id == expected_event_id
+    assert payload["untrusted"]["metadata"]["actionable_kind"] == expected_kind
+    assert payload["untrusted"]["body"] == "경계 조건을 확인해 주세요."
+
+
+@pytest.mark.parametrize("reason", ("mention", "team_mention"))
+def test_runtime_hydrates_allowlisted_ai_review_for_mention_reasons(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    result, store = _poll(
+        tmp_path,
+        _AIReviewClient("review", reason=reason),
+    )
+
+    assert result.created == 1
+    assert result.skipped == 1
+    connection = sqlite3.connect(store.path)
+    source_event_id, event_json = connection.execute(
+        "SELECT source_event_id, event_json FROM mention_events"
+    ).fetchone()
+    connection.close()
+    payload = json.loads(event_json)
+    assert source_event_id == "PRR_404"
+    assert payload["untrusted"]["metadata"]["candidate_reason"] == reason
+    assert payload["untrusted"]["metadata"]["actionable_kind"] == (
+        "own_pr_review_summary"
+    )
+
+
+def test_runtime_prefers_typed_review_payload_over_tied_timeline_event(
+    tmp_path: Path,
+) -> None:
+    result, store = _poll(
+        tmp_path,
+        _AIReviewClient("review", timeline_review_tie=True),
+    )
+
+    assert result.created == 1
+    assert result.skipped == 1
+    connection = sqlite3.connect(store.path)
+    source_event_id, event_json = connection.execute(
+        "SELECT source_event_id, event_json FROM mention_events"
+    ).fetchone()
+    connection.close()
+    payload = json.loads(event_json)
+    assert source_event_id == "PRR_404"
+    assert payload["untrusted"]["metadata"]["actionable_kind"] == (
+        "own_pr_review_summary"
+    )

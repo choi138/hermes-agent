@@ -76,6 +76,7 @@ def _proposal_content(event: MentionEvent) -> dict[str, object]:
         "team_review_requested": "team review 요청 범위를 확인하고 필요한 검토 결과를 준비한다.",
         "assigned": "할당된 항목의 범위를 확인하고 필요한 변경안을 준비한다.",
         "direct_assigned": "할당된 항목의 범위를 확인하고 필요한 변경안을 준비한다.",
+        "own_pr_review_summary": "review 요약의 요청 사항을 확인하고 필요한 대응안을 준비한다.",
         "own_pr_changes_requested": "요청된 변경 사항을 확인하고 범위 내 수정안을 준비한다.",
     }
     goal = goals.get(kind, "요청된 GitHub 항목을 확인하고 범위 내 대응안을 준비한다.")

@@ -17,6 +17,7 @@ class GitHubActionKind(str, Enum):
     ASSIGNED = "assigned"
     OWN_PR_COMMENT = "own_pr_comment"
     OWN_PR_REVIEW_COMMENT = "own_pr_review_comment"
+    OWN_PR_REVIEW_SUMMARY = "own_pr_review_summary"
     OWN_PR_CHANGES_REQUESTED = "own_pr_changes_requested"
 
 
@@ -97,6 +98,17 @@ _CANDIDATE_REASONS = frozenset({
 })
 _HUMAN_TYPES = frozenset({"user"})
 _BOT_TYPES = frozenset({"bot", "app"})
+_ALLOWED_AI_REVIEW_BOT_LOGINS = frozenset({
+    "chatgpt-codex-connector[bot]",
+    "codex[bot]",
+    "coderabbitai[bot]",
+    "openai-codex[bot]",
+})
+_ALLOWED_AI_REVIEW_SUMMARY_STATES = frozenset({
+    "approved",
+    "changes_requested",
+    "commented",
+})
 _TEAM_MENTION_RE = re.compile(
     r"(?<![A-Za-z0-9-])@([A-Za-z0-9-]+)/([A-Za-z0-9_-]+)(?![A-Za-z0-9_-])"
 )
@@ -349,9 +361,38 @@ def classify_actionable(
         target_login=context.target_login,
         target_node_id=context.target_node_id,
     )
+    subject_author = subject.get("user")
+    own_pr = _mapping(notification.get("subject")).get(
+        "type"
+    ) == "PullRequest" and _identity_matches(
+        subject_author,
+        login=context.target_login,
+        node_id=context.target_node_id,
+    )
+    event_type = _event_type(event)
+    allowlisted_ai_reviewer = (
+        actor_kind in _BOT_TYPES
+        and actor_login is not None
+        and actor_login.casefold() in _ALLOWED_AI_REVIEW_BOT_LOGINS
+    )
+    allowlisted_ai_review_activity = (
+        own_pr
+        and allowlisted_ai_reviewer
+        and event_type
+        in {
+            "review",
+            "pull_request_review",
+            "review_comment",
+            "pull_request_review_comment",
+        }
+    )
 
     # Exact human direct mention in the actual latest event takes precedence.
-    if _has_direct_mention(body, context.target_login):
+    # Allowlisted AI review activity is classified by its narrower own-PR rule.
+    if (
+        _has_direct_mention(body, context.target_login)
+        and not allowlisted_ai_review_activity
+    ):
         if actor_kind in _BOT_TYPES:
             return _suppressed(SuppressionReason.BOT_GENERATED_MENTION)
         if self_authored:
@@ -366,7 +407,7 @@ def classify_actionable(
         )
 
     mentioned_teams = _mentioned_teams(body)
-    if mentioned_teams:
+    if mentioned_teams and not allowlisted_ai_review_activity:
         verified = next(
             (team for team in mentioned_teams if team in context.verified_team_slugs),
             None,
@@ -457,33 +498,41 @@ def classify_actionable(
                     event=event,
                 )
 
-    subject_author = subject.get("user")
-    own_pr = _mapping(notification.get("subject")).get(
-        "type"
-    ) == "PullRequest" and _identity_matches(
-        subject_author,
-        login=context.target_login,
-        node_id=context.target_node_id,
-    )
     if own_pr and event is not None:
         if self_authored:
             return _suppressed(SuppressionReason.SELF_AUTHORED)
-        if actor_kind in _BOT_TYPES or actor_kind not in _HUMAN_TYPES:
-            return _suppressed(SuppressionReason.NON_ACTIONABLE)
-        event_type = _event_type(event)
         state = event.get("state")
-        normalized_state = state.upper() if isinstance(state, str) else ""
-        if event_type in {"review", "pull_request_review"}:
-            if normalized_state == "CHANGES_REQUESTED":
-                kind = GitHubActionKind.OWN_PR_CHANGES_REQUESTED
+        normalized_state = state.casefold() if isinstance(state, str) else ""
+        if actor_kind in _BOT_TYPES:
+            if not allowlisted_ai_reviewer or not _body(event).strip():
+                return _suppressed(SuppressionReason.NON_ACTIONABLE)
+            if event_type in {"review_comment", "pull_request_review_comment"}:
+                kind = GitHubActionKind.OWN_PR_REVIEW_COMMENT
+            elif (
+                event_type in {"review", "pull_request_review"}
+                and normalized_state in _ALLOWED_AI_REVIEW_SUMMARY_STATES
+            ):
+                kind = (
+                    GitHubActionKind.OWN_PR_CHANGES_REQUESTED
+                    if normalized_state == "changes_requested"
+                    else GitHubActionKind.OWN_PR_REVIEW_SUMMARY
+                )
             else:
                 return _suppressed(SuppressionReason.NON_ACTIONABLE)
-        elif event_type in {"review_comment", "pull_request_review_comment"}:
-            kind = GitHubActionKind.OWN_PR_REVIEW_COMMENT
-        elif event_type in {"issue_comment", "comment"}:
-            kind = GitHubActionKind.OWN_PR_COMMENT
         else:
-            return _suppressed(SuppressionReason.NON_ACTIONABLE)
+            if actor_kind not in _HUMAN_TYPES:
+                return _suppressed(SuppressionReason.NON_ACTIONABLE)
+            if event_type in {"review", "pull_request_review"}:
+                if normalized_state == "changes_requested":
+                    kind = GitHubActionKind.OWN_PR_CHANGES_REQUESTED
+                else:
+                    return _suppressed(SuppressionReason.NON_ACTIONABLE)
+            elif event_type in {"review_comment", "pull_request_review_comment"}:
+                kind = GitHubActionKind.OWN_PR_REVIEW_COMMENT
+            elif event_type in {"issue_comment", "comment"}:
+                kind = GitHubActionKind.OWN_PR_COMMENT
+            else:
+                return _suppressed(SuppressionReason.NON_ACTIONABLE)
         return _build_event(
             kind=kind,
             notification=notification,

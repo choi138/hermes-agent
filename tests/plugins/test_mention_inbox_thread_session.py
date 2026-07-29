@@ -22,6 +22,7 @@ def _event(
     source_revision: str = "2026-07-29T10:01:00Z",
     head_sha: str = "head-1",
     body: str = "이 줄을 확인해 주세요.",
+    actionable_kind: str = "own_pr_review_comment",
 ):
     return ingest_event({
         "schema_version": "1",
@@ -34,10 +35,10 @@ def _event(
         "untrusted": {
             "title": "Inbox contract",
             "body": body,
-            "action_detail": "own_pr_review_comment",
+            "action_detail": actionable_kind,
             "source_url": "https://github.com/silviahealth/content/pull/7#discussion_r123",
             "metadata": {
-                "actionable_kind": "own_pr_review_comment",
+                "actionable_kind": actionable_kind,
                 "repository": "silviahealth/content",
                 "subject_type": "PullRequest",
                 "subject_number": 7,
@@ -119,6 +120,22 @@ async def test_same_subject_creates_one_thread_and_one_proposal(tmp_path: Path) 
     assert len(discord.created) == 1
     assert len(discord.messages["thread-1"]) == 1
     assert discord.marked == ["thread-1", "thread-1"]
+
+
+@pytest.mark.asyncio
+async def test_review_summary_proposal_uses_visible_review_summary_goal(
+    tmp_path: Path,
+) -> None:
+    discord = _Discord()
+    await _coordinator(tmp_path / "inbox.db", discord).ensure_thread(
+        _event(actionable_kind="own_pr_review_summary"),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    content = discord.messages["thread-1"][0][1]
+    assert "review 요약의 요청 사항" in content
+    assert "review comment의 요청 사항" not in content
 
 
 @pytest.mark.asyncio

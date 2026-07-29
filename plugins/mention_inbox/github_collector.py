@@ -29,6 +29,7 @@ _ACTION_BY_KIND = {
     GitHubActionKind.ASSIGNED: "investigate",
     GitHubActionKind.OWN_PR_COMMENT: "reply",
     GitHubActionKind.OWN_PR_REVIEW_COMMENT: "reply",
+    GitHubActionKind.OWN_PR_REVIEW_SUMMARY: "reply",
     GitHubActionKind.OWN_PR_CHANGES_REQUESTED: "investigate",
 }
 _MAX_TITLE_CHARS = 500

@@ -256,13 +256,21 @@ current, user-directed actions:
 - a current direct assignment whose notification reason is `assign` ->
   `investigate`
 - an external human comment, review, or change request on the target user's own
-  pull request -> `reply` or `revise`
+  pull request -> `reply` or `investigate`
+- a non-empty inline review comment or submitted review summary on the target
+  user's own pull request from exactly one of `coderabbitai[bot]`,
+  `chatgpt-codex-connector[bot]`, `openai-codex[bot]`, or `codex[bot]` ->
+  `reply` or `investigate`
 
-Bot/self activity, sticky reviewer/assignee state on unrelated notifications,
+All other bot/self activity, sticky reviewer/assignee state on unrelated
+notifications,
 missing/deleted hydration, CI/state/subscription noise, and unverified team
 activity fail closed. Team mentions and team review requests are disabled by
 default; when explicitly enabled they still require verified active team
-membership.
+membership. With team mentions disabled, pull-request `team_mention` candidates
+are hydrated only far enough to distinguish the narrow allowlisted AI review
+activity above; ordinary team activity remains suppressed and performs no team
+membership lookup.
 
 `notification.id` is `source.event_id`. `updated_at` is kept only as the
 out-of-band `source_revision`; it is deliberately absent from the canonical

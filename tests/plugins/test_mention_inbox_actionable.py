@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from plugins.mention_inbox.actionable import (
     GitHubActionKind,
     GitHubHydrationContext,
@@ -329,3 +331,153 @@ def test_approval_on_own_pr_is_suppressed_by_default() -> None:
     )
     assert decision.event is None
     assert decision.suppression_reason is SuppressionReason.NON_ACTIONABLE
+
+
+@pytest.mark.parametrize(
+    "login",
+    (
+        "coderabbitai[bot]",
+        "chatgpt-codex-connector[bot]",
+        "openai-codex[bot]",
+        "codex[bot]",
+    ),
+)
+def test_allowlisted_ai_bot_inline_comment_on_own_pr_is_actionable(login: str) -> None:
+    decision = classify_actionable(
+        _notification(reason="author"),
+        _context(
+            latest_event=_human_event(
+                body="@recent-won 이 줄의 예외 처리를 보완해 주세요.",
+                event_type="review_comment",
+                login=login,
+                actor_type="Bot",
+            ),
+            subject_overrides=_own_pr(),
+        ),
+    )
+
+    assert decision.event is not None
+    assert decision.event.kind is GitHubActionKind.OWN_PR_REVIEW_COMMENT
+
+
+@pytest.mark.parametrize(
+    "login",
+    (
+        "coderabbitai[bot]",
+        "chatgpt-codex-connector[bot]",
+        "openai-codex[bot]",
+        "codex[bot]",
+    ),
+)
+@pytest.mark.parametrize(
+    ("state", "expected_kind"),
+    (
+        ("COMMENTED", "own_pr_review_summary"),
+        ("APPROVED", "own_pr_review_summary"),
+        ("CHANGES_REQUESTED", "own_pr_changes_requested"),
+    ),
+)
+def test_allowlisted_ai_bot_nonempty_review_summary_on_own_pr_is_actionable(
+    login: str,
+    state: str,
+    expected_kind: str,
+) -> None:
+    decision = classify_actionable(
+        _notification(reason="author"),
+        _context(
+            latest_event=_human_event(
+                body="전체적으로 안전하지만 이 경계 조건은 수정이 필요해요.",
+                event_type="review",
+                login=login,
+                actor_type="Bot",
+                state=state,
+            ),
+            subject_overrides=_own_pr(),
+        ),
+    )
+
+    assert decision.event is not None
+    assert decision.event.kind.value == expected_kind
+
+
+@pytest.mark.parametrize(
+    ("event_type", "body", "state"),
+    (
+        ("review", "   ", "COMMENTED"),
+        ("review", "review 처리 중", "PENDING"),
+        ("review", "dismissed review", "DISMISSED"),
+        ("review_comment", "\n\t", None),
+        ("issue_comment", "일반 PR 댓글", None),
+    ),
+)
+def test_allowlisted_ai_bot_other_own_pr_activity_remains_suppressed(
+    event_type: str,
+    body: str,
+    state: str | None,
+) -> None:
+    decision = classify_actionable(
+        _notification(reason="author"),
+        _context(
+            latest_event=_human_event(
+                body=body,
+                event_type=event_type,
+                login="coderabbitai[bot]",
+                actor_type="Bot",
+                state=state,
+            ),
+            subject_overrides=_own_pr(),
+        ),
+    )
+
+    assert decision.event is None
+    assert decision.suppression_reason is SuppressionReason.NON_ACTIONABLE
+
+
+@pytest.mark.parametrize(
+    ("event_type", "state"),
+    (
+        ("review", "COMMENTED"),
+        ("review_comment", None),
+    ),
+)
+def test_unallowlisted_bot_review_activity_on_own_pr_remains_suppressed(
+    event_type: str,
+    state: str | None,
+) -> None:
+    decision = classify_actionable(
+        _notification(reason="author"),
+        _context(
+            latest_event=_human_event(
+                body="자동 생성한 review 내용",
+                event_type=event_type,
+                login="other-review-bot[bot]",
+                actor_type="Bot",
+                state=state,
+            ),
+            subject_overrides=_own_pr(),
+        ),
+    )
+
+    assert decision.event is None
+    assert decision.suppression_reason is SuppressionReason.NON_ACTIONABLE
+
+
+@pytest.mark.parametrize("event_type", ("review", "review_comment"))
+def test_allowlisted_ai_bot_review_on_non_owned_pr_remains_suppressed(
+    event_type: str,
+) -> None:
+    decision = classify_actionable(
+        _notification(reason="mention"),
+        _context(
+            latest_event=_human_event(
+                body="@recent-won 이 review를 확인해 주세요.",
+                event_type=event_type,
+                login="coderabbitai[bot]",
+                actor_type="Bot",
+                state="COMMENTED" if event_type == "review" else None,
+            ),
+        ),
+    )
+
+    assert decision.event is None
+    assert decision.suppression_reason is SuppressionReason.BOT_GENERATED_MENTION

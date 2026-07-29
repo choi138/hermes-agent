@@ -191,3 +191,13 @@ def test_completed_voice_requires_verified_evidence() -> None:
     )
     assert "완료" in completed
     assert "4 passed" in completed
+
+
+def test_alert_names_review_summary_action() -> None:
+    rendered = render_action_alert(
+        _event(kind="own_pr_review_summary"),
+        revision_number=1,
+        destination=DESTINATION,
+    )
+
+    assert "review 요약" in rendered.content
