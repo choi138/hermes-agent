@@ -22033,6 +22033,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
+
+        # ``generic`` is the explicit opt-in for profile-authored heartbeat
+        # copy. Keep the normal localized/semantic renderer as the default,
+        # but honor the status_phrases catalog when a profile asks for it.
+        _long_running_phrase_catalog = None
+        _long_running_phrase_recent: List[str] = []
+        if _long_running_mode == "generic":
+            try:
+                from gateway.status_phrases import resolve_status_phrase_catalog
+
+                _long_running_phrase_catalog = resolve_status_phrase_catalog(
+                    user_config,
+                    platform_key,
+                )
+            except Exception as _phrase_catalog_err:
+                logger.debug(
+                    "Long-running status phrase catalog failed to load: %s",
+                    _phrase_catalog_err,
+                )
         _notify_start = time.time()
 
         async def _notify_long_running():
@@ -22066,7 +22085,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # from get_activity_summary(). Discord re-renders the same
                 # structured semantic snapshot; other platforms get localized
                 # elapsed-time copy without tool or iteration names.
-                if semantic_progress_enabled and semantic_progress_tracker is not None:
+                if _long_running_mode == "generic" and _long_running_phrase_catalog:
+                    try:
+                        from gateway.status_phrases import choose_status_phrase
+
+                        _heartbeat_text = choose_status_phrase(
+                            "long_running",
+                            recent=_long_running_phrase_recent,
+                            catalog=_long_running_phrase_catalog,
+                        )
+                    except Exception as _phrase_err:
+                        logger.debug(
+                            "Long-running status phrase selection failed: %s",
+                            _phrase_err,
+                        )
+                        from gateway.progress_snapshot import render_long_running
+
+                        _heartbeat_text = render_long_running(
+                            _elapsed_mins,
+                            language=progress_language,
+                        )
+                    _active_heartbeat_id = (
+                        semantic_progress_message_id_ref[0]
+                        if semantic_progress_enabled
+                        else _heartbeat_msg_id
+                    )
+                elif semantic_progress_enabled and semantic_progress_tracker is not None:
                     from gateway.progress_snapshot import render_long_running
 
                     _heartbeat_text = render_long_running(

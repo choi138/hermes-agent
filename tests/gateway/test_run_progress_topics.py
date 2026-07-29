@@ -1077,6 +1077,53 @@ async def test_discord_long_running_heartbeat_reuses_korean_semantic_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_discord_verbose_heartbeat_uses_profile_status_phrase(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.05")
+    custom_phrase = "아직 꼼꼼히 살펴보고 있어요. 조금만 더 기다려 주세요."
+
+    def _setup_runner(runner):
+        runner._should_emit_long_running_notification = lambda *args, **kwargs: True
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowSemanticHeartbeatAgent,
+        session_id="sess-discord-persona-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "verbose",
+                "language": "ko",
+                "interim_assistant_messages": False,
+                "platforms": {
+                    "discord": {
+                        "long_running_notifications": "generic",
+                        "status_phrases": {
+                            "mode": "replace",
+                            "status": [custom_phrase],
+                        },
+                    }
+                },
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm-persona-heartbeat",
+        chat_type="dm",
+        thread_id=None,
+        runner_setup=_setup_runner,
+    )
+
+    assert result["final_response"] == "done"
+    rendered = [call["content"] for call in adapter.sent] + [
+        call["content"] for call in adapter.edits
+    ]
+    assert custom_phrase in rendered
+    assert "⏳ 작업을 계속 진행하고 있습니다" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_discord_inactivity_warning_and_timeout_use_semantic_handoff(
     monkeypatch,
     tmp_path,
