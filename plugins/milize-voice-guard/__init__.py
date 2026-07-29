@@ -62,7 +62,7 @@ _QUOTED_SPAN_RE = re.compile(
     r'"[^"\n]+"|“[^”\n]+”|‘[^’\n]+’|「[^」\n]+」|『[^』\n]+』'
 )
 _NUMBER_RE = re.compile(
-    r"(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?(?:%|[A-Za-z]{1,4})?(?![\w])"
+    r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?(?:%|[A-Za-z]{1,4})?"
 )
 _IDENTIFIER_RE = re.compile(
     r"\b(?:t_[a-z0-9]+|[A-Z][A-Z0-9._/^-]{1,20}|[0-9a-f]{7,40})\b"
@@ -76,6 +76,41 @@ _MARKDOWN_HEADING_RE = re.compile(r"(?m)^(?P<level>#{1,6})\s+")
 _MARKDOWN_LIST_RE = re.compile(
     r"(?m)^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+"
 )
+_SAFE_SUFFIX_RULES = (
+    ("아니었습니다", "아니었어요"),
+    ("없었습니다", "없었어요"),
+    ("있었습니다", "있었어요"),
+    ("않았습니다", "않았어요"),
+    ("하였습니다", "했어요"),
+    ("되었습니다", "됐어요"),
+    ("하겠습니다", "하겠어요"),
+    ("했습니다", "했어요"),
+    ("보입니다", "보여요"),
+    ("줄입니다", "줄여요"),
+    ("높입니다", "높여요"),
+    ("붙입니다", "붙여요"),
+    ("쓰입니다", "쓰여요"),
+    ("모입니다", "모여요"),
+    ("아닙니다", "아니에요"),
+    ("있습니다", "있어요"),
+    ("없습니다", "없어요"),
+    ("맞습니다", "맞아요"),
+    ("같습니다", "같아요"),
+    ("됩니다", "돼요"),
+    ("드립니다", "드려요"),
+    ("바랍니다", "바라요"),
+    ("합니다", "해요"),
+    ("겠습니다", "겠어요"),
+)
+_REPAIR_PROTECTED_PATTERNS = (
+    _FENCED_CODE_RE,
+    _INLINE_CODE_RE,
+    _URL_RE,
+    _TABLE_LINE_RE,
+    _BLOCKQUOTE_LINE_RE,
+    _QUOTED_SPAN_RE,
+)
+_MARKDOWN_CLOSERS = frozenset("*_~`])}")
 
 
 @dataclass(frozen=True)
@@ -215,6 +250,71 @@ def _unwrap_markdown_fence(candidate: str) -> str:
     raw = candidate or ""
     match = _MARKDOWN_FENCE_WRAPPER_RE.fullmatch(raw.strip())
     return match.group("body") if match else raw
+
+
+def _repair_protected_ranges(text: str) -> list[tuple[int, int]]:
+    ranges = [
+        (match.start(), match.end())
+        for pattern in _REPAIR_PROTECTED_PATTERNS
+        for match in pattern.finditer(text or "")
+    ]
+    ranges.sort()
+    return ranges
+
+
+def _range_is_protected(start: int, end: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(range_start < end and start < range_end for range_start, range_end in ranges)
+
+
+def _preceding_visible_char(text: str, index: int) -> str:
+    index -= 1
+    while index >= 0 and (text[index].isspace() or text[index] in _MARKDOWN_CLOSERS):
+        index -= 1
+    return text[index] if index >= 0 else ""
+
+
+def _copula_haeyo(text: str, index: int) -> str:
+    previous = _preceding_visible_char(text, index)
+    codepoint = ord(previous) - 0xAC00 if previous else -1
+    if 0 <= codepoint <= 0xD7A3 - 0xAC00:
+        return "이에요" if codepoint % 28 else "예요"
+    if previous.isdigit():
+        return "이에요"
+    return "예요"
+
+
+def deterministic_repair(text: str) -> str:
+    """Convert only allowlisted formal suffixes outside protected Markdown.
+
+    Unknown morphology is deliberately left untouched so the bounded LLM
+    fallback (and its invariant validation) can handle it or fail open.
+    """
+
+    original = text or ""
+    protected = _repair_protected_ranges(original)
+    replacements: list[tuple[int, int, str]] = []
+    for match in _FORMAL_ENDING_RE.finditer(original):
+        if _range_is_protected(match.start(), match.end(), protected):
+            continue
+        replacement: tuple[int, int, str] | None = None
+        prefix = original[: match.end()]
+        for source, target in _SAFE_SUFFIX_RULES:
+            if prefix.endswith(source):
+                replacement = (match.end() - len(source), match.end(), target)
+                break
+        if replacement is None and match.group(0) == "입니다":
+            replacement = (
+                match.start(),
+                match.end(),
+                _copula_haeyo(original, match.start()),
+            )
+        if replacement is not None:
+            replacements.append(replacement)
+
+    candidate = original
+    for start, end, target in reversed(replacements):
+        candidate = candidate[:start] + target + candidate[end:]
+    return candidate
 
 
 def validate_rewrite(
@@ -406,6 +506,21 @@ class VoiceGuard:
         )
         if not metrics.should_repair or not bool(config["repair_enabled"]):
             return None
+
+        deterministic = deterministic_repair(response_text)
+        if deterministic != response_text and validate_rewrite(
+            response_text,
+            deterministic,
+            semantic_similarity_min=float(config["semantic_similarity_min"]),
+            min_length_ratio=float(config["min_length_ratio"]),
+            max_length_ratio=float(config["max_length_ratio"]),
+        ):
+            logger.info(
+                "voice guard applied deterministic repair sentences=%d formal=%d",
+                metrics.sentence_count,
+                metrics.formal_count,
+            )
+            return deterministic
 
         logger.info(
             "voice guard repairing long response sentences=%d formal=%d haeyo=%d run=%d",

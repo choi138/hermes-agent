@@ -46,6 +46,35 @@ symbol = "TEST"
 ```
 """
 
+DETERMINISTIC_RESEARCH_FIXTURE = """\
+## 시장 분석
+
+현재 가격은 101.25달러예요.
+20일 이동평균은 98.40달러예요.
+단기 변동성은 17.2%로 관찰돼요.
+기준 시나리오의 핵심 위험은 거래량 감소예요.
+`risk_limit = 0.08` 설정을 유지하는 것이 필요해요.
+세부 근거는 https://example.com/research?id=20260729 에 있어요.
+
+```python
+risk_limit = 0.08
+symbol = "TEST"
+```
+"""
+
+UNSUPPORTED_FORMAL_FIXTURE = """\
+## 식단
+
+아침에는 사과 1개를 먹습니다.
+점심에는 현미밥을 먹습니다.
+간식에는 견과류를 먹습니다.
+저녁에는 채소를 먹습니다.
+운동 뒤에는 바나나를 먹습니다.
+취침 전에는 아무것도 먹습니다.
+"""
+
+UNSUPPORTED_WARM_FIXTURE = UNSUPPORTED_FORMAL_FIXTURE.replace("먹습니다", "먹어요")
+
 
 def _load_guard():
     repo_root = Path(__file__).resolve().parents[2]
@@ -136,6 +165,15 @@ def test_rewrite_validation_preserves_numbers_urls_code_and_markdown():
     ) is False
 
 
+def test_deterministic_repair_changes_only_supported_sentence_endings():
+    guard = _load_guard()
+
+    candidate = guard.deterministic_repair(FORMAL_RESEARCH_FIXTURE)
+
+    assert candidate == DETERMINISTIC_RESEARCH_FIXTURE
+    assert guard.validate_rewrite(FORMAL_RESEARCH_FIXTURE, candidate) is True
+
+
 def test_guard_adds_late_contract_and_repairs_once_for_default_discord():
     guard_mod = _load_guard()
     llm = _FakeLlm(WARM_RESEARCH_FIXTURE)
@@ -154,7 +192,27 @@ def test_guard_adds_late_contract_and_repairs_once_for_default_discord():
     )
 
     assert "따뜻한 해요체" in contract
-    assert transformed == WARM_RESEARCH_FIXTURE
+    assert transformed == DETERMINISTIC_RESEARCH_FIXTURE
+    assert len(llm.calls) == 0
+
+
+def test_guard_uses_one_llm_fallback_for_unsupported_formal_ending():
+    guard_mod = _load_guard()
+    llm = _FakeLlm(UNSUPPORTED_WARM_FIXTURE)
+    voice_guard = guard_mod.VoiceGuard(llm=llm, profile_name="default")
+
+    voice_guard.pre_llm(
+        session_id="fallback-session",
+        platform="discord",
+        user_message="식단을 자세히 설명해줘",
+    )
+    transformed = voice_guard.transform(
+        session_id="fallback-session",
+        platform="discord",
+        response_text=UNSUPPORTED_FORMAL_FIXTURE,
+    )
+
+    assert transformed == UNSUPPORTED_WARM_FIXTURE
     assert len(llm.calls) == 1
     assert llm.calls[0]["temperature"] == 0
 
@@ -216,7 +274,7 @@ def test_explicit_formal_request_skips_repair():
 
 def test_semantic_anchor_drift_fails_open_to_original_response():
     guard_mod = _load_guard()
-    changed_number = WARM_RESEARCH_FIXTURE.replace("101.25", "109.25", 1)
+    changed_number = UNSUPPORTED_WARM_FIXTURE.replace("1개", "2개", 1)
     llm = _FakeLlm(changed_number)
     voice_guard = guard_mod.VoiceGuard(llm=llm, profile_name="default")
 
@@ -228,7 +286,7 @@ def test_semantic_anchor_drift_fails_open_to_original_response():
     transformed = voice_guard.transform(
         session_id="drift-session",
         platform="discord",
-        response_text=FORMAL_RESEARCH_FIXTURE,
+        response_text=UNSUPPORTED_FORMAL_FIXTURE,
     )
 
     assert transformed is None
