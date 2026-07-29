@@ -3171,13 +3171,24 @@ class TestTruncateToolCallArgsJson:
     The previous implementation produced invalid JSON by slicing
     ``function.arguments`` mid-string, which caused non-retryable 400s from
     strict providers (observed on MiniMax) and stuck long sessions in a
-    re-send loop. The helper here must always emit parseable JSON whose
-    shape matches the original — shrunken, not corrupted.
+    re-send loop. A later regression showed that preserving a replayable
+    prefix inside ``write_file.content`` is also unsafe: the model can mistake
+    the compacted history for complete file bytes and overwrite a large file
+    with the preview. The helper must therefore emit parseable JSON whose
+    long string leaves are explicit, non-replayable tombstones.
     """
+
+    _ELISION_PREFIX = "[HERMES_CONTEXT_ELIDED "
 
     def _helper(self):
         from agent.context_compressor import _truncate_tool_call_args_json
         return _truncate_tool_call_args_json
+
+    def _assert_elided(self, value):
+        assert isinstance(value, str)
+        assert value.startswith(self._ELISION_PREFIX)
+        assert "DO_NOT_REUSE_AS_INPUT" in value
+        assert "...[truncated]" not in value
 
     def test_shrunken_args_remain_valid_json(self):
         import json as _json
@@ -3190,7 +3201,8 @@ class TestTruncateToolCallArgsJson:
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["content"])
+        assert "# Shopping Browser Setup Notes" not in parsed["content"]
         assert len(shrunk) < len(original)
 
     def test_non_json_arguments_pass_through(self):
@@ -3215,9 +3227,9 @@ class TestTruncateToolCallArgsJson:
             "meta": {"note": "y" * 500},
         })
         parsed = _json.loads(shrink(payload))
-        assert parsed["messages"][0]["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["messages"][0]["content"])
         assert parsed["messages"][1]["content"] == "ok"
-        assert parsed["meta"]["note"].endswith("...[truncated]")
+        self._assert_elided(parsed["meta"]["note"])
 
     def test_non_string_leaves_preserved(self):
         import json as _json
@@ -3234,23 +3246,50 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        self._assert_elided(parsed["note"])
 
     def test_scalar_json_string_gets_shrunk(self):
         import json as _json
         shrink = self._helper()
         payload = _json.dumps("q" * 500)
         parsed = _json.loads(shrink(payload))
-        assert isinstance(parsed, str)
-        assert parsed.endswith("...[truncated]")
+        self._assert_elided(parsed)
 
     def test_unicode_preserved(self):
         import json as _json
         shrink = self._helper()
-        payload = _json.dumps({"content": "非德满" + ("a" * 500)})
+        payload = _json.dumps({
+            "label": "非德满",
+            "content": "a" * 500,
+        })
         out = shrink(payload)
         # ensure_ascii=False keeps CJK intact rather than emitting \uXXXX
         assert "非德满" in out
+        self._assert_elided(_json.loads(out)["content"])
+
+    def test_write_file_content_does_not_keep_replayable_file_prefix(self):
+        """Exact regression for the 633-line -> 246-byte overwrite incident."""
+        import json as _json
+        shrink = self._helper()
+        file_prefix = (
+            '"""Deterministic mention-inbox approval and execution promotion."""\n'
+            "from __future__ import annotations\n\n"
+            "import sqlite3\n"
+            "from dataclasses import replace\n"
+            "from datetime import datetime, timezone\n"
+            "from pathlib import Path\n\n"
+            "import pytest\n\n"
+        )
+        payload = _json.dumps({
+            "path": "/tmp/test_mention_inbox_approval.py",
+            "content": file_prefix + ("rest of source\n" * 100),
+        })
+
+        parsed = _json.loads(shrink(payload))
+
+        self._assert_elided(parsed["content"])
+        assert file_prefix not in parsed["content"]
+        assert "import pytest" not in parsed["content"]
 
     def test_pass3_emits_valid_json_for_downstream_provider(self):
         """End-to-end: Pass 3 must never produce the exact failure payload
@@ -3286,7 +3325,8 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["content"])
+        assert "# Shopping Browser Setup Notes" not in parsed["content"]
 
 
 class TestPreflightSentinelGuard:

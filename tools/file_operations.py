@@ -25,6 +25,7 @@ Usage:
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
 
+import hashlib
 import os
 import re
 import difflib
@@ -459,6 +460,19 @@ class FileOperations(ABC):
                       replace_all: bool = False) -> PatchResult:
         """Replace text in a file using fuzzy matching."""
         ...
+
+    def patch_append(
+        self,
+        path: str,
+        content: str,
+        expected_sha256: Optional[str] = None,
+    ) -> PatchResult:
+        """Append content while preserving existing file bytes.
+
+        Backends predating append mode remain instantiable; they return an
+        explicit capability error until they implement the operation.
+        """
+        return PatchResult(error="Append is not implemented for this backend")
 
     @abstractmethod
     def patch_v4a(self, patch_content: str) -> PatchResult:
@@ -1673,6 +1687,89 @@ class ShellFileOperations(FileOperations):
             # ``_snapshot_lsp_baseline``) so the delta is correct for
             # the patch as a whole.  Keep the field separate from the
             # syntax-check ``lint`` so the agent can read both signals.
+            lsp_diagnostics=write_result.lsp_diagnostics,
+        )
+
+    def patch_append(
+        self,
+        path: str,
+        content: str,
+        expected_sha256: Optional[str] = None,
+    ) -> PatchResult:
+        """Atomically append ``content`` to an existing text file.
+
+        The complete current file is read under the tool layer's per-path lock,
+        combined with only the new suffix, and routed through ``write_file``'s
+        atomic temp-file swap. Repeating an already-applied suffix is a no-op,
+        which makes retries safe after an ambiguous timeout. When supplied,
+        ``expected_sha256`` is an optimistic-concurrency check over the
+        BOM-stripped current text returned by :meth:`read_file_raw`.
+        """
+
+        path = self._expand_path(path)
+        denied = get_write_denied_error(path)
+        if denied:
+            return PatchResult(error=denied)
+        if not isinstance(content, str):
+            return PatchResult(error="Append content must be a string")
+        if expected_sha256 is not None and not isinstance(expected_sha256, str):
+            return PatchResult(error="expected_sha256 must be a string")
+
+        current_result = self.read_file_raw(path)
+        if current_result.error:
+            return PatchResult(error=f"Failed to read file for append: {current_result.error}")
+        current_content = current_result.content
+
+        file_ending = _detect_line_ending(current_content)
+        append_content = (
+            _normalize_line_endings(content, file_ending)
+            if file_ending
+            else content
+        )
+
+        # A retry after a successful append may carry the pre-append hash.
+        # Suffix equality proves the desired state already exists, so return
+        # success before checking the now-stale optimistic-concurrency token.
+        if not append_content or current_content.endswith(append_content):
+            return PatchResult(success=True)
+
+        current_sha256 = hashlib.sha256(
+            current_content.encode("utf-8")
+        ).hexdigest()
+        if (
+            expected_sha256 is not None
+            and expected_sha256.strip().lower() != current_sha256
+        ):
+            return PatchResult(
+                error=(
+                    f"Append refused for {path}: expected_sha256 did not match "
+                    f"the current file. current_sha256={current_sha256}"
+                )
+            )
+
+        new_content = current_content + append_content
+        write_result = self.write_file(path, new_content)
+        if write_result.error:
+            return PatchResult(error=f"Failed to append content: {write_result.error}")
+
+        verify_result = self.read_file_raw(path)
+        if verify_result.error:
+            return PatchResult(
+                error=f"Post-append verification failed: {verify_result.error}"
+            )
+        if verify_result.content != new_content:
+            return PatchResult(
+                error=(
+                    f"Post-append verification failed for {path}: on-disk "
+                    "content differs from the intended appended result."
+                )
+            )
+
+        return PatchResult(
+            success=True,
+            diff=self._unified_diff(current_content, new_content, path),
+            files_modified=[path],
+            lint=write_result.lint,
             lsp_diagnostics=write_result.lsp_diagnostics,
         )
     

@@ -2,6 +2,7 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
+from agent.tool_arg_elision import is_tool_arg_elision
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -940,6 +942,101 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
+_DESTRUCTIVE_SHRINK_MIN_BYTES = 4096
+_DESTRUCTIVE_SHRINK_RATIO = 0.5
+_LEGACY_CONTEXT_TRUNCATION_SUFFIX = "...[truncated]"
+
+
+def _destructive_overwrite_guard(
+    file_ops,
+    path: str,
+    content: str,
+    *,
+    expected_sha256: str | None,
+    allow_destructive_overwrite: bool,
+) -> str | None:
+    """Require a current-content challenge before a suspicious whole-file shrink.
+
+    ``write_file`` is intentionally a whole-file replacement primitive.  That
+    makes a compacted historical argument especially dangerous: a small,
+    syntactically valid preview can atomically replace a much larger source
+    file.  Inspect the existing text while the caller holds the per-path lock
+    and require both an explicit destructive flag and the current content hash
+    before allowing either:
+
+    * a loss of at least 4 KiB that leaves less than half the original bytes;
+    * a smaller candidate ending in Hermes' legacy ``...[truncated]`` marker.
+
+    Missing files are new-file writes and bypass this guard. Test doubles that
+    do not expose real string content also bypass it; production file
+    operations always return a concrete ``ReadResult``. Inspection failures
+    fail closed so a backend error cannot silently disable the safety check.
+    """
+
+    try:
+        current = file_ops.read_file_raw(path)
+    except Exception as exc:
+        return (
+            f"Refusing write_file for {path!r}: existing content could not be "
+            f"inspected safely ({type(exc).__name__}). Use patch for a "
+            "targeted edit."
+        )
+
+    read_error = getattr(current, "error", None)
+    if isinstance(read_error, str) and read_error:
+        if "not found" in read_error.lower():
+            return None
+        return (
+            f"Refusing write_file for {path!r}: existing content could not be "
+            f"inspected safely ({read_error}). Use patch for a targeted edit."
+        )
+
+    current_content = getattr(current, "content", None)
+    if not isinstance(current_content, str):
+        return None
+
+    measured_size = getattr(current, "file_size", None)
+    current_size = (
+        measured_size
+        if type(measured_size) is int and measured_size >= 0
+        else len(current_content.encode("utf-8"))
+    )
+    candidate_size = len(content.encode("utf-8"))
+    shrinks_legacy_preview = (
+        candidate_size < current_size
+        and content.rstrip().endswith(_LEGACY_CONTEXT_TRUNCATION_SUFFIX)
+    )
+    severe_shrink = (
+        current_size - candidate_size >= _DESTRUCTIVE_SHRINK_MIN_BYTES
+        and candidate_size < current_size * _DESTRUCTIVE_SHRINK_RATIO
+    )
+    if not (shrinks_legacy_preview or severe_shrink):
+        return None
+
+    current_sha256 = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
+    supplied_hash = (expected_sha256 or "").strip().lower()
+    if (
+        allow_destructive_overwrite
+        and supplied_hash
+        and supplied_hash == current_sha256
+    ):
+        return None
+
+    mismatch = (
+        " The supplied expected_sha256 did not match."
+        if allow_destructive_overwrite and supplied_hash
+        else ""
+    )
+    return (
+        f"Refusing destructive overwrite of {path!r}: existing file is "
+        f"{current_size} bytes and candidate is {candidate_size} bytes."
+        f"{mismatch} If this large shrink is intentional, retry with "
+        "allow_destructive_overwrite=true and "
+        f"expected_sha256={current_sha256}. current_sha256={current_sha256}. "
+        "For additions or localized edits, use patch instead."
+    )
+
+
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """Get or create ShellFileOperations for a terminal environment.
 
@@ -1586,7 +1683,9 @@ def _mark_verification_stale(
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
-                    session_id: str | None = None) -> str:
+                    session_id: str | None = None,
+                    expected_sha256: str | None = None,
+                    allow_destructive_overwrite: bool = False) -> str:
     """Write content to a file.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
@@ -1602,6 +1701,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    if is_tool_arg_elision(content):
+        return tool_error(
+            "Refusing to write context-elided historical tool arguments as "
+            "file content. Re-read the file and use patch, or reconstruct the "
+            "complete intended content before calling write_file."
+        )
     if _is_internal_file_tool_content(content):
         return tool_error(
             "Refusing to write internal read_file display text as file content. "
@@ -1620,6 +1725,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
+            guard_error = _destructive_overwrite_guard(
+                file_ops,
+                path,
+                content,
+                expected_sha256=expected_sha256,
+                allow_destructive_overwrite=allow_destructive_overwrite,
+            )
+            if guard_error:
+                return tool_error(guard_error)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
@@ -1641,6 +1755,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
+            guard_error = _destructive_overwrite_guard(
+                file_ops,
+                _resolved,
+                content,
+                expected_sha256=expected_sha256,
+                allow_destructive_overwrite=allow_destructive_overwrite,
+            )
+            if guard_error:
+                return tool_error(guard_error)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
@@ -1670,8 +1793,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
-               session_id: str | None = None) -> str:
-    """Patch a file using replace mode or V4A patch format.
+               session_id: str | None = None, content: str = None,
+               expected_sha256: str = None) -> str:
+    """Patch a file using replace, append, or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
     targets under another profile's skills/plugins/cron/memories
@@ -1780,6 +1904,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
+                if is_tool_arg_elision(old_string) or is_tool_arg_elision(new_string):
+                    return tool_error(
+                        "Refusing to use context-elided historical tool "
+                        "arguments in a replacement. Re-read the target and "
+                        "reconstruct the intended edit first."
+                    )
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
                 # shell's own cwd may differ (worktree-cwd bug), and a relative
@@ -1787,9 +1917,32 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+            elif mode == "append":
+                if not path:
+                    return tool_error("path required")
+                if content is None:
+                    return tool_error("content required")
+                if not isinstance(content, str):
+                    return tool_error("content must be a string")
+                if is_tool_arg_elision(content):
+                    return tool_error(
+                        "Refusing to append context-elided historical tool "
+                        "arguments. Reconstruct the intended suffix first."
+                    )
+                _append_target = _path_to_resolved.get(path) or path
+                result = file_ops.patch_append(
+                    _append_target,
+                    content,
+                    expected_sha256=expected_sha256,
+                )
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
+                if is_tool_arg_elision(patch):
+                    return tool_error(
+                        "Refusing to apply a context-elided historical patch. "
+                        "Reconstruct the complete patch first."
+                    )
                 result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
@@ -1975,12 +2128,21 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits or mode='append' for EOF additions. Suspicious large shrink operations are refused unless explicitly confirmed with the current content SHA-256. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
             "content": {"type": "string", "description": "Complete content to write to the file"},
+            "expected_sha256": {
+                "type": "string",
+                "description": "Current file-content SHA-256 returned by a destructive-shrink refusal. Required together with allow_destructive_overwrite=true when intentionally replacing a large file with much smaller content.",
+            },
+            "allow_destructive_overwrite": {
+                "type": "boolean",
+                "description": "Permit an intentional large whole-file shrink only when expected_sha256 exactly matches the current file. Never set this to bypass a refusal caused by truncated or uncertain content.",
+                "default": False,
+            },
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
@@ -1999,6 +2161,9 @@ PATCH_SCHEMA = {
         "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
         "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
+        "APPEND MODE (mode='append'): atomically add content at EOF without "
+        "replacing existing bytes; retries of the same suffix are no-ops. "
+        "REQUIRED PARAMETERS: mode, path, content.\n"
         "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "
         "REQUIRED PARAMETERS: mode, patch."
     ),
@@ -2007,13 +2172,13 @@ PATCH_SCHEMA = {
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["replace", "patch"],
-                "description": "Edit mode. 'replace' (default): requires path + old_string + new_string. 'patch': requires patch content only.",
+                "enum": ["replace", "append", "patch"],
+                "description": "Edit mode. 'replace' (default): requires path + old_string + new_string. 'append': requires path + content. 'patch': requires patch content only.",
                 "default": "replace",
             },
             "path": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. File path to edit.",
+                "description": "REQUIRED when mode='replace' or mode='append'. File path to edit.",
             },
             "old_string": {
                 "type": "string",
@@ -2031,6 +2196,14 @@ PATCH_SCHEMA = {
             "patch": {
                 "type": "string",
                 "description": "REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
+            },
+            "content": {
+                "type": "string",
+                "description": "REQUIRED when mode='append'. Exact content to append at EOF. Include any desired leading newline.",
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional when mode='append'. If supplied, append only when the current file content has this SHA-256.",
             },
             "cross_profile": {
                 "type": "boolean",
@@ -2087,10 +2260,20 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
+    expected_sha256 = args.get("expected_sha256")
+    if expected_sha256 is not None and not isinstance(expected_sha256, str):
+        return tool_error("write_file: 'expected_sha256' must be a string.")
+    allow_destructive_overwrite = args.get("allow_destructive_overwrite", False)
+    if not isinstance(allow_destructive_overwrite, bool):
+        return tool_error(
+            "write_file: 'allow_destructive_overwrite' must be a boolean."
+        )
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        expected_sha256=expected_sha256,
+        allow_destructive_overwrite=allow_destructive_overwrite,
     )
 
 
@@ -2102,6 +2285,8 @@ def _handle_patch(args, **kw):
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        content=args.get("content"),
+        expected_sha256=args.get("expected_sha256"),
     )
 
 

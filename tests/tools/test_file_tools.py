@@ -4,6 +4,7 @@ Tests verify tool schemas, handler dispatch, validation logic, and error
 handling without requiring a running terminal environment.
 """
 
+import hashlib
 import json
 import logging
 from unittest.mock import MagicMock, patch
@@ -102,6 +103,85 @@ class TestWriteFileHandler:
         assert "error" in result
         assert "line-number" in result["error"].lower()
         mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_rejects_context_elision_tombstone(self, mock_get):
+        """Compacted historical tool arguments must never become file bytes."""
+        from tools.file_tools import write_file_tool
+
+        content = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(write_file_tool("/tmp/config.py", content))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_rejects_large_destructive_shrink_without_confirmation(self, mock_get):
+        """A 20 KiB source file cannot silently become a 246-byte preview."""
+        old_content = "x = 1\n" * 3500
+        prior = MagicMock(
+            content=old_content,
+            file_size=len(old_content.encode()),
+            error=None,
+        )
+        mock_ops = MagicMock()
+        mock_ops.read_file_raw.return_value = prior
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool(
+            "/tmp/test_mention_inbox_approval.py",
+            '"""header"""\n\n...[truncated]',
+        ))
+
+        assert "error" in result
+        assert "destructive overwrite" in result["error"].lower()
+        assert "current_sha256" in result["error"]
+        mock_ops.write_file.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_destructive_guard_fails_closed_when_inspection_raises(self, mock_get):
+        mock_ops = MagicMock()
+        mock_ops.read_file_raw.side_effect = RuntimeError("backend unavailable")
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/tmp/existing.py", "pass\n"))
+
+        assert "error" in result
+        assert "could not be inspected safely" in result["error"]
+        mock_ops.write_file.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_allows_confirmed_destructive_shrink_with_matching_hash(self, mock_get):
+        old_content = "x = 1\n" * 3500
+        old_hash = hashlib.sha256(old_content.encode()).hexdigest()
+        prior = MagicMock(
+            content=old_content,
+            file_size=len(old_content.encode()),
+            error=None,
+        )
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"bytes_written": 4}
+        mock_ops = MagicMock()
+        mock_ops.read_file_raw.return_value = prior
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool(
+            "/tmp/large.py",
+            "pass",
+            expected_sha256=old_hash,
+            allow_destructive_overwrite=True,
+        ))
+
+        assert "error" not in result
+        mock_ops.write_file.assert_called_once()
 
     @patch("tools.file_tools._get_file_ops")
     def test_allows_sparse_literal_pipe_content(self, mock_get):
@@ -227,6 +307,71 @@ class TestPatchHandler:
         from tools.file_tools import patch_tool
         result = json.loads(patch_tool(mode="patch", patch=None))
         assert "error" in result
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_append_mode_calls_atomic_append(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"success": True, "diff": "diff"}
+        mock_ops.patch_append.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="append",
+            path="/tmp/f.py",
+            content="\nnew_test()\n",
+            expected_sha256="abc123",
+        ))
+
+        assert result["success"] is True
+        mock_ops.patch_append.assert_called_once_with(
+            "/tmp/f.py", "\nnew_test()\n", expected_sha256="abc123"
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_append_mode_requires_path_and_content(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        missing_path = json.loads(patch_tool(mode="append", content="x"))
+        missing_content = json.loads(patch_tool(mode="append", path="/tmp/f.py"))
+
+        assert "error" in missing_path
+        assert "error" in missing_content
+        mock_get.return_value.patch_append.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_mode_rejects_context_elision_tombstone(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        tombstone = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(patch_tool(
+            mode="replace",
+            path="/tmp/f.py",
+            old_string="old",
+            new_string=tombstone,
+        ))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.return_value.patch_replace.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_mode_rejects_context_elision_tombstone(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        tombstone = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=tombstone))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.return_value.patch_v4a.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
     def test_unknown_mode_errors(self, mock_get):
@@ -662,10 +807,13 @@ class TestPatchSchemaShape:
         desc = PATCH_SCHEMA["description"]
         assert "REQUIRED PARAMETERS: mode, path, old_string, new_string" in desc
         assert "REQUIRED PARAMETERS: mode, patch" in desc
+        assert "REQUIRED PARAMETERS: mode, path, content" in desc
         props = PATCH_SCHEMA["parameters"]["properties"]
         for name in ("path", "old_string", "new_string"):
             assert "REQUIRED when mode='replace'" in props[name]["description"]
         assert "REQUIRED when mode='patch'" in props["patch"]["description"]
+        assert "REQUIRED when mode='append'" in props["content"]["description"]
+        assert "append" in props["mode"]["enum"]
 
     def test_no_anyof_required_stays_mode_only(self):
         # anyOf/oneOf at parameters level break Anthropic, Fireworks, and the

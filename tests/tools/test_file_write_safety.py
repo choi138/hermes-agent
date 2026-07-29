@@ -3,6 +3,7 @@
 Based on PR #1085 by ismoilh (salvaged).
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -377,6 +378,59 @@ class TestAtomicWrite:
         assert res.success, res.error
         assert target.read_text() == "a = 1\nb = 22\nc = 3\n"
         assert (os.stat(target).st_mode & 0o777) == 0o600
+
+    def test_patch_append_preserves_existing_content(self, ops, tmp_path: Path):
+        target = tmp_path / "append.py"
+        target.write_text("first = 1\n")
+
+        res = ops.patch_append(str(target), "\nsecond = 2\n")
+
+        assert res.success, res.error
+        assert target.read_text() == "first = 1\n\nsecond = 2\n"
+        assert "+second = 2" in res.diff
+
+    def test_patch_append_retry_is_idempotent(self, ops, tmp_path: Path):
+        target = tmp_path / "append.py"
+        target.write_text("first = 1\n")
+        addition = "\nsecond = 2\n"
+
+        first = ops.patch_append(str(target), addition)
+        second = ops.patch_append(str(target), addition)
+
+        assert first.success, first.error
+        assert second.success, second.error
+        assert target.read_text().count("second = 2") == 1
+
+    def test_patch_append_rejects_stale_expected_hash(self, ops, tmp_path: Path):
+        target = tmp_path / "append.py"
+        original = "first = 1\n"
+        target.write_text(original)
+        stale_hash = hashlib.sha256(b"different").hexdigest()
+
+        res = ops.patch_append(
+            str(target),
+            "\nsecond = 2\n",
+            expected_sha256=stale_hash,
+        )
+
+        assert res.error is not None
+        assert "sha256" in res.error.lower()
+        assert target.read_text() == original
+
+    def test_patch_append_accepts_matching_expected_hash(self, ops, tmp_path: Path):
+        target = tmp_path / "append.py"
+        original = "first = 1\n"
+        target.write_text(original)
+        current_hash = hashlib.sha256(original.encode()).hexdigest()
+
+        res = ops.patch_append(
+            str(target),
+            "\nsecond = 2\n",
+            expected_sha256=current_hash,
+        )
+
+        assert res.success, res.error
+        assert target.read_text() == "first = 1\n\nsecond = 2\n"
 
 
 class TestBomHandling:
