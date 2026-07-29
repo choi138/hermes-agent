@@ -32,6 +32,7 @@ class FakeAgent:
         self._iters_since_skill = 0
         self.valid_tool_names = []
         self.persisted_messages: list[dict[str, Any]] | None = None
+        self.trajectory_messages: list[dict[str, Any]] | None = None
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
@@ -45,8 +46,8 @@ class FakeAgent:
     def _safe_print(self, *_args, **_kwargs):
         pass
 
-    def _save_trajectory(self, *_args, **_kwargs):
-        pass
+    def _save_trajectory(self, messages, *_args, **_kwargs):
+        self.trajectory_messages = [dict(message) for message in messages]
 
     def _cleanup_task_resources(self, *_args, **_kwargs):
         pass
@@ -328,3 +329,51 @@ def test_fill_pops_db_persisted_marker_for_durable_rewrite(monkeypatch):
     assert "_db_persisted" not in persisted[-1], (
         "marker must be popped so the next flush re-writes the filled content"
     )
+
+
+def test_transformed_response_is_synced_before_trajectory_and_persistence(monkeypatch):
+    """The delivered transform must be the only final assistant transcript.
+
+    ``transform_llm_output`` historically ran after trajectory/session writes,
+    so Discord could show the transformed response while a resumed session saw
+    the original.  The transform must happen first and update the in-memory
+    assistant row before any durable write.
+    """
+    original = "분석 결과입니다. 위험이 있습니다. 확인이 필요합니다."
+    transformed = "분석 결과예요. 위험이 있어요. 확인이 필요해요."
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook, **_kwargs: [transformed]
+        if hook == "transform_llm_output"
+        else [],
+    )
+
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "분석해줘"},
+        {"role": "assistant", "content": original},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=original,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="분석해줘",
+        original_user_message="분석해줘",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == transformed
+    assert result["response_transformed"] is True
+    assert result["messages"][-1]["content"] == transformed
+    assert agent.trajectory_messages is not None
+    assert agent.trajectory_messages[-1]["content"] == transformed
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == transformed
