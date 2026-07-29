@@ -6,10 +6,10 @@ import hashlib
 import json
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
 from plugins.mention_inbox.contract import (
@@ -20,10 +20,17 @@ from plugins.mention_inbox.contract import (
     restore_event,
     transition_approval as transition_event_approval,
 )
+from plugins.mention_inbox.proposals import (
+    ProposalStatus,
+    WorkProposal,
+    proposal_to_json,
+    restore_proposal,
+    verify_proposal_hash,
+)
 
 Clock = Callable[[], datetime]
-DEFAULT_DESTINATION = "discord:1526407515313668247"
-SCHEMA_VERSION = 2
+DEFAULT_DESTINATION = "discord:1531851208858275860"
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,90 @@ class DeliveryClaim:
     marker: str
     attempts: int
     requires_reconciliation: bool
+
+
+@dataclass(frozen=True)
+class WorkItemSession:
+    subject_key: str
+    source_dedupe_key: str
+    parent_message_id: str | None
+    discord_thread_id: str | None
+    state: str
+    last_event_revision: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class ApprovalCASResult:
+    approved: bool
+    reason: str
+    proposal: WorkProposal
+
+
+@dataclass(frozen=True)
+class WorkExecution:
+    execution_id: str
+    proposal_id: str
+    proposal_revision: int
+    proposal_hash: str
+    approval_message_id: str
+    thread_id: str
+    mode: str
+    status: str
+    dispatch_id: str | None
+    evidence_json: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class RecoverableExecution:
+    execution: WorkExecution
+    approver_user_id: str
+
+
+_CLOSED_SESSION_STATES = frozenset({"completed", "rejected", "expired"})
+_PROPOSAL_TRANSITIONS: dict[ProposalStatus, frozenset[ProposalStatus]] = {
+    ProposalStatus.PENDING: frozenset(
+        {ProposalStatus.REJECTED, ProposalStatus.NEEDS_REAPPROVAL}
+    ),
+    ProposalStatus.APPROVED: frozenset(
+        {
+            ProposalStatus.QUEUED,
+            ProposalStatus.BLOCKED,
+            ProposalStatus.NEEDS_REAPPROVAL,
+        }
+    ),
+    ProposalStatus.NEEDS_REAPPROVAL: frozenset(
+        {ProposalStatus.PENDING, ProposalStatus.REJECTED}
+    ),
+    ProposalStatus.QUEUED: frozenset(
+        {ProposalStatus.RUNNING, ProposalStatus.BLOCKED, ProposalStatus.NEEDS_REAPPROVAL}
+    ),
+    ProposalStatus.RUNNING: frozenset(
+        {ProposalStatus.VERIFYING, ProposalStatus.BLOCKED}
+    ),
+    ProposalStatus.VERIFYING: frozenset(
+        {ProposalStatus.COMPLETED, ProposalStatus.BLOCKED}
+    ),
+    ProposalStatus.BLOCKED: frozenset(
+        {ProposalStatus.QUEUED, ProposalStatus.NEEDS_REAPPROVAL}
+    ),
+    ProposalStatus.REJECTED: frozenset(),
+    ProposalStatus.COMPLETED: frozenset(),
+}
+
+
+def _require_stable_text(value: str, name: str, *, limit: int = 500) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > limit
+    ):
+        raise ValueError(f"{name} must be a bounded non-empty trimmed string")
+    return value
 
 
 def _utc_now() -> datetime:
@@ -116,6 +207,51 @@ def _collector_status(row: sqlite3.Row) -> CollectorStatus:
         last_attempt_at=_parse_datetime(str(row["last_attempt_at"])),
         last_success_at=_optional_datetime(row["last_success_at"]),
         next_poll_at=_parse_datetime(str(row["next_poll_at"])),
+    )
+
+
+def _work_item_session(row: sqlite3.Row) -> WorkItemSession:
+    return WorkItemSession(
+        subject_key=str(row["subject_key"]),
+        source_dedupe_key=str(row["source_dedupe_key"]),
+        parent_message_id=(
+            None if row["parent_message_id"] is None else str(row["parent_message_id"])
+        ),
+        discord_thread_id=(
+            None if row["discord_thread_id"] is None else str(row["discord_thread_id"])
+        ),
+        state=str(row["state"]),
+        last_event_revision=str(row["last_event_revision"]),
+        created_at=_parse_datetime(str(row["created_at"])),
+        updated_at=_parse_datetime(str(row["updated_at"])),
+    )
+
+
+def _stored_proposal(row: sqlite3.Row) -> WorkProposal:
+    proposal = restore_proposal(str(row["proposal_json"]))
+    if proposal.status.value != str(row["status"]):
+        raise RuntimeError("stored proposal status disagrees with canonical JSON")
+    if proposal.content_hash != str(row["proposal_hash"]):
+        raise RuntimeError("stored proposal hash disagrees with canonical JSON")
+    return proposal
+
+
+def _work_execution(row: sqlite3.Row) -> WorkExecution:
+    return WorkExecution(
+        execution_id=str(row["execution_id"]),
+        proposal_id=str(row["proposal_id"]),
+        proposal_revision=int(row["proposal_revision"]),
+        proposal_hash=str(row["proposal_hash"]),
+        approval_message_id=str(row["approval_message_id"]),
+        thread_id=str(row["thread_id"]),
+        mode=str(row["mode"]),
+        status=str(row["status"]),
+        dispatch_id=(None if row["dispatch_id"] is None else str(row["dispatch_id"])),
+        evidence_json=(
+            None if row["evidence_json"] is None else str(row["evidence_json"])
+        ),
+        created_at=_parse_datetime(str(row["created_at"])),
+        updated_at=_parse_datetime(str(row["updated_at"])),
     )
 
 
@@ -276,6 +412,78 @@ class MentionInboxStore:
                     SELECT e.source_revision FROM mention_events e
                     WHERE e.dedupe_key = mention_event_lineage.dedupe_key
                 ), latest_source_revision)
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS work_item_sessions (
+                    subject_key TEXT PRIMARY KEY,
+                    source_dedupe_key TEXT NOT NULL,
+                    parent_message_id TEXT,
+                    discord_thread_id TEXT,
+                    state TEXT NOT NULL,
+                    last_event_revision TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_work_item_thread
+                ON work_item_sessions(discord_thread_id)
+                WHERE discord_thread_id IS NOT NULL
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS work_proposals (
+                    proposal_id TEXT NOT NULL,
+                    proposal_revision INTEGER NOT NULL,
+                    subject_key TEXT NOT NULL,
+                    source_dedupe_key TEXT NOT NULL,
+                    source_revision TEXT NOT NULL,
+                    head_sha TEXT,
+                    proposal_json TEXT NOT NULL,
+                    proposal_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    discord_message_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (proposal_id, proposal_revision)
+                )
+            """)
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_work_proposal_message
+                ON work_proposals(discord_message_id)
+                WHERE discord_message_id IS NOT NULL
+            """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS ix_work_proposal_subject
+                ON work_proposals(subject_key, proposal_revision DESC)
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS work_approvals (
+                    proposal_id TEXT NOT NULL,
+                    proposal_revision INTEGER NOT NULL,
+                    proposal_hash TEXT NOT NULL,
+                    approver_platform TEXT NOT NULL,
+                    approver_user_id TEXT NOT NULL,
+                    approval_message_id TEXT NOT NULL UNIQUE,
+                    approved_at TEXT NOT NULL,
+                    PRIMARY KEY (proposal_id, proposal_revision)
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS work_executions (
+                    execution_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL,
+                    proposal_revision INTEGER NOT NULL,
+                    proposal_hash TEXT NOT NULL,
+                    approval_message_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    dispatch_id TEXT,
+                    evidence_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (proposal_id, proposal_revision)
+                )
             """)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
@@ -492,6 +700,1113 @@ class MentionInboxStore:
                     stale=False,
                     revision_number=revision_number,
                 )
+        finally:
+            connection.close()
+
+    def reserve_work_item_session(
+        self, subject_key: str, source_dedupe_key: str, source_revision: str
+    ) -> WorkItemSession:
+        subject = _require_stable_text(subject_key, "subject_key")
+        dedupe = _require_stable_text(source_dedupe_key, "source_dedupe_key")
+        _parse_datetime(source_revision)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO work_item_sessions (
+                            subject_key, source_dedupe_key, state,
+                            last_event_revision, created_at, updated_at
+                        ) VALUES (?, ?, 'reserved', ?, ?, ?)
+                        """,
+                        (subject, dedupe, source_revision, now, now),
+                    )
+                else:
+                    state = str(row["state"])
+                    if state in _CLOSED_SESSION_STATES:
+                        state = "reserved"
+                    connection.execute(
+                        """
+                        UPDATE work_item_sessions
+                        SET source_dedupe_key = ?, last_event_revision = ?,
+                            state = ?, updated_at = ?
+                        WHERE subject_key = ?
+                        """,
+                        (dedupe, source_revision, state, now, subject),
+                    )
+                stored = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                return _work_item_session(stored)
+        finally:
+            connection.close()
+
+    def get_active_work_item_session(self, subject_key: str) -> WorkItemSession | None:
+        subject = _require_stable_text(subject_key, "subject_key")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                (subject,),
+            ).fetchone()
+            if row is None or str(row["state"]) in _CLOSED_SESSION_STATES:
+                return None
+            return _work_item_session(row)
+        finally:
+            connection.close()
+
+    def prepare_work_item_parent(
+        self, subject_key: str, parent_message_id: str
+    ) -> WorkItemSession:
+        subject = _require_stable_text(subject_key, "subject_key")
+        parent = _require_stable_text(parent_message_id, "parent_message_id", limit=80)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("work item session not found")
+                existing = row["parent_message_id"]
+                if existing is not None and str(existing) != parent:
+                    raise ValueError("work item session already maps to a different parent")
+                connection.execute(
+                    """
+                    UPDATE work_item_sessions
+                    SET parent_message_id = ?, updated_at = ?
+                    WHERE subject_key = ?
+                    """,
+                    (parent, now, subject),
+                )
+                stored = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                return _work_item_session(stored)
+        finally:
+            connection.close()
+
+    def get_work_item_session_by_thread(self, thread_id: str) -> WorkItemSession | None:
+        value = _require_stable_text(thread_id, "thread_id", limit=80)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_item_sessions WHERE discord_thread_id = ?",
+                (value,),
+            ).fetchone()
+            return None if row is None else _work_item_session(row)
+        finally:
+            connection.close()
+
+    def record_work_item_thread(
+        self, subject_key: str, parent_message_id: str, thread_id: str
+    ) -> WorkItemSession:
+        subject = _require_stable_text(subject_key, "subject_key")
+        parent = _require_stable_text(parent_message_id, "parent_message_id", limit=80)
+        thread = _require_stable_text(thread_id, "thread_id", limit=80)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("work item session not found")
+                existing_parent = row["parent_message_id"]
+                existing_thread = row["discord_thread_id"]
+                if (
+                    (existing_parent is not None and str(existing_parent) != parent)
+                    or (existing_thread is not None and str(existing_thread) != thread)
+                ):
+                    raise ValueError("work item session already maps to a different thread")
+                state = "thread_open" if str(row["state"]) == "reserved" else str(row["state"])
+                connection.execute(
+                    """
+                    UPDATE work_item_sessions
+                    SET parent_message_id = ?, discord_thread_id = ?,
+                        state = ?, updated_at = ?
+                    WHERE subject_key = ?
+                    """,
+                    (parent, thread, state, now, subject),
+                )
+                stored = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                return _work_item_session(stored)
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _write_proposal_status(
+        connection: sqlite3.Connection,
+        proposal: WorkProposal,
+        status: ProposalStatus,
+        now: str,
+    ) -> WorkProposal:
+        updated = replace(proposal, status=status)
+        cursor = connection.execute(
+            """
+            UPDATE work_proposals
+            SET status = ?, proposal_json = ?, updated_at = ?
+            WHERE proposal_id = ? AND proposal_revision = ?
+            """,
+            (
+                status.value,
+                proposal_to_json(updated),
+                now,
+                proposal.proposal_id,
+                proposal.revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("proposal status CAS target disappeared")
+        return updated
+
+    def create_proposal(self, proposal: WorkProposal) -> WorkProposal:
+        if not isinstance(proposal, WorkProposal) or not verify_proposal_hash(proposal):
+            raise ValueError("proposal must have a valid canonical hash")
+        if proposal.status is not ProposalStatus.PENDING:
+            raise ValueError("new proposal status must be pending")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                session = connection.execute(
+                    "SELECT subject_key FROM work_item_sessions WHERE subject_key = ?",
+                    (proposal.subject_key,),
+                ).fetchone()
+                if session is None:
+                    raise KeyError("work item session not found")
+                existing = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal.proposal_id, proposal.revision),
+                ).fetchone()
+                if existing is not None:
+                    restored = _stored_proposal(existing)
+                    if restored == proposal:
+                        return restored
+                    raise ValueError("proposal revision already exists with different content")
+                latest = connection.execute(
+                    """
+                    SELECT MAX(proposal_revision) FROM work_proposals
+                    WHERE proposal_id = ?
+                    """,
+                    (proposal.proposal_id,),
+                ).fetchone()[0]
+                if latest is not None and proposal.revision <= int(latest):
+                    raise ValueError("proposal revision must advance monotonically")
+                older = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND status IN ('pending', 'approved')
+                    """,
+                    (proposal.proposal_id,),
+                ).fetchall()
+                for row in older:
+                    self._write_proposal_status(
+                        connection,
+                        _stored_proposal(row),
+                        ProposalStatus.NEEDS_REAPPROVAL,
+                        now,
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO work_proposals (
+                        proposal_id, proposal_revision, subject_key,
+                        source_dedupe_key, source_revision, head_sha,
+                        proposal_json, proposal_hash, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal.proposal_id,
+                        proposal.revision,
+                        proposal.subject_key,
+                        proposal.source_dedupe_key,
+                        proposal.source_revision,
+                        proposal.head_sha,
+                        proposal_to_json(proposal),
+                        proposal.content_hash,
+                        proposal.status.value,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE work_item_sessions
+                    SET state = 'pending_proposal',
+                        source_dedupe_key = ?, last_event_revision = ?, updated_at = ?
+                    WHERE subject_key = ?
+                    """,
+                    (
+                        proposal.source_dedupe_key,
+                        proposal.source_revision,
+                        now,
+                        proposal.subject_key,
+                    ),
+                )
+                return proposal
+        finally:
+            connection.close()
+
+    def record_proposal_message(
+        self, proposal_id: str, revision: int, message_id: str
+    ) -> WorkProposal:
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        message = _require_stable_text(message_id, "message_id", limit=80)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError("revision must be a positive integer")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal_key, revision),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("proposal not found")
+                existing = row["discord_message_id"]
+                if existing is not None and str(existing) != message:
+                    raise ValueError("proposal already maps to a different message")
+                connection.execute(
+                    """
+                    UPDATE work_proposals
+                    SET discord_message_id = ?, updated_at = ?
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (message, now, proposal_key, revision),
+                )
+                return _stored_proposal(row)
+        finally:
+            connection.close()
+
+    def get_proposal(
+        self, proposal_id: str, revision: int
+    ) -> WorkProposal | None:
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError("revision must be a positive integer")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                (proposal_key, revision),
+            ).fetchone()
+            return None if row is None else _stored_proposal(row)
+        finally:
+            connection.close()
+
+    def get_proposal_message_id(self, proposal_id: str, revision: int) -> str | None:
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT discord_message_id FROM work_proposals
+                WHERE proposal_id = ? AND proposal_revision = ?
+                """,
+                (proposal_key, revision),
+            ).fetchone()
+            if row is None:
+                raise KeyError("proposal not found")
+            return None if row["discord_message_id"] is None else str(row["discord_message_id"])
+        finally:
+            connection.close()
+
+    def get_proposal_by_message_id(self, message_id: str) -> WorkProposal | None:
+        message = _require_stable_text(message_id, "message_id", limit=80)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_proposals WHERE discord_message_id = ?",
+                (message,),
+            ).fetchone()
+            return None if row is None else _stored_proposal(row)
+        finally:
+            connection.close()
+
+    def get_latest_proposal(self, subject_key: str) -> WorkProposal | None:
+        subject = _require_stable_text(subject_key, "subject_key")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT * FROM work_proposals WHERE subject_key = ?
+                ORDER BY proposal_revision DESC LIMIT 1
+                """,
+                (subject,),
+            ).fetchone()
+            return None if row is None else _stored_proposal(row)
+        finally:
+            connection.close()
+
+    def mark_proposal_needs_reapproval(
+        self, proposal_id: str, revision: int
+    ) -> WorkProposal:
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal_id, revision),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("proposal not found")
+                proposal = _stored_proposal(row)
+                if proposal.status is ProposalStatus.NEEDS_REAPPROVAL:
+                    return proposal
+                updated = self._write_proposal_status(
+                    connection, proposal, ProposalStatus.NEEDS_REAPPROVAL, now
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = 'needs_reapproval', updated_at = ? WHERE subject_key = ?",
+                    (now, proposal.subject_key),
+                )
+                return updated
+        finally:
+            connection.close()
+
+    def transition_proposal_status(
+        self,
+        proposal_id: str,
+        revision: int,
+        requested_status: ProposalStatus,
+        *,
+        expected_statuses: Iterable[ProposalStatus] | None = None,
+    ) -> WorkProposal:
+        if not isinstance(requested_status, ProposalStatus):
+            raise ValueError("requested_status must be a ProposalStatus")
+        expected = None if expected_statuses is None else frozenset(expected_statuses)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal_id, revision),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("proposal not found")
+                proposal = _stored_proposal(row)
+                if expected is not None and proposal.status not in expected:
+                    raise ValueError("proposal status did not match expected state")
+                if requested_status not in _PROPOSAL_TRANSITIONS[proposal.status]:
+                    raise ValueError("illegal proposal status transition")
+                updated = self._write_proposal_status(
+                    connection, proposal, requested_status, now
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = ?, updated_at = ? WHERE subject_key = ?",
+                    (requested_status.value, now, proposal.subject_key),
+                )
+                return updated
+        finally:
+            connection.close()
+
+    def approve_proposal_cas(
+        self,
+        *,
+        proposal_id: str,
+        revision: int,
+        proposal_hash: str,
+        source_revision: str,
+        current_head_sha: str | None,
+        approver_platform: str,
+        approver_user_id: str,
+        authorized_approver_ids: frozenset[str],
+        approval_message_id: str,
+    ) -> ApprovalCASResult:
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        expected_hash = _require_stable_text(proposal_hash, "proposal_hash", limit=64)
+        _parse_datetime(source_revision)
+        platform = _require_stable_text(approver_platform, "approver_platform", limit=32)
+        approver = _require_stable_text(approver_user_id, "approver_user_id", limit=80)
+        approval_message = _require_stable_text(
+            approval_message_id, "approval_message_id", limit=80
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal_key, revision),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("proposal not found")
+                proposal = _stored_proposal(row)
+                if approver not in authorized_approver_ids:
+                    return ApprovalCASResult(False, "unauthorized_approver", proposal)
+                reused = connection.execute(
+                    "SELECT 1 FROM work_approvals WHERE approval_message_id = ?",
+                    (approval_message,),
+                ).fetchone()
+                if reused is not None:
+                    return ApprovalCASResult(False, "approval_message_reused", proposal)
+                latest = connection.execute(
+                    "SELECT MAX(proposal_revision) FROM work_proposals WHERE proposal_id = ?",
+                    (proposal_key,),
+                ).fetchone()[0]
+                if int(latest) != revision:
+                    return ApprovalCASResult(False, "not_latest_revision", proposal)
+                if proposal.status is ProposalStatus.APPROVED:
+                    return ApprovalCASResult(False, "already_approved", proposal)
+                if proposal.status is not ProposalStatus.PENDING:
+                    return ApprovalCASResult(False, proposal.status.value, proposal)
+                if not verify_proposal_hash(proposal) or proposal.content_hash != expected_hash:
+                    return ApprovalCASResult(False, "proposal_hash_mismatch", proposal)
+                if proposal.source_revision != source_revision:
+                    updated = self._write_proposal_status(
+                        connection, proposal, ProposalStatus.NEEDS_REAPPROVAL, now
+                    )
+                    connection.execute(
+                        "UPDATE work_item_sessions SET state = 'needs_reapproval', updated_at = ? WHERE subject_key = ?",
+                        (now, proposal.subject_key),
+                    )
+                    return ApprovalCASResult(False, "source_changed", updated)
+                if proposal.head_sha != current_head_sha:
+                    updated = self._write_proposal_status(
+                        connection, proposal, ProposalStatus.NEEDS_REAPPROVAL, now
+                    )
+                    connection.execute(
+                        "UPDATE work_item_sessions SET state = 'needs_reapproval', updated_at = ? WHERE subject_key = ?",
+                        (now, proposal.subject_key),
+                    )
+                    return ApprovalCASResult(False, "head_changed", updated)
+                connection.execute(
+                    """
+                    INSERT INTO work_approvals (
+                        proposal_id, proposal_revision, proposal_hash,
+                        approver_platform, approver_user_id,
+                        approval_message_id, approved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal.proposal_id,
+                        proposal.revision,
+                        proposal.content_hash,
+                        platform,
+                        approver,
+                        approval_message,
+                        now,
+                    ),
+                )
+                updated = self._write_proposal_status(
+                    connection, proposal, ProposalStatus.APPROVED, now
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = 'approved', updated_at = ? WHERE subject_key = ?",
+                    (now, proposal.subject_key),
+                )
+                return ApprovalCASResult(True, "approved", updated)
+        finally:
+            connection.close()
+
+    def reserve_work_execution(
+        self,
+        *,
+        proposal_id: str,
+        revision: int,
+        proposal_hash: str,
+        approval_message_id: str,
+        thread_id: str,
+        mode: str,
+    ) -> WorkExecution:
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        expected_hash = _require_stable_text(proposal_hash, "proposal_hash", limit=64)
+        approval_message = _require_stable_text(
+            approval_message_id, "approval_message_id", limit=80
+        )
+        thread = _require_stable_text(thread_id, "thread_id", limit=80)
+        route = _require_stable_text(mode, "mode", limit=32)
+        if route != route.casefold() or not route.replace("_", "").replace("-", "").isalnum():
+            raise ValueError("mode must be a lowercase identifier")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError("revision must be a positive integer")
+        identity = f"{proposal_key}\0{revision}"
+        execution_id = "wx_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                existing = connection.execute(
+                    "SELECT * FROM work_executions WHERE proposal_id = ? AND proposal_revision = ?",
+                    (proposal_key, revision),
+                ).fetchone()
+                if existing is not None:
+                    execution = _work_execution(existing)
+                    if (
+                        execution.proposal_hash != expected_hash
+                        or execution.approval_message_id != approval_message
+                        or execution.thread_id != thread
+                        or execution.mode != route
+                    ):
+                        raise ValueError("execution receipt conflicts with existing scope")
+                    return execution
+                proposal_row = connection.execute(
+                    "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                    (proposal_key, revision),
+                ).fetchone()
+                if proposal_row is None:
+                    raise KeyError("proposal not found")
+                proposal = _stored_proposal(proposal_row)
+                if proposal.status is not ProposalStatus.APPROVED:
+                    raise ValueError("proposal must be approved before execution is reserved")
+                if proposal.executor_hint != route:
+                    raise ValueError("execution mode must match the approved proposal")
+                if proposal.content_hash != expected_hash:
+                    raise ValueError("proposal hash changed before execution reservation")
+                approval = connection.execute(
+                    """
+                    SELECT proposal_hash FROM work_approvals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                      AND approval_message_id = ?
+                    """,
+                    (proposal_key, revision, approval_message),
+                ).fetchone()
+                if approval is None or str(approval["proposal_hash"]) != expected_hash:
+                    raise ValueError("matching committed approval receipt is required")
+                session = connection.execute(
+                    "SELECT discord_thread_id FROM work_item_sessions WHERE subject_key = ?",
+                    (proposal.subject_key,),
+                ).fetchone()
+                if session is None or str(session["discord_thread_id"] or "") != thread:
+                    raise ValueError("execution thread does not match work-item session")
+                connection.execute(
+                    """
+                    INSERT INTO work_executions (
+                        execution_id, proposal_id, proposal_revision, proposal_hash,
+                        approval_message_id, thread_id, mode, status, dispatch_id,
+                        evidence_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, ?)
+                    """,
+                    (
+                        execution_id,
+                        proposal_key,
+                        revision,
+                        expected_hash,
+                        approval_message,
+                        thread,
+                        route,
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_id,),
+                ).fetchone()
+                return _work_execution(row)
+        finally:
+            connection.close()
+
+    def mark_execution_dispatched(
+        self, execution_id: str, dispatch_id: str
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        dispatch = _require_stable_text(dispatch_id, "dispatch_id", limit=200)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status == "queued":
+                    if current.dispatch_id != dispatch:
+                        raise ValueError("execution already maps to a different dispatch")
+                    return current
+                if current.status != "reserved":
+                    raise ValueError("only a reserved execution may be dispatched")
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET status = 'queued', dispatch_id = ?, updated_at = ?
+                    WHERE execution_id = ? AND status = 'reserved'
+                    """,
+                    (dispatch, now, execution_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def list_recoverable_executions(
+        self, *, limit: int = 100
+    ) -> tuple[RecoverableExecution, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT e.*, a.approver_user_id AS recovery_approver_user_id
+                FROM work_executions AS e
+                JOIN work_approvals AS a
+                  ON a.proposal_id = e.proposal_id
+                 AND a.proposal_revision = e.proposal_revision
+                 AND a.approval_message_id = e.approval_message_id
+                WHERE e.status IN ('reserved', 'queued')
+                ORDER BY e.created_at, e.execution_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return tuple(
+                RecoverableExecution(
+                    execution=_work_execution(row),
+                    approver_user_id=_require_stable_text(
+                        str(row["recovery_approver_user_id"]),
+                        "approver_user_id",
+                        limit=80,
+                    ),
+                )
+                for row in rows
+            )
+        finally:
+            connection.close()
+
+    def invalidate_execution_for_reapproval(
+        self, execution_id: str, *, evidence_category: str
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        category = _require_error_category(evidence_category)
+        evidence_json = json.dumps(
+            {"category": category}, separators=(",", ":"), sort_keys=True
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status == "blocked":
+                    return current
+                if current.status not in {"reserved", "queued"}:
+                    raise ValueError("only unstarted execution may require reapproval")
+                proposal_row = connection.execute(
+                    "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                    (current.proposal_id, current.proposal_revision),
+                ).fetchone()
+                if proposal_row is None:
+                    raise KeyError("execution proposal not found")
+                proposal = _stored_proposal(proposal_row)
+                if ProposalStatus.NEEDS_REAPPROVAL not in _PROPOSAL_TRANSITIONS.get(
+                    proposal.status, frozenset()
+                ):
+                    raise ValueError("proposal cannot require reapproval")
+                self._write_proposal_status(
+                    connection, proposal, ProposalStatus.NEEDS_REAPPROVAL, now
+                )
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET status = 'blocked', evidence_json = ?, updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (evidence_json, now, execution_key),
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = 'needs_reapproval', updated_at = ? WHERE subject_key = ?",
+                    (now, proposal.subject_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def mark_execution_blocked(
+        self, execution_id: str, *, evidence_category: str
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        category = _require_error_category(evidence_category)
+        evidence_json = json.dumps(
+            {"category": category}, separators=(",", ":"), sort_keys=True
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status == "blocked":
+                    return current
+                if current.status not in {"reserved", "queued", "running", "verifying"}:
+                    raise ValueError("execution cannot transition to blocked")
+                proposal_row = connection.execute(
+                    "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                    (current.proposal_id, current.proposal_revision),
+                ).fetchone()
+                if proposal_row is None:
+                    raise KeyError("execution proposal not found")
+                proposal = _stored_proposal(proposal_row)
+                if ProposalStatus.BLOCKED not in _PROPOSAL_TRANSITIONS.get(
+                    proposal.status, frozenset()
+                ):
+                    raise ValueError("proposal cannot transition to blocked")
+                self._write_proposal_status(
+                    connection, proposal, ProposalStatus.BLOCKED, now
+                )
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET status = 'blocked', evidence_json = ?, updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (evidence_json, now, execution_key),
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = 'blocked', updated_at = ? WHERE subject_key = ?",
+                    (now, proposal.subject_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _decode_execution_evidence(raw: str | None) -> dict[str, object]:
+        if raw is None:
+            return {"tool_starts": {}, "tool_completions": []}
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            raise RuntimeError("stored execution evidence is invalid") from None
+        if not isinstance(value, dict):
+            raise RuntimeError("stored execution evidence is invalid")
+        starts = value.get("tool_starts", {})
+        completions = value.get("tool_completions", [])
+        if not isinstance(starts, dict) or not isinstance(completions, list):
+            raise RuntimeError("stored execution evidence is invalid")
+        return {"tool_starts": dict(starts), "tool_completions": list(completions)}
+
+    def mark_execution_running(
+        self,
+        execution_id: str,
+        *,
+        tool_name: str,
+        transition_proposal: bool = True,
+    ) -> tuple[WorkExecution, bool]:
+        if not isinstance(transition_proposal, bool):
+            raise ValueError("transition_proposal must be boolean")
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        tool = _require_stable_text(tool_name, "tool_name", limit=100)
+        if not all(char.isalnum() or char in "_.:-" for char in tool):
+            raise ValueError("tool_name contains unsupported characters")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status not in {"queued", "running"}:
+                    raise ValueError("execution cannot record tool start")
+                evidence = self._decode_execution_evidence(current.evidence_json)
+                starts = evidence["tool_starts"]
+                assert isinstance(starts, dict)
+                count = starts.get(tool, 0)
+                starts[tool] = (count if isinstance(count, int) else 0) + 1
+                evidence_json = json.dumps(
+                    evidence, separators=(",", ":"), sort_keys=True
+                )
+                changed = current.status == "queued"
+                if changed and transition_proposal:
+                    proposal_row = connection.execute(
+                        "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                        (current.proposal_id, current.proposal_revision),
+                    ).fetchone()
+                    proposal = _stored_proposal(proposal_row)
+                    if proposal.status is not ProposalStatus.QUEUED:
+                        raise ValueError("queued execution proposal state mismatch")
+                    self._write_proposal_status(
+                        connection, proposal, ProposalStatus.RUNNING, now
+                    )
+                    connection.execute(
+                        "UPDATE work_item_sessions SET state = 'running', updated_at = ? WHERE subject_key = ?",
+                        (now, proposal.subject_key),
+                    )
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET status = 'running', evidence_json = ?, updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (evidence_json, now, execution_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated), changed
+        finally:
+            connection.close()
+
+    def record_execution_tool_completion(
+        self,
+        execution_id: str,
+        *,
+        tool_name: str,
+        success: bool,
+        exit_code: int | None,
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        tool = _require_stable_text(tool_name, "tool_name", limit=100)
+        if not all(char.isalnum() or char in "_.:-" for char in tool):
+            raise ValueError("tool_name contains unsupported characters")
+        if not isinstance(success, bool):
+            raise ValueError("success must be boolean")
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            raise ValueError("exit_code must be integer or null")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status != "running":
+                    raise ValueError("tool completion requires a running execution")
+                evidence = self._decode_execution_evidence(current.evidence_json)
+                completions = evidence["tool_completions"]
+                assert isinstance(completions, list)
+                if len(completions) < 100:
+                    completions.append(
+                        {"tool": tool, "success": success, "exit_code": exit_code}
+                    )
+                evidence_json = json.dumps(
+                    evidence, separators=(",", ":"), sort_keys=True
+                )
+                connection.execute(
+                    "UPDATE work_executions SET evidence_json = ?, updated_at = ? WHERE execution_id = ?",
+                    (evidence_json, now, execution_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def mark_kanban_execution_admitted(self, execution_id: str) -> WorkExecution:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status == "completed":
+                    return current
+                if current.status != "running" or current.mode != "kanban":
+                    raise ValueError("only running Kanban intake may be admitted")
+                evidence = self._decode_execution_evidence(current.evidence_json)
+                completions = evidence["tool_completions"]
+                if not any(
+                    isinstance(item, dict)
+                    and item.get("tool") == "kanban_task"
+                    and item.get("success") is True
+                    for item in completions
+                ):
+                    raise ValueError("successful kanban_task receipt is required")
+                proposal_row = connection.execute(
+                    "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                    (current.proposal_id, current.proposal_revision),
+                ).fetchone()
+                if proposal_row is None:
+                    raise KeyError("execution proposal not found")
+                proposal = _stored_proposal(proposal_row)
+                if proposal.status is not ProposalStatus.QUEUED:
+                    raise ValueError("Kanban-admitted proposal must remain queued")
+                connection.execute(
+                    "UPDATE work_executions SET status = 'completed', updated_at = ? WHERE execution_id = ?",
+                    (now, execution_key),
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = 'queued', updated_at = ? WHERE subject_key = ?",
+                    (now, proposal.subject_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def mark_execution_verifying(self, execution_id: str) -> WorkExecution:
+        return self._advance_execution_and_proposal(
+            execution_id,
+            expected_execution="running",
+            target_execution="verifying",
+            expected_proposal=ProposalStatus.RUNNING,
+            target_proposal=ProposalStatus.VERIFYING,
+        )
+
+    def mark_execution_completed(self, execution_id: str) -> WorkExecution:
+        return self._advance_execution_and_proposal(
+            execution_id,
+            expected_execution="verifying",
+            target_execution="completed",
+            expected_proposal=ProposalStatus.VERIFYING,
+            target_proposal=ProposalStatus.COMPLETED,
+        )
+
+    def _advance_execution_and_proposal(
+        self,
+        execution_id: str,
+        *,
+        expected_execution: str,
+        target_execution: str,
+        expected_proposal: ProposalStatus,
+        target_proposal: ProposalStatus,
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status == target_execution:
+                    return current
+                if current.status != expected_execution:
+                    raise ValueError("execution status transition mismatch")
+                evidence = self._decode_execution_evidence(current.evidence_json)
+                completions = evidence["tool_completions"]
+                if not any(
+                    isinstance(item, dict) and item.get("success") is True
+                    for item in completions
+                ):
+                    raise ValueError("successful tool evidence is required")
+                proposal_row = connection.execute(
+                    "SELECT * FROM work_proposals WHERE proposal_id = ? AND proposal_revision = ?",
+                    (current.proposal_id, current.proposal_revision),
+                ).fetchone()
+                proposal = _stored_proposal(proposal_row)
+                if proposal.status is not expected_proposal:
+                    raise ValueError("execution proposal status transition mismatch")
+                self._write_proposal_status(
+                    connection, proposal, target_proposal, now
+                )
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET status = ?, updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (target_execution, now, execution_key),
+                )
+                connection.execute(
+                    "UPDATE work_item_sessions SET state = ?, updated_at = ? WHERE subject_key = ?",
+                    (target_execution, now, proposal.subject_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def get_execution(self, execution_id: str) -> WorkExecution | None:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_executions WHERE execution_id = ?",
+                (execution_key,),
+            ).fetchone()
+            return None if row is None else _work_execution(row)
+        finally:
+            connection.close()
+
+    def get_execution_for_proposal(
+        self, proposal_id: str, revision: int
+    ) -> WorkExecution | None:
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_executions WHERE proposal_id = ? AND proposal_revision = ?",
+                (proposal_key, revision),
+            ).fetchone()
+            return None if row is None else _work_execution(row)
         finally:
             connection.close()
 

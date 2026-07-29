@@ -128,6 +128,12 @@ def test_schema_keeps_single_intake_surface_within_750_byte_budget():
     assert metrics.json_bytes <= 750
 
 
+def test_kanban_submit_toolset_enables_discord_intake() -> None:
+    assert intake._kanban_enabled_for_discord(
+        {"platform_toolsets": {"discord": ["kanban_submit"]}}
+    )
+
+
 def test_handler_fails_closed_without_trusted_gateway_context(intake_env, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")

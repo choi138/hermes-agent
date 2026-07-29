@@ -247,11 +247,22 @@ other external write.
 ### Selection and mapping
 
 The collector requires an explicit repository allowlist. An empty allowlist
-collects nothing. P3-M2 selects only:
+collects nothing. P3-M2 hydrates the current GitHub subject and emits only
+current, user-directed actions:
 
-- `mention` and `team_mention` -> `reply`
-- `review_requested` -> `review`
-- `assign` -> `investigate`
+- an explicit direct mention in the selected comment/review -> `reply`
+- a current direct review request whose notification reason is `review_requested`
+  -> `review`
+- a current direct assignment whose notification reason is `assign` ->
+  `investigate`
+- an external human comment, review, or change request on the target user's own
+  pull request -> `reply` or `revise`
+
+Bot/self activity, sticky reviewer/assignee state on unrelated notifications,
+missing/deleted hydration, CI/state/subscription noise, and unverified team
+activity fail closed. Team mentions and team review requests are disabled by
+default; when explicitly enabled they still require verified active team
+membership.
 
 `notification.id` is `source.event_id`. `updated_at` is kept only as the
 out-of-band `source_revision`; it is deliberately absent from the canonical
@@ -315,7 +326,15 @@ mention_inbox:
   enabled: false
   credential_env: GITHUB_PAT_TOKEN
   repositories: [silviahealth/content]
-  destination: discord:1526407515313668247
+  destination: discord:1531851208858275860
+  team_mentions: false
+  team_review_requests: false
+  action_sessions:
+    enabled: false
+    execution_enabled: false
+    authorized_approver_ids: []
+    bot_mention: null
+    execution_mode: direct
   retention_days: 30
   lease_seconds: 60
 ```
@@ -335,6 +354,14 @@ guarantee: a marker outside Discord's bounded retrievable history can still be
 reposted.
 
 Rendered messages are deterministic, bounded, label title/body as untrusted data,
-neutralize mentions/markdown, include source/repository/action/URL, and force
-Discord `AllowedMentions.none()`. No LLM, approval/reject/draft UI, GitHub mutation,
-or external reply is part of this runtime.
+neutralize mentions/markdown, include source/repository/action/exact permalink, and
+force Discord `AllowedMentions.none()`.
+
+Action sessions and execution are separate, disabled-by-default gates. An
+actionable item can open one durable PR/Issue thread with a local deterministic
+proposal. Execution requires an authorized user's exact reply to the latest
+proposal, then revalidates the current GitHub source revision and PR HEAD before
+queueing. Direct execution runs in an isolated gateway session with only scoped
+file tools and approved foreground verification commands; Kanban intake exposes
+only the single `kanban_task` surface. Neither path may infer merge, deployment,
+deletion, secret access, or any GitHub mutation from untrusted source content.

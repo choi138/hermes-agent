@@ -71,11 +71,12 @@ def _configured_string_set(value: Any) -> set[str]:
 
 
 def _kanban_enabled_for_discord(config: dict[str, Any]) -> bool:
-    if "kanban" in _configured_string_set(config.get("toolsets")):
+    accepted = {"kanban", "kanban_submit"}
+    if accepted & _configured_string_set(config.get("toolsets")):
         return True
     platform_toolsets = config.get("platform_toolsets")
-    return isinstance(platform_toolsets, dict) and (
-        "kanban" in _configured_string_set(platform_toolsets.get("discord"))
+    return isinstance(platform_toolsets, dict) and bool(
+        accepted & _configured_string_set(platform_toolsets.get("discord"))
     )
 
 

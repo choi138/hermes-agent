@@ -169,12 +169,19 @@ class GitHubMentionPoller:
                     continue
                 selected += 1
                 detail = None
-                subject_url = _subject_url(notification)
-                if subject_url is not None:
+                hydrator = getattr(self._collector, "hydrate", None)
+                if callable(hydrator):
                     try:
-                        detail = self._client.fetch_subject(subject_url)
+                        detail = hydrator(notification)
                     except ValueError:
                         detail = None
+                else:
+                    subject_url = _subject_url(notification)
+                    if subject_url is not None:
+                        try:
+                            detail = self._client.fetch_subject(subject_url)
+                        except ValueError:
+                            detail = None
                 try:
                     collected = self._collector.normalize(notification, detail)
                 except ValueError:

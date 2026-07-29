@@ -21,7 +21,8 @@ from plugins.mention_inbox.operational import (
 )
 
 NOW = datetime(2026, 7, 29, 9, 0, tzinfo=timezone.utc)
-DESTINATION = "discord:1526407515313668247"
+DESTINATION = "discord:1531851208858275860"
+WORK_INBOX_DESTINATION = DESTINATION
 
 
 def _event(*, title: str = "Review requested", body: str = "Please review", event_id: str = "n1"):
@@ -55,7 +56,11 @@ def _enabled_config() -> MentionInboxConfig:
 
 
 def test_config_defaults_disabled_and_validates_fail_closed() -> None:
-    assert parse_mention_inbox_config({}).enabled is False
+    disabled = parse_mention_inbox_config({})
+    assert disabled.enabled is False
+    assert disabled.destination == WORK_INBOX_DESTINATION
+    assert disabled.team_mentions is False
+    assert disabled.team_review_requests is False
     config = parse_mention_inbox_config({"mention_inbox": {
         "enabled": True,
         "credential_env": "GITHUB_PAT_TOKEN",
@@ -440,7 +445,7 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
 
     connection = sqlite3.connect(db)
     connection.row_factory = sqlite3.Row
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(delivery_outbox)")}
     assert "event_json" in columns
     migrated = connection.execute(
@@ -475,7 +480,7 @@ def test_future_schema_version_fails_closed_without_mutation(tmp_path: Path) -> 
     connection.commit()
     connection.close()
 
-    with pytest.raises(RuntimeError, match="newer than supported schema version 2"):
+    with pytest.raises(RuntimeError, match="newer than supported schema version 4"):
         MentionInboxStore(db, clock=lambda: NOW)
 
     connection = sqlite3.connect(db)
@@ -576,7 +581,7 @@ def test_migration_supersedes_unreconstructible_older_revision(tmp_path: Path) -
     }
     assert rows[1]["status"] == "pending"
     assert rows[1]["event_json"] == event_to_json(revision_two)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     connection.close()
     assert store.get_cursor("github.notifications") == "cursor-2"
     assert store.pending_delivery_count() == 1
@@ -619,6 +624,63 @@ async def test_disabled_and_missing_credential_are_degraded_not_fatal(tmp_path: 
     await missing.start()
     assert missing.health()["status"] == "degraded"
     assert missing.health()["error_category"] == "missing_credential"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution_enabled", "expected_handler"),
+    ((False, False), (True, True)),
+)
+async def test_execution_handler_is_wired_only_when_explicitly_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution_enabled: bool,
+    expected_handler: bool,
+) -> None:
+    import plugins.mention_inbox.operational as operational
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            assert token == "opaque-token"
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.router = None
+            self.execution_observer = None
+
+        def set_mention_inbox_router(self, router) -> None:
+            self.router = router
+
+        def set_mention_inbox_execution_observer(self, observer) -> None:
+            self.execution_observer = observer
+
+    monkeypatch.setattr(operational, "GitHubNotificationsClient", Client)
+    monkeypatch.setattr(operational.MentionInboxRuntime, "start", lambda self: None)
+    adapter = Adapter()
+    config = MentionInboxConfig(
+        enabled=True,
+        repositories=("silviahealth/content",),
+        destination=DESTINATION,
+        action_sessions_enabled=True,
+        proposal_bot_mention="<@1525050677381279865>",
+        authorized_approver_ids=("396159160201658368",),
+        execution_enabled=execution_enabled,
+        execution_mode="kanban",
+    )
+    service = MentionInboxGatewayService(
+        config,
+        adapter,
+        environ={"GITHUB_PAT_TOKEN": "opaque-token"},
+        db_path=tmp_path / f"wired-{execution_enabled}.db",
+    )
+
+    await service.start()
+
+    assert adapter.router is not None
+    assert (adapter.router._approval_handler is not None) is expected_handler
+    assert (adapter.execution_observer is not None) is execution_enabled
+    assert service._runtime is not None
+    assert service._runtime.delivery._thread_coordinator._executor_hint == "kanban"
 
 
 def test_collector_bounds_external_title_body_before_persistence() -> None:
