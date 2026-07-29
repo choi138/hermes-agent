@@ -13,6 +13,8 @@ Every durable *notes* write flows through here::
                        procedural→REJECT (skills are gated separately) |
                        evidence→existing graph ingest path
      3. neighbor retrieval (NotesStore.neighbor_search, deterministic)
+        + propose-time grounding preview: exact checks plus up to three
+          taint-clean recognition candidates for failed WAL/L0 quotes.
      4. verdict        ADD | UPDATE | SUPERSEDE | NOOP — decided by the
                        CALLER, but only after receiving the neighbor list:
                        the two-step propose→confirm contract binds the
@@ -26,6 +28,9 @@ Every durable *notes* write flows through here::
         alter is refused outright, so secret-bearing quotes can neither
         ground nor be persisted. Episode UUIDs are format-validated (graph
         existence checks are the graph side's job).
+     5a. current-turn deferral — absence/mismatch failures aimed at the
+         proposing session land pending/unconfirmed and are re-verified from
+         ``state/notes-pending-grounding.jsonl`` after the journal catches up.
      5b. write-approval gate — mutating verdicts respect
         ``memory.write_approval`` (the same switch that gates MEMORY.md
         writes): gate on → the fully-resolved plan is staged for
@@ -59,11 +64,15 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid as _uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +92,7 @@ from agent.notes_store import (
     validate_kind,
     validate_topic_key,
 )
+from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +100,12 @@ logger = logging.getLogger(__name__)
 # enough for a propose→confirm round trip inside one agent turn, short
 # enough that a stale snapshot can't authorize a write much later.
 PROPOSAL_TTL_S = 10 * 60
+
+# Current-turn citations may arrive before the turn's asynchronous journal
+# write. They remain unconfirmed until this lazy sweeper can verify them.
+DEFERRED_GROUNDING_GRACE_S = 120
+DEFERRED_GROUNDING_MAX_ATTEMPTS = 5
+DEFERRED_GROUNDING_MAX_AGE_S = 48 * 60 * 60
 
 VERDICTS = ("ADD", "UPDATE", "SUPERSEDE", "NOOP")
 
@@ -123,6 +139,48 @@ _MASK_TOKEN_RE = re.compile(r"«[^»]{0,120}»|\*{3,}|\S{1,16}\.\.\.\S{1,16}")
 MIN_QUOTE_EFFECTIVE_LEN = 15
 # Minimum effective length remaining after mask tokens are stripped.
 _MIN_QUOTE_RESIDUAL_LEN = 8
+
+
+# The deferred-grounding sidecar is append-heavy but also needs atomic
+# compaction after sweeps. Serialize both operations across threads/processes
+# so an append cannot be lost behind a read-modify-replace cycle.
+_pending_path_locks: Dict[str, threading.Lock] = {}
+_pending_path_locks_guard = threading.Lock()
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platform-specific
+    fcntl = None
+
+
+def _pending_lock_for(path: Path) -> threading.Lock:
+    key = str(path)
+    with _pending_path_locks_guard:
+        lock = _pending_path_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _pending_path_locks[key] = lock
+        return lock
+
+
+@contextmanager
+def _pending_file_lock(path: Path):
+    with _pending_lock_for(path):
+        if fcntl is None:
+            yield
+            return
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
 
 
 def _effective_len(text: str) -> int:
@@ -294,6 +352,9 @@ class MemoryWritePipeline:
         self._wal_dir = home / "state" / "memory-pending"
         self._mirror_dir = home / "memory" / "l0-mirror"
         self._ledger_path = home / "state" / "memory-notes-ledger.jsonl"
+        self._pending_grounding_path = (
+            home / "state" / "notes-pending-grounding.jsonl"
+        )
         self._proposals: Dict[str, _Proposal] = {}
         self._proposals_lock = threading.Lock()
 
@@ -326,6 +387,7 @@ class MemoryWritePipeline:
         """Steps 0–3. On success returns the neighbor list plus a TTL'd
         token; the caller must decide the verdict and call :meth:`confirm`
         with that token — there is no single-step write path."""
+        self.sweep_pending_grounding()
         evidence_refs = list(evidence_refs or [])
 
         # Step 0 — deterministic scrub + injection-pattern hard reject.
@@ -517,6 +579,7 @@ class MemoryWritePipeline:
         SUPERSEDE (the sanctioned re-typing path). Mutating verdicts
         require a session-bound token (non-empty session_id at propose).
         Returns the written note metadata (or the NOOP/staged record)."""
+        self.sweep_pending_grounding()
         verdict = (verdict or "").strip().upper()
         if verdict not in VERDICTS:
             return self._reject(
@@ -613,10 +676,20 @@ class MemoryWritePipeline:
 
         # Step 5 — grounded admission (mechanical, zero LLM calls).
         grounding: List[Dict[str, Any]] = []
-        for ref in effective_refs:
+        deferred: List[Dict[str, Any]] = []
+        for ref_index, ref in enumerate(effective_refs):
             check = self._ground_ref(ref)
             grounding.append(check)
             if not check["ok"]:
+                if self._deferred_grounding_eligible(
+                    ref, check, current_session_id=proposal.session_id
+                ):
+                    deferred.append({
+                        "ref_index": ref_index,
+                        "evidence_ref": dict(ref),
+                        "check": dict(check),
+                    })
+                    continue
                 self._ledger({
                     "event": "confirm",
                     "verdict": verdict,
@@ -634,6 +707,7 @@ class MemoryWritePipeline:
                     "grounding": grounding,
                 }
         evidence_strs = [serialize_evidence_ref(r) for r in effective_refs]
+        grounded_count = sum(1 for check in grounding if check.get("ok"))
 
         # Step 4 verdict application (the caller decided; we enforce the
         # neighbor-snapshot contract). First resolve the full write plan —
@@ -648,6 +722,9 @@ class MemoryWritePipeline:
             "evidence": evidence_strs,
             "origin": proposal.origin,
         }
+        if deferred:
+            plan["deferred_grounding"] = deferred
+            plan["session_id"] = proposal.session_id
         update_conflict = False
         if verdict == "ADD":
             if not topic_key:
@@ -669,6 +746,8 @@ class MemoryWritePipeline:
                 and proposal.origin != "user"
                 else "active"
             )
+            if deferred and grounded_count == 0:
+                status = "unconfirmed"
             plan.update(kind=write_kind, topic_key=topic_key, status=status)
         else:  # UPDATE / SUPERSEDE (VERDICTS + NOOP handled above)
             target = (target or "").strip()
@@ -698,6 +777,8 @@ class MemoryWritePipeline:
                 except (NoteNotFoundError, NoteValidationError):
                     pass  # store.update below produces the real error
                 plan["update_conflict"] = update_conflict
+                if deferred and grounded_count == 0:
+                    plan["status"] = "unconfirmed"
             else:
                 try:
                     if kind_arg:
@@ -710,6 +791,8 @@ class MemoryWritePipeline:
                     new_kind=write_kind if kind_arg else None,
                     new_topic_key=topic_key or None,
                 )
+                if deferred and grounded_count == 0:
+                    plan["status"] = "unconfirmed"
 
         # Durable-write approval gate — same subsystem flag as the memory
         # tool's MEMORY.md writes (memory.write_approval), so the notes tier
@@ -720,9 +803,35 @@ class MemoryWritePipeline:
         if gated is not None:
             return gated
 
+        pending_records: List[Dict[str, Any]] = []
+        if deferred:
+            pending_records = self._pending_records_for_plan(plan)
+            try:
+                self._append_pending_records(pending_records)
+            except Exception as e:
+                self._remove_pending_records(pending_records)
+                self._ledger({
+                    "event": "confirm",
+                    "verdict": verdict,
+                    "token": token,
+                    "result": "rejected",
+                    "reason": f"pending grounding queue failed: {e}",
+                    "caller": caller,
+                    "session_id": proposal.session_id,
+                    "checks": {"grounding": grounding},
+                })
+                return {
+                    "success": False,
+                    "step": "confirm",
+                    "error": "deferred grounding could not be queued; write refused",
+                    "grounding": grounding,
+                }
+
         try:
             note = apply_notes_plan(plan, store=self._store)
         except (NoteValidationError, NoteNotFoundError) as e:
+            if pending_records:
+                self._remove_pending_records(pending_records)
             self._ledger({
                 "event": "confirm",
                 "verdict": verdict,
@@ -739,7 +848,7 @@ class MemoryWritePipeline:
             "event": "confirm",
             "verdict": verdict,
             "token": token,
-            "result": "written",
+            "result": "accepted-deferred" if deferred else "written",
             "kind": note["kind"],
             "topic_key": note["topic_key"],
             "caller": caller,
@@ -755,8 +864,13 @@ class MemoryWritePipeline:
                 "body_replaced": True,
                 "conflict_flagged": update_conflict,
             }
+        if deferred:
+            ledger_record["deferred_grounding"] = {
+                "pending_count": len(deferred),
+                "failed_checks": [item["check"] for item in deferred],
+            }
         self._ledger(ledger_record)
-        return {
+        result = {
             "success": True,
             "step": "confirm",
             "verdict": verdict,
@@ -766,8 +880,19 @@ class MemoryWritePipeline:
                 "status": note["status"],
                 "confidence": note["confidence"],
             },
-            "message": "Note written. This update is complete — do not repeat it.",
+            "message": (
+                "Note accepted with deferred grounding and queued for "
+                "re-verification. Do not repeat it."
+                if deferred
+                else "Note written. This update is complete — do not repeat it."
+            ),
         }
+        if deferred:
+            result["deferred_grounding"] = {
+                "pending_count": len(deferred),
+                "status": "pending",
+            }
+        return result
 
     # -- grounding helpers -------------------------------------------------------
 
@@ -786,6 +911,33 @@ class MemoryWritePipeline:
             and check.get("checked") in ("wal", "wal-quote", "l0", "l0-quote")
             and "read failed" not in str(check.get("detail") or "")
         )
+
+    @staticmethod
+    def _deferred_grounding_eligible(
+        ref: Dict[str, Any],
+        check: Dict[str, Any],
+        *,
+        current_session_id: str,
+    ) -> bool:
+        """True only for absence/mismatch failures aimed at this session."""
+        if not current_session_id or ref.get("type") not in ("wal", "l0"):
+            return False
+        if str(ref.get("session_id") or "") != current_session_id:
+            return False
+        detail = str(check.get("detail") or "")
+        if check.get("checked") == "wal":
+            return detail.startswith("no WAL file for session") or (
+                detail.startswith("WAL entry ") and detail.endswith(" not found")
+            )
+        if check.get("checked") == "wal-quote":
+            return detail.startswith("quote is not a substring of the WAL record")
+        if check.get("checked") == "l0":
+            return detail.startswith("no L0-mirror file for ")
+        if check.get("checked") == "l0-quote":
+            return detail.startswith(
+                "quote is not a substring of any matching L0-mirror record"
+            )
+        return False
 
     @staticmethod
     def _wal_record_spans(
@@ -832,7 +984,11 @@ class MemoryWritePipeline:
                     "wal_entry_id": str(rec.get("wal_entry_id") or ""),
                     "role": str(role),
                     "content": str(content),
-                    "taint": rec_taint.get(role) if isinstance(rec_taint.get(role), dict) else None,
+                    "taint": (
+                        rec_taint.get(role)
+                        if isinstance(rec_taint.get(role), dict)
+                        else None
+                    ),
                     "ts": rec.get("ts"),
                 }
                 for role, content in body.items()
@@ -1168,10 +1324,13 @@ class MemoryWritePipeline:
         try:
             from agent.memory_taint import matched_quote_taint
             want_entry = ref.get("wal_entry_id")
+            want_session = ref.get("session_id")
             found_match = False
             taint_detail: Optional[str] = None
             for rec in _iter_jsonl_records(path):
                 if want_entry and rec.get("wal_entry_id") != want_entry:
+                    continue
+                if want_session and rec.get("session_id") != want_session:
                     continue
                 body = rec.get("body") or {}
                 rec_taint = rec.get("taint") if isinstance(rec.get("taint"), dict) else {}
@@ -1214,6 +1373,269 @@ class MemoryWritePipeline:
             return {"ref": serialize_evidence_ref(ref), "ok": False,
                     "checked": "l0", "detail": f"L0-mirror read failed: {e}"}
 
+    # -- deferred current-turn grounding ---------------------------------------
+
+    @staticmethod
+    def _planned_note_ref(plan: Dict[str, Any]) -> str:
+        verdict = plan.get("verdict")
+        if verdict == "ADD":
+            return note_ref(plan["kind"], plan["topic_key"])
+        if verdict == "SUPERSEDE":
+            return note_ref(
+                plan.get("new_kind") or plan["target_kind"],
+                plan.get("new_topic_key") or plan["target_topic_key"],
+            )
+        return note_ref(plan["target_kind"], plan["target_topic_key"])
+
+    def _pending_records_for_plan(
+        self, plan: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        created_ts = round(time.time(), 3)
+        target_ref = self._planned_note_ref(plan)
+        records: List[Dict[str, Any]] = []
+        for item in plan.get("deferred_grounding") or []:
+            evidence_ref = dict(item.get("evidence_ref") or {})
+            records.append({
+                "note_ref": target_ref,
+                "evidence_ref": evidence_ref,
+                "quote": _scrub(str(evidence_ref.get("quote") or "")),
+                "created_ts": created_ts,
+                "session_id": str(plan.get("session_id") or ""),
+                "attempts": 0,
+            })
+        return records
+
+    def _read_pending_locked(self) -> List[Dict[str, Any]]:
+        path = self._pending_grounding_path
+        if not path.exists() or path.stat().st_size == 0:
+            return []
+        records: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    record = json.loads(raw)
+                except Exception as e:
+                    raise ValueError(
+                        f"invalid pending-grounding JSON at line {line_number}: {e}"
+                    ) from e
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"invalid pending-grounding record at line {line_number}"
+                    )
+                records.append(record)
+        return records
+
+    def _rewrite_pending_locked(self, records: List[Dict[str, Any]]) -> None:
+        path = self._pending_grounding_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".notes-grounding_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(
+                        json.dumps(
+                            record, ensure_ascii=False, separators=(",", ":")
+                        )
+                        + "\n"
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _append_pending_records(self, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            return
+        with _pending_file_lock(self._pending_grounding_path):
+            existing = self._read_pending_locked()
+            self._rewrite_pending_locked(existing + records)
+
+    def _remove_pending_records(self, removed: List[Dict[str, Any]]) -> None:
+        if not removed:
+            return
+        try:
+            with _pending_file_lock(self._pending_grounding_path):
+                records = self._read_pending_locked()
+                remaining = list(records)
+                for record in removed:
+                    try:
+                        remaining.remove(record)
+                    except ValueError:
+                        continue
+                if remaining != records:
+                    self._rewrite_pending_locked(remaining)
+        except Exception:
+            # A failed store write can leave an orphan queue record. The lazy
+            # sweeper removes it once it observes that the note does not exist.
+            logger.debug("pending grounding rollback failed", exc_info=True)
+
+    @staticmethod
+    def _split_note_ref(value: str) -> tuple:
+        kind, separator, topic_key = str(value or "").partition("/")
+        if not separator:
+            raise NoteValidationError(f"invalid pending note ref {value!r}")
+        return kind, topic_key
+
+    def _finish_deferred_success(self, entry: Dict[str, Any]) -> str:
+        kind, topic_key = self._split_note_ref(entry.get("note_ref") or "")
+        try:
+            note = self._store.read(kind, topic_key)
+        except (NoteNotFoundError, NoteValidationError):
+            return "note-missing"
+        if note.get("status") == "unconfirmed" and not note.get("superseded_by"):
+            self._store.update(
+                kind,
+                topic_key,
+                evidence_add=[serialize_evidence_ref(entry["evidence_ref"])],
+                status="active",
+            )
+            return "promoted"
+        # Active notes already carry the pending serialized ref. Demoted,
+        # superseded, and tombstoned notes are deliberately left untouched.
+        return "verified-no-promotion"
+
+    def _finish_deferred_failure(
+        self,
+        entry: Dict[str, Any],
+        other_pending: List[Dict[str, Any]],
+    ) -> str:
+        kind, topic_key = self._split_note_ref(entry.get("note_ref") or "")
+        try:
+            note = self._store.read(kind, topic_key)
+        except (NoteNotFoundError, NoteValidationError):
+            return "note-missing"
+        if note.get("status") == "tombstoned" or note.get("superseded_by"):
+            return "note-unchanged"
+
+        failed_evidence = serialize_evidence_ref(entry["evidence_ref"])
+        remaining_evidence = [
+            value for value in note.get("evidence") or []
+            if value != failed_evidence
+        ]
+        same_ref_still_pending = any(
+            pending.get("note_ref") == entry.get("note_ref")
+            and serialize_evidence_ref(pending.get("evidence_ref") or {})
+            == failed_evidence
+            for pending in other_pending
+        )
+        if remaining_evidence:
+            self._store.update(
+                kind, topic_key, evidence_remove=[failed_evidence]
+            )
+            return "evidence-dropped"
+        if same_ref_still_pending:
+            return "duplicate-still-pending"
+        self._store.tombstone(kind, topic_key)
+        return "tombstoned"
+
+    def sweep_pending_grounding(self) -> Dict[str, int]:
+        """Re-verify mature current-turn citations and compact the sidecar."""
+        summary = {"checked": 0, "promoted": 0, "failed": 0, "pending": 0}
+        path = self._pending_grounding_path
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                return summary
+            now = time.time()
+            with _pending_file_lock(path):
+                entries = self._read_pending_locked()
+                if not entries:
+                    return summary
+                if all(
+                    now - float(entry.get("created_ts") or 0.0)
+                    < DEFERRED_GROUNDING_GRACE_S
+                    for entry in entries
+                ):
+                    summary["pending"] = len(entries)
+                    return summary
+
+                kept: List[Dict[str, Any]] = []
+                for index, original in enumerate(entries):
+                    entry = dict(original)
+                    try:
+                        created_ts = float(entry.get("created_ts") or 0.0)
+                    except (TypeError, ValueError):
+                        created_ts = 0.0
+                    age = now - created_ts
+                    if age < DEFERRED_GROUNDING_GRACE_S:
+                        kept.append(entry)
+                        continue
+
+                    ref = entry.get("evidence_ref")
+                    if not isinstance(ref, dict):
+                        check = {
+                            "ref": "?", "ok": False, "checked": "format",
+                            "detail": "pending evidence ref is malformed",
+                        }
+                    else:
+                        check = self._ground_ref(ref)
+                    summary["checked"] += 1
+                    if check.get("ok"):
+                        try:
+                            action = self._finish_deferred_success(entry)
+                        except (NoteValidationError, NoteNotFoundError) as e:
+                            action = f"note-update-failed: {e}"
+                        self._ledger({
+                            "event": "deferred-grounding-ok",
+                            "result": action,
+                            "note_ref": entry.get("note_ref"),
+                            "session_id": entry.get("session_id"),
+                            "checks": {"grounding": check},
+                        })
+                        if action == "promoted":
+                            summary["promoted"] += 1
+                        continue
+
+                    try:
+                        attempts = int(entry.get("attempts") or 0) + 1
+                    except (TypeError, ValueError):
+                        attempts = 1
+                    entry["attempts"] = attempts
+                    exhausted = (
+                        attempts >= DEFERRED_GROUNDING_MAX_ATTEMPTS
+                        or age > DEFERRED_GROUNDING_MAX_AGE_S
+                    )
+                    if not exhausted:
+                        kept.append(entry)
+                        continue
+
+                    other_pending = kept + [
+                        dict(item) for item in entries[index + 1:]
+                    ]
+                    try:
+                        action = self._finish_deferred_failure(
+                            entry, other_pending
+                        )
+                    except (NoteValidationError, NoteNotFoundError) as e:
+                        action = f"note-update-failed: {e}"
+                    self._ledger({
+                        "event": "deferred-grounding-failed",
+                        "result": action,
+                        "note_ref": entry.get("note_ref"),
+                        "session_id": entry.get("session_id"),
+                        "attempts": attempts,
+                        "reason": check.get("detail"),
+                        "checks": {"grounding": check},
+                    })
+                    summary["failed"] += 1
+
+                self._rewrite_pending_locked(kept)
+                summary["pending"] = len(kept)
+                return summary
+        except Exception:
+            # Maintenance failures never admit a citation. Existing affected
+            # notes remain unconfirmed and the sidecar is left intact.
+            logger.debug("pending grounding sweep failed", exc_info=True)
+            return summary
+
     # -- write-approval gate (memory.write_approval) ------------------------------
 
     @staticmethod
@@ -1244,7 +1666,7 @@ class MemoryWritePipeline:
         Reuses the ``memory`` subsystem flag (``memory.write_approval``) —
         one switch supervises both durable memory tiers. The staged payload
         is the fully-resolved plan (scrubbed content, serialized evidence,
-        grounding already passed), replayed token-free by
+        grounding already passed or explicitly deferred), replayed token-free by
         :func:`apply_notes_pending` on approval. Gate-module import failure
         fails open, mirroring tools/memory_tool.py.
         """
@@ -1377,6 +1799,7 @@ def apply_notes_plan(
             body=plan["content"],
             evidence_add=plan["evidence"],
             confidence="contested" if plan.get("update_conflict") else None,
+            status=plan.get("status") or None,
         )
     if verdict == "SUPERSEDE":
         return store.supersede(
@@ -1387,6 +1810,7 @@ def apply_notes_plan(
             origin=plan["origin"],
             new_kind=plan.get("new_kind") or None,
             new_topic_key=plan.get("new_topic_key") or None,
+            status=plan.get("status") or "active",
         )
     raise NoteValidationError(f"unknown staged notes verdict {verdict!r}")
 
@@ -1419,9 +1843,29 @@ def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
     admission control at this point. Returns a store-style result dict.
     """
     pipeline = MemoryWritePipeline()
+    pending_records: List[Dict[str, Any]] = []
+    if payload.get("deferred_grounding"):
+        pending_records = pipeline._pending_records_for_plan(payload)
+        try:
+            pipeline._append_pending_records(pending_records)
+        except Exception as e:
+            pipeline._remove_pending_records(pending_records)
+            pipeline._ledger({
+                "event": "apply-pending",
+                "verdict": payload.get("verdict"),
+                "result": "rejected",
+                "reason": f"pending grounding queue failed: {e}",
+                "caller": "write-approval",
+            })
+            return {
+                "success": False,
+                "error": "deferred grounding could not be queued; write refused",
+            }
     try:
         note = apply_notes_plan(payload, store=pipeline.store)
     except (NoteValidationError, NoteNotFoundError) as e:
+        if pending_records:
+            pipeline._remove_pending_records(pending_records)
         pipeline._ledger({
             "event": "apply-pending",
             "verdict": payload.get("verdict"),
@@ -1433,11 +1877,19 @@ def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
     pipeline._ledger({
         "event": "apply-pending",
         "verdict": payload.get("verdict"),
-        "result": "written",
+        "result": "accepted-deferred" if pending_records else "written",
         "kind": note["kind"],
         "topic_key": note["topic_key"],
         "caller": "write-approval",
         "origin": payload.get("origin"),
+        "session_id": payload.get("session_id") or "",
+        "checks": {
+            "grounding": [
+                item.get("check")
+                for item in (payload.get("deferred_grounding") or [])
+                if isinstance(item, dict) and item.get("check")
+            ]
+        } if pending_records else {"grounding": "approved resolved plan"},
     })
     return {
         "success": True,

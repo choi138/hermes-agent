@@ -5,7 +5,7 @@ Three tools in the memory family:
 
 * ``notes_write`` — the §③ write pipeline's two-step contract:
   ``propose`` (scrub → taint check → kind routing → neighbor retrieval,
-  returns neighbors + a TTL'd token) then ``confirm`` (caller's
+  returns neighbors + grounding preview + a TTL'd token) then ``confirm`` (caller's
   ADD/UPDATE/SUPERSEDE/NOOP verdict + mechanical quote-grounding). A
   verdict without a token is impossible, so no caller can write a note
   without first seeing its neighbors.
@@ -316,7 +316,7 @@ _EVIDENCE_SCHEMA = {
         "Evidence references (>=1 for writes). Each item: "
         "{type:'episode', uuid} for a graph episode UUID, or "
         "{type:'wal', session_id, entry_id, quote} / "
-        "{type:'l0', month:'YYYY-MM', quote, wal_entry_id?} for a local "
+        "{type:'l0', month:'YYYY-MM', quote, wal_entry_id?, session_id?} for a local "
         "journal record — the quote must be a VERBATIM substring of that "
         "record, substantive (a phrase, not a 2-word fragment), and must "
         "never contain secret material. Set tainted:true on any span that "
@@ -345,7 +345,11 @@ NOTES_WRITE_SCHEMA = {
         "grounding_preview item fails but offers candidates, either select "
         "one at confirm with evidence_overrides={ref_index:candidate_id}, or "
         "fix the quote and propose again. Confirming without resolving a "
-        "failed preview is rejected."
+        "failed preview is rejected. A structurally valid wal/l0 quote for "
+        "the current session may be accepted as status=unconfirmed when its "
+        "turn has not reached the journal yet; it is re-verified lazily and "
+        "promoted or removed fail-closed. Include session_id on l0 refs when "
+        "citing the current turn so that race can be identified safely."
     ),
     "parameters": {
         "type": "object",

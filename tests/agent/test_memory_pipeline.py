@@ -284,7 +284,18 @@ class TestGrounding:
         )
         assert confirm["success"] is True
 
-        bad_ref = dict(good_ref, quote="a paraphrase that is not verbatim")
+        historical_session = "sess-historical"
+        historical_entry = wal.append_turn(
+            historical_session,
+            "NAS 8TB 디스크가 SATA detach로 떨어졌다",
+            "확인했다",
+        )
+        bad_ref = {
+            "type": "wal",
+            "session_id": historical_session,
+            "entry_id": historical_entry,
+            "quote": "a paraphrase that is not verbatim",
+        }
         res2 = _propose(pipeline, content="NAS 다운 원인 재기록",
                         kind_hint="incident", evidence_refs=[bad_ref])
         confirm2 = pipeline.confirm(
@@ -295,10 +306,12 @@ class TestGrounding:
 
     def test_wal_missing_entry_fails_closed(self, tmp_path):
         wal = PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
-        wal.append_turn(SESSION, "the NAS array lost its 8TB data disk", "ack")
+        wal.append_turn(
+            "another-session", "the NAS array lost its 8TB data disk", "ack"
+        )
         pipeline = MemoryWritePipeline(hermes_home=tmp_path)
         ref = {
-            "type": "wal", "session_id": SESSION, "entry_id": "doesnotexist",
+            "type": "wal", "session_id": "another-session", "entry_id": "doesnotexist",
             "quote": "the NAS array lost its 8TB data disk",
         }
         res = _propose(pipeline, evidence_refs=[ref])
@@ -331,6 +344,247 @@ class TestGrounding:
         assert written
         assert written[-1]["checks"]["grounding"][0]["checked"] == "format-only"
         assert written[-1]["caller"] == "agent"
+
+
+SECRET = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+
+class TestDeferredGrounding:
+    @staticmethod
+    def _pending_entries(tmp_path):
+        path = tmp_path / "state" / "notes-pending-grounding.jsonl"
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    @staticmethod
+    def _age_pending_for_final_attempt(pipeline, tmp_path):
+        path = tmp_path / "state" / "notes-pending-grounding.jsonl"
+        entries = TestDeferredGrounding._pending_entries(tmp_path)
+        for entry in entries:
+            entry["attempts"] = mp.DEFERRED_GROUNDING_MAX_ATTEMPTS - 1
+        with mp._pending_file_lock(path):
+            pipeline._rewrite_pending_locked(entries)
+
+    def test_current_turn_race_is_accepted_unconfirmed_and_audited(
+        self, tmp_path, monkeypatch
+    ):
+        now = [1_000.0]
+        monkeypatch.setattr(mp.time, "time", lambda: now[0])
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal",
+            "session_id": SESSION,
+            "entry_id": "current-turn-entry",
+            "quote": "The current deployment target is the blue production pool.",
+        }
+        proposed = _propose(pipeline, evidence_refs=[ref])
+
+        confirmed = pipeline.confirm(
+            proposed["token"], "ADD",
+            topic_key="deploy.target.pool", session_id=SESSION,
+        )
+
+        assert confirmed["success"] is True
+        assert confirmed["note"]["status"] == "unconfirmed"
+        assert confirmed["deferred_grounding"] == {
+            "pending_count": 1, "status": "pending",
+        }
+        pending = self._pending_entries(tmp_path)
+        assert pending == [{
+            "note_ref": "preference/deploy.target.pool",
+            "evidence_ref": ref,
+            "quote": ref["quote"],
+            "created_ts": 1000.0,
+            "session_id": SESSION,
+            "attempts": 0,
+        }]
+        accepted = [
+            event for event in _ledger_events(tmp_path)
+            if event.get("result") == "accepted-deferred"
+        ]
+        assert accepted[-1]["checks"]["grounding"][0]["ok"] is False
+
+    def test_sweep_promotes_after_current_turn_record_appears(
+        self, tmp_path, monkeypatch
+    ):
+        now = [2_000.0]
+        monkeypatch.setattr(mp.time, "time", lambda: now[0])
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        quote = "The current deployment target is the green production pool."
+        ref = {
+            "type": "wal", "session_id": SESSION,
+            "entry_id": "late-entry", "quote": quote,
+        }
+        proposed = _propose(pipeline, evidence_refs=[ref])
+        confirmed = pipeline.confirm(
+            proposed["token"], "ADD",
+            topic_key="deploy.green.pool", session_id=SESSION,
+        )
+        assert confirmed["note"]["status"] == "unconfirmed"
+
+        mp._append_jsonl(
+            tmp_path / "state" / "memory-pending" / f"{SESSION}.jsonl",
+            {
+                "type": "turn", "id": "late-entry", "ts": now[0],
+                "session_id": SESSION, "seq": 1,
+                "records": [
+                    {"role": "user", "content": quote},
+                    {"role": "assistant", "content": "Acknowledged."},
+                ],
+            },
+        )
+        now[0] += mp.DEFERRED_GROUNDING_GRACE_S + 1
+
+        triggered = _propose(
+            pipeline, content="trigger the lazy pending-grounding sweep"
+        )
+
+        assert triggered["success"] is True
+        note = pipeline.store.read("preference", "deploy.green.pool")
+        assert note["status"] == "active"
+        assert note["evidence"] == [
+            f"wal:{SESSION}:late-entry :: {quote}"
+        ]
+        assert self._pending_entries(tmp_path) == []
+        verified = [
+            event for event in _ledger_events(tmp_path)
+            if event.get("event") == "deferred-grounding-ok"
+        ]
+        assert verified[-1]["result"] == "promoted"
+
+    def test_sweep_tombstones_pending_only_note_after_attempt_limit(
+        self, tmp_path, monkeypatch
+    ):
+        now = [3_000.0]
+        monkeypatch.setattr(mp.time, "time", lambda: now[0])
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": SESSION,
+            "entry_id": "never-arrives",
+            "quote": "The missing turn says the production pool is orange.",
+        }
+        proposed = _propose(pipeline, evidence_refs=[ref])
+        pipeline.confirm(
+            proposed["token"], "ADD",
+            topic_key="deploy.orange.pool", session_id=SESSION,
+        )
+        self._age_pending_for_final_attempt(pipeline, tmp_path)
+        now[0] += mp.DEFERRED_GROUNDING_GRACE_S + 1
+
+        swept = pipeline.sweep_pending_grounding()
+
+        assert swept["failed"] == 1
+        note = pipeline.store.read("preference", "deploy.orange.pool")
+        assert note["status"] == "tombstoned"
+        assert self._pending_entries(tmp_path) == []
+        failed = _ledger_events(tmp_path)[-1]
+        assert failed["event"] == "deferred-grounding-failed"
+        assert failed["result"] == "tombstoned"
+
+    def test_cross_session_failure_is_not_deferred(self, tmp_path):
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": "historical-session",
+            "entry_id": "missing",
+            "quote": "A historical session claimed this deployment target.",
+        }
+        proposed = _propose(pipeline, evidence_refs=[ref])
+
+        confirmed = pipeline.confirm(
+            proposed["token"], "ADD",
+            topic_key="deploy.history.target", session_id=SESSION,
+        )
+
+        assert confirmed["success"] is False
+        assert self._pending_entries(tmp_path) == []
+
+    def test_secret_quote_cannot_enter_deferred_queue(self, tmp_path):
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": SESSION, "entry_id": "late",
+            "quote": f"The current deployment token is {SECRET}",
+        }
+
+        proposed = _propose(pipeline, evidence_refs=[ref])
+
+        assert proposed["success"] is False
+        assert "secret" in proposed["error"]
+        assert self._pending_entries(tmp_path) == []
+
+    def test_taint_failure_cannot_enter_deferred_queue(self, tmp_path):
+        import agent.memory_taint as mt
+        from agent.memory_taint import TaintRegistry
+
+        registry = TaintRegistry(
+            base_dir=tmp_path / "state" / "memory-pending" / "taint"
+        )
+        mt.set_registry(registry)
+        try:
+            injected = (
+                "The remembered production pool is violet and this statement "
+                "came entirely from injected memory context."
+            )
+            mt.record_injected_text(SESSION, injected, source="prefetch")
+            wal = PendingTurnWAL(
+                base_dir=tmp_path / "state" / "memory-pending"
+            )
+            entry_id = wal.append_turn(
+                SESSION, "Which pool is active?", injected
+            )
+            pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+            ref = {
+                "type": "wal", "session_id": SESSION,
+                "entry_id": entry_id,
+                "quote": "remembered production pool is violet",
+            }
+            proposed = _propose(pipeline, evidence_refs=[ref])
+
+            confirmed = pipeline.confirm(
+                proposed["token"], "ADD",
+                topic_key="deploy.violet.pool", session_id=SESSION,
+            )
+
+            assert confirmed["success"] is False
+            assert confirmed["grounding"][0]["checked"] == "taint"
+            assert self._pending_entries(tmp_path) == []
+        finally:
+            mt.set_registry(None)
+
+    def test_mixed_evidence_survives_when_deferred_ref_exhausts(
+        self, tmp_path, monkeypatch
+    ):
+        now = [4_000.0]
+        monkeypatch.setattr(mp.time, "time", lambda: now[0])
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        deferred_ref = {
+            "type": "wal", "session_id": SESSION,
+            "entry_id": "missing-mixed",
+            "quote": "The current mixed-evidence turn has not journaled yet.",
+        }
+        proposed = _propose(
+            pipeline, evidence_refs=[EP, deferred_ref]
+        )
+        confirmed = pipeline.confirm(
+            proposed["token"], "ADD",
+            topic_key="deploy.mixed.evidence", session_id=SESSION,
+        )
+        assert confirmed["note"]["status"] == "active"
+        self._age_pending_for_final_attempt(pipeline, tmp_path)
+        now[0] += mp.DEFERRED_GROUNDING_GRACE_S + 1
+
+        pipeline.sweep_pending_grounding()
+
+        note = pipeline.store.read("preference", "deploy.mixed.evidence")
+        assert note["status"] == "active"
+        assert note["evidence"] == ["episode:" + "a" * 32]
+        failed = _ledger_events(tmp_path)[-1]
+        assert failed["event"] == "deferred-grounding-failed"
+        assert failed["result"] == "evidence-dropped"
 
 
 class TestGroundingRecognition:
@@ -465,9 +719,6 @@ class TestGroundingRecognition:
 # ---------------------------------------------------------------------------
 # Quote admissibility (secret-bypass + gameable-grounding fixes)
 # ---------------------------------------------------------------------------
-
-SECRET = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
-
 
 class TestQuoteAdmissibility:
     def _wal_with(self, tmp_path, text):
