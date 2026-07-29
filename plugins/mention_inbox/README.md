@@ -329,10 +329,12 @@ mention_inbox:
   destination: discord:1531851208858275860
   team_mentions: false
   team_review_requests: false
-  action_sessions_enabled: false
-  execution_enabled: false
-  authorized_approver_ids: []
-  bot_mention: null
+  action_sessions:
+    enabled: false
+    execution_enabled: false
+    authorized_approver_ids: []
+    bot_mention: null
+    execution_mode: direct
   retention_days: 30
   lease_seconds: 60
 ```
