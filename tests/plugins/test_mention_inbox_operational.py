@@ -445,11 +445,13 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
 
     connection = sqlite3.connect(db)
     connection.row_factory = sqlite3.Row
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(delivery_outbox)")}
     assert "event_json" in columns
+    assert "source_revision" in columns
     migrated = connection.execute(
-        "SELECT status, attempts, message_id, lease_until, event_json FROM delivery_outbox "
+        "SELECT status, attempts, message_id, lease_until, event_json, source_revision "
+        "FROM delivery_outbox "
         "ORDER BY delivery_id"
     ).fetchall()
     assert [(row["status"], row["attempts"]) for row in migrated] == [
@@ -460,6 +462,7 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
     assert migrated[1]["lease_until"] == "2026-07-29T10:00:00Z"
     assert migrated[2]["message_id"] == "message-sent"
     assert all(row["event_json"] is not None for row in migrated)
+    assert all(row["source_revision"] == timestamp for row in migrated)
     assert connection.execute("SELECT COUNT(*) FROM mention_event_lineage").fetchone()[0] == 3
     connection.close()
     assert store.get_cursor("github.notifications") == "cursor-1"
@@ -467,6 +470,7 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
     claim = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert claim is not None
     assert claim.event.untrusted.body == "pending payload"
+    assert claim.source_revision == timestamp
 
 
 def test_future_schema_version_fails_closed_without_mutation(tmp_path: Path) -> None:
@@ -480,7 +484,7 @@ def test_future_schema_version_fails_closed_without_mutation(tmp_path: Path) -> 
     connection.commit()
     connection.close()
 
-    with pytest.raises(RuntimeError, match="newer than supported schema version 4"):
+    with pytest.raises(RuntimeError, match="newer than supported schema version 5"):
         MentionInboxStore(db, clock=lambda: NOW)
 
     connection = sqlite3.connect(db)
@@ -581,13 +585,14 @@ def test_migration_supersedes_unreconstructible_older_revision(tmp_path: Path) -
     }
     assert rows[1]["status"] == "pending"
     assert rows[1]["event_json"] == event_to_json(revision_two)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     connection.close()
     assert store.get_cursor("github.notifications") == "cursor-2"
     assert store.pending_delivery_count() == 1
     claim = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert claim is not None
     assert claim.revision_number == 2
+    assert claim.source_revision == "2026-07-29T08:05:00Z"
     assert claim.event.untrusted.body == "revision two"
 
 

@@ -227,17 +227,33 @@ class DiscordMentionDelivery:
             revision_number=claim.revision_number,
             destination=claim.destination,
         )
-        confirmed_message_id: str | None = None
+        confirmed_message_id = claim.message_id
         try:
+            if confirmed_message_id is not None:
+                if self._thread_coordinator is not None:
+                    await self._thread_coordinator.ensure_thread(
+                        claim.event,
+                        parent_message_id=confirmed_message_id,
+                        source_revision=claim.source_revision,
+                    )
+                self._store.mark_delivery_sent(
+                    claim.delivery_id, message_id=confirmed_message_id
+                )
+                return "reconciled"
             if claim.requires_reconciliation:
                 existing = await self._discord.find_marker(
                     self._channel_id, claim.marker, limit=100
                 )
                 if existing is not None:
                     confirmed_message_id = existing
+                    self._store.mark_delivery_parent_confirmed(
+                        claim.delivery_id, message_id=existing
+                    )
                     if self._thread_coordinator is not None:
                         await self._thread_coordinator.ensure_thread(
-                            claim.event, parent_message_id=existing
+                            claim.event,
+                            parent_message_id=existing,
+                            source_revision=claim.source_revision,
                         )
                     self._store.mark_delivery_sent(
                         claim.delivery_id, message_id=existing
@@ -249,18 +265,23 @@ class DiscordMentionDelivery:
                 allowed_mentions=rendered.allowed_mentions,
             )
             confirmed_message_id = message_id
+            self._store.mark_delivery_parent_confirmed(
+                claim.delivery_id, message_id=message_id
+            )
             if self._thread_coordinator is not None:
                 await self._thread_coordinator.ensure_thread(
-                    claim.event, parent_message_id=message_id
+                    claim.event,
+                    parent_message_id=message_id,
+                    source_revision=claim.source_revision,
                 )
         except Exception:
-            if confirmed_message_id is None:
+            if confirmed_message_id is None and not claim.requires_reconciliation:
                 self._store.release_delivery(
                     claim.delivery_id, error_category="discord_send"
                 )
             # A returned/reconciled message ID proves the parent alert exists.
-            # Keep the sending lease intact so the next expired claim performs
-            # bounded marker reconciliation instead of posting a duplicate.
+            # Keep the sending lease intact so the next expired claim resumes
+            # from the durable ID, or marker-reconciles if that write failed.
             return "error"
         self._store.mark_delivery_sent(claim.delivery_id, message_id=message_id)
         return "sent"

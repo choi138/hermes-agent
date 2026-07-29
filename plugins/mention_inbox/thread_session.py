@@ -51,13 +51,6 @@ def _subject_key(event: MentionEvent) -> str:
     return value if isinstance(value, str) and value else event.thread.thread_id
 
 
-def _source_revision(event: MentionEvent) -> str:
-    value = _metadata(event).get("source_revision")
-    if not isinstance(value, str) or not value:
-        raise ValueError("actionable event requires source_revision metadata")
-    return value
-
-
 def _head_sha(event: MentionEvent) -> str | None:
     value = _metadata(event).get("subject_head_sha")
     return value if isinstance(value, str) and value else None
@@ -145,10 +138,9 @@ class MentionInboxThreadCoordinator:
         return lock
 
     def _proposal_for(
-        self, event: MentionEvent
+        self, event: MentionEvent, *, source_revision: str
     ) -> tuple[WorkProposal, WorkProposal | None]:
         subject = _subject_key(event)
-        source_revision = _source_revision(event)
         head_sha = _head_sha(event)
         latest = self._store.get_latest_proposal(subject)
         content = _proposal_content(event)
@@ -171,6 +163,7 @@ class MentionInboxThreadCoordinator:
             return latest, latest
         proposal = revise_work_proposal(
             latest,
+            source_dedupe_key=event.dedupe_key,
             source_revision=source_revision,
             head_sha=head_sha,
             **content,
@@ -178,7 +171,11 @@ class MentionInboxThreadCoordinator:
         return proposal, latest
 
     async def ensure_thread(
-        self, event: MentionEvent, *, parent_message_id: str
+        self,
+        event: MentionEvent,
+        *,
+        parent_message_id: str,
+        source_revision: str,
     ) -> WorkItemSession:
         if not isinstance(event, MentionEvent):
             raise ValueError("event must be a MentionEvent")
@@ -186,7 +183,7 @@ class MentionInboxThreadCoordinator:
         async with self._lock(subject):
             existing = self._store.get_active_work_item_session(subject)
             session = self._store.reserve_work_item_session(
-                subject, event.dedupe_key, _source_revision(event)
+                subject, event.dedupe_key, source_revision
             )
             if existing is None or existing.parent_message_id is None:
                 session = self._store.prepare_work_item_parent(
@@ -208,7 +205,9 @@ class MentionInboxThreadCoordinator:
                 )
             self._discord.mark_thread_participation(thread_id)
 
-            proposal, previous = self._proposal_for(event)
+            proposal, previous = self._proposal_for(
+                event, source_revision=source_revision
+            )
             self._store.create_proposal(proposal)
             message_id = self._store.get_proposal_message_id(
                 proposal.proposal_id, proposal.revision

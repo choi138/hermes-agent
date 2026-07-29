@@ -245,6 +245,7 @@ def build_work_proposal(
 def revise_work_proposal(
     proposal: WorkProposal,
     *,
+    source_dedupe_key: str | None = None,
     source_revision: str,
     head_sha: str | None,
     goal: str,
@@ -259,7 +260,11 @@ def revise_work_proposal(
     return _build(
         proposal_id=proposal.proposal_id,
         revision=proposal.revision + 1,
-        source_dedupe_key=proposal.source_dedupe_key,
+        source_dedupe_key=(
+            proposal.source_dedupe_key
+            if source_dedupe_key is None
+            else source_dedupe_key
+        ),
         source_revision=source_revision,
         subject_key=proposal.subject_key,
         head_sha=head_sha,

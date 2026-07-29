@@ -30,7 +30,7 @@ from plugins.mention_inbox.proposals import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1531851208858275860"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -65,9 +65,11 @@ class CollectorStatus:
 class DeliveryClaim:
     delivery_id: int
     event: MentionEvent
+    source_revision: str
     revision_number: int
     destination: str
     marker: str
+    message_id: str | None
     attempts: int
     requires_reconciliation: bool
 
@@ -336,6 +338,7 @@ class MentionInboxStore:
                     delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     dedupe_key TEXT NOT NULL,
                     revision_number INTEGER NOT NULL,
+                    source_revision TEXT,
                     destination TEXT NOT NULL,
                     marker TEXT NOT NULL,
                     event_json TEXT,
@@ -363,6 +366,23 @@ class MentionInboxStore:
             }
             if "event_json" not in outbox_columns:
                 connection.execute("ALTER TABLE delivery_outbox ADD COLUMN event_json TEXT")
+            if "source_revision" not in outbox_columns:
+                connection.execute(
+                    "ALTER TABLE delivery_outbox ADD COLUMN source_revision TEXT"
+                )
+            connection.execute("""
+                UPDATE delivery_outbox
+                SET source_revision = (
+                    SELECT e.source_revision FROM mention_events e
+                    WHERE e.dedupe_key = delivery_outbox.dedupe_key
+                      AND e.revision_number = delivery_outbox.revision_number
+                )
+                WHERE source_revision IS NULL AND EXISTS (
+                    SELECT 1 FROM mention_events e
+                    WHERE e.dedupe_key = delivery_outbox.dedupe_key
+                      AND e.revision_number = delivery_outbox.revision_number
+                )
+            """)
             connection.execute("""
                 UPDATE delivery_outbox
                 SET event_json = (
@@ -378,8 +398,13 @@ class MentionInboxStore:
             """)
             connection.execute("""
                 UPDATE delivery_outbox
-                SET status = 'superseded', lease_until = NULL
-                WHERE status IN ('pending', 'sending') AND event_json IS NULL
+                SET status = 'superseded', lease_until = NULL,
+                    error_category = CASE
+                        WHEN source_revision IS NULL THEN 'missing_source_revision'
+                        ELSE error_category
+                    END
+                WHERE status IN ('pending', 'sending')
+                  AND (event_json IS NULL OR source_revision IS NULL)
             """)
             connection.execute("""
                 INSERT OR IGNORE INTO mention_event_lineage (
@@ -499,6 +524,7 @@ class MentionInboxStore:
         connection: sqlite3.Connection,
         event: MentionEvent,
         revision_number: int,
+        source_revision: str,
         now: str,
     ) -> None:
         event_json = event_to_json(event)
@@ -508,13 +534,14 @@ class MentionInboxStore:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO delivery_outbox (
-                    dedupe_key, revision_number, destination, marker, event_json,
-                    status, attempts, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                    dedupe_key, revision_number, source_revision, destination,
+                    marker, event_json, status, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
                 """,
                 (
                     event.dedupe_key,
                     revision_number,
+                    source_revision,
                     destination,
                     marker,
                     event_json,
@@ -637,7 +664,9 @@ class MentionInboxStore:
                         source_revision=source_revision,
                         now=now,
                     )
-                    self._enqueue_deliveries(connection, event, revision_number, now)
+                    self._enqueue_deliveries(
+                        connection, event, revision_number, source_revision, now
+                    )
                     return UpsertResult(
                         created=False,
                         content_changed=True,
@@ -693,7 +722,9 @@ class MentionInboxStore:
                     source_revision=source_revision,
                     now=now,
                 )
-                self._enqueue_deliveries(connection, event, revision_number, now)
+                self._enqueue_deliveries(
+                    connection, event, revision_number, source_revision, now
+                )
                 return UpsertResult(
                     created=True,
                     content_changed=True,
@@ -2020,7 +2051,7 @@ class MentionInboxStore:
                 WHERE o.destination = ? AND (
                     o.status = 'pending' OR
                     (o.status = 'sending' AND o.lease_until <= ?)
-                ) AND o.event_json IS NOT NULL
+                ) AND o.event_json IS NOT NULL AND o.source_revision IS NOT NULL
                 ORDER BY o.delivery_id LIMIT 1
                 """,
                 (destination, now),
@@ -2043,9 +2074,11 @@ class MentionInboxStore:
             return DeliveryClaim(
                 delivery_id=int(row["delivery_id"]),
                 event=restore_event(json.loads(row["event_json"])),
+                source_revision=str(row["source_revision"]),
                 revision_number=int(row["revision_number"]),
                 destination=str(row["destination"]),
                 marker=str(row["marker"]),
+                message_id=None if row["message_id"] is None else str(row["message_id"]),
                 attempts=attempts,
                 requires_reconciliation=uncertain,
             )
@@ -2070,6 +2103,44 @@ class MentionInboxStore:
                     """,
                     (category, now, delivery_id),
                 )
+        finally:
+            connection.close()
+
+    def mark_delivery_parent_confirmed(
+        self, delivery_id: int, *, message_id: str
+    ) -> None:
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("message_id must be a non-empty string")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, message_id FROM delivery_outbox WHERE delivery_id = ?",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("delivery not found")
+            existing = row["message_id"]
+            if existing is not None and str(existing) != message_id:
+                raise ValueError("delivery already maps to a different message")
+            if str(row["status"]) == "sent":
+                connection.commit()
+                return
+            if str(row["status"]) != "sending":
+                raise ValueError("only a sending delivery may confirm its parent")
+            connection.execute(
+                """
+                UPDATE delivery_outbox
+                SET message_id = ?, updated_at = ?
+                WHERE delivery_id = ? AND status = 'sending'
+                """,
+                (message_id, now, delivery_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

@@ -104,8 +104,16 @@ async def test_same_subject_creates_one_thread_and_one_proposal(tmp_path: Path) 
     coordinator = _coordinator(tmp_path / "inbox.db", discord)
     event = _event()
 
-    first = await coordinator.ensure_thread(event, parent_message_id="parent-1")
-    second = await coordinator.ensure_thread(event, parent_message_id="parent-1")
+    first = await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    second = await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
 
     assert first.discord_thread_id == second.discord_thread_id == "thread-1"
     assert len(discord.created) == 1
@@ -130,7 +138,9 @@ async def test_interrupted_creation_recovers_existing_anchored_thread(
     discord = _Discord()
     discord.threads["parent-1"] = "existing-thread"
     session = await _coordinator(path, discord).ensure_thread(
-        event, parent_message_id="parent-1"
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
     )
 
     assert session.discord_thread_id == "existing-thread"
@@ -143,20 +153,32 @@ async def test_new_source_revision_reuses_thread_and_posts_r2(tmp_path: Path) ->
     path = tmp_path / "inbox.db"
     discord = _Discord()
     coordinator = _coordinator(path, discord)
-    await coordinator.ensure_thread(_event(), parent_message_id="parent-1")
     await coordinator.ensure_thread(
-        _event(
-            event_id="RC_124",
-            source_revision="2026-07-29T10:02:00Z",
-            head_sha="head-2",
-        ),
+        _event(),
         parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    revised_event = _event(
+        event_id="RC_124",
+        source_revision="2026-07-29T10:02:00Z",
+        head_sha="head-2",
+    )
+    await coordinator.ensure_thread(
+        revised_event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:02:00Z",
+    )
+    await coordinator.ensure_thread(
+        revised_event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:02:00Z",
     )
 
     store = MentionInboxStore(path, clock=lambda: NOW)
     latest = store.get_latest_proposal("github:R_repo:PR_7")
     assert latest is not None
     assert latest.revision == 2
+    assert latest.source_dedupe_key == revised_event.dedupe_key
     assert latest.head_sha == "head-2"
     assert latest.status is ProposalStatus.PENDING
     assert len(discord.created) == 1
@@ -167,7 +189,11 @@ async def test_new_source_revision_reuses_thread_and_posts_r2(tmp_path: Path) ->
 async def test_different_subjects_create_different_threads(tmp_path: Path) -> None:
     discord = _Discord()
     coordinator = _coordinator(tmp_path / "inbox.db", discord)
-    await coordinator.ensure_thread(_event(), parent_message_id="parent-1")
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
     await coordinator.ensure_thread(
         _event(
             event_id="IC_8",
@@ -175,6 +201,7 @@ async def test_different_subjects_create_different_threads(tmp_path: Path) -> No
             head_sha="",
         ),
         parent_message_id="parent-2",
+        source_revision="2026-07-29T10:01:00Z",
     )
     assert {value for value in discord.threads.values()} == {"thread-1", "thread-2"}
 
@@ -186,7 +213,9 @@ async def test_pending_proposal_is_local_no_tools_and_omits_full_body(
     body = "앞부분 " + ("x" * 1000) + " FULL_BODY_SENTINEL"
     discord = _Discord()
     await _coordinator(tmp_path / "inbox.db", discord).ensure_thread(
-        _event(body=body), parent_message_id="parent-1"
+        _event(body=body),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
     )
     content = discord.messages["thread-1"][0][1]
     assert "FULL_BODY_SENTINEL" not in content
