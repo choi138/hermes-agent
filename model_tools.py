@@ -1090,6 +1090,16 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    # A model may emit an undeclared tool name even when it is absent from the
+    # advertised catalog.  Internal-only registry entries are available to
+    # narrowly bound capabilities, not to this model-originated dispatcher.
+    entry = registry.get_entry(function_name)
+    if entry is not None and not entry.expose_to_model:
+        return json.dumps(
+            {"error": f"Tool '{function_name}' is not available for model dispatch"},
+            ensure_ascii=False,
+        )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):

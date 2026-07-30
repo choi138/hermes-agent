@@ -32,6 +32,28 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_positional_override_argument_remains_backward_compatible(self):
+        reg = ToolRegistry()
+        reg.register("same", "first", _make_schema("same"), _dummy_handler)
+
+        reg.register(
+            "same",
+            "second",
+            _make_schema("same"),
+            _dummy_handler,
+            None,
+            None,
+            False,
+            "",
+            "",
+            None,
+            None,
+            True,
+        )
+
+        assert reg.get_toolset_for_tool("same") == "second"
+        assert reg.get_entry("same").expose_to_model is True
+
     def test_dispatch_passes_args(self):
         reg = ToolRegistry()
 

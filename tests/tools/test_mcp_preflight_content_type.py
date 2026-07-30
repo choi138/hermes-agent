@@ -340,6 +340,73 @@ def test_run_skips_preflight_when_skip_preflight_set(monkeypatch):
     )
 
 
+def test_run_forwards_redirect_policy_to_preflight(monkeypatch):
+    import tools.mcp_tool as _mcp
+
+    preflight_kwargs: list[dict] = []
+
+    async def _inner():
+        async def _fake_preflight(self, _url, **kwargs):
+            preflight_kwargs.append(kwargs)
+
+        async def _fake_run_http(self, _config):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda _n, _u: None)
+        monkeypatch.setattr(_mcp.MCPServerTask, "_preflight_content_type", _fake_preflight)
+        monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _fake_run_http)
+
+        task = _mcp.MCPServerTask("redirect-policy-test")
+        with pytest.raises(asyncio.CancelledError):
+            await task.run(
+                {
+                    "url": "http://127.0.0.1:8201/mcp",
+                    "follow_redirects": False,
+                }
+            )
+
+    asyncio.run(_inner())
+
+    assert len(preflight_kwargs) == 1
+    assert preflight_kwargs[0]["follow_redirects"] is False
+
+
+def test_run_records_credential_redirect_error_without_retry(monkeypatch):
+    import tools.mcp_tool as _mcp
+
+    transport_called = False
+
+    async def _inner():
+        async def _blocked_preflight(self, _url, **_kwargs):
+            raise _mcp.McpCredentialRedirectError("blocked credential redirect")
+
+        async def _unexpected_transport(self, _config):
+            nonlocal transport_called
+            transport_called = True
+
+        monkeypatch.setattr(_mcp, "_MCP_NEW_HTTP", True)
+        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda _n, _u: None)
+        monkeypatch.setattr(
+            _mcp.MCPServerTask,
+            "_preflight_content_type",
+            _blocked_preflight,
+        )
+        monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _unexpected_transport)
+
+        task = _mcp.MCPServerTask("credential-redirect-test")
+        await task.run(
+            {
+                "url": "https://origin.example/mcp",
+                "headers": {"X-Api-Key": "synthetic-secret"},
+            }
+        )
+        assert isinstance(task._error, _mcp.McpCredentialRedirectError)
+        assert task._ready.is_set()
+
+    asyncio.run(_inner())
+    assert transport_called is False
+
+
 def test_ssl_verify_and_cert_forwarded(monkeypatch):
     captured: dict = {}
 
@@ -369,6 +436,151 @@ def test_ssl_verify_and_cert_forwarded(monkeypatch):
     assert captured.get("verify") is False
     assert captured.get("cert") == "/path/to/cert.pem"
     assert captured.get("follow_redirects") is True
+
+
+def test_preflight_can_disable_redirects(monkeypatch):
+    captured: dict = {}
+
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, headers=None):
+            return httpx.Response(302, headers={"location": "https://other.invalid/mcp"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    task = _make_task()
+
+    asyncio.run(
+        task._preflight_content_type(
+            "http://127.0.0.1:8201/mcp",
+            follow_redirects=False,
+            timeout=3.0,
+        )
+    )
+
+    assert captured.get("follow_redirects") is False
+    assert captured.get("trust_env") is False
+
+
+@pytest.mark.parametrize("client_cert", [None, "/path/to/cert.pem"])
+def test_preflight_cross_origin_redirect_strips_credentials_and_blocks_cert(
+    monkeypatch, client_cert
+):
+    captured: dict = {}
+
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, headers=None):
+            return httpx.Response(200, headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    task = _make_task()
+    asyncio.run(
+        task._preflight_content_type(
+            "https://origin.example/mcp",
+            headers={"X-Api-Key": "synthetic-secret"},
+            client_cert=client_cert,
+            timeout=3.0,
+        )
+    )
+
+    hook = captured["event_hooks"]["response"][0]
+    response = httpx.Response(
+        302,
+        headers={"Location": "https://redirect.example/mcp"},
+        request=httpx.Request(
+            "GET",
+            "https://origin.example/mcp",
+            headers={
+                "X-Api-Key": "synthetic-secret",
+                "Authorization": "Bearer synthetic",
+                "Cookie": "session=synthetic",
+            },
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="cross-origin.*(?:credential|client certificate)",
+    ):
+        asyncio.run(hook(response))
+
+
+def test_preflight_real_cross_origin_redirect_stops_before_target():
+    target_requests: list[str] = []
+
+    class _TargetHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            target_requests.append(self.headers.get("X-Api-Key", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with _serve(_TargetHandler) as target:
+        class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_response(302)
+                self.send_header("Location", f"{target}/mcp")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        with _serve(_RedirectHandler) as source:
+            with pytest.raises(RuntimeError, match="cross-origin.*credential"):
+                asyncio.run(
+                    _make_task()._preflight_content_type(
+                        f"{source}/mcp",
+                        headers={"X-Api-Key": "synthetic-secret"},
+                        timeout=3.0,
+                    )
+                )
+
+    assert target_requests == []
+
+
+def test_preflight_strict_loopback_ignores_proxy_environment(monkeypatch):
+    record: list[str] = []
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+    task = _make_task()
+    with _serve(
+        _handler(status=200, content_type="application/json", record=record)
+    ) as base:
+        asyncio.run(
+            task._preflight_content_type(
+                f"{base}/mcp",
+                follow_redirects=False,
+                timeout=3.0,
+            )
+        )
+
+    assert "HEAD" in record
 
 
 # ---------------------------------------------------------------------------

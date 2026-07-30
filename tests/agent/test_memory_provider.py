@@ -1,5 +1,6 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
+import contextvars
 import json
 import threading
 import time
@@ -415,6 +416,16 @@ class TestMemoryManager:
 
         result = mgr.prefetch_all("query")
         assert "external memory" in result
+
+    def test_external_prefetch_preserves_profile_context(self):
+        profile_home = contextvars.ContextVar("profile_home", default="wrong-profile")
+        profile_home.set("expected-profile")
+        manager = MemoryManager()
+        external = FakeMemoryProvider("external")
+        external.prefetch = lambda _query, *, session_id="": profile_home.get()
+        manager.add_provider(external)
+
+        assert manager.prefetch_all("query") == "expected-profile"
 
     def test_external_prefetch_timeout_skips_stuck_provider(self):
         mgr = MemoryManager(external_prefetch_timeout=0.01)
