@@ -176,6 +176,62 @@ async def test_responder_sends_untrusted_json_with_no_tools() -> None:
     assert payload["context"]["proposal"]["execution_available"] is False
 
 
+@pytest.mark.asyncio
+async def test_responder_restores_profile_scope_for_multiplex(
+    tmp_path, monkeypatch
+) -> None:
+    from agent import secret_scope
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    stored = _stored_mention()
+    context = build_conversation_context(
+        stored=stored,
+        proposal=_proposal(stored),
+        approval_offered=False,
+        execution_available=False,
+    )
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "MENTION_INBOX_TEST_KEY=profile-value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    observed: dict[str, object] = {}
+
+    async def fake_llm_call(**kwargs):
+        observed["secret"] = secret_scope.get_secret(
+            "MENTION_INBOX_TEST_KEY"
+        )
+        observed["home"] = get_hermes_home()
+        return "현재 코멘트의 핵심을 읽기 전용으로 설명했어요."
+
+    assert secret_scope.current_secret_scope() is None
+    home_token = set_hermes_home_override(profile_home)
+    try:
+        responder = HostReadOnlyConversationResponder(
+            llm_call=fake_llm_call,
+        )
+    finally:
+        reset_hermes_home_override(home_token)
+    answer = await responder.answer(
+        message="그 코멘트 정확히 뭐임",
+        context=context,
+        bot_mention=BOT_MENTION,
+    )
+
+    assert "읽기 전용" in answer
+    assert observed == {
+        "secret": "profile-value",
+        "home": profile_home,
+    }
+    assert secret_scope.current_secret_scope() is None
+
+
 def test_response_normalization_is_bounded_and_removes_controls() -> None:
     response = normalize_conversation_response(
         "답변\x00입니다.\n\n\n" + ("가" * 3000)

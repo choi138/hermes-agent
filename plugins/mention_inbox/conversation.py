@@ -7,7 +7,9 @@ import json
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from plugins.mention_inbox.preflight import brief_from_metadata
@@ -230,6 +232,35 @@ def normalize_conversation_response(value: object) -> str:
     return text
 
 
+@contextmanager
+def _profile_llm_scope(hermes_home: Path):
+    """Restore the owning profile context around a router-side model call."""
+
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        is_multiplex_active,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    home_token = set_hermes_home_override(str(hermes_home))
+    secret_token = None
+    try:
+        if is_multiplex_active():
+            secret_token = set_secret_scope(
+                build_profile_secret_scope(hermes_home)
+            )
+        yield
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 class HostReadOnlyConversationResponder:
     """Use the configured model for one stateless completion with no tools."""
 
@@ -240,6 +271,7 @@ class HostReadOnlyConversationResponder:
         request_timeout: float = 20.0,
         wall_timeout: float = 35.0,
         max_concurrency: int = 2,
+        hermes_home: Path | None = None,
     ) -> None:
         if request_timeout <= 0 or wall_timeout <= 0:
             raise ValueError("conversation timeouts must be positive")
@@ -249,6 +281,11 @@ class HostReadOnlyConversationResponder:
         self._request_timeout = request_timeout
         self._wall_timeout = wall_timeout
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        if hermes_home is None:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = get_hermes_home()
+        self._hermes_home = Path(hermes_home)
 
     async def answer(
         self,
@@ -306,17 +343,18 @@ class HostReadOnlyConversationResponder:
 
             caller = async_call_llm
         async with self._semaphore:
-            response = await asyncio.wait_for(
-                caller(
-                    task=None,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=450,
-                    tools=[],
-                    timeout=self._request_timeout,
-                ),
-                timeout=self._wall_timeout,
-            )
+            with _profile_llm_scope(self._hermes_home):
+                response = await asyncio.wait_for(
+                    caller(
+                        task=None,
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=450,
+                        tools=[],
+                        timeout=self._request_timeout,
+                    ),
+                    timeout=self._wall_timeout,
+                )
         if isinstance(response, str):
             return normalize_conversation_response(response)
 
