@@ -6,6 +6,9 @@ import pytest
 from types import SimpleNamespace
 
 from gateway.platforms.base import Platform
+from plugins.mention_inbox.proposals import build_work_proposal
+from plugins.mention_inbox.router import InboxProposalRouter, InboxRouteResult
+from plugins.mention_inbox.store import MentionInboxStore
 from plugins.platforms.discord.adapter import DiscordAdapter
 
 
@@ -219,3 +222,127 @@ async def test_approved_execution_is_admitted_as_internal_thread_event() -> None
             "mode": "direct",
         }
     }
+
+class _ProposalTransport:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    async def find_message_content(
+        self, thread_id: str, content: str, *, limit: int
+    ) -> str | None:
+        for message_id, existing in self.messages[-limit:]:
+            if existing == content:
+                return message_id
+        return None
+
+    async def send_to_thread(self, thread_id: str, content: str) -> str:
+        message_id = f"notice-{len(self.messages) + 1}"
+        self.messages.append((message_id, content))
+        return message_id
+
+
+class _ApprovalHandler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def approve(self, message, proposal) -> InboxRouteResult:
+        self.calls.append((message, proposal))
+        return InboxRouteResult(True, "approval_queued", proposal)
+
+
+def _real_router(tmp_path, transport, handler):
+    subject = "github:R_repo:PR_7"
+    store = MentionInboxStore(tmp_path / "inbox.db")
+    store.reserve_work_item_session(
+        subject, "github:RC_123:U_recent", "2026-07-29T10:01:00Z"
+    )
+    store.record_work_item_thread(subject, "parent-1", "99")
+    proposal = build_work_proposal(
+        revision=1,
+        source_dedupe_key="github:RC_123:U_recent",
+        source_revision="2026-07-29T10:01:00Z",
+        subject_key=subject,
+        head_sha="head-1",
+        goal="리뷰 의견을 확인한다.",
+        steps=("diff를 확인한다.",),
+        allowed_actions=("read_repository", "run_tests"),
+        forbidden_actions=("merge", "deploy", "delete", "read_secrets"),
+        verification=("대상 테스트 통과",),
+        executor_hint="direct",
+    )
+    store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        proposal.revision,
+        "321",
+        approval_offered=True,
+    )
+    router = InboxProposalRouter(
+        store=store,
+        discord=transport,
+        bot_mention="<@777>",
+        authorized_approver_ids=frozenset({"456"}),
+        approval_handler=handler,
+    )
+    return store, proposal, router
+
+
+@pytest.mark.asyncio
+async def test_adapter_reference_reaches_real_router_and_exact_handler(tmp_path) -> None:
+    adapter = _adapter(_Message(99))
+    adapter._client.user = SimpleNamespace(id=777)
+    transport = _ProposalTransport()
+    handler = _ApprovalHandler()
+    store, proposal, router = _real_router(tmp_path, transport, handler)
+    adapter.set_mention_inbox_router(router)
+    raw = SimpleNamespace(
+        id=123,
+        author=SimpleNamespace(id=456),
+        reference=SimpleNamespace(message_id=321),
+        channel=SimpleNamespace(),
+    )
+
+    handled = await adapter._route_mention_inbox_message(
+        raw,
+        thread_id="99",
+        raw_content="<@!777> 승인",
+    )
+
+    assert handled is True
+    assert len(handler.calls) == 1
+    envelope, routed_proposal = handler.calls[0]
+    assert envelope.reply_to_message_id == "321"
+    assert envelope.text == "<@777> 승인"
+    assert routed_proposal == proposal
+    assert store.get_latest_proposal(proposal.subject_key).revision == 1
+    assert transport.messages == []
+
+
+@pytest.mark.asyncio
+async def test_adapter_wrong_reference_is_visible_without_revision(tmp_path) -> None:
+    adapter = _adapter(_Message(99))
+    adapter._client.user = SimpleNamespace(id=777)
+    transport = _ProposalTransport()
+    handler = _ApprovalHandler()
+    store, proposal, router = _real_router(tmp_path, transport, handler)
+    adapter.set_mention_inbox_router(router)
+    raw = SimpleNamespace(
+        id=124,
+        author=SimpleNamespace(id=456),
+        reference=SimpleNamespace(
+            message_id=None,
+            resolved=SimpleNamespace(id=999),
+        ),
+        channel=SimpleNamespace(),
+    )
+
+    handled = await adapter._route_mention_inbox_message(
+        raw,
+        thread_id="99",
+        raw_content="<@777> 승인",
+    )
+
+    assert handled is True
+    assert handler.calls == []
+    assert store.get_latest_proposal(proposal.subject_key).revision == 1
+    assert "최신 제안 메시지와 일치하지 않아요" in transport.messages[-1][1]

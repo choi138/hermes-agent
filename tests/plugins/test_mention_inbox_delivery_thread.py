@@ -41,6 +41,28 @@ def _event(
     }
     if include_source_revision_metadata:
         metadata["source_revision"] = source_revision
+        metadata["preapproval_brief"] = {
+            "schema_version": 1,
+            "disposition": "review_needed",
+            "summary": body,
+            "findings": [
+                {
+                    "source_event_id": "RC_123",
+                    "body": body,
+                    "source_url": (
+                        "https://github.com/silviahealth/content/pull/7"
+                        "#discussion_r123"
+                    ),
+                    "path": "plugins/mention_inbox/voice.py",
+                    "line": 181,
+                    "review_id": None,
+                    "commit_id": "head-1",
+                }
+            ],
+            "source_revision": source_revision,
+            "head_sha": "head-1",
+            "approvable": True,
+        }
     return ingest_event({
         "schema_version": "1",
         "source": {"platform": "github", "event_id": "RC_123"},
@@ -133,12 +155,13 @@ class _ThreadDiscord:
         return message_id
 
 
-def test_proposal_content_names_direct_review_and_assignment() -> None:
+def test_proposal_content_uses_concrete_preflight_for_review_and_assignment() -> None:
     review = _proposal_content(_event(kind="review_requested"))
     assignment = _proposal_content(_event(kind="assigned"))
 
-    assert "review 범위" in str(review["goal"])
-    assert "할당된 항목" in str(assignment["goal"])
+    assert "현재 HEAD에서 확인이 필요한 리뷰 요청" in str(review["goal"])
+    assert "이 줄을 확인해 주세요" in str(review["goal"])
+    assert "현재 HEAD에서 확인이 필요한 리뷰 요청" in str(assignment["goal"])
 
 
 @pytest.mark.asyncio

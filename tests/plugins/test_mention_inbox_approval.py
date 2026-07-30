@@ -68,7 +68,12 @@ def _seed(path: Path, *, executor_hint: str = "direct"):
     store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
     proposal = _proposal(executor_hint=executor_hint)
     store.create_proposal(proposal)
-    store.record_proposal_message(proposal.proposal_id, 1, "proposal-message-1")
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        "proposal-message-1",
+        approval_offered=True,
+    )
     return store, proposal
 
 

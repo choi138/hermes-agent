@@ -158,30 +158,148 @@ def render_thread_opened(event: MentionEvent) -> str:
     )
 
 
-def _proposal_lines(values: tuple[str, ...], *, limit: int = 5) -> list[str]:
-    return [f"- {_compact_untrusted(value, 300)}" for value in values[:limit]]
+def _proposal_lines(
+    values: tuple[str, ...], *, limit: int = 4, item_limit: int = 220
+) -> list[str]:
+    lines = [f"- {_compact_untrusted(value, item_limit)}" for value in values[:limit]]
+    if len(values) > limit:
+        lines.append(f"- 외 {len(values) - limit}개")
+    return lines
 
 
-def render_proposal(proposal: WorkProposal, bot_mention: str) -> str:
+def _render_bounded_with_footer(
+    lines: list[str], footer: tuple[str, ...], *, limit: int = 1700
+) -> str:
+    footer_text = "\n".join(footer)
+    available = limit - len(footer_text) - 2
+    if available <= 1:
+        raise ValueError("proposal footer exceeds Discord message budget")
+    body = "\n".join(lines)
+    if len(body) > available:
+        body = body[: available - 1].rstrip() + "…"
+    return f"{body}\n\n{footer_text}"
+
+
+def render_approval_reply_required(bot_mention: str) -> str:
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")
+    return (
+        "승인 문구로 확인했지만 reply 대상이 없어요. "
+        f"승인 안내가 표시된 최신 제안 메시지에 답장으로 `{bot_mention} 승인`을 남겨 주세요."
+    )
+
+
+def render_approval_reference_mismatch(bot_mention: str) -> str:
+    if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
+        raise ValueError("bot_mention must be a trusted Discord user mention")
+    return (
+        "답장한 메시지가 승인 가능한 최신 제안 메시지와 일치하지 않아요. "
+        f"최신 제안에 답장으로 `{bot_mention} 승인`을 남겨 주세요."
+    )
+
+
+def render_approval_not_offered() -> str:
+    return (
+        "이 제안은 검토용으로 게시돼 승인할 수 없어요. "
+        "실행 가능한 새 제안에 승인 안내가 표시될 때까지 실제 변경은 시작되지 않아요."
+    )
+
+
+def render_approval_not_enabled() -> str:
+    return (
+        "실행 기능이 현재 꺼져 있어 승인을 처리할 수 없어요. "
+        "제안 내용은 검토할 수 있지만 실제 변경은 시작되지 않아요."
+    )
+
+
+def render_approval_unauthorized() -> str:
+    return "이 제안을 승인할 권한이 없어요. 실제 변경은 시작되지 않았어요."
+
+
+def render_revision_instruction(bot_mention: str) -> str:
+    if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
+        raise ValueError("bot_mention must be a trusted Discord user mention")
+    return (
+        "일반 대화는 제안을 바꾸지 않아요. 변경할 내용이 있다면 "
+        f"`{bot_mention} 제안 수정: 바꿀 내용`처럼 명시해 주세요."
+    )
+
+
+def render_proposal_question(proposal: WorkProposal, bot_mention: str) -> str:
+    if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
+        raise ValueError("bot_mention must be a trusted Discord user mention")
+    summary = _compact_untrusted(proposal.goal, 500)
+    return (
+        "질문으로 확인했어요. 제안 revision은 바꾸지 않았어요.\n"
+        f"현재 확인된 내용: {summary}\n"
+        "제안 자체를 바꾸려면 "
+        f"`{bot_mention} 제안 수정: 바꿀 내용`처럼 남겨 주세요."
+    )
+
+
+def render_revision_unauthorized() -> str:
+    return "이 제안을 수정할 권한이 없어 revision을 바꾸지 않았어요."
+
+
+def render_proposal(
+    proposal: WorkProposal,
+    bot_mention: str,
+    *,
+    approval_offered: bool = False,
+    approval_unavailable_reason: str | None = None,
+) -> str:
+    if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
+        raise ValueError("bot_mention must be a trusted Discord user mention")
+    if not isinstance(approval_offered, bool):
+        raise ValueError("approval_offered must be a boolean")
+    if approval_offered and approval_unavailable_reason is not None:
+        raise ValueError("approval offer cannot have an unavailable reason")
+    if approval_unavailable_reason not in {
+        None,
+        "execution_unavailable",
+        "preflight_not_approvable",
+        "approval_unavailable",
+    }:
+        raise ValueError("invalid approval unavailable reason")
+
+    action_heading = (
+        "승인 후 진행할 작업:" if approval_offered else "읽기 전용 확인 범위:"
+    )
     lines = [
-        "이렇게 진행하면 좋겠습니다.",
-        f"이번 제안은 {proposal.revision}번째 검토안입니다.",
-        f"목표: {_compact_untrusted(proposal.goal, 500)}",
-        "진행 순서:",
+        "이렇게 확인했어요.",
+        f"이번 제안은 {proposal.revision}번째 검토안이에요.",
+        "확인한 내용:",
+        f"- {_compact_untrusted(proposal.goal, 500)}",
+        action_heading,
         *_proposal_lines(proposal.steps),
         "가능한 작업:",
-        *_proposal_lines(proposal.allowed_actions),
+        *_proposal_lines(proposal.allowed_actions, item_limit=140),
         "하지 않을 작업:",
-        *_proposal_lines(proposal.forbidden_actions),
+        *_proposal_lines(proposal.forbidden_actions, item_limit=140),
         "확인 방법:",
-        *_proposal_lines(proposal.verification),
-        "",
-        f"진행해도 된다면 이 메시지에 답장으로 `{bot_mention} 승인`이라고 남겨 주세요.",
-        "그 전에는 읽기와 제안만 하고 실제 변경은 시작하지 않습니다.",
+        *_proposal_lines(proposal.verification, item_limit=180),
     ]
-    return "\n".join(lines)
+    if approval_offered:
+        footer = (
+            f"진행해도 된다면 이 메시지에 답장으로 `{bot_mention} 승인`이라고 남겨 주세요.",
+            "그 전에는 읽기와 제안만 하고 실제 변경은 시작하지 않아요.",
+        )
+    elif approval_unavailable_reason == "execution_unavailable":
+        footer = (
+            "현재 실행 기능이 꺼져 있어 이 메시지에서는 승인을 받지 않아요.",
+            "위 내용은 검토용이며 실제 변경은 시작되지 않아요.",
+        )
+    elif approval_unavailable_reason == "preflight_not_approvable":
+        footer = (
+            "현재 근거로는 변경 승인을 받을 수 없어요.",
+            "먼저 읽기 전용 확인을 마친 뒤 새 제안을 올릴게요.",
+        )
+    else:
+        footer = (
+            "현재 이 메시지에서는 변경 승인을 받을 수 없어요.",
+            "실제 변경은 시작되지 않아요.",
+        )
+    return _render_bounded_with_footer(lines, footer)
 
 
 def render_queued(proposal: WorkProposal) -> str:

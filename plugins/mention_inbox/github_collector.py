@@ -11,6 +11,7 @@ from plugins.mention_inbox.actionable import (
     classify_actionable,
 )
 from plugins.mention_inbox.contract import MentionEvent, ingest_event
+from plugins.mention_inbox.preflight import brief_to_metadata, build_preapproval_brief
 
 _CANDIDATE_REASONS = frozenset(
     {"assign", "mention", "review_requested", "team_mention", "author", "comment"}
@@ -184,6 +185,15 @@ class GitHubNotificationCollector:
             "subject_api_url": actionable.subject_url,
             "actor_login": actionable.actor_login,
             "source_revision": actionable.source_revision,
+            "preapproval_brief": brief_to_metadata(
+                build_preapproval_brief(
+                    kind=actionable.kind,
+                    source_event=context.latest_event,
+                    context=context,
+                    source_revision=actionable.source_revision,
+                    head_sha=actionable.subject_head_sha,
+                )
+            ),
         }
         metadata.update(actionable.metadata)
         event = ingest_event(

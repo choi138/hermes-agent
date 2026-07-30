@@ -11,9 +11,14 @@ import pytest
 from plugins.mention_inbox.proposals import (
     ProposalStatus,
     build_work_proposal,
+    proposal_to_json,
     revise_work_proposal,
 )
-from plugins.mention_inbox.store import MentionInboxStore
+from plugins.mention_inbox.store import (
+    SCHEMA_VERSION,
+    MentionInboxStore,
+    ProposalMessageBinding,
+)
 
 NOW = datetime(2026, 7, 29, 11, 0, tzinfo=timezone.utc)
 SUBJECT = "github:R_repo:PR_7"
@@ -83,7 +88,12 @@ def test_restart_restores_pending_proposal_and_message_mapping(tmp_path: Path) -
     store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
     proposal = _proposal()
     store.create_proposal(proposal)
-    store.record_proposal_message(proposal.proposal_id, 1, "proposal-message-1")
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        "proposal-message-1",
+        approval_offered=True,
+    )
 
     restarted = _store(path)
     restored = restarted.get_proposal_by_message_id("proposal-message-1")
@@ -96,7 +106,12 @@ def test_exact_pending_proposal_approval_succeeds_once(tmp_path: Path) -> None:
     store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
     proposal = _proposal()
     store.create_proposal(proposal)
-    store.record_proposal_message(proposal.proposal_id, 1, "proposal-message-1")
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        "proposal-message-1",
+        approval_offered=True,
+    )
 
     result = store.approve_proposal_cas(
         proposal_id=proposal.proposal_id,
@@ -206,6 +221,12 @@ def test_source_or_head_mismatch_marks_needs_reapproval(
     store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
     proposal = _proposal()
     store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        f"proposal-{reason}",
+        approval_offered=True,
+    )
 
     result = store.approve_proposal_cas(
         proposal_id=proposal.proposal_id,
@@ -222,6 +243,135 @@ def test_source_or_head_mismatch_marks_needs_reapproval(
     assert result.approved is False
     assert result.reason == reason
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.NEEDS_REAPPROVAL
+
+
+def test_proposal_message_capability_persists_and_is_immutable(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.db"
+    store = _store(path)
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+
+    binding = store.record_proposal_message(
+        proposal.proposal_id,
+        proposal.revision,
+        "proposal-message-capability",
+        approval_offered=True,
+    )
+    restored = _store(path).get_proposal_message_binding(
+        proposal.proposal_id, proposal.revision
+    )
+
+    assert binding == ProposalMessageBinding(
+        proposal=proposal,
+        message_id="proposal-message-capability",
+        approval_offered=True,
+    )
+    assert restored == binding
+    with pytest.raises(ValueError, match="capability"):
+        store.record_proposal_message(
+            proposal.proposal_id,
+            proposal.revision,
+            "proposal-message-capability",
+            approval_offered=False,
+        )
+
+
+def test_proposal_message_without_approval_offer_cannot_be_approved(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "inbox.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        proposal.revision,
+        "review-only-message",
+        approval_offered=False,
+    )
+
+    result = store.approve_proposal_cas(
+        proposal_id=proposal.proposal_id,
+        revision=proposal.revision,
+        proposal_hash=proposal.content_hash,
+        source_revision=proposal.source_revision,
+        current_head_sha=proposal.head_sha,
+        approver_platform="discord",
+        approver_user_id=APPROVER,
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id="approval-review-only",
+    )
+
+    assert result.approved is False
+    assert result.reason == "approval_not_offered"
+    assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.PENDING
+
+
+def test_v5_proposal_rows_migrate_to_review_only_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-v5.db"
+    proposal = _proposal()
+    connection = sqlite3.connect(path)
+    connection.execute("""
+        CREATE TABLE work_proposals (
+            proposal_id TEXT NOT NULL,
+            proposal_revision INTEGER NOT NULL,
+            subject_key TEXT NOT NULL,
+            source_dedupe_key TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            head_sha TEXT,
+            proposal_json TEXT NOT NULL,
+            proposal_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            discord_message_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (proposal_id, proposal_revision)
+        )
+    """)
+    connection.execute(
+        """
+        INSERT INTO work_proposals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            proposal.proposal_id,
+            proposal.revision,
+            proposal.subject_key,
+            proposal.source_dedupe_key,
+            proposal.source_revision,
+            proposal.head_sha,
+            proposal_to_json(proposal),
+            proposal.content_hash,
+            proposal.status.value,
+            "legacy-message",
+            "2026-07-29T11:00:00Z",
+            "2026-07-29T11:00:00Z",
+        ),
+    )
+    connection.execute("PRAGMA user_version = 5")
+    connection.commit()
+    connection.close()
+
+    store = _store(path)
+    binding = store.get_proposal_message_binding(
+        proposal.proposal_id, proposal.revision
+    )
+    connection = sqlite3.connect(path)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    approval_offered = connection.execute(
+        "SELECT approval_offered FROM work_proposals"
+    ).fetchone()[0]
+    quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+    connection.close()
+
+    assert version == SCHEMA_VERSION == 6
+    assert approval_offered == 0
+    assert binding == ProposalMessageBinding(
+        proposal=proposal,
+        message_id="legacy-message",
+        approval_offered=False,
+    )
+    assert quick_check == "ok"
 
 
 def test_additive_schema_keeps_database_private_and_healthy(tmp_path: Path) -> None:

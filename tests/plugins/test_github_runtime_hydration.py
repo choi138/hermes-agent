@@ -341,8 +341,35 @@ def test_runtime_hydrates_allowlisted_ai_review_activity_on_owned_pr(
     connection.close()
     payload = json.loads(event_json)
     assert source_event_id == expected_event_id
-    assert payload["untrusted"]["metadata"]["actionable_kind"] == expected_kind
+    metadata = payload["untrusted"]["metadata"]
+    assert metadata["actionable_kind"] == expected_kind
     assert payload["untrusted"]["body"] == "경계 조건을 확인해 주세요."
+    assert metadata["preapproval_brief"] == {
+        "schema_version": 1,
+        "disposition": "review_needed",
+        "summary": "경계 조건을 확인해 주세요.",
+        "findings": (
+            [
+                {
+                    "source_event_id": "PRRC_404",
+                    "body": "경계 조건을 확인해 주세요.",
+                    "source_url": (
+                        "https://github.com/silviahealth/content/pull/7"
+                        "#pullrequestreview-404"
+                    ),
+                    "path": None,
+                    "line": None,
+                    "review_id": None,
+                    "commit_id": None,
+                }
+            ]
+            if event_type == "review_comment"
+            else []
+        ),
+        "source_revision": "2026-07-29T10:00:00Z",
+        "head_sha": "head-1",
+        "approvable": True,
+    }
 
 
 @pytest.mark.parametrize("reason", ("mention", "team_mention"))

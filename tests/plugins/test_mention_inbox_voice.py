@@ -157,13 +157,56 @@ def test_thread_opened_voice_states_no_changes_started() -> None:
 def test_proposal_and_status_messages_hide_internal_ids() -> None:
     proposal = _proposal()
     combined = "\n".join((
-        render_proposal(proposal, bot_mention="<@1525050525641805886>"),
+        render_proposal(
+            proposal,
+            bot_mention="<@1525050525641805886>",
+            approval_offered=True,
+        ),
         render_queued(proposal),
     ))
     assert proposal.proposal_id not in combined
     assert proposal.content_hash not in combined
     assert proposal.subject_key not in combined
+    assert "확인한 내용" in combined
+    assert "승인 후 진행할 작업" in combined
     assert "승인" in combined
+
+
+def test_review_only_proposal_never_renders_approval_cta() -> None:
+    rendered = render_proposal(
+        _proposal(),
+        bot_mention="<@1525050525641805886>",
+        approval_offered=False,
+        approval_unavailable_reason="execution_unavailable",
+    )
+
+    assert "<@1525050525641805886> 승인" not in rendered
+    assert "현재 실행 기능이 꺼져 있어" in rendered
+
+
+def test_proposal_message_is_bounded_without_dropping_approval_instruction() -> None:
+    proposal = build_work_proposal(
+        revision=1,
+        source_dedupe_key="github:RC_123:U_recent",
+        source_revision="2026-07-29T10:01:00Z",
+        subject_key="github:R_repo:PR_7",
+        head_sha="head-1",
+        goal="현재 HEAD에서 확인된 요청: " + ("가" * 1200),
+        steps=tuple(f"작업 {index}: " + ("나" * 450) for index in range(8)),
+        allowed_actions=("read_repository", "edit_scoped_files", "run_tests"),
+        forbidden_actions=("merge", "deploy", "delete", "read_secrets"),
+        verification=("대상 테스트 통과", "diff 검토"),
+        executor_hint="direct",
+    )
+
+    rendered = render_proposal(
+        proposal,
+        bot_mention="<@1525050525641805886>",
+        approval_offered=True,
+    )
+
+    assert len(rendered) <= 1900
+    assert "<@1525050525641805886> 승인" in rendered
 
 
 def test_completed_voice_requires_verified_evidence() -> None:

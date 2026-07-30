@@ -30,7 +30,7 @@ from plugins.mention_inbox.proposals import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1531851208858275860"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -91,6 +91,13 @@ class ApprovalCASResult:
     approved: bool
     reason: str
     proposal: WorkProposal
+
+
+@dataclass(frozen=True)
+class ProposalMessageBinding:
+    proposal: WorkProposal
+    message_id: str
+    approval_offered: bool
 
 
 @dataclass(frozen=True)
@@ -236,6 +243,20 @@ def _stored_proposal(row: sqlite3.Row) -> WorkProposal:
     if proposal.content_hash != str(row["proposal_hash"]):
         raise RuntimeError("stored proposal hash disagrees with canonical JSON")
     return proposal
+
+
+def _proposal_message_binding(row: sqlite3.Row) -> ProposalMessageBinding:
+    message_id = row["discord_message_id"]
+    if message_id is None:
+        raise RuntimeError("proposal message binding is incomplete")
+    offered = int(row["approval_offered"])
+    if offered not in {0, 1}:
+        raise RuntimeError("stored approval capability is invalid")
+    return ProposalMessageBinding(
+        proposal=_stored_proposal(row),
+        message_id=str(message_id),
+        approval_offered=bool(offered),
+    )
 
 
 def _work_execution(row: sqlite3.Row) -> WorkExecution:
@@ -467,11 +488,25 @@ class MentionInboxStore:
                     proposal_hash TEXT NOT NULL,
                     status TEXT NOT NULL,
                     discord_message_id TEXT,
+                    approval_offered INTEGER NOT NULL DEFAULT 0
+                        CHECK (approval_offered IN (0, 1)),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (proposal_id, proposal_revision)
                 )
             """)
+            proposal_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(work_proposals)")
+            }
+            if "approval_offered" not in proposal_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE work_proposals
+                    ADD COLUMN approval_offered INTEGER NOT NULL DEFAULT 0
+                        CHECK (approval_offered IN (0, 1))
+                    """
+                )
             connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_work_proposal_message
                 ON work_proposals(discord_message_id)
@@ -998,12 +1033,19 @@ class MentionInboxStore:
             connection.close()
 
     def record_proposal_message(
-        self, proposal_id: str, revision: int, message_id: str
-    ) -> WorkProposal:
+        self,
+        proposal_id: str,
+        revision: int,
+        message_id: str,
+        *,
+        approval_offered: bool,
+    ) -> ProposalMessageBinding:
         proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
         message = _require_stable_text(message_id, "message_id", limit=80)
         if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
             raise ValueError("revision must be a positive integer")
+        if not isinstance(approval_offered, bool):
+            raise ValueError("approval_offered must be a boolean")
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
@@ -1020,15 +1062,33 @@ class MentionInboxStore:
                 existing = row["discord_message_id"]
                 if existing is not None and str(existing) != message:
                     raise ValueError("proposal already maps to a different message")
+                stored_capability = bool(int(row["approval_offered"]))
+                if existing is not None and stored_capability is not approval_offered:
+                    raise ValueError("proposal message capability cannot be changed")
                 connection.execute(
                     """
                     UPDATE work_proposals
-                    SET discord_message_id = ?, updated_at = ?
+                    SET discord_message_id = ?, approval_offered = ?, updated_at = ?
                     WHERE proposal_id = ? AND proposal_revision = ?
                     """,
-                    (message, now, proposal_key, revision),
+                    (
+                        message,
+                        int(approval_offered),
+                        now,
+                        proposal_key,
+                        revision,
+                    ),
                 )
-                return _stored_proposal(row)
+                stored = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal_key, revision),
+                ).fetchone()
+                if stored is None:
+                    raise RuntimeError("proposal message binding disappeared")
+                return _proposal_message_binding(stored)
         finally:
             connection.close()
 
@@ -1048,20 +1108,44 @@ class MentionInboxStore:
         finally:
             connection.close()
 
-    def get_proposal_message_id(self, proposal_id: str, revision: int) -> str | None:
+    def get_proposal_message_binding(
+        self, proposal_id: str, revision: int
+    ) -> ProposalMessageBinding | None:
         proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError("revision must be a positive integer")
         connection = self._connect()
         try:
             row = connection.execute(
                 """
-                SELECT discord_message_id FROM work_proposals
+                SELECT * FROM work_proposals
                 WHERE proposal_id = ? AND proposal_revision = ?
                 """,
                 (proposal_key, revision),
             ).fetchone()
             if row is None:
                 raise KeyError("proposal not found")
-            return None if row["discord_message_id"] is None else str(row["discord_message_id"])
+            if row["discord_message_id"] is None:
+                return None
+            return _proposal_message_binding(row)
+        finally:
+            connection.close()
+
+    def get_proposal_message_id(self, proposal_id: str, revision: int) -> str | None:
+        binding = self.get_proposal_message_binding(proposal_id, revision)
+        return None if binding is None else binding.message_id
+
+    def get_proposal_message_binding_by_message_id(
+        self, message_id: str
+    ) -> ProposalMessageBinding | None:
+        message = _require_stable_text(message_id, "message_id", limit=80)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_proposals WHERE discord_message_id = ?",
+                (message,),
+            ).fetchone()
+            return None if row is None else _proposal_message_binding(row)
         finally:
             connection.close()
 
@@ -1217,6 +1301,11 @@ class MentionInboxStore:
                     return ApprovalCASResult(False, proposal.status.value, proposal)
                 if not verify_proposal_hash(proposal) or proposal.content_hash != expected_hash:
                     return ApprovalCASResult(False, "proposal_hash_mismatch", proposal)
+                if (
+                    row["discord_message_id"] is None
+                    or int(row["approval_offered"]) != 1
+                ):
+                    return ApprovalCASResult(False, "approval_not_offered", proposal)
                 if proposal.source_revision != source_revision:
                     updated = self._write_proposal_status(
                         connection, proposal, ProposalStatus.NEEDS_REAPPROVAL, now

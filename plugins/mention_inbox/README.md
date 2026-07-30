@@ -1,10 +1,10 @@
 # Unified Mention Inbox event contract
 
 This package defines the versioned domain contract shared by GitHub, Slack, and
-Notion mention collectors. P3-M2 also provides an explicitly invoked,
-read-only GitHub Notifications pilot and a profile-scoped SQLite store. It
-remains unregistered: there is no plugin manifest, scheduler, gateway hook,
-credential lookup, prompt builder, or external write path.
+Notion mention collectors. The P3-M2 core remains a GET-only GitHub Notifications
+collector with a profile-scoped SQLite store; the bounded gateway integration,
+Discord work threads, and separately gated execution path are described below.
+External writes are never authorized by source content alone.
 
 ## Public API
 
@@ -291,7 +291,9 @@ $HERMES_HOME/mention_inbox/inbox.db
 
 The store enables WAL, a bounded busy timeout, and owner-only `0600` file mode
 where the platform supports POSIX permissions. The dedupe key is the event
-primary key.
+primary key. Store schema version 6 binds each Discord proposal message to an
+immutable `approval_offered` boolean; migration of older rows defaults this
+value to false.
 
 - First observation inserts revision 1 in `pending` state.
 - Same content updates source revision and `last_seen` without duplicating the
@@ -365,11 +367,57 @@ Rendered messages are deterministic, bounded, label title/body as untrusted data
 neutralize mentions/markdown, include source/repository/action/exact permalink, and
 force Discord `AllowedMentions.none()`.
 
-Action sessions and execution are separate, disabled-by-default gates. An
-actionable item can open one durable PR/Issue thread with a local deterministic
-proposal. Execution requires an authorized user's exact reply to the latest
-proposal, then revalidates the current GitHub source revision and PR HEAD before
-queueing. Direct execution runs in an isolated gateway session with only scoped
-file tools and approved foreground verification commands; Kanban intake exposes
-only the single `kanban_task` surface. Neither path may infer merge, deployment,
-deletion, secret access, or any GitHub mutation from untrusted source content.
+### Preapproval brief, review-only mode, and commands
+
+Before a proposal can offer execution approval, the collector builds a bounded,
+deterministic preapproval brief from the already fetched GitHub review summary,
+matching inline comments, current source revision, and PR HEAD. It does not open
+an agent session. User-visible evidence includes the request summary, file and
+current line when available, and the exact GitHub permalink.
+
+The conservative dispositions are:
+
+- `action_required`: a current change request is bound to the observed HEAD.
+- `review_needed`: current review evidence needs inspection before scoped work.
+- `possibly_stale`: a comment is bound to an older commit or current line cannot
+  be established; read-only revalidation is required.
+- `informational`: the review contains no actionable finding.
+- `insufficient_evidence`: required IDs, revision, HEAD, or evidence are missing
+  or malformed; execution approval fails closed.
+
+`action_sessions.enabled=true` may create and maintain the durable work thread,
+but `action_sessions.execution_enabled=false` is review-only mode. Review-only
+messages contain no approval CTA and are stored with `approval_offered=false`.
+Even when execution is enabled, stale, informational, or insufficient evidence
+cannot offer approval.
+
+Approval is accepted only when all of these conditions hold:
+
+1. the author is an authorized approver;
+2. the text is exactly `<@bot_id> 승인` after trusted bot-mention normalization;
+3. the Discord message is a reply to the latest proposal message;
+4. that exact message was durably stored with `approval_offered=true`; and
+5. the execution handler is currently available.
+
+A missing or stale reply reference, an approval-like non-reply, an unauthorized
+user, or an unavailable execution handler receives a user-visible explanation.
+It never becomes proposal feedback and never creates a new revision. Questions
+also leave the revision unchanged. To change a proposal, an authorized user must
+use the explicit command `<@bot_id> 제안 수정: 바꿀 내용`.
+
+Historical proposals are not retroactively enabled by a configuration toggle.
+Rows migrated from older schemas remain `approval_offered=false`; after fresh
+source hydration, the old pending revision moves to `needs_reapproval` and a new
+message is posted from the current revision, HEAD, and preapproval brief.
+
+Action sessions and execution remain separate, disabled-by-default gates. Code
+deployment with `execution_enabled=false` and execution activation are separate
+rollout stages. Activation requires its own operational approval and canary; it
+must not make historical messages executable.
+
+After a valid approval, the runtime revalidates the current GitHub source
+revision and PR HEAD before queueing. Direct execution runs in an isolated
+gateway session with only scoped file tools and approved foreground verification
+commands; Kanban intake exposes only the single `kanban_task` surface. Neither
+path may infer merge, deployment, deletion, secret access, or any GitHub
+mutation from untrusted source content.

@@ -648,13 +648,6 @@ class MentionInboxGatewayService:
 
                 if self.config.proposal_bot_mention is None:
                     raise ValueError("action session bot mention is required")
-                thread_coordinator = MentionInboxThreadCoordinator(
-                    store=store,
-                    discord=discord_transport,
-                    bot_mention=self.config.proposal_bot_mention,
-                    executor_hint=self.config.execution_mode,
-                    auto_archive_duration=self.config.thread_auto_archive_minutes,
-                )
                 from plugins.mention_inbox.router import InboxProposalRouter
 
                 approval_handler = None
@@ -681,6 +674,14 @@ class MentionInboxGatewayService:
                             self.config.authorized_approver_ids
                         ),
                     )
+                thread_coordinator = MentionInboxThreadCoordinator(
+                    store=store,
+                    discord=discord_transport,
+                    bot_mention=self.config.proposal_bot_mention,
+                    executor_hint=self.config.execution_mode,
+                    auto_archive_duration=self.config.thread_auto_archive_minutes,
+                    approval_available=approval_handler is not None,
+                )
                 router = InboxProposalRouter(
                     store=store,
                     discord=discord_transport,
