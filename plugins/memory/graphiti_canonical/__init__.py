@@ -424,13 +424,25 @@ _CONTEXT_DELIMITER_PATTERN = re.compile(
     r"<\s*/?\s*(?:memory(?:[_\s-]*)context|provider|system|developer|assistant|user|tool)\b",
     re.IGNORECASE,
 )
+_EPHEMERAL_STATE_WORDS = (
+    r"(?:blocked|completed|done|failed|in\s+progress|pending|queued|ready"
+    r"|retrying|running|waiting)"
+)
+# Progress-status facts are ephemeral: recalling them makes queued work look running.
+# Copula phrasings ("is running") are not enough -- graphs also store participle
+# and reporting forms ("marked completed", "flagged as failed", "완료됨").
 _EPHEMERAL_TEXT_PATTERN = re.compile(
-    r"\b(?:currently|now|still|remains?|remained)\s+"
-    r"(?:blocked|completed|done|failed|in\s+progress|pending|queued|ready|retrying|running|waiting)\b"
+    r"\b(?:currently|now|still|remains?|remained)\s+" + _EPHEMERAL_STATE_WORDS + r"\b"
     r"|\b(?:is|are|was|were|has|have|had)\s+(?:been\s+)?"
-    r"(?:blocked|completed|done|failed|in\s+progress|pending|queued|ready|retrying|running|waiting)\b"
+    + _EPHEMERAL_STATE_WORDS
+    + r"\b"
+    r"|\b(?:marked|flagged|labelled|labeled|listed|reported|recorded|left|kept"
+    r"|stays?|stayed|becomes?|became|set|moved|switched|put|placed)\s+"
+    r"(?:as\s+|to\s+|back\s+to\s+|in\s+)?" + _EPHEMERAL_STATE_WORDS + r"\b"
+    r"|\bqueued\s+for\s+retry\b"
     r"|\b(?:current\s+)?status\s*[:=]"
-    r"|(?:현재.{0,20}(?:차단|진행|대기|완료|실패)|(?:차단|진행|대기)\s*중)",
+    r"|(?:현재.{0,20}(?:차단|진행|대기|완료|실패)|(?:차단|진행|대기)\s*중)"
+    r"|(?:차단|진행|대기|완료|실패|재시도)(?:됨|되었|됐|한\s*상태|\s*상태)",
     re.IGNORECASE,
 )
 

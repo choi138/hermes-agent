@@ -2328,3 +2328,130 @@ def test_trusted_continuity_and_project_status_controls_remain_recallable():
 
     assert "edge=trusted" in result
     assert "edge=project" in result
+
+
+# --- Ephemeral progress-status recall boundary (P1-M4 remediation) -----------
+#
+# Stale task-status facts ("marked completed", "queued for retry") must never be
+# injected as durable memory: they make the agent report queued work as running.
+# The relation allowlist cannot stop them because the graph stores such facts
+# under HAS_PREFERENCE, so the ephemeral *text* filter is the only gate.
+
+_EPHEMERAL_STATUS_FACTS = [
+    "choegeun-won prefers the P1 repository task marked completed and queued for retry",
+    "choegeun-won prefers the P1 repository task queued for retry",
+    "choegeun-won prefers the P1 repository task left running overnight",
+    "choegeun-won prefers the P1 repository task stays blocked until review",
+    "choegeun-won prefers the P1 repository task became ready after the fix",
+    "choegeun-won prefers the P1 repository task reported done by the worker",
+    "choegeun-won prefers the P1 repository task flagged as failed",
+    "choegeun-won prefers the P1 repository task set to pending",
+]
+
+
+@pytest.mark.parametrize("fact", _EPHEMERAL_STATUS_FACTS)
+def test_participle_status_facts_are_never_recalled(fact):
+    result = graphiti_module._format_facts(
+        [{"uuid": "ephemeral", "name": "HAS_PREFERENCE", "fact": fact}],
+        query="choegeun-won prefers what convention for the P1 repository work",
+        identity_terms={"choegeun-won"},
+    )
+
+    assert result == ""
+
+
+_ALREADY_BLOCKED_STATUS_FACTS = [
+    "choegeun-won prefers the P1 repository task is running",
+    "choegeun-won prefers the P1 repository task was completed",
+    "choegeun-won prefers the P1 repository task currently blocked",
+    "choegeun-won prefers the P1 repository status: running",
+]
+
+
+@pytest.mark.parametrize("fact", _ALREADY_BLOCKED_STATUS_FACTS)
+def test_copula_status_facts_stay_blocked(fact):
+    result = graphiti_module._format_facts(
+        [{"uuid": "ephemeral", "name": "HAS_PREFERENCE", "fact": fact}],
+        query="choegeun-won prefers what convention for the P1 repository work",
+        identity_terms={"choegeun-won"},
+    )
+
+    assert result == ""
+
+
+# Korean status phrasings are asserted directly against the text filter. Going
+# through _format_facts would pass for the wrong reason: Korean particles keep
+# query anchors from matching inflected fact tokens, so the relevance gate --
+# not the status filter -- would be doing the blocking.
+_KOREAN_EPHEMERAL_PHRASES = [
+    "P1 저장소 작업이 완료됨",
+    "P1 저장소 작업이 대기됨",
+    "P1 저장소 작업이 차단됨",
+    "P1 저장소 작업이 진행됨",
+    "P1 저장소 작업 완료 상태",
+    "P1 저장소 작업 대기 상태",
+]
+
+
+@pytest.mark.parametrize("phrase", _KOREAN_EPHEMERAL_PHRASES)
+def test_korean_status_phrasings_match_the_ephemeral_filter(phrase):
+    assert graphiti_module._EPHEMERAL_TEXT_PATTERN.search(phrase) is not None
+
+
+_DURABLE_KOREAN_PHRASES = [
+    "choegeun-won은 한국어 요약을 선호한다",
+    "choegeun-won은 간결한 보고를 선호한다",
+    "choegeun-won은 읽기 전용 검증을 요구한다",
+]
+
+
+@pytest.mark.parametrize("phrase", _DURABLE_KOREAN_PHRASES)
+def test_durable_korean_preferences_do_not_match_the_ephemeral_filter(phrase):
+    """Positive control: tightening the filter must not swallow real preferences."""
+    assert graphiti_module._EPHEMERAL_TEXT_PATTERN.search(phrase) is None
+
+
+_DURABLE_PREFERENCE_FACTS = [
+    "choegeun-won prefers Korean for final summaries and review comments",
+    "choegeun-won prefers the P1 repository work to stay on one branch",
+    "choegeun-won prefers concise reports for the P1 repository review",
+    "choegeun-won prefers read-only verification before the P1 repository merge",
+]
+
+
+@pytest.mark.parametrize("fact", _DURABLE_PREFERENCE_FACTS)
+def test_durable_preferences_survive_the_ephemeral_status_filter(fact):
+    result = graphiti_module._format_facts(
+        [{"uuid": "durable", "name": "HAS_PREFERENCE", "fact": fact}],
+        query="choegeun-won prefers what convention for the P1 repository work",
+        identity_terms={"choegeun-won"},
+    )
+
+    assert "edge=durable" in result
+
+
+def test_ephemeral_status_fact_cannot_ride_along_with_a_durable_fact():
+    """A blocked status fact must not be rendered just because a sibling passes."""
+    result = graphiti_module._format_facts(
+        [
+            {
+                "uuid": "durable",
+                "name": "HAS_PREFERENCE",
+                "fact": "choegeun-won prefers Korean for final summaries",
+            },
+            {
+                "uuid": "ephemeral",
+                "name": "HAS_PREFERENCE",
+                "fact": (
+                    "choegeun-won prefers the P1 repository task marked completed "
+                    "and queued for retry"
+                ),
+            },
+        ],
+        query="choegeun-won prefers what convention for the P1 repository work",
+        identity_terms={"choegeun-won"},
+    )
+
+    assert "edge=durable" in result
+    assert "edge=ephemeral" not in result
+    assert "queued for retry" not in result
