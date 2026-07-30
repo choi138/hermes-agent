@@ -159,21 +159,120 @@ except ClassificationError:
     ...
 ```
 
+## The policy router
+
+`agent/direct_agent_policy.py` is the single place where a description becomes a
+decision. It takes a validated `RequestClassification` and returns an
+`ExecutionDecision`.
+
+```
+lane              codex | claude | hermes | refuse
+host              mac | remote
+workdir           absolute path resolved against the allowlist, or None
+permissions       read_only | write_workdir | write_workdir_network
+timeout_seconds   positive, capped at MAX_TIMEOUT_SECONDS
+approval          not_required | required
+refusal_reason    set only when lane is refuse
+policy_trace      why each field came out the way it did
+```
+
+Routing is a pure function: no clock, no filesystem, no network, no model call.
+The same classification produces the same decision every time, which is what
+makes the M5 evidence check meaningful.
+
+### Hints are re-derived, never trusted
+
+The classifier may suggest `lane_hint: claude` for a request whose intent is
+`code`. Policy derives the lane from the intent and discards the hint, recording
+the disagreement in `policy_trace`:
+
+```text
+lane=codex derived from intent=code; discarded lane_hint=claude
+```
+
+The host works the same way. It follows the verified workdir rather than
+`host_hint`, because a resolved path is evidence about where work lives and a
+hint is not.
+
+### Refusal is a value, not an exception
+
+`lane="refuse"` travels through the same return path as any other decision. A
+caller cannot forget to handle it the way it might forget an `except` clause,
+and the exhaustive `Lane` type makes an unhandled branch visible.
+
+A refusal carries no workdir, the narrowest permissions, and
+`approval="required"`.
+
+### Workdir containment
+
+Containment is checked after normalization and only at a path boundary, so
+`/repo-evil` cannot ride in on the `/repo` prefix. Parent traversal that lands
+outside the allowlist is refused even when the literal string starts with an
+allowed root.
+
+The allowlist lives in `ALLOWED_WORKDIRS` as a code constant for M2, keeping this
+milestone self-contained. Reading it from live config is M3's job.
+
+An empty allowlist refuses every lane that needs a workdir. Misconfiguration
+fails closed rather than falling back to something permissive.
+
+### Least privilege
+
+Permissions come from the classified risk categories, not from the lane:
+
+| Categories | Permissions |
+| --- | --- |
+| no write category | `read_only` |
+| write, delete, or migration | `write_workdir` |
+| plus `network_egress` | `write_workdir_network` |
+
+`filesystem_delete` is deliberately not a wider grant than write. Removal happens
+inside the workdir, and the extra protection is the approval gate rather than a
+broader sandbox.
+
+### Approval
+
+Approval is required when the risk level is `high`, or when any category is
+sensitive: `filesystem_delete`, `external_send`, `deployment`, `data_migration`,
+`credential_access`, `shared_state`.
+
+Level alone is not enough. A classifier that judges a deletion "low" still hits
+the approval gate, because the category is what matters.
+
+### Usage
+
+```python
+from agent.direct_agent_classification import parse_classification
+from agent.direct_agent_policy import route_classification
+
+classification = parse_classification(raw_response)
+decision = route_classification(classification)
+
+if decision.lane == "refuse":
+    ...  # decision.refusal_reason explains why
+elif decision.approval == "required":
+    ...  # ask the user before proceeding
+```
+
+Passing a bare mapping raises `TypeError`: accepting one would let a caller
+bypass the M1 contract entirely.
+
 ## Milestone boundary
 
-**P2-M1 (this page)** delivers the contract, the validator, and the prompt
-surface.
+**P2-M1** delivers the classification contract, the validator, and the prompt
+surface. **P2-M2** delivers the policy router described above.
 
-Not included, and deliberately so:
+Not included in either, and deliberately so:
 
 - Calling a classifier model
 - Gateway wiring for automatic classification
 - Codex or Claude execution
-- Final policy routing
+- Reading the allowlist from live configuration
+- The approval prompt itself
 - Graphiti lookups or writes
 - Deployment, restarts, or live configuration changes
 
-**P2-M2** adds the policy router that turns a validated classification into an
-actual execution decision: resolving the lane, host, workdir, permissions, and
-timeout, checking them against allowlists, and requiring user approval where the
-risk warrants it.
+**P2-M3** runs the Codex lane against an allowlisted Mac workdir in an ephemeral
+session and returns test evidence. **P2-M4** does the same for Claude with no
+session persistence. **P2-M5** reads back host, CWD, changed files, and test
+results before anything is promoted to a durable workflow.
