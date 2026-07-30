@@ -364,7 +364,7 @@ def test_v5_proposal_rows_migrate_to_review_only_fail_closed(tmp_path: Path) -> 
     quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
     connection.close()
 
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION
     assert approval_offered == 0
     assert binding == ProposalMessageBinding(
         proposal=proposal,

@@ -44,9 +44,24 @@ DEDUPE = build_dedupe_key(
 SOURCE_REVISION = "2026-07-29T10:01:00Z"
 APPROVER = "396159160201658368"
 BOT_MENTION = "<@1525050677381279865>"
+HEAD_REF = "feature/review-fix"
+HEAD_REPOSITORY = "silviahealth/content"
+WORKSPACE = "/Users/test/Documents/hermes-workspaces/silviahealth-content"
+COMMIT_SHA = "abc1234" + ("0" * 33)
 
 
-def _proposal(*, executor_hint: str = "direct"):
+def _proposal(*, executor_hint: str = "direct", publish: bool = False):
+    allowed_actions = [
+        "read_repository",
+        "edit_scoped_files",
+        "run_tests",
+    ]
+    verification = ["대상 테스트 통과", "diff 검토"]
+    if publish:
+        allowed_actions.extend(
+            ("switch_to_pr_branch", "commit_changes", "push_current_branch")
+        )
+        verification.extend(("commit SHA 확인", "non-force push 성공"))
     return build_work_proposal(
         revision=1,
         source_dedupe_key=DEDUPE,
@@ -55,18 +70,36 @@ def _proposal(*, executor_hint: str = "direct"):
         head_sha="head-1",
         goal="요청된 PR 변경을 확인하고 범위 안에서 수정한다.",
         steps=("diff를 읽는다.", "범위 내 수정을 한다.", "테스트한다."),
-        allowed_actions=("read_repository", "edit_scoped_files", "run_tests"),
+        allowed_actions=tuple(allowed_actions),
         forbidden_actions=("merge", "deploy", "delete", "read_secrets"),
-        verification=("대상 테스트 통과", "diff 검토"),
+        verification=tuple(verification),
         executor_hint=executor_hint,
     )
 
 
-def _seed(path: Path, *, executor_hint: str = "direct"):
+def _state(
+    head_sha: str = "head-1",
+    *,
+    source_revision: str = SOURCE_REVISION,
+) -> ResolvedSourceState:
+    return ResolvedSourceState(
+        source_revision=source_revision,
+        head_sha=head_sha,
+        head_ref=HEAD_REF,
+        head_repository=HEAD_REPOSITORY,
+    )
+
+
+def _seed(
+    path: Path,
+    *,
+    executor_hint: str = "direct",
+    publish: bool = False,
+):
     store = MentionInboxStore(path, clock=lambda: NOW)
     store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
     store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
-    proposal = _proposal(executor_hint=executor_hint)
+    proposal = _proposal(executor_hint=executor_hint, publish=publish)
     store.create_proposal(proposal)
     store.record_proposal_message(
         proposal.proposal_id,
@@ -136,6 +169,7 @@ def _handler(store, resolver, dispatcher, discord):
         discord=discord,
         bot_mention=BOT_MENTION,
         authorized_approver_ids=frozenset({APPROVER}),
+        workspace=WORKSPACE,
     )
 
 
@@ -156,7 +190,7 @@ async def test_authorized_exact_reply_commits_receipts_before_queued_dispatch(
     tmp_path: Path,
 ) -> None:
     store, proposal = _seed(tmp_path / "inbox.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-1"))
+    resolver = _Resolver(_state())
     discord = _Discord()
     dispatcher = _Dispatcher(store)
 
@@ -174,6 +208,9 @@ async def test_authorized_exact_reply_commits_receipts_before_queued_dispatch(
     assert request.forbidden_actions == proposal.forbidden_actions
     assert request.verification == proposal.verification
     assert request.approval_message_id == "approval-message-1"
+    assert request.head_ref == HEAD_REF
+    assert request.head_repository == HEAD_REPOSITORY
+    assert request.workspace == WORKSPACE
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.QUEUED
     execution = store.get_execution_for_proposal(proposal.proposal_id, 1)
     assert execution is not None and execution.status == "queued"
@@ -188,7 +225,7 @@ async def test_authorized_exact_reply_commits_receipts_before_queued_dispatch(
 @pytest.mark.asyncio
 async def test_unauthorized_user_never_resolves_or_dispatches(tmp_path: Path) -> None:
     store, proposal = _seed(tmp_path / "unauthorized.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-1"))
+    resolver = _Resolver(_state())
     dispatcher = _Dispatcher(store)
     discord = _Discord()
 
@@ -209,7 +246,7 @@ async def test_changed_head_requires_new_approval_without_dispatch(
     tmp_path: Path,
 ) -> None:
     store, proposal = _seed(tmp_path / "changed-head.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-2"))
+    resolver = _Resolver(_state("head-2"))
     dispatcher = _Dispatcher(store)
     discord = _Discord()
 
@@ -229,7 +266,7 @@ async def test_duplicate_approval_reuses_queued_execution_without_dispatch(
     tmp_path: Path,
 ) -> None:
     store, proposal = _seed(tmp_path / "duplicate.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-1"))
+    resolver = _Resolver(_state())
     dispatcher = _Dispatcher(store)
     discord = _Discord()
     handler = _handler(store, resolver, dispatcher, discord)
@@ -259,7 +296,7 @@ async def test_dispatch_failure_is_persisted_blocked_without_error_leak(
     tmp_path: Path,
 ) -> None:
     store, proposal = _seed(tmp_path / "dispatch-failure.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-1"))
+    resolver = _Resolver(_state())
     discord = _Discord()
     dispatcher = _FailingDispatcher()
 
@@ -319,7 +356,11 @@ class _GitHubClient:
         return {
             "number": 7,
             "updated_at": "2026-07-29T10:03:00Z",
-            "head": {"sha": "head-3"},
+            "head": {
+                "sha": "head-3",
+                "ref": HEAD_REF,
+                "repo": {"full_name": HEAD_REPOSITORY},
+            },
         }
 
 
@@ -337,7 +378,10 @@ async def test_github_resolver_reloads_subject_revision_and_head_from_stored_url
     )
 
     assert state == ResolvedSourceState(
-        source_revision="2026-07-29T10:03:00Z", head_sha="head-3"
+        source_revision="2026-07-29T10:03:00Z",
+        head_sha="head-3",
+        head_ref=HEAD_REF,
+        head_repository=HEAD_REPOSITORY,
     )
     assert client.urls == [api_url]
 
@@ -376,6 +420,9 @@ def _approved_request(*, mode: str = "direct") -> ApprovedExecutionRequest:
         executor_hint=mode,
         source_revision=proposal.source_revision,
         head_sha=proposal.head_sha,
+        head_ref=HEAD_REF,
+        head_repository=HEAD_REPOSITORY,
+        workspace=WORKSPACE,
         thread_id="55",
         approval_message_id="555",
         approver_user_id="456",
@@ -391,6 +438,8 @@ def test_approved_execution_prompt_is_code_owned_and_scope_exact() -> None:
     assert "Do not infer or add actions" in prompt
     assert "Do not merge or deploy" in prompt
     assert "isolated approved-execution session" in prompt
+    assert WORKSPACE in prompt
+    assert HEAD_REF in prompt
     assert request.goal in prompt
 
 
@@ -425,8 +474,18 @@ async def test_gateway_dispatcher_rejects_empty_admission_receipt() -> None:
     assert receipt == DispatchReceipt(accepted=False, dispatch_id=None)
 
 
-def _seed_queued(path: Path, *, executor_hint: str = "direct"):
-    store, proposal = _seed(path, executor_hint=executor_hint)
+def _seed_queued(
+    path: Path,
+    *,
+    executor_hint: str = "direct",
+    publish: bool = False,
+    workspace: str = WORKSPACE,
+):
+    store, proposal = _seed(
+        path,
+        executor_hint=executor_hint,
+        publish=publish,
+    )
     approved = store.approve_proposal_cas(
         proposal_id=proposal.proposal_id,
         revision=proposal.revision,
@@ -445,6 +504,9 @@ def _seed_queued(path: Path, *, executor_hint: str = "direct"):
         approval_message_id="approval-message-1",
         thread_id="thread-1",
         mode=executor_hint,
+        head_ref=HEAD_REF,
+        head_repository=HEAD_REPOSITORY,
+        workspace=workspace,
     )
     execution = store.mark_execution_dispatched(
         execution.execution_id, f"{executor_hint}:{execution.execution_id}"
@@ -464,12 +526,18 @@ async def test_lifecycle_completes_only_with_successful_verification_receipt(
 ) -> None:
     store, proposal, execution = _seed_queued(tmp_path / "lifecycle.db")
     discord = _Discord()
-    observer = ExecutionLifecycleObserver(store=store, discord=discord)
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=discord, workspace=WORKSPACE
+    )
     observer.tool_started(execution.execution_id, "terminal")
     observer.tool_completed(
         execution.execution_id,
         "terminal",
         {"exit_code": 0, "output": "private-token-value"},
+        args={
+            "command": "python -m pytest tests/unit -q",
+            "workdir": WORKSPACE,
+        },
     )
     await observer.run_completed(
         execution.execution_id, {"completed": True, "final_response": "done"}
@@ -494,7 +562,9 @@ async def test_lifecycle_blocks_agent_turn_without_tool_activity(
 ) -> None:
     store, _, execution = _seed_queued(tmp_path / "no-tool.db")
     discord = _Discord()
-    observer = ExecutionLifecycleObserver(store=store, discord=discord)
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=discord, workspace=WORKSPACE
+    )
     await observer.run_completed(
         execution.execution_id,
         {"completed": True, "final_response": "claimed completion"},
@@ -503,18 +573,25 @@ async def test_lifecycle_blocks_agent_turn_without_tool_activity(
     assert store.get_execution(execution.execution_id).status == "blocked"
     assert len(discord.sent) == 1
     assert "시작하지 못" in discord.sent[0][1]
+    assert "no_tool_activity" in discord.sent[0][1]
 
 
 @pytest.mark.asyncio
 async def test_lifecycle_blocks_failed_verification_receipt(tmp_path: Path) -> None:
     store, _, execution = _seed_queued(tmp_path / "failed-verify.db")
     discord = _Discord()
-    observer = ExecutionLifecycleObserver(store=store, discord=discord)
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=discord, workspace=WORKSPACE
+    )
     observer.tool_started(execution.execution_id, "terminal")
     observer.tool_completed(
         execution.execution_id,
         "terminal",
         {"exit_code": 1, "output": "secret failing output"},
+        args={
+            "command": "python -m pytest tests/unit -q",
+            "workdir": WORKSPACE,
+        },
     )
     await observer.run_completed(execution.execution_id, {"completed": True})
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.BLOCKED
@@ -531,7 +608,9 @@ async def test_kanban_lifecycle_records_durable_queue_without_claiming_completio
         tmp_path / "kanban.db", executor_hint="kanban"
     )
     discord = _Discord()
-    observer = ExecutionLifecycleObserver(store=store, discord=discord)
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=discord, workspace=WORKSPACE
+    )
 
     observer.tool_started(execution.execution_id, "kanban_task")
     observer.tool_completed(
@@ -556,7 +635,9 @@ async def test_execution_context_must_match_reserved_proposal_and_mode(
     tmp_path: Path,
 ) -> None:
     store, proposal, execution = _seed_queued(tmp_path / "context-policy.db")
-    observer = ExecutionLifecycleObserver(store=store, discord=_Discord())
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=_Discord(), workspace=WORKSPACE
+    )
 
     observer.validate_execution_context(
         execution.execution_id,
@@ -582,15 +663,17 @@ async def test_direct_pretool_policy_blocks_forbidden_commands_and_paths(
     tmp_path: Path,
 ) -> None:
     store, _, execution = _seed_queued(tmp_path / "direct-policy.db")
-    observer = ExecutionLifecycleObserver(store=store, discord=_Discord())
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=_Discord(), workspace=WORKSPACE
+    )
 
-    with pytest.raises(ValueError, match="forbidden terminal action"):
+    with pytest.raises(ValueError, match="outside approved actions"):
         observer.authorize_tool_start(
             execution.execution_id,
             "terminal",
-            {"command": "git push origin main"},
+            {"command": "git push origin main", "workdir": WORKSPACE},
         )
-    with pytest.raises(ValueError, match="scoped relative path"):
+    with pytest.raises(ValueError, match="outside the approved workspace"):
         observer.authorize_tool_start(
             execution.execution_id,
             "patch",
@@ -609,7 +692,7 @@ async def test_direct_pretool_policy_blocks_forbidden_commands_and_paths(
         observer.authorize_tool_start(
             execution.execution_id,
             "write_file",
-            {"path": "safe.py", "cross_profile": True},
+            {"path": f"{WORKSPACE}/safe.py", "cross_profile": True},
         )
     with pytest.raises(ValueError, match="background"):
         observer.authorize_tool_start(
@@ -623,26 +706,237 @@ async def test_direct_pretool_policy_blocks_forbidden_commands_and_paths(
             "process",
             {"action": "kill", "session_id": "unrelated"},
         )
-    with pytest.raises(ValueError, match="approved verification command"):
+    with pytest.raises(ValueError, match="not approved"):
         observer.authorize_tool_start(
             execution.execution_id,
             "terminal",
-            {"command": "python -c 'print(1)'"},
+            {"command": "python -c 'print(1)'", "workdir": WORKSPACE},
         )
     with pytest.raises(ValueError, match="shell composition"):
         observer.authorize_tool_start(
             execution.execution_id,
             "terminal",
-            {"command": "python -m pytest tests/unit -q; echo $GITHUB_PAT_TOKEN"},
+            {
+                "command": "python -m pytest tests/unit -q; echo $GITHUB_PAT_TOKEN",
+                "workdir": WORKSPACE,
+            },
         )
 
     assert store.get_execution(execution.execution_id).status == "queued"
     observer.authorize_tool_start(
         execution.execution_id,
         "terminal",
-        {"command": "python -m pytest tests/unit -q"},
+        {"command": "python -m pytest tests/unit -q", "workdir": WORKSPACE},
     )
     assert store.get_execution(execution.execution_id).status == "running"
+
+
+@pytest.mark.asyncio
+async def test_direct_pretool_policy_blocks_symlink_workspace_escape(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    escape = workspace / "escape"
+    try:
+        escape.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    store, _, execution = _seed_queued(
+        tmp_path / "symlink-policy.db",
+        workspace=str(workspace),
+    )
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=_Discord(),
+        workspace=str(workspace),
+    )
+
+    with pytest.raises(ValueError, match="outside the approved workspace"):
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "patch",
+            {
+                "mode": "replace",
+                "path": str(escape / "outside.py"),
+            },
+        )
+    with pytest.raises(ValueError, match="outside the approved workspace"):
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "terminal",
+            {
+                "command": "python -m pytest tests/unit -q",
+                "workdir": str(escape),
+            },
+        )
+    with pytest.raises(ValueError, match="outside the approved workspace"):
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "terminal",
+            {
+                "command": "python -m pytest escape/test_outside.py -q",
+                "workdir": str(workspace),
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_publish_policy_allows_only_scoped_non_force_git_flow(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(
+        tmp_path / "publish-policy.db",
+        publish=True,
+    )
+    _store_source_event(
+        store,
+        api_url="https://api.github.com/repos/silviahealth/content/pulls/7",
+    )
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=_Discord(),
+        workspace=WORKSPACE,
+    )
+
+    allowed_commands = (
+        f"git fetch origin {HEAD_REF}",
+        f"git switch {HEAD_REF}",
+        "git add -- plugins/mention_inbox/approval.py",
+        "git commit -m 'fix: address review'",
+        f"git push origin HEAD:{HEAD_REF}",
+    )
+    for command in allowed_commands:
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "terminal",
+            {"command": command, "workdir": WORKSPACE},
+        )
+
+    for command in (
+        f"git push --force origin HEAD:{HEAD_REF}",
+        "git push origin HEAD:other-branch",
+        "git add -- .",
+        "git reset --hard HEAD",
+    ):
+        with pytest.raises(ValueError):
+            observer.authorize_tool_start(
+                execution.execution_id,
+                "terminal",
+                {"command": command, "workdir": WORKSPACE},
+            )
+
+
+@pytest.mark.asyncio
+async def test_publish_completion_requires_bound_git_receipts_and_redacts_summary(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(
+        tmp_path / "publish-complete.db",
+        publish=True,
+    )
+    _store_source_event(
+        store,
+        api_url="https://api.github.com/repos/silviahealth/content/pulls/7",
+    )
+    discord = _Discord()
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=discord,
+        workspace=WORKSPACE,
+    )
+
+    receipts = (
+        ("git status --porcelain", ""),
+        ("git remote get-url origin", "https://github.com/silviahealth/content.git"),
+        (f"git switch {HEAD_REF}", ""),
+        ("git rev-parse --abbrev-ref HEAD", HEAD_REF),
+        ("git rev-parse HEAD", "head-1"),
+        ("python -m pytest tests/unit -q", "1 passed"),
+        ("git add -- plugins/mention_inbox/approval.py", ""),
+        ("git commit -m 'fix: address review'", "[feature abc1234] fix"),
+        ("git rev-parse HEAD", COMMIT_SHA),
+        (f"git push origin HEAD:{HEAD_REF}", "updated"),
+    )
+    for command, output in receipts:
+        args = {"command": command, "workdir": WORKSPACE}
+        observer.authorize_tool_start(execution.execution_id, "terminal", args)
+        observer.tool_completed(
+            execution.execution_id,
+            "terminal",
+            {"exit_code": 0, "output": output},
+            args=args,
+        )
+
+    outcome = await observer.run_completed(
+        execution.execution_id,
+        {
+            "completed": True,
+            "final_response": (
+                "수정·테스트·push 완료. commit abc1234 "
+                "github_pat_abcdefghijklmnopqrstuvwxyz"
+            ),
+        },
+    )
+
+    assert outcome == "completed"
+    rendered = "\n".join(content for _, content in discord.sent)
+    assert "abc1234" in rendered
+    assert COMMIT_SHA in rendered
+    assert "github_pat_abcdefghijklmnopqrstuvwxyz" not in rendered
+    assert "non-force push 성공" in rendered
+
+
+@pytest.mark.asyncio
+async def test_publish_completion_requires_post_commit_sha_receipt(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(
+        tmp_path / "publish-missing-commit-sha.db",
+        publish=True,
+    )
+    _store_source_event(
+        store,
+        api_url="https://api.github.com/repos/silviahealth/content/pulls/7",
+    )
+    discord = _Discord()
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=discord,
+        workspace=WORKSPACE,
+    )
+
+    receipts = (
+        ("git status --porcelain", ""),
+        ("git remote get-url origin", "https://github.com/silviahealth/content.git"),
+        ("git rev-parse --abbrev-ref HEAD", HEAD_REF),
+        ("git rev-parse HEAD", "head-1"),
+        ("python -m pytest tests/unit -q", "1 passed"),
+        ("git add -- plugins/mention_inbox/approval.py", ""),
+        ("git commit -m 'fix: address review'", "[feature abc1234] fix"),
+        (f"git push origin HEAD:{HEAD_REF}", "updated"),
+    )
+    for command, output in receipts:
+        args = {"command": command, "workdir": WORKSPACE}
+        observer.authorize_tool_start(execution.execution_id, "terminal", args)
+        observer.tool_completed(
+            execution.execution_id,
+            "terminal",
+            {"exit_code": 0, "output": output},
+            args=args,
+        )
+
+    outcome = await observer.run_completed(
+        execution.execution_id,
+        {"completed": True, "final_response": "commit SHA 확인 없이 완료"},
+    )
+
+    assert outcome == "blocked"
+    assert store.get_execution(execution.execution_id).status == "blocked"
+    assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.BLOCKED
+    assert "verification_missing" in discord.sent[-1][1]
 
 
 class _RecoveryDispatcher:
@@ -662,7 +956,7 @@ async def test_recovery_revalidates_and_readmits_queued_execution(
     tmp_path: Path,
 ) -> None:
     store, _, execution = _seed_queued(tmp_path / "recover.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-1"))
+    resolver = _Resolver(_state())
     dispatcher = _RecoveryDispatcher()
     discord = _Discord()
     handler = _handler(store, resolver, dispatcher, discord)
@@ -683,7 +977,7 @@ async def test_recovery_marks_stale_head_for_reapproval_without_dispatch(
     tmp_path: Path,
 ) -> None:
     store, _, execution = _seed_queued(tmp_path / "recover-stale.db")
-    resolver = _Resolver(ResolvedSourceState(SOURCE_REVISION, "new-head"))
+    resolver = _Resolver(_state("new-head"))
     dispatcher = _RecoveryDispatcher()
     discord = _Discord()
     handler = _handler(store, resolver, dispatcher, discord)
@@ -721,12 +1015,15 @@ async def test_recovery_promotes_reserved_receipt_before_readmission(
         approval_message_id="approval-message-1",
         thread_id="thread-1",
         mode="direct",
+        head_ref=HEAD_REF,
+        head_repository=HEAD_REPOSITORY,
+        workspace=WORKSPACE,
     )
     dispatcher = _RecoveryDispatcher()
     discord = _Discord()
     handler = _handler(
         store,
-        _Resolver(ResolvedSourceState(SOURCE_REVISION, "head-1")),
+        _Resolver(_state()),
         dispatcher,
         discord,
     )

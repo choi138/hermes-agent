@@ -3040,9 +3040,14 @@ def _compose_mention_inbox_execution_callbacks(
                 logger.debug("mention-inbox voice callback failed", exc_info=True)
 
     def on_complete(call_id: str, tool_name: str, args: Any, result: Any) -> None:
-        del call_id, args
+        del call_id
         try:
-            observer.tool_completed(execution_id, tool_name, result)
+            observer.tool_completed(
+                execution_id,
+                tool_name,
+                result,
+                args=args,
+            )
         except Exception:
             logger.exception("mention-inbox tool-complete receipt failed")
 

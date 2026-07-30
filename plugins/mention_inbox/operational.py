@@ -21,6 +21,8 @@ from plugins.mention_inbox.approval import (
     ExecutionLifecycleObserver,
     GatewayExecutionDispatcher,
     GitHubSubjectStateResolver,
+    normalize_execution_workspace,
+    resolve_execution_workspace,
 )
 from plugins.mention_inbox.github_client import GitHubNotificationsClient
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
@@ -52,6 +54,8 @@ class MentionInboxConfig:
     thread_auto_archive_minutes: int = 1440
     execution_enabled: bool = False
     execution_mode: str = "direct"
+    execution_workspace: str | None = None
+    terminal_cwd: str | None = None
 
 
 class DiscordDeliveryTransport(Protocol):
@@ -126,10 +130,27 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
     execution_mode = action_sessions.get("execution_mode", "direct")
     if execution_mode not in {"direct", "kanban"}:
         raise ValueError("mention_inbox action-session execution_mode is invalid")
+    workspace_value = action_sessions.get("workspace")
+    execution_workspace = (
+        None
+        if workspace_value is None
+        else normalize_execution_workspace(workspace_value)
+    )
     if action_sessions_enabled and (bot_mention is None or not approver_ids):
         raise ValueError("enabled action sessions require bot mention and approvers")
     if execution_enabled and not action_sessions_enabled:
         raise ValueError("execution cannot be enabled while action sessions are disabled")
+    terminal_cwd: str | None = None
+    if execution_enabled:
+        if execution_workspace is None:
+            raise ValueError("enabled execution requires an action-session workspace")
+        terminal = config.get("terminal", {})
+        if not isinstance(terminal, Mapping):
+            raise ValueError("terminal must be an object for mention-inbox execution")
+        terminal_cwd_value = terminal.get("cwd")
+        resolve_execution_workspace(terminal_cwd_value, execution_workspace)
+        assert isinstance(terminal_cwd_value, str)
+        terminal_cwd = terminal_cwd_value
     return MentionInboxConfig(
         enabled=enabled,
         credential_env=credential_env,
@@ -145,6 +166,8 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         thread_auto_archive_minutes=archive_minutes,
         execution_enabled=execution_enabled,
         execution_mode=execution_mode,
+        execution_workspace=execution_workspace,
+        terminal_cwd=terminal_cwd,
     )
 
 
@@ -665,9 +688,14 @@ class MentionInboxGatewayService:
 
                 approval_handler = None
                 if self.config.execution_enabled:
+                    workspace = resolve_execution_workspace(
+                        self.config.terminal_cwd,
+                        self.config.execution_workspace,
+                    )
                     execution_observer = ExecutionLifecycleObserver(
                         store=store,
                         discord=discord_transport,
+                        workspace=workspace,
                     )
                     self._discord_adapter.set_mention_inbox_execution_observer(
                         execution_observer
@@ -686,6 +714,7 @@ class MentionInboxGatewayService:
                         authorized_approver_ids=frozenset(
                             self.config.authorized_approver_ids
                         ),
+                        workspace=workspace,
                     )
                 thread_coordinator = MentionInboxThreadCoordinator(
                     store=store,
@@ -707,6 +736,8 @@ class MentionInboxGatewayService:
                 )
                 self._discord_adapter.set_mention_inbox_router(router)
                 self._router_installed = True
+                if approval_handler is not None:
+                    await thread_coordinator.reconcile_execution_activation()
                 if approval_handler is not None:
                     await approval_handler.recover_queued()
             delivery = DiscordMentionDelivery(

@@ -13,12 +13,14 @@ from plugins.mention_inbox.preflight import (
     brief_from_metadata,
 )
 from plugins.mention_inbox.proposals import (
+    ProposalStatus,
     WorkProposal,
     build_work_proposal,
     revise_work_proposal,
 )
 from plugins.mention_inbox.store import MentionInboxStore, WorkItemSession
 from plugins.mention_inbox.voice import (
+    render_execution_enabled_reproposal,
     render_needs_reapproval,
     render_proposal,
     render_thread_opened,
@@ -77,6 +79,14 @@ _DISPOSITION_TEXT = {
     PreApprovalDisposition.INFORMATIONAL: "현재 상태에서는 정보성 알림으로 확인됐어요.",
     PreApprovalDisposition.INSUFFICIENT_EVIDENCE: "상세를 안전하게 확인하지 못했어요.",
 }
+_OWN_PR_ACTION_KINDS = frozenset(
+    {
+        "own_pr_comment",
+        "own_pr_review_comment",
+        "own_pr_review_summary",
+        "own_pr_changes_requested",
+    }
+)
 
 
 def _bound_brief(event: MentionEvent, *, source_revision: str | None) -> PreApprovalBrief | None:
@@ -167,17 +177,39 @@ def _proposal_content(
     if not steps:
         steps.append(f"확인된 요청: {_bounded(brief.summary, 400)}")
     steps.append("승인된 범위 안에서만 수정하고 대상 테스트로 검증한다.")
+    allowed_actions = [
+        "read_repository",
+        "edit_scoped_files",
+        "run_targeted_tests",
+    ]
+    verification = [
+        "대상 테스트 통과",
+        "변경 diff와 확인된 요청 대조",
+        "완료 전 실제 실행 근거 확인",
+    ]
+    actionable_kind = metadata.get("actionable_kind") or event.untrusted.action_detail
+    if actionable_kind in _OWN_PR_ACTION_KINDS and _head_sha(event) is not None:
+        allowed_actions.extend(
+            (
+                "switch_to_pr_branch",
+                "commit_changes",
+                "push_current_branch",
+            )
+        )
+        verification.extend(
+            (
+                "현재 PR branch와 승인 HEAD 일치",
+                "선택 파일 commit SHA 확인",
+                "현재 PR branch non-force push 성공",
+            )
+        )
     return {
         "goal": (
             f"{repository}의 ‘{title}’에서 {explanation} "
             f"확인한 내용: {brief.summary}"
         ),
         "steps": tuple(steps),
-        "allowed_actions": (
-            "read_repository",
-            "edit_scoped_files",
-            "run_targeted_tests",
-        ),
+        "allowed_actions": tuple(allowed_actions),
         "forbidden_actions": (
             "merge",
             "deploy",
@@ -185,11 +217,7 @@ def _proposal_content(
             "read_secrets",
             "change_live_configuration",
         ),
-        "verification": (
-            "대상 테스트 통과",
-            "변경 diff와 확인된 요청 대조",
-            "완료 전 실제 실행 근거 확인",
-        ),
+        "verification": tuple(verification),
         "executor_hint": "direct",
     }
 
@@ -239,8 +267,12 @@ class MentionInboxThreadCoordinator:
         return True, None
 
     def _proposal_for(
-        self, event: MentionEvent, *, source_revision: str
-    ) -> tuple[WorkProposal, WorkProposal | None]:
+        self,
+        event: MentionEvent,
+        *,
+        source_revision: str,
+        approval_offered: bool,
+    ) -> tuple[WorkProposal, WorkProposal | None, bool]:
         subject = _subject_key(event)
         head_sha = _head_sha(event)
         latest = self._store.get_latest_proposal(subject)
@@ -255,13 +287,31 @@ class MentionInboxThreadCoordinator:
                 head_sha=head_sha,
                 **content,
             )
-            return proposal, None
+            return proposal, None, False
         if (
             latest.source_dedupe_key == event.dedupe_key
             and latest.source_revision == source_revision
             and latest.head_sha == head_sha
         ):
-            return latest, latest
+            binding = self._store.get_proposal_message_binding(
+                latest.proposal_id, latest.revision
+            )
+            capability_upgrade = bool(
+                approval_offered
+                and latest.status is ProposalStatus.PENDING
+                and binding is not None
+                and not binding.approval_offered
+            )
+            if not capability_upgrade:
+                return latest, latest, False
+            proposal = revise_work_proposal(
+                latest,
+                source_dedupe_key=event.dedupe_key,
+                source_revision=source_revision,
+                head_sha=head_sha,
+                **content,
+            )
+            return proposal, latest, True
         proposal = revise_work_proposal(
             latest,
             source_dedupe_key=event.dedupe_key,
@@ -269,7 +319,7 @@ class MentionInboxThreadCoordinator:
             head_sha=head_sha,
             **content,
         )
-        return proposal, latest
+        return proposal, latest, False
 
     async def ensure_thread(
         self,
@@ -306,11 +356,13 @@ class MentionInboxThreadCoordinator:
                 )
             self._discord.mark_thread_participation(thread_id)
 
-            proposal, previous = self._proposal_for(
-                event, source_revision=source_revision
-            )
             approval_offered, unavailable_reason = self._approval_offer(
                 event, source_revision=source_revision
+            )
+            proposal, previous, capability_upgrade = self._proposal_for(
+                event,
+                source_revision=source_revision,
+                approval_offered=approval_offered,
             )
             self._store.create_proposal(proposal)
             message_id = self._store.get_proposal_message_id(
@@ -320,6 +372,8 @@ class MentionInboxThreadCoordinator:
                 parts: list[str] = []
                 if proposal.revision == 1:
                     parts.append(render_thread_opened(event))
+                elif capability_upgrade and previous is not None:
+                    parts.append(render_execution_enabled_reproposal(previous))
                 elif previous is not None:
                     parts.append(render_needs_reapproval(previous))
                 parts.append(
@@ -347,3 +401,41 @@ class MentionInboxThreadCoordinator:
             if restored is None:
                 raise RuntimeError("work item session disappeared")
             return restored
+
+    async def reconcile_execution_activation(self, *, limit: int = 100) -> int:
+        if not self._approval_available:
+            return 0
+        reconciled = 0
+        for session in self._store.list_active_work_item_sessions(limit=limit):
+            if (
+                session.parent_message_id is None
+                or session.discord_thread_id is None
+            ):
+                continue
+            stored = self._store.get(session.source_dedupe_key)
+            if stored is None or _subject_key(stored.event) != session.subject_key:
+                continue
+            before = self._store.get_latest_proposal(session.subject_key)
+            if before is None:
+                continue
+            try:
+                await self.ensure_thread(
+                    stored.event,
+                    parent_message_id=session.parent_message_id,
+                    source_revision=stored.source_revision,
+                )
+            except Exception:
+                continue
+            after = self._store.get_latest_proposal(session.subject_key)
+            if (
+                after is not None
+                and after.revision == before.revision + 1
+                and after.source_revision == before.source_revision
+                and after.head_sha == before.head_sha
+            ):
+                binding = self._store.get_proposal_message_binding(
+                    after.proposal_id, after.revision
+                )
+                if binding is not None and binding.approval_offered:
+                    reconciled += 1
+        return reconciled

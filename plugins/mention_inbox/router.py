@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from plugins.mention_inbox.conversation import (
@@ -41,6 +42,28 @@ _APPROVAL_LIKE_COMMANDS = frozenset(
         "승인할게요",
         "승인합니다",
     }
+)
+_EXECUTION_REQUEST_PATTERNS = (
+    re.compile(
+        r"^(?:이\s*작업|그\s*작업|해당\s*작업|이\s*건|그\s*건|"
+        r"이거|그거|이것|그것|작업)"
+        r"(?:은|는|을|를)?\s*"
+        r"(?:(?:네가|너가|니가|헤르메스가|hermes가)\s*)?"
+        r"(?:직접\s*|알아서\s*)?"
+        r"(?:수행|처리|진행|해결|수정)"
+        r"(?:해|해줘|해주세요|해\s*주세요|해라)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:네가|너가|니가|헤르메스가|hermes가)\s*"
+        r"(?:이\s*작업|그\s*작업|해당\s*작업|이\s*건|그\s*건|"
+        r"이거|그거|이것|그것)"
+        r"(?:은|는|을|를)?\s*"
+        r"(?:직접\s*|알아서\s*)?"
+        r"(?:수행|처리|진행|해결|수정)"
+        r"(?:해|해줘|해주세요|해\s*주세요|해라)$",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -115,6 +138,13 @@ class InboxProposalRouter:
         if not feedback.startswith(prefix):
             return None
         return feedback[len(prefix) :].strip()
+
+    def _is_execution_request(self, feedback: str) -> bool:
+        command = feedback
+        if command.startswith(self._bot_mention):
+            command = command[len(self._bot_mention) :].strip()
+        command = command.rstrip(" \t.!")
+        return any(pattern.fullmatch(command) for pattern in _EXECUTION_REQUEST_PATTERNS)
 
     async def _post_notice(
         self, message: InboxDiscordMessage, content: str
@@ -254,6 +284,58 @@ class InboxProposalRouter:
             content=render_approval_reply_required(self._bot_mention),
         )
 
+    async def _route_execution_request(
+        self,
+        message: InboxDiscordMessage,
+        latest: WorkProposal,
+        binding: ProposalMessageBinding | None,
+    ) -> InboxRouteResult:
+        if message.user_id not in self._authorized_approver_ids:
+            return await self._notice_result(
+                message,
+                kind="approval_unauthorized",
+                proposal=latest,
+                content=render_approval_unauthorized(),
+            )
+        if binding is None:
+            return await self._notice_result(
+                message,
+                kind="approval_reference_mismatch",
+                proposal=latest,
+                content=render_approval_reference_mismatch(self._bot_mention),
+            )
+        if (
+            message.reply_to_message_id is not None
+            and message.reply_to_message_id != binding.message_id
+        ):
+            return await self._notice_result(
+                message,
+                kind="approval_reference_mismatch",
+                proposal=latest,
+                content=render_approval_reference_mismatch(self._bot_mention),
+            )
+        if not binding.approval_offered:
+            return await self._notice_result(
+                message,
+                kind="approval_not_offered",
+                proposal=latest,
+                content=render_approval_not_offered(),
+            )
+        handler = self._approval_handler
+        if handler is None:
+            return await self._notice_result(
+                message,
+                kind="approval_not_enabled",
+                proposal=latest,
+                content=render_approval_not_enabled(),
+            )
+        canonical = replace(
+            message,
+            text=f"{self._bot_mention} 승인",
+            reply_to_message_id=binding.message_id,
+        )
+        return await handler.approve(canonical, latest)
+
     async def _route_revision(
         self,
         message: InboxDiscordMessage,
@@ -388,6 +470,9 @@ class InboxProposalRouter:
 
         if self._is_approval_like(feedback):
             return await self._route_approval_like(message, latest, binding)
+
+        if self._is_execution_request(feedback):
+            return await self._route_execution_request(message, latest, binding)
 
         return await self._route_conversation(
             message, latest, binding, feedback

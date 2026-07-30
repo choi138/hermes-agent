@@ -364,10 +364,42 @@ def render_kanban_queued(proposal: WorkProposal) -> str:
     )
 
 
-def render_blocked(proposal: WorkProposal) -> str:
-    return (
+_BLOCKED_REASONS = {
+    "no_tool_activity": "실제 도구 실행 기록이 없어 완료로 인정하지 않았습니다.",
+    "verification_missing": "필수 검증·commit·push 근거가 모두 확인되지 않았습니다.",
+    "agent_failed": "실행 agent가 정상 완료 상태를 반환하지 않았습니다.",
+    "kanban_receipt_missing": "durable Kanban 등록 근거를 확인하지 못했습니다.",
+    "dispatch_failed": "승인된 실행 session을 시작하지 못했습니다.",
+    "recovery_dispatch_failed": "재시작 후 실행 session 복구에 실패했습니다.",
+    "execution_scope_changed": "저장된 workspace 또는 PR branch 범위가 달라졌습니다.",
+}
+
+
+def render_blocked(
+    proposal: WorkProposal, *, category: str | None = None
+) -> str:
+    message = (
         "승인 기록은 보존했지만 작업을 시작하지 못했어요. "
         "범위를 넓히거나 자동으로 다시 시도하지 않고, 이 thread에서 상태를 확인하겠습니다."
+    )
+    if category is None:
+        return message
+    reason = _BLOCKED_REASONS.get(
+        category,
+        "안전하게 완료를 입증할 실행 근거가 부족했습니다.",
+    )
+    safe_category = (
+        category
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", category)
+        else "execution_blocked"
+    )
+    return f"{message}\n원인: {reason}\n원인 코드: `{safe_category}`"
+
+
+def render_execution_enabled_reproposal(proposal: WorkProposal) -> str:
+    return (
+        "실행 기능이 활성화되어, 같은 원본과 PR HEAD에 결속된 새 실행 가능 제안을 "
+        "올립니다. 이전 읽기 전용 제안은 승인 대상으로 사용하지 않습니다."
     )
 
 

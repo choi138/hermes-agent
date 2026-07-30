@@ -164,6 +164,19 @@ def test_proposal_content_uses_concrete_preflight_for_review_and_assignment() ->
     assert "현재 HEAD에서 확인이 필요한 리뷰 요청" in str(assignment["goal"])
 
 
+def test_only_own_pr_proposal_can_commit_and_push_current_branch() -> None:
+    own_pr = _proposal_content(_event(kind="own_pr_review_comment"))
+    requested_review = _proposal_content(_event(kind="review_requested"))
+
+    assert {
+        "switch_to_pr_branch",
+        "commit_changes",
+        "push_current_branch",
+    }.issubset(set(own_pr["allowed_actions"]))
+    assert "현재 PR branch non-force push 성공" in own_pr["verification"]
+    assert "push_current_branch" not in requested_review["allowed_actions"]
+
+
 @pytest.mark.asyncio
 async def test_thread_bootstrap_happens_before_delivery_is_marked_sent(
     tmp_path: Path,

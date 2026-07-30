@@ -291,9 +291,11 @@ $HERMES_HOME/mention_inbox/inbox.db
 
 The store enables WAL, a bounded busy timeout, and owner-only `0600` file mode
 where the platform supports POSIX permissions. The dedupe key is the event
-primary key. Store schema version 6 binds each Discord proposal message to an
-immutable `approval_offered` boolean; migration of older rows defaults this
-value to false.
+primary key. Store schema version 7 binds each Discord proposal message to an
+immutable `approval_offered` boolean and each approved execution to its verified
+PR head repository, head branch, and absolute workspace root. Migration of
+older proposal rows defaults `approval_offered` to false; an older execution
+without the new scope fields cannot be resumed under a newly configured scope.
 
 - First observation inserts revision 1 in `pending` state.
 - Same content updates source revision and `last_seen` without duplicating the
@@ -332,6 +334,9 @@ The gateway lifecycle starts one runtime per served profile and cancels it befor
 Discord adapter teardown. Configuration is fail-closed and disabled by default:
 
 ```yaml
+terminal:
+  cwd: /Users/choegeun-won
+
 mention_inbox:
   enabled: false
   credential_env: GITHUB_PAT_TOKEN
@@ -345,9 +350,17 @@ mention_inbox:
     authorized_approver_ids: []
     bot_mention: null
     execution_mode: direct
+    workspace: Documents/hermes-workspaces/silviahealth-content
   retention_days: 30
   lease_seconds: 60
 ```
+
+When `execution_enabled=true`, both `terminal.cwd` and
+`action_sessions.workspace` are required. `workspace` must be a safe relative
+POSIX path. The runtime resolves it under `terminal.cwd` and durably binds the
+resulting absolute root to each approval. Use a dedicated, clean clone for this
+path; do not point it at the gateway checkout or a directory with unrelated
+changes.
 
 Only the launcher resolves `GITHUB_PAT_TOKEN`; status and logs expose category
 labels, never credential or source payload values. Missing credentials and an
@@ -391,11 +404,23 @@ messages contain no approval CTA and are stored with `approval_offered=false`.
 Even when execution is enabled, stale, informational, or insufficient evidence
 cannot offer approval.
 
-Approval is accepted only when all of these conditions hold:
+There are two deterministic ways for an authorized user to request execution:
+
+- reply to the latest proposal with exactly `<@bot_id> 승인`; or
+- in the registered work thread, use a recognized imperative such as
+  `<@bot_id> 이 작업 네가 수행해` or `이거 수정해줘`.
+
+The natural-language form is a small code-owned grammar, not an LLM decision.
+When it is not a reply, it binds only to the latest durably stored proposal that
+actually offered approval. A question such as `이거 수정해주냐?`, ordinary
+conversation, and unrecognized wording remain in the read-only conversation
+path.
+
+Execution is accepted only when all of these conditions hold:
 
 1. the author is an authorized approver;
-2. the text is exactly `<@bot_id> 승인` after trusted bot-mention normalization;
-3. the Discord message is a reply to the latest proposal message;
+2. the text matches one of the deterministic forms above;
+3. an explicit reply, when present, references the latest proposal message;
 4. that exact message was durably stored with `approval_offered=true`; and
 5. the execution handler is currently available.
 
@@ -411,10 +436,13 @@ path. Ordinary conversation always leaves proposal, approval, and execution
 state unchanged. To change a proposal, an authorized user must use the explicit
 command `<@bot_id> 제안 수정: 바꿀 내용`.
 
-Historical proposals are not retroactively enabled by a configuration toggle.
-Rows migrated from older schemas remain `approval_offered=false`; after fresh
-source hydration, the old pending revision moves to `needs_reapproval` and a new
-message is posted from the current revision, HEAD, and preapproval brief.
+Historical proposal messages are never mutated into executable approvals.
+When execution is activated, startup reconciliation examines active work
+sessions. If the latest pending proposal still matches the stored source
+revision and PR HEAD but its message had `approval_offered=false`, the old
+revision moves to `needs_reapproval` and one new approval-capable revision is
+posted. Repeated startup is idempotent. A source or HEAD change still requires
+fresh hydration and a newly bound proposal.
 
 Action sessions and execution remain separate, disabled-by-default gates. Code
 deployment with `execution_enabled=false` and execution activation are separate
@@ -422,8 +450,28 @@ rollout stages. Activation requires its own operational approval and canary; it
 must not make historical messages executable.
 
 After a valid approval, the runtime revalidates the current GitHub source
-revision and PR HEAD before queueing. Direct execution runs in an isolated
-gateway session with only scoped file tools and approved foreground verification
-commands; Kanban intake exposes only the single `kanban_task` surface. Neither
-path may infer merge, deployment, deletion, secret access, or any GitHub
-mutation from untrusted source content.
+revision, PR HEAD SHA, head repository, and head branch before queueing. Direct
+execution runs in an isolated gateway session with only scoped file and terminal
+tools. File paths must be absolute, remain under the approved workspace after
+symlink resolution, and use only the approved read/write actions. Terminal
+calls require an explicit workspace-contained `workdir`; background and
+interactive PTY calls, shell composition, and unapproved programs are blocked.
+
+Only actionable notifications on the authenticated user's own PR add
+`switch_to_pr_branch`, `commit_changes`, and `push_current_branch`. The allowed
+Git flow is deliberately narrow:
+
+1. prove a clean workspace, base `origin`, current branch, and approved HEAD;
+2. fetch and switch only to the verified PR head branch;
+3. edit within the workspace and run approved targeted tests;
+4. stage explicit paths with `git add -- <file>...`;
+5. create one normal `git commit -m <message>`;
+6. verify the new commit with `git rev-parse HEAD`; and
+7. push only `HEAD` to the verified head branch without force.
+
+Completion requires successful receipts for the applicable branch, HEAD,
+verification, commit-SHA, and push steps. The Discord completion message uses a
+forced-redacted bounded agent summary and reports the verified commit SHA and
+receipt categories. Force push, merge, rebase, deployment, deletion, secret
+access, live configuration changes, and pushing another branch remain outside
+this approval. Kanban intake exposes only the single `kanban_task` surface.

@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
@@ -30,7 +31,7 @@ from plugins.mention_inbox.proposals import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1531851208858275860"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,9 @@ class WorkExecution:
     approval_message_id: str
     thread_id: str
     mode: str
+    head_ref: str | None
+    head_repository: str | None
+    workspace: str | None
     status: str
     dispatch_id: str | None
     evidence_json: str | None
@@ -163,6 +167,46 @@ def _require_stable_text(value: str, name: str, *, limit: int = 500) -> str:
     ):
         raise ValueError(f"{name} must be a bounded non-empty trimmed string")
     return value
+
+
+def _require_git_ref(value: str | None) -> str | None:
+    if value is None:
+        return None
+    ref = _require_stable_text(value, "head_ref", limit=240)
+    if (
+        ref.startswith(("-", ".", "/"))
+        or ref.endswith(("/", ".", ".lock"))
+        or ".." in ref
+        or "//" in ref
+        or "@{" in ref
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", ref) is None
+    ):
+        raise ValueError("head_ref must be a safe Git branch ref")
+    return ref
+
+
+def _require_repository(value: str | None) -> str | None:
+    if value is None:
+        return None
+    repository = _require_stable_text(value, "head_repository", limit=200)
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
+        raise ValueError("head_repository must be an owner/repository name")
+    return repository
+
+
+def _require_workspace(value: str) -> str:
+    workspace = _require_stable_text(value, "workspace", limit=1000)
+    if "\\" in workspace or any(ord(char) < 32 for char in workspace):
+        raise ValueError("workspace must be a canonical absolute POSIX path")
+    parsed = PurePosixPath(workspace)
+    if (
+        not parsed.is_absolute()
+        or parsed.as_posix() != workspace
+        or any(part in {"", ".", ".."} for part in parsed.parts[1:])
+        or workspace == "/"
+    ):
+        raise ValueError("workspace must be a canonical absolute POSIX path")
+    return workspace
 
 
 def _utc_now() -> datetime:
@@ -268,6 +312,11 @@ def _work_execution(row: sqlite3.Row) -> WorkExecution:
         approval_message_id=str(row["approval_message_id"]),
         thread_id=str(row["thread_id"]),
         mode=str(row["mode"]),
+        head_ref=(None if row["head_ref"] is None else str(row["head_ref"])),
+        head_repository=(
+            None if row["head_repository"] is None else str(row["head_repository"])
+        ),
+        workspace=(None if row["workspace"] is None else str(row["workspace"])),
         status=str(row["status"]),
         dispatch_id=(None if row["dispatch_id"] is None else str(row["dispatch_id"])),
         evidence_json=(
@@ -537,6 +586,9 @@ class MentionInboxStore:
                     approval_message_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
                     mode TEXT NOT NULL,
+                    head_ref TEXT,
+                    head_repository TEXT,
+                    workspace TEXT,
                     status TEXT NOT NULL,
                     dispatch_id TEXT,
                     evidence_json TEXT,
@@ -545,6 +597,15 @@ class MentionInboxStore:
                     UNIQUE (proposal_id, proposal_revision)
                 )
             """)
+            execution_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(work_executions)")
+            }
+            for column in ("head_ref", "head_repository", "workspace"):
+                if column not in execution_columns:
+                    connection.execute(
+                        f"ALTER TABLE work_executions ADD COLUMN {column} TEXT"
+                    )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         finally:
@@ -825,6 +886,26 @@ class MentionInboxStore:
             if row is None or str(row["state"]) in _CLOSED_SESSION_STATES:
                 return None
             return _work_item_session(row)
+        finally:
+            connection.close()
+
+    def list_active_work_item_sessions(
+        self, *, limit: int = 100
+    ) -> tuple[WorkItemSession, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_item_sessions
+                WHERE state NOT IN ('completed', 'rejected', 'expired')
+                ORDER BY updated_at, subject_key
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return tuple(_work_item_session(row) for row in rows)
         finally:
             connection.close()
 
@@ -1362,6 +1443,9 @@ class MentionInboxStore:
         approval_message_id: str,
         thread_id: str,
         mode: str,
+        head_ref: str | None,
+        head_repository: str | None,
+        workspace: str,
     ) -> WorkExecution:
         proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
         expected_hash = _require_stable_text(proposal_hash, "proposal_hash", limit=64)
@@ -1370,6 +1454,9 @@ class MentionInboxStore:
         )
         thread = _require_stable_text(thread_id, "thread_id", limit=80)
         route = _require_stable_text(mode, "mode", limit=32)
+        branch = _require_git_ref(head_ref)
+        repository = _require_repository(head_repository)
+        workspace_root = _require_workspace(workspace)
         if route != route.casefold() or not route.replace("_", "").replace("-", "").isalnum():
             raise ValueError("mode must be a lowercase identifier")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
@@ -1391,6 +1478,9 @@ class MentionInboxStore:
                         or execution.approval_message_id != approval_message
                         or execution.thread_id != thread
                         or execution.mode != route
+                        or execution.head_ref != branch
+                        or execution.head_repository != repository
+                        or execution.workspace != workspace_root
                     ):
                         raise ValueError("execution receipt conflicts with existing scope")
                     return execution
@@ -1407,6 +1497,11 @@ class MentionInboxStore:
                     raise ValueError("execution mode must match the approved proposal")
                 if proposal.content_hash != expected_hash:
                     raise ValueError("proposal hash changed before execution reservation")
+                if proposal.head_sha is None:
+                    if branch is not None or repository is not None:
+                        raise ValueError("non-PR execution cannot carry a head branch")
+                elif branch is None or repository is None:
+                    raise ValueError("PR execution requires a verified head branch")
                 approval = connection.execute(
                     """
                     SELECT proposal_hash FROM work_approvals
@@ -1427,9 +1522,12 @@ class MentionInboxStore:
                     """
                     INSERT INTO work_executions (
                         execution_id, proposal_id, proposal_revision, proposal_hash,
-                        approval_message_id, thread_id, mode, status, dispatch_id,
+                        approval_message_id, thread_id, mode, head_ref,
+                        head_repository, workspace, status, dispatch_id,
                         evidence_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, ?)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, ?
+                    )
                     """,
                     (
                         execution_id,
@@ -1439,6 +1537,9 @@ class MentionInboxStore:
                         approval_message,
                         thread,
                         route,
+                        branch,
+                        repository,
+                        workspace_root,
                         now,
                         now,
                     ),
@@ -1727,6 +1828,8 @@ class MentionInboxStore:
         tool_name: str,
         success: bool,
         exit_code: int | None,
+        action: str | None = None,
+        detail: str | None = None,
     ) -> WorkExecution:
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
         tool = _require_stable_text(tool_name, "tool_name", limit=100)
@@ -1734,6 +1837,20 @@ class MentionInboxStore:
             raise ValueError("tool_name contains unsupported characters")
         if not isinstance(success, bool):
             raise ValueError("success must be boolean")
+        normalized_action = None
+        if action is not None:
+            normalized_action = _require_stable_text(action, "action", limit=100)
+            if not all(
+                char.isalnum() or char in "_.:-" for char in normalized_action
+            ):
+                raise ValueError("action contains unsupported characters")
+        normalized_detail = None
+        if detail is not None:
+            normalized_detail = _require_stable_text(detail, "detail", limit=100)
+            if not all(
+                char.isalnum() or char in "._:/-" for char in normalized_detail
+            ):
+                raise ValueError("detail contains unsupported characters")
         if exit_code is not None and (
             isinstance(exit_code, bool) or not isinstance(exit_code, int)
         ):
@@ -1755,9 +1872,16 @@ class MentionInboxStore:
                 completions = evidence["tool_completions"]
                 assert isinstance(completions, list)
                 if len(completions) < 100:
-                    completions.append(
-                        {"tool": tool, "success": success, "exit_code": exit_code}
-                    )
+                    receipt: dict[str, object] = {
+                        "tool": tool,
+                        "success": success,
+                        "exit_code": exit_code,
+                    }
+                    if normalized_action is not None:
+                        receipt["action"] = normalized_action
+                    if normalized_detail is not None:
+                        receipt["detail"] = normalized_detail
+                    completions.append(receipt)
                 evidence_json = json.dumps(
                     evidence, separators=(",", ":"), sort_keys=True
                 )

@@ -197,6 +197,44 @@ async def test_execution_unavailable_renders_review_only_and_binds_false(
 
 
 @pytest.mark.asyncio
+async def test_execution_activation_reconciles_same_head_to_one_new_revision(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "activation.db"
+    event = _event()
+    store = MentionInboxStore(path, clock=lambda: NOW)
+    store.upsert(event, source_revision="2026-07-29T10:01:00Z")
+    discord = _Discord()
+    await _coordinator(path, discord, approval_available=False).ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    coordinator = _coordinator(path, discord, approval_available=True)
+    assert await coordinator.reconcile_execution_activation() == 1
+    assert await coordinator.reconcile_execution_activation() == 0
+
+    restored = MentionInboxStore(path)
+    latest = restored.get_latest_proposal(event.thread.thread_id)
+    assert latest is not None and latest.revision == 2
+    previous = restored.get_proposal(latest.proposal_id, 1)
+    assert previous is not None
+    assert previous.status is ProposalStatus.NEEDS_REAPPROVAL
+    assert {
+        "switch_to_pr_branch",
+        "commit_changes",
+        "push_current_branch",
+    }.issubset(latest.allowed_actions)
+    binding = restored.get_proposal_message_binding(
+        latest.proposal_id, latest.revision
+    )
+    assert binding is not None and binding.approval_offered is True
+    assert len(discord.messages["thread-1"]) == 2
+    assert "실행 기능이 활성화" in discord.messages["thread-1"][-1][1]
+
+
+@pytest.mark.asyncio
 async def test_non_approvable_preflight_stays_review_only_when_execution_exists(
     tmp_path: Path,
 ) -> None:

@@ -594,6 +594,102 @@ async def test_exact_authorized_reply_routes_to_handler(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    (
+        "이 작업 너가 수행해",
+        "이 작업 네가 수행해줘",
+        "네가 이 작업 직접 처리해 주세요",
+        "이거 알아서 수정해줘",
+        f"{BOT_MENTION} 해당 작업 진행해주세요",
+    ),
+)
+async def test_authorized_natural_execution_request_binds_latest_proposal(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    store, proposal = _seed(tmp_path / f"{abs(hash(text))}.db")
+    discord = _Discord()
+    handler = _Handler()
+    responder = _Responder()
+    message = _message(text)
+
+    result = await _router(
+        store,
+        discord,
+        handler=handler,
+        responder=responder,
+    ).handle_message(message)
+
+    canonical = InboxDiscordMessage(
+        thread_id=message.thread_id,
+        message_id=message.message_id,
+        user_id=message.user_id,
+        text=f"{BOT_MENTION} 승인",
+        reply_to_message_id="proposal-message-1",
+    )
+    assert result.kind == "approval_queued"
+    assert handler.calls == [(canonical, proposal)]
+    assert responder.calls == []
+    assert discord.messages == []
+
+
+@pytest.mark.asyncio
+async def test_natural_execution_request_rejects_stale_explicit_reply(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "stale-natural.db")
+    discord = _Discord()
+    handler = _Handler()
+
+    result = await _router(store, discord, handler=handler).handle_message(
+        _message("이 작업 네가 수행해줘", reply_to="older-proposal-message")
+    )
+
+    assert result.kind == "approval_reference_mismatch"
+    assert handler.calls == []
+    assert "최신 제안 메시지와 일치하지 않아요" in discord.messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_natural_execution_question_stays_conversational(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "natural-question.db")
+    discord = _Discord()
+    handler = _Handler()
+    responder = _Responder("수행 전에는 변경 범위와 검증 계획만 설명해요.")
+
+    result = await _router(
+        store,
+        discord,
+        handler=handler,
+        responder=responder,
+    ).handle_message(_message("이 작업 네가 수행하면 어떤 변경을 하게 돼?"))
+
+    assert result.kind == "conversation_response"
+    assert handler.calls == []
+    assert len(responder.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_natural_execution_request_is_rejected(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "unauthorized-natural.db")
+    discord = _Discord()
+    handler = _Handler()
+
+    result = await _router(store, discord, handler=handler).handle_message(
+        _message("이 작업 네가 수행해줘", user_id=OTHER_USER)
+    )
+
+    assert result.kind == "approval_unauthorized"
+    assert handler.calls == []
+    assert "승인할 권한이 없어요" in discord.messages[-1][1]
+
+
+@pytest.mark.asyncio
 async def test_unregistered_thread_is_not_intercepted(tmp_path: Path) -> None:
     store, _ = _seed(tmp_path / "inbox.db")
     router = _router(store, _Discord())

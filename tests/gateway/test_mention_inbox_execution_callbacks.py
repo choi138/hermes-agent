@@ -69,8 +69,10 @@ def test_execution_callbacks_preserve_voice_and_forward_sanitized_receipts() -> 
         def tool_started(self, execution_id, tool_name):
             calls.append(("observer-start", execution_id, tool_name))
 
-        def tool_completed(self, execution_id, tool_name, result):
-            calls.append(("observer-complete", execution_id, tool_name, result))
+        def tool_completed(self, execution_id, tool_name, result, *, args):
+            calls.append(
+                ("observer-complete", execution_id, tool_name, args, result)
+            )
 
     def voice(call_id, tool_name, args):
         calls.append(("voice", call_id, tool_name, args))
@@ -88,7 +90,13 @@ def test_execution_callbacks_preserve_voice_and_forward_sanitized_receipts() -> 
 
     assert calls == [
         ("voice", "call-1", "terminal", {"command": "pytest"}),
-        ("observer-complete", execution_id, "terminal", result),
+        (
+            "observer-complete",
+            execution_id,
+            "terminal",
+            {"command": "pytest"},
+            result,
+        ),
     ]
 
 

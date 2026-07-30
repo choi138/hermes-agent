@@ -21,6 +21,7 @@ from plugins.mention_inbox.operational import (
     parse_mention_inbox_config,
     render_discord_event,
 )
+from plugins.mention_inbox.store import SCHEMA_VERSION
 
 NOW = datetime(2026, 7, 29, 9, 0, tzinfo=timezone.utc)
 DESTINATION = "discord:1531851208858275860"
@@ -80,6 +81,46 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     ):
         with pytest.raises(ValueError):
             parse_mention_inbox_config({"mention_inbox": invalid})
+
+
+def test_execution_config_requires_scoped_workspace_and_terminal_cwd() -> None:
+    raw = {
+        "terminal": {"cwd": "/Users/test"},
+        "mention_inbox": {
+            "action_sessions": {
+                "enabled": True,
+                "bot_mention": "<@1525050677381279865>",
+                "authorized_approver_ids": ["396159160201658368"],
+                "execution_enabled": True,
+                "workspace": "Documents/hermes-workspaces/silviahealth-content",
+            }
+        },
+    }
+
+    parsed = parse_mention_inbox_config(raw)
+
+    assert (
+        parsed.execution_workspace
+        == "Documents/hermes-workspaces/silviahealth-content"
+    )
+    assert parsed.terminal_cwd == "/Users/test"
+
+    for workspace in (None, "../content", "/Users/test/content", "content//repo"):
+        invalid = {
+            **raw,
+            "mention_inbox": {
+                "action_sessions": {
+                    **raw["mention_inbox"]["action_sessions"],
+                    "workspace": workspace,
+                }
+            },
+        }
+        with pytest.raises(ValueError):
+            parse_mention_inbox_config(invalid)
+
+    without_cwd = {**raw, "terminal": {}}
+    with pytest.raises(ValueError):
+        parse_mention_inbox_config(without_cwd)
 
 
 def test_renderer_bounds_untrusted_text_escapes_mentions_and_has_marker() -> None:
@@ -490,7 +531,7 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
 
     connection = sqlite3.connect(db)
     connection.row_factory = sqlite3.Row
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(delivery_outbox)")}
     assert "event_json" in columns
     assert "source_revision" in columns
@@ -529,7 +570,10 @@ def test_future_schema_version_fails_closed_without_mutation(tmp_path: Path) -> 
     connection.commit()
     connection.close()
 
-    with pytest.raises(RuntimeError, match="newer than supported schema version 6"):
+    with pytest.raises(
+        RuntimeError,
+        match=rf"newer than supported schema version {SCHEMA_VERSION}",
+    ):
         MentionInboxStore(db, clock=lambda: NOW)
 
     connection = sqlite3.connect(db)
@@ -630,7 +674,7 @@ def test_migration_supersedes_unreconstructible_older_revision(tmp_path: Path) -
     }
     assert rows[1]["status"] == "pending"
     assert rows[1]["event_json"] == event_to_json(revision_two)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     connection.close()
     assert store.get_cursor("github.notifications") == "cursor-2"
     assert store.pending_delivery_count() == 1
@@ -716,6 +760,8 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
         authorized_approver_ids=("396159160201658368",),
         execution_enabled=execution_enabled,
         execution_mode="kanban",
+        execution_workspace="Documents/hermes-workspaces/silviahealth-content",
+        terminal_cwd="/Users/test",
     )
     service = MentionInboxGatewayService(
         config,
