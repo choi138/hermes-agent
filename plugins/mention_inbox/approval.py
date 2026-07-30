@@ -503,6 +503,9 @@ class ExecutionLifecycleObserver:
             or any(part in {"", ".", ".."} for part in parsed.parts[1:])
         ):
             raise ValueError(f"{name} is outside the approved workspace")
+        relative_parts = parsed.relative_to(root).parts
+        if any(part.casefold() == ".git" for part in relative_parts):
+            raise ValueError(f"{name} cannot access Git metadata")
         try:
             resolved = Path(value).resolve(strict=False)
             resolved_root = Path(self._workspace).resolve(strict=False)
@@ -510,6 +513,9 @@ class ExecutionLifecycleObserver:
             raise ValueError(f"{name} is outside the approved workspace") from exc
         if resolved != resolved_root and resolved_root not in resolved.parents:
             raise ValueError(f"{name} is outside the approved workspace")
+        resolved_relative = resolved.relative_to(resolved_root)
+        if any(part.casefold() == ".git" for part in resolved_relative.parts):
+            raise ValueError(f"{name} cannot access Git metadata")
         return value
 
     def _base_repository(self, proposal: WorkProposal) -> str:
@@ -554,6 +560,8 @@ class ExecutionLifecycleObserver:
             parsed = PurePosixPath(candidate)
             if candidate.startswith(("/", "~")) or ".." in parsed.parts:
                 raise ValueError("terminal argument is outside the approved workspace")
+            if any(part.casefold() == ".git" for part in parsed.parts):
+                raise ValueError("terminal argument cannot access Git metadata")
             try:
                 resolved = (Path(workdir) / candidate).resolve(strict=False)
             except (OSError, RuntimeError) as exc:

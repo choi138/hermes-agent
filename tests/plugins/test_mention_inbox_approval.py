@@ -694,6 +694,12 @@ async def test_direct_pretool_policy_blocks_forbidden_commands_and_paths(
             "write_file",
             {"path": f"{WORKSPACE}/safe.py", "cross_profile": True},
         )
+    with pytest.raises(ValueError, match="Git metadata"):
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "write_file",
+            {"path": f"{WORKSPACE}/.Git/hooks/pre-commit"},
+        )
     with pytest.raises(ValueError, match="background"):
         observer.authorize_tool_start(
             execution.execution_id,
@@ -718,6 +724,15 @@ async def test_direct_pretool_policy_blocks_forbidden_commands_and_paths(
             "terminal",
             {
                 "command": "python -m pytest tests/unit -q; echo $GITHUB_PAT_TOKEN",
+                "workdir": WORKSPACE,
+            },
+        )
+    with pytest.raises(ValueError, match="Git metadata"):
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "terminal",
+            {
+                "command": "python -m pytest .git/hooks/test_hook.py -q",
                 "workdir": WORKSPACE,
             },
         )
