@@ -226,6 +226,7 @@ async def test_approved_execution_is_admitted_as_internal_thread_event() -> None
 class _ProposalTransport:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
+        self.reply_to_message_ids: list[str | None] = []
 
     async def find_message_content(
         self, thread_id: str, content: str, *, limit: int
@@ -235,9 +236,16 @@ class _ProposalTransport:
                 return message_id
         return None
 
-    async def send_to_thread(self, thread_id: str, content: str) -> str:
+    async def send_to_thread(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        reply_to_message_id: str | None = None,
+    ) -> str:
         message_id = f"notice-{len(self.messages) + 1}"
         self.messages.append((message_id, content))
+        self.reply_to_message_ids.append(reply_to_message_id)
         return message_id
 
 
@@ -346,3 +354,43 @@ async def test_adapter_wrong_reference_is_visible_without_revision(tmp_path) -> 
     assert handler.calls == []
     assert store.get_latest_proposal(proposal.subject_key).revision == 1
     assert "최신 제안 메시지와 일치하지 않아요" in transport.messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_adapter_distinct_questions_receive_distinct_replies(tmp_path) -> None:
+    adapter = _adapter(_Message(99))
+    adapter._client.user = SimpleNamespace(id=777)
+    transport = _ProposalTransport()
+    handler = _ApprovalHandler()
+    store, proposal, router = _real_router(tmp_path, transport, handler)
+    adapter.set_mention_inbox_router(router)
+    first = SimpleNamespace(
+        id=124,
+        author=SimpleNamespace(id=456),
+        reference=None,
+        channel=SimpleNamespace(),
+    )
+    second = SimpleNamespace(
+        id=125,
+        author=SimpleNamespace(id=456),
+        reference=None,
+        channel=SimpleNamespace(),
+    )
+
+    first_handled = await adapter._route_mention_inbox_message(
+        first,
+        thread_id="99",
+        raw_content="그 코멘트가 정확히 뭐야?",
+    )
+    second_handled = await adapter._route_mention_inbox_message(
+        second,
+        thread_id="99",
+        raw_content="그 코멘트가 정확히 뭐야?",
+    )
+
+    assert first_handled is second_handled is True
+    assert len(transport.messages) == 2
+    assert transport.messages[0][1] == transport.messages[1][1]
+    assert transport.reply_to_message_ids == ["124", "125"]
+    assert store.get_latest_proposal(proposal.subject_key).revision == 1
+    assert handler.calls == []

@@ -401,15 +401,25 @@ class GatewayDiscordTransport:
                 return str(message.id)
         return None
 
-    async def send_to_thread(self, thread_id: str, content: str) -> str:
+    async def send_to_thread(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        reply_to_message_id: str | None = None,
+    ) -> str:
+        metadata: dict[str, Any] = {
+            "thread_id": thread_id,
+            "nonconversational": True,
+            "mention_inbox_no_mentions": True,
+        }
+        if reply_to_message_id is not None:
+            metadata["notify"] = True
         result = await self._adapter.send(
             thread_id,
             content,
-            metadata={
-                "thread_id": thread_id,
-                "nonconversational": True,
-                "mention_inbox_no_mentions": True,
-            },
+            reply_to=reply_to_message_id,
+            metadata=metadata,
         )
         if not result.success or not result.message_id:
             raise RuntimeError("discord_thread_send_failed")

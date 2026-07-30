@@ -25,6 +25,7 @@ OTHER_USER = "123456789012345678"
 class _Discord:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
+        self.reply_to_message_ids: list[str | None] = []
 
     async def find_message_content(
         self, thread_id: str, content: str, *, limit: int
@@ -34,9 +35,16 @@ class _Discord:
                 return message_id
         return None
 
-    async def send_to_thread(self, thread_id: str, content: str) -> str:
+    async def send_to_thread(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        reply_to_message_id: str | None = None,
+    ) -> str:
         message_id = f"bot-{len(self.messages) + 1}"
         self.messages.append((message_id, content))
+        self.reply_to_message_ids.append(reply_to_message_id)
         return message_id
 
 
@@ -166,6 +174,29 @@ async def test_question_does_not_revise_proposal(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_distinct_messages_with_same_question_each_receive_reply(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "inbox.db")
+    discord = _Discord()
+    router = _router(store, discord)
+
+    first = await router.handle_message(
+        _message("그 코멘트가 정확히 뭐야?", message_id="user-message-1")
+    )
+    second = await router.handle_message(
+        _message("그 코멘트가 정확히 뭐야?", message_id="user-message-2")
+    )
+
+    assert first.response_message_id == "bot-1"
+    assert second.response_message_id == "bot-2"
+    assert len(discord.messages) == 2
+    assert discord.messages[0][1] == discord.messages[1][1]
+    assert discord.reply_to_message_ids == ["user-message-1", "user-message-2"]
+    assert store.get_latest_proposal(SUBJECT).revision == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "text",
     (
@@ -225,6 +256,41 @@ async def test_review_only_proposal_rejects_exact_reply_before_handler(
     assert result.kind == "approval_not_offered"
     assert store.get_latest_proposal(SUBJECT).revision == 1
     assert "검토용으로 게시돼 승인할 수 없어요" in discord.messages[-1][1]
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_distinct_review_only_approval_attempts_each_receive_notice(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "inbox.db", approval_offered=False)
+    discord = _Discord()
+    handler = _Handler()
+    router = _router(store, discord, handler=handler)
+
+    first = await router.handle_message(
+        _message(
+            f"{BOT_MENTION} 승인",
+            message_id="approval-message-1",
+            reply_to="proposal-message-1",
+        )
+    )
+    second = await router.handle_message(
+        _message(
+            f"{BOT_MENTION} 승인",
+            message_id="approval-message-2",
+            reply_to="proposal-message-1",
+        )
+    )
+
+    assert first.kind == second.kind == "approval_not_offered"
+    assert first.response_message_id == "bot-1"
+    assert second.response_message_id == "bot-2"
+    assert discord.reply_to_message_ids == [
+        "approval-message-1",
+        "approval-message-2",
+    ]
+    assert store.get_latest_proposal(SUBJECT).revision == 1
     assert handler.calls == []
 
 

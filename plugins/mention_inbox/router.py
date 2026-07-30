@@ -46,7 +46,13 @@ class ProposalReplyTransport(Protocol):
         self, thread_id: str, content: str, *, limit: int
     ) -> str | None: ...
 
-    async def send_to_thread(self, thread_id: str, content: str) -> str: ...
+    async def send_to_thread(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        reply_to_message_id: str | None = None,
+    ) -> str: ...
 
 
 def _feedback_text(value: str) -> str:
@@ -98,13 +104,16 @@ class InboxProposalRouter:
             return None
         return feedback[len(prefix) :].strip()
 
-    async def _post_notice(self, thread_id: str, content: str) -> str:
-        message_id = await self._discord.find_message_content(
-            thread_id, content, limit=100
+    async def _post_notice(
+        self, message: InboxDiscordMessage, content: str
+    ) -> str:
+        # Discord ingress deduplicates replayed message IDs. Content matching
+        # here would instead hide legitimate repeated requests from the user.
+        return await self._discord.send_to_thread(
+            message.thread_id,
+            content,
+            reply_to_message_id=message.message_id,
         )
-        if message_id is None:
-            message_id = await self._discord.send_to_thread(thread_id, content)
-        return message_id
 
     async def _notice_result(
         self,
@@ -114,7 +123,7 @@ class InboxProposalRouter:
         proposal: WorkProposal,
         content: str,
     ) -> InboxRouteResult:
-        response_message_id = await self._post_notice(message.thread_id, content)
+        response_message_id = await self._post_notice(message, content)
         return InboxRouteResult(True, kind, proposal, response_message_id)
 
     async def _post_proposal(

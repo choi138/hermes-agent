@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from plugins.mention_inbox.contract import event_to_json
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
 from plugins.mention_inbox.operational import (
     DiscordMentionDelivery,
+    GatewayDiscordTransport,
     MentionInboxConfig,
     MentionInboxGatewayService,
     MentionInboxRuntime,
@@ -177,6 +179,49 @@ async def test_uncertain_send_reconciles_marker_without_duplicate(tmp_path: Path
     assert await delivery.deliver_once() == "reconciled"
     assert discord.sends == []
     assert store.pending_delivery_count() == 0
+
+
+class _GatewayAdapter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None, dict[str, Any]]] = []
+
+    async def send(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        reply_to: str | None = None,
+        metadata: dict[str, Any],
+    ) -> SimpleNamespace:
+        self.calls.append((thread_id, content, reply_to, metadata))
+        return SimpleNamespace(success=True, message_id=f"message-{len(self.calls)}")
+
+
+@pytest.mark.asyncio
+async def test_gateway_transport_correlates_notice_to_inbound_message() -> None:
+    adapter = _GatewayAdapter()
+    transport = GatewayDiscordTransport(adapter)
+
+    message_id = await transport.send_to_thread(
+        "thread-1",
+        "notice",
+        reply_to_message_id="user-message-1",
+    )
+
+    assert message_id == "message-1"
+    assert adapter.calls == [
+        (
+            "thread-1",
+            "notice",
+            "user-message-1",
+            {
+                "thread_id": "thread-1",
+                "nonconversational": True,
+                "mention_inbox_no_mentions": True,
+                "notify": True,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
