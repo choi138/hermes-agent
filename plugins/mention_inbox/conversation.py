@@ -178,7 +178,6 @@ def build_conversation_context(
 def _context_payload(context: ConversationContext) -> dict[str, object]:
     return {
         "proposal": {
-            "id": context.proposal_id,
             "revision": context.proposal_revision,
             "status": context.proposal_status,
             "source_revision": context.source_revision,
@@ -313,7 +312,11 @@ class HostReadOnlyConversationResponder:
             "- 변경, 승인, 실행, 배포를 했다고 주장하지 마세요.\n"
             "- 근거가 부족하면 무엇이 부족한지 명확히 말하세요.\n"
             "- 사용자가 proposal 변경을 원해도 현재 proposal은 바뀌지 않았다고 알리고, "
-            f"필요할 때만 `{bot_mention} 제안 수정: 바꿀 내용` 형식을 안내하세요.\n"
+            f"현재 문장에서 변경을 명시적으로 요청한 경우에만 `{bot_mention} 제안 수정: "
+            "바꿀 내용` 형식을 안내하세요. 질문, 설명 요청, 불만, 재촉에는 이 형식을 "
+            "절대로 덧붙이지 마세요.\n"
+            "- 사용자가 '내 질문에 답해'처럼 이전 질문을 가리키면 대화 기록이 없다고 "
+            "변명하지 말고, 제공된 source summary와 findings의 핵심을 바로 설명하세요.\n"
             "- 한국어로 간결하지만 실질적으로 답하세요. 고정 안내문만 반복하지 마세요."
         )
         payload = {
