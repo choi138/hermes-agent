@@ -21081,6 +21081,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = False
         try:
+            if durable_claim_id:
+                try:
+                    from tools.async_delegation import (
+                        is_completion_delivery_claim_active,
+                    )
+
+                    if not is_completion_delivery_claim_active(
+                        durable_delegation_id,
+                        durable_claim_id,
+                    ):
+                        return None
+                except Exception as exc:
+                    logger.warning(
+                        "Could not revalidate durable async completion %s: %s",
+                        durable_delegation_id,
+                        exc,
+                    )
+                    return False
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
@@ -21944,6 +21962,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         current = state.persistent.run_generation if state is not None else 0
         return int(current) == int(generation)
 
+    async def _cancel_session_background_work(
+        self,
+        session_key: str,
+        *,
+        parent_session_id: str = "",
+        reason: str = "session_end",
+    ) -> int:
+        """Cancel detached delegations and stale restart recovery for a session.
+
+        ``delegate_task(background=true)`` is intentionally detached from the
+        foreground AIAgent, so ``running_agent.interrupt()`` cannot reach it.
+        Keep this as the single gateway cancellation funnel used by both the
+        active-run fast path and the idle /stop handler.
+        """
+        if not session_key:
+            return 0
+
+        cancelled = 0
+        try:
+            from tools.async_delegation import interrupt_for_session
+
+            cancelled = interrupt_for_session(
+                session_key=session_key,
+                parent_session_id=str(parent_session_id or ""),
+                reason=reason,
+            )
+        except Exception as exc:
+            # /stop must still release the foreground session even if the
+            # background registry or its durable DB is degraded.
+            logger.warning(
+                "Failed to cancel async delegations for %s (%s): %s",
+                session_key,
+                reason,
+                exc,
+            )
+
+        # An explicit /stop or /new is a terminal user decision, not a restart
+        # interruption. Leaving this marker set would synthesize an empty
+        # auto-resume event on the next gateway boot and restart work the user
+        # explicitly ended.
+        try:
+            await self.async_session_store.clear_resume_pending(session_key)
+        except Exception as exc:
+            logger.debug(
+                "Failed to clear resume_pending for stopped session %s: %s",
+                session_key,
+                exc,
+            )
+        return cancelled
+
     def _bind_adapter_run_generation(
         self,
         adapter: Any,
@@ -21968,12 +22036,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupt_reason: str,
         invalidation_reason: str,
         release_running_state: bool = True,
-    ) -> None:
+    ) -> int:
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
-            return
+            return 0
         _iac_state = self._peek_session_state(session_key)
         running_agent = _iac_state.turn.agent if _iac_state else None
+        parent_session_id = (
+            str(getattr(running_agent, "session_id", "") or "")
+            if running_agent is not _AGENT_PENDING_SENTINEL
+            else ""
+        )
+        cancelled_background = await self._cancel_session_background_work(
+            session_key,
+            parent_session_id=parent_session_id,
+            reason=invalidation_reason,
+        )
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
@@ -22013,6 +22091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # object keeps its interrupt flag so a hung drain still dies
             # when it unblocks.
             self._evict_cached_agent(session_key)
+        return cancelled_background
 
     async def _refresh_agent_cache_message_count(
         self, session_key: str, session_id: Optional[str]
