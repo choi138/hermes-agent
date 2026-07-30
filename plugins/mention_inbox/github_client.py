@@ -6,6 +6,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -284,6 +285,24 @@ def _bounded_limit(limit: int) -> int:
     return limit
 
 
+def _notification_since(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError("notification since must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _notification_id(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise ValueError("notification ID must be a positive decimal string")
+    return value
+
+
 class GitHubNotificationsClient:
     """A GET-only client for authenticated-user notification reads."""
 
@@ -314,9 +333,21 @@ class GitHubNotificationsClient:
         *,
         if_modified_since: str | None = None,
         page_url: str | None = None,
+        include_read: bool = False,
+        since: datetime | None = None,
     ) -> GitHubNotificationPage:
+        if not isinstance(include_read, bool):
+            raise ValueError("include_read must be a boolean")
+        if page_url is not None and (include_read or since is not None):
+            raise ValueError("notification filters cannot be combined with a page URL")
         if page_url is None:
-            query = urlencode({"participating": "true", "per_page": "50"})
+            parameters = {"participating": "true", "per_page": "50"}
+            if include_read:
+                parameters["all"] = "true"
+            normalized_since = _notification_since(since)
+            if normalized_since is not None:
+                parameters["since"] = normalized_since
+            query = urlencode(parameters)
             url = f"{GITHUB_API_BASE}/notifications?{query}"
         else:
             url = _require_notifications_url(page_url)
@@ -355,6 +386,18 @@ class GitHubNotificationsClient:
             last_modified=_header(response.headers, "Last-Modified"),
             poll_interval_seconds=_poll_interval(response.headers),
         )
+
+    def fetch_notification(self, notification_id: str) -> dict[str, Any] | None:
+        decoded = self._get_json(
+            f"{GITHUB_API_BASE}/notifications/threads/"
+            f"{quote(_notification_id(notification_id))}",
+            allow_not_found=True,
+        )
+        if decoded is None:
+            return None
+        if not isinstance(decoded, dict):
+            raise _protocol_error(200)
+        return decoded
 
     def _get_json(
         self,

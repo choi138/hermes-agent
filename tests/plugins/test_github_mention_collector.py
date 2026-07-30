@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +21,7 @@ from plugins.mention_inbox.github_client import (
     GITHUB_API_VERSION,
     GitHubClientError,
     GitHubHttpResponse,
+    GitHubNotificationPage,
     GitHubNotificationsClient,
 )
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
@@ -292,6 +293,35 @@ def test_client_treats_304_as_empty_unchanged_page() -> None:
     assert page.not_modified is True
 
 
+def test_client_bounds_read_notification_replay_with_all_and_since() -> None:
+    requests = []
+
+    def transport(request: Any, timeout: float) -> GitHubHttpResponse:
+        requests.append(request)
+        return GitHubHttpResponse(status=200, headers={}, body=b"[]")
+
+    client = GitHubNotificationsClient(token="test-token", transport=transport)
+    since = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+
+    page = client.list_notifications(include_read=True, since=since)
+
+    assert page.items == ()
+    parsed = urlparse(requests[0].full_url)
+    assert parse_qs(parsed.query) == {
+        "participating": ["true"],
+        "per_page": ["50"],
+        "all": ["true"],
+        "since": ["2026-07-29T12:00:00Z"],
+    }
+    with pytest.raises(ValueError, match="timezone-aware"):
+        client.list_notifications(since=datetime(2026, 7, 29, 12, 0))
+    with pytest.raises(ValueError, match="filters"):
+        client.list_notifications(
+            page_url="https://api.github.com/notifications?page=2",
+            include_read=True,
+        )
+
+
 def test_client_follows_only_github_notification_page_urls() -> None:
     requests = []
 
@@ -319,6 +349,30 @@ def test_client_follows_only_github_notification_page_urls() -> None:
             client.list_notifications(page_url=denied)
 
     assert len(requests) == 1
+
+
+def test_client_fetches_one_notification_thread_with_get_only() -> None:
+    requests = []
+    notification = _notification(notification_id="24842857013")
+
+    def transport(request: Any, timeout: float) -> GitHubHttpResponse:
+        requests.append(request)
+        return GitHubHttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(notification).encode(),
+        )
+
+    client = GitHubNotificationsClient(token="test-token", transport=transport)
+
+    assert client.fetch_notification("24842857013") == notification
+    assert requests[0].full_url == (
+        "https://api.github.com/notifications/threads/24842857013"
+    )
+    assert requests[0].get_method() == "GET"
+    assert requests[0].data is None
+    with pytest.raises(ValueError, match="notification ID"):
+        client.fetch_notification("../user")
 
 
 def test_client_fetches_only_issue_and_pull_request_subjects() -> None:
@@ -620,6 +674,143 @@ def test_poller_follows_pagination_and_uses_largest_poll_interval(
         "/notifications",
         "/repos/silviahealth/content/pulls/7",
     ]
+
+
+class _ReadReplayClient:
+    def __init__(self) -> None:
+        self.replay_since: list[datetime] = []
+        self.notification = _notification(
+            notification_id="24842857013",
+            reason="review_requested",
+            updated_at="2026-07-29T11:20:30Z",
+        )
+        self.notification["unread"] = False
+
+    def list_notifications(self, **kwargs: Any) -> GitHubNotificationPage:
+        if kwargs.get("include_read"):
+            self.replay_since.append(kwargs["since"])
+            return GitHubNotificationPage(
+                items=(self.notification,),
+                next_url=None,
+                last_modified=None,
+                poll_interval_seconds=60,
+            )
+        return GitHubNotificationPage(
+            items=(),
+            next_url=None,
+            last_modified=None,
+            poll_interval_seconds=60,
+            not_modified=True,
+        )
+
+    def fetch_subject(self, url: str) -> dict[str, Any]:
+        return _pull_request_detail()
+
+    def fetch_notification(self, notification_id: str) -> dict[str, Any] | None:
+        return self.notification if notification_id == "24842857013" else None
+
+
+class _TruncatedReadReplayClient(_ReadReplayClient):
+    def list_notifications(self, **kwargs: Any) -> GitHubNotificationPage:
+        page = super().list_notifications(**kwargs)
+        if kwargs.get("include_read"):
+            return GitHubNotificationPage(
+                items=page.items,
+                next_url=(
+                    "https://api.github.com/notifications"
+                    "?all=true&participating=true&per_page=50&page=2"
+                ),
+                last_modified=None,
+                poll_interval_seconds=60,
+            )
+        return page
+
+
+def test_poller_recovers_read_notification_once_with_bounded_replay(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+    client = _ReadReplayClient()
+    store = MentionInboxStore(tmp_path / "mention-inbox.db", clock=lambda: now)
+    poller = GitHubMentionPoller(
+        client=client,
+        collector=GitHubNotificationCollector(
+            target_id="U_kgDORecentWon",
+            allowed_repositories={"silviahealth/content"},
+        ),
+        store=store,
+        clock=lambda: now,
+        read_replay_lookback=timedelta(days=1),
+        max_replay_pages=2,
+    )
+
+    first = poller.poll_once()
+    second = poller.poll_once()
+
+    assert first.pages == 2
+    assert first.fetched == 1
+    assert first.selected == 1
+    assert first.created == 1
+    assert second.created == 0
+    assert store.count() == 1
+    assert store.pending_delivery_count() == 1
+    assert store.get_cursor("github.notifications.read-replay") == (
+        "2026-07-29T12:00:00Z"
+    )
+    assert client.replay_since == [
+        datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 29, 11, 55, tzinfo=timezone.utc),
+    ]
+
+
+def test_read_replay_page_cap_does_not_block_unread_polling(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+    client = _TruncatedReadReplayClient()
+    store = MentionInboxStore(tmp_path / "mention-inbox.db", clock=lambda: now)
+    poller = GitHubMentionPoller(
+        client=client,
+        collector=GitHubNotificationCollector(
+            target_id="U_kgDORecentWon",
+            allowed_repositories={"silviahealth/content"},
+        ),
+        store=store,
+        clock=lambda: now,
+        read_replay_lookback=timedelta(days=1),
+        max_replay_pages=1,
+    )
+
+    result = poller.poll_once()
+
+    assert result.status == "ok"
+    assert result.created == 1
+    assert store.get_cursor("github.notifications.read-replay") == (
+        "2026-07-29T12:00:00Z"
+    )
+
+
+def test_targeted_read_notification_replay_is_idempotent(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+    client = _ReadReplayClient()
+    store = MentionInboxStore(tmp_path / "mention-inbox.db", clock=lambda: now)
+    poller = GitHubMentionPoller(
+        client=client,
+        collector=GitHubNotificationCollector(
+            target_id="U_kgDORecentWon",
+            allowed_repositories={"silviahealth/content"},
+        ),
+        store=store,
+        clock=lambda: now,
+    )
+
+    first = poller.replay_notification("24842857013")
+    second = poller.replay_notification("24842857013")
+
+    assert first.created == 1
+    assert second.created == 0
+    assert store.count() == 1
+    assert store.pending_delivery_count() == 1
+    assert store.get_cursor("github.notifications") is None
+    assert store.get_cursor("github.notifications.read-replay") is None
 
 
 def test_poller_records_rate_limit_without_advancing_cursor(tmp_path: Path) -> None:

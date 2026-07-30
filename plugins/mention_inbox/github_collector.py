@@ -1,8 +1,8 @@
 """Normalize GitHub notification payloads into the shared mention contract."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 from plugins.mention_inbox.actionable import (
@@ -36,6 +36,20 @@ _ACTION_BY_KIND = {
 _MAX_TITLE_CHARS = 500
 _MAX_BODY_CHARS = 4000
 _MAX_URL_CHARS = 500
+_MAX_SEMANTIC_EVENTS_PER_NOTIFICATION = 20
+_SEMANTIC_EVENT_LOOKBACK = timedelta(minutes=10)
+_SEMANTIC_EVENT_TYPES = frozenset({
+    "issue_comment",
+    "comment",
+    "review",
+    "pull_request_review",
+    "review_comment",
+    "pull_request_review_comment",
+})
+_TIMELINE_EVENT_BY_REASON = {
+    "assign": "assigned",
+    "review_requested": "review_requested",
+}
 
 
 def _bounded(value: str, limit: int) -> str:
@@ -57,6 +71,91 @@ def _source_revision(value: Any) -> str:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("notification.updated_at must include a timezone offset")
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _event_type(event: Mapping[str, Any]) -> str:
+    value = event.get("event_type") or event.get("event")
+    return value.casefold() if isinstance(value, str) else ""
+
+
+def _event_timestamp(event: Mapping[str, Any]) -> datetime | None:
+    for key in ("updated_at", "submitted_at", "created_at"):
+        value = event.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            continue
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _event_identity(event: Mapping[str, Any]) -> str | None:
+    for key in ("node_id", "id"):
+        value = event.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _semantic_contexts(
+    notification: Mapping[str, Any],
+    context: GitHubHydrationContext,
+) -> tuple[GitHubHydrationContext, ...]:
+    expected_timeline_type = _TIMELINE_EVENT_BY_REASON.get(notification.get("reason"))
+    if expected_timeline_type is not None:
+        relevant = tuple(
+            event
+            for event in context.timeline
+            if isinstance(event, Mapping)
+            and _event_type(event) == expected_timeline_type
+        )
+        selected = (
+            max(
+                relevant,
+                key=lambda event: (
+                    _event_timestamp(event) or datetime.min.replace(tzinfo=timezone.utc),
+                    _event_identity(event) or "",
+                ),
+            )
+            if relevant
+            else (
+                context.latest_event
+                if isinstance(context.latest_event, Mapping)
+                and _event_type(context.latest_event) in _SEMANTIC_EVENT_TYPES
+                else None
+            )
+        )
+        return (replace(context, latest_event=selected),)
+
+    notification_revision = _source_revision(notification.get("updated_at"))
+    normalized = notification_revision[:-1] + "+00:00"
+    lower_bound = (
+        datetime.fromisoformat(normalized).astimezone(timezone.utc)
+        - _SEMANTIC_EVENT_LOOKBACK
+    )
+    raw_events = (
+        tuple(context.reviews)
+        + tuple(context.review_comments)
+        + ((context.latest_event,) if isinstance(context.latest_event, Mapping) else ())
+        + tuple(context.timeline)
+    )
+    unique: dict[str, tuple[datetime, Mapping[str, Any]]] = {}
+    for event in raw_events:
+        if not isinstance(event, Mapping) or _event_type(event) not in _SEMANTIC_EVENT_TYPES:
+            continue
+        timestamp = _event_timestamp(event)
+        identity = _event_identity(event)
+        if timestamp is None or timestamp < lower_bound or identity is None:
+            continue
+        unique.setdefault(identity, (timestamp, event))
+
+    ordered = sorted(unique.values(), key=lambda item: (item[0], _event_identity(item[1]) or ""))
+    bounded = ordered[-_MAX_SEMANTIC_EVENTS_PER_NOTIFICATION:]
+    return tuple(replace(context, latest_event=event) for _, event in bounded)
 
 
 @dataclass(frozen=True)
@@ -145,6 +244,49 @@ class GitHubNotificationCollector:
         if isinstance(subject_detail, GitHubHydrationContext):
             return self._normalize_actionable(notification, subject_detail)
         return self._normalize_legacy(notification, subject_detail)
+
+    def normalize_many(
+        self,
+        notification: Mapping[str, Any],
+        subject_detail: Mapping[str, Any] | GitHubHydrationContext | None,
+    ) -> tuple[GitHubCollectedEvent, ...]:
+        if not isinstance(subject_detail, GitHubHydrationContext):
+            collected = self.normalize(notification, subject_detail)
+            return () if collected is None else (collected,)
+
+        candidates: list[tuple[Mapping[str, Any] | None, GitHubCollectedEvent]] = []
+        for context in _semantic_contexts(notification, subject_detail):
+            collected = self.normalize(notification, context)
+            if collected is not None:
+                candidates.append((context.latest_event, collected))
+
+        represented_reviews = {
+            str(event.get("id"))
+            for event, collected in candidates
+            if isinstance(event, Mapping)
+            and _event_type(event) in {"review", "pull_request_review"}
+            and event.get("id") is not None
+            and collected.event.untrusted.metadata.get("actionable_kind")
+            in {
+                GitHubActionKind.OWN_PR_REVIEW_SUMMARY.value,
+                GitHubActionKind.OWN_PR_CHANGES_REQUESTED.value,
+            }
+        }
+        result: list[GitHubCollectedEvent] = []
+        seen_dedupe_keys: set[str] = set()
+        for event, collected in candidates:
+            if isinstance(event, Mapping) and _event_type(event) in {
+                "review_comment",
+                "pull_request_review_comment",
+            }:
+                review_id = event.get("pull_request_review_id")
+                if review_id is not None and str(review_id) in represented_reviews:
+                    continue
+            if collected.event.dedupe_key in seen_dedupe_keys:
+                continue
+            seen_dedupe_keys.add(collected.event.dedupe_key)
+            result.append(collected)
+        return tuple(result)
 
     def _normalize_actionable(
         self,

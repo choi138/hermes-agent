@@ -64,6 +64,8 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     assert disabled.destination == WORK_INBOX_DESTINATION
     assert disabled.team_mentions is False
     assert disabled.team_review_requests is False
+    assert disabled.read_replay_lookback_minutes == 1440
+    assert disabled.read_replay_max_pages == 2
     config = parse_mention_inbox_config({"mention_inbox": {
         "enabled": True,
         "credential_env": "GITHUB_PAT_TOKEN",
@@ -78,6 +80,8 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
         {"enabled": True, "repositories": ["other/repo"]},
         {"enabled": True, "destination": "discord:not-a-channel"},
         {"enabled": True, "retention_days": 0},
+        {"enabled": True, "read_replay_lookback_minutes": 10081},
+        {"enabled": True, "read_replay_max_pages": 11},
     ):
         with pytest.raises(ValueError):
             parse_mention_inbox_config({"mention_inbox": invalid})

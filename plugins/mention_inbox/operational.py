@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
@@ -46,6 +46,8 @@ class MentionInboxConfig:
     destination: str = DEFAULT_DESTINATION
     retention_days: int = 30
     lease_seconds: int = 60
+    read_replay_lookback_minutes: int = 1440
+    read_replay_max_pages: int = 2
     team_mentions: bool = False
     team_review_requests: bool = False
     action_sessions_enabled: bool = False
@@ -151,6 +153,20 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         resolve_execution_workspace(terminal_cwd_value, execution_workspace)
         assert isinstance(terminal_cwd_value, str)
         terminal_cwd = terminal_cwd_value
+    replay_lookback_minutes = _positive_int(
+        raw.get("read_replay_lookback_minutes"),
+        "read_replay_lookback_minutes",
+        1440,
+    )
+    replay_max_pages = _positive_int(
+        raw.get("read_replay_max_pages"),
+        "read_replay_max_pages",
+        2,
+    )
+    if replay_lookback_minutes > 10080:
+        raise ValueError("mention_inbox.read_replay_lookback_minutes exceeds 7 days")
+    if replay_max_pages > 10:
+        raise ValueError("mention_inbox.read_replay_max_pages exceeds 10 pages")
     return MentionInboxConfig(
         enabled=enabled,
         credential_env=credential_env,
@@ -158,6 +174,8 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         destination=destination,
         retention_days=_positive_int(raw.get("retention_days"), "retention_days", 30),
         lease_seconds=_positive_int(raw.get("lease_seconds"), "lease_seconds", 60),
+        read_replay_lookback_minutes=replay_lookback_minutes,
+        read_replay_max_pages=replay_max_pages,
         team_mentions=team_mentions,
         team_review_requests=team_review_requests,
         action_sessions_enabled=action_sessions_enabled,
@@ -455,6 +473,14 @@ class _LazyGitHubNotificationCollector:
     _TEAM_MENTION_RE = re.compile(
         r"(?<![A-Za-z0-9-])@([A-Za-z0-9-]+)/([A-Za-z0-9_-]+)(?![A-Za-z0-9_-])"
     )
+    _SEMANTIC_EVENT_TYPES = frozenset({
+        "issue_comment",
+        "comment",
+        "review",
+        "pull_request_review",
+        "review_comment",
+        "pull_request_review_comment",
+    })
 
     def __init__(
         self,
@@ -507,6 +533,17 @@ class _LazyGitHubNotificationCollector:
             if isinstance(value, str):
                 return value
         return ""
+
+    @staticmethod
+    def _event_type(event: Mapping[str, Any]) -> str:
+        value = event.get("event_type") or event.get("event")
+        return value.casefold() if isinstance(value, str) else ""
+
+    @classmethod
+    def _is_semantic(cls, event: Mapping[str, Any] | None) -> bool:
+        return isinstance(event, Mapping) and (
+            cls._event_type(event) in cls._SEMANTIC_EVENT_TYPES
+        )
 
     @classmethod
     def _latest(cls, events: tuple[Mapping[str, Any], ...]) -> Mapping[str, Any] | None:
@@ -578,20 +615,31 @@ class _LazyGitHubNotificationCollector:
             for event in ((latest_event,) + reviews + review_comments + timeline)
             if isinstance(event, Mapping)
         )
+        semantic_events = tuple(
+            event for event in all_events if self._is_semantic(event)
+        )
         if reason == "review_requested":
             relevant = tuple(
                 event
                 for event in timeline
                 if event.get("event_type") == "review_requested"
             )
-            selected_event = self._latest(relevant) or latest_event or self._latest(all_events)
+            selected_event = (
+                self._latest(relevant)
+                or (latest_event if self._is_semantic(latest_event) else None)
+                or self._latest(semantic_events)
+            )
         elif reason == "assign":
             relevant = tuple(
                 event for event in timeline if event.get("event_type") == "assigned"
             )
-            selected_event = self._latest(relevant) or latest_event or self._latest(all_events)
+            selected_event = (
+                self._latest(relevant)
+                or (latest_event if self._is_semantic(latest_event) else None)
+                or self._latest(semantic_events)
+            )
         else:
-            selected_event = self._latest(all_events)
+            selected_event = self._latest(semantic_events)
 
         teams: set[str] = set()
         if self._team_review_requests and reason == "review_requested":
@@ -629,6 +677,16 @@ class _LazyGitHubNotificationCollector:
         if not isinstance(detail, GitHubHydrationContext):
             return None
         return self._collector.normalize(notification, detail)
+
+    def normalize_many(
+        self,
+        notification: Mapping[str, Any],
+        detail: Mapping[str, Any] | GitHubHydrationContext | None,
+    ):
+        self._resolve()
+        if not isinstance(detail, GitHubHydrationContext):
+            return ()
+        return self._collector.normalize_many(notification, detail)
 
 
 class MentionInboxGatewayService:
@@ -671,7 +729,15 @@ class MentionInboxGatewayService:
                 team_mentions=self.config.team_mentions,
                 team_review_requests=self.config.team_review_requests,
             )
-            poller = GitHubMentionPoller(client=client, collector=collector, store=store)
+            poller = GitHubMentionPoller(
+                client=client,
+                collector=collector,
+                store=store,
+                read_replay_lookback=timedelta(
+                    minutes=self.config.read_replay_lookback_minutes
+                ),
+                max_replay_pages=self.config.read_replay_max_pages,
+            )
             discord_transport = GatewayDiscordTransport(self._discord_adapter)
             thread_coordinator = None
             if self.config.action_sessions_enabled:

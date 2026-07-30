@@ -304,6 +304,13 @@ without the new scope fields cannot be resumed under a newly configured scope.
   `pending` state, invalidating any prior approval.
 - Older source revisions cannot overwrite newer content or approval.
 - `Last-Modified` is persisted separately as the collector cursor.
+- Review summaries, inline review comments, and issue comments are selected
+  before administrative timeline events. Labels, commits, and cross-references
+  cannot hide a semantic event merely because they have a later timestamp.
+- Up to 20 semantic events in the bounded 10-minute notification activity
+  window are classified independently. An inline comment already represented
+  by an actionable review summary is folded into that review's preapproval
+  brief instead of creating a duplicate alert.
 
 GitHub title/body/URL fields are bounded before canonical persistence (500/4000/
 500 characters). Sent event payloads are pruned after the configured conservative
@@ -319,6 +326,10 @@ payload-free delivery audit ledger remains after event pruning.
 - The greatest observed `X-Poll-Interval` controls the next success delay;
   missing or invalid values default to 60 seconds.
 - Cursor commit happens only after all pages succeed.
+- A separate read-replay cursor queries recent participating notifications with
+  `all=true&since=...`. The default window is 1440 minutes with a five-minute
+  overlap and a two-page cap. Stable GitHub event IDs and the SQLite outbox make
+  repeated replay idempotent.
 - 401, forbidden 403, rate-limited 403, transport failure, 5xx, malformed JSON,
   and pagination-limit failures become bounded category-only status records.
 - Retryable failures use 60-second exponential backoff capped at 3600 seconds.
@@ -344,6 +355,8 @@ mention_inbox:
   destination: discord:1531851208858275860
   team_mentions: false
   team_review_requests: false
+  read_replay_lookback_minutes: 1440
+  read_replay_max_pages: 2
   action_sessions:
     enabled: false
     execution_enabled: false
@@ -354,6 +367,9 @@ mention_inbox:
   retention_days: 30
   lease_seconds: 60
 ```
+
+Read replay is limited to at most seven days and ten pages even when configured
+explicitly. It is GET-only and never changes GitHub notification read state.
 
 When `execution_enabled=true`, both `terminal.cwd` and
 `action_sessions.workspace` are required. `workspace` must be a safe relative

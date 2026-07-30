@@ -417,3 +417,192 @@ def test_runtime_prefers_typed_review_payload_over_tied_timeline_event(
     assert payload["untrusted"]["metadata"]["actionable_kind"] == (
         "own_pr_review_summary"
     )
+
+
+class _CodexReviewBehindLabelClient(_AIReviewClient):
+    def __init__(self) -> None:
+        super().__init__("review")
+
+    def _ai_event(self) -> dict[str, Any]:
+        event = super()._ai_event()
+        event.update(
+            {
+                "id": 4817597705,
+                "node_id": "PRR_codex_450",
+                "body": "### Codex Review\n검토 결과 한 가지 수정이 필요합니다.",
+                "html_url": (
+                    "https://github.com/silviahealth/content/pull/450"
+                    "#pullrequestreview-4817597705"
+                ),
+                "user": {
+                    "login": "chatgpt-codex-connector[bot]",
+                    "node_id": "B_codex",
+                    "type": "Bot",
+                },
+            }
+        )
+        return event
+
+    def fetch_pull_timeline(
+        self, url: str, *, repository: str, limit: int = 50
+    ) -> tuple[dict[str, Any], ...]:
+        self.calls.append("timeline")
+        return (
+            {
+                "id": 28713245231,
+                "node_id": "LE_codex_needs_work",
+                "event_type": "labeled",
+                "created_at": "2026-07-29T10:03:25Z",
+                "actor": {
+                    "login": "github-actions[bot]",
+                    "node_id": "B_actions",
+                    "type": "Bot",
+                },
+                "label": {"name": "codex: needs work"},
+            },
+        )
+
+    def fetch_pull_review_comments(
+        self, url: str, *, repository: str, limit: int = 50
+    ) -> tuple[dict[str, Any], ...]:
+        self.calls.append("review_comments")
+        return (
+            {
+                "id": 3681771634,
+                "node_id": "PRRC_codex_450",
+                "event_type": "review_comment",
+                "pull_request_review_id": 4817597705,
+                "body": "착지 애니메이션이 끝나기 전에 shared value를 덮어쓰지 마세요.",
+                "path": "packages/game/tower.view.tsx",
+                "line": 92,
+                "html_url": (
+                    "https://github.com/silviahealth/content/pull/450"
+                    "#discussion_r3681771634"
+                ),
+                "created_at": "2026-07-29T10:03:00Z",
+                "updated_at": "2026-07-29T10:03:00Z",
+                "user": {
+                    "login": "chatgpt-codex-connector[bot]",
+                    "node_id": "B_codex",
+                    "type": "Bot",
+                },
+            },
+        )
+
+
+def test_runtime_keeps_codex_review_when_later_label_event_exists(
+    tmp_path: Path,
+) -> None:
+    result, store = _poll(tmp_path, _CodexReviewBehindLabelClient())
+
+    assert result.created == 1
+    assert result.skipped == 1
+    connection = sqlite3.connect(store.path)
+    rows = connection.execute(
+        "SELECT source_event_id, event_json FROM mention_events"
+    ).fetchall()
+    connection.close()
+    assert len(rows) == 1
+    source_event_id, event_json = rows[0]
+    payload = json.loads(event_json)
+    assert source_event_id == "PRR_codex_450"
+    assert payload["untrusted"]["metadata"]["actionable_kind"] == (
+        "own_pr_review_summary"
+    )
+    assert payload["untrusted"]["metadata"]["preapproval_brief"]["findings"] == [
+        {
+            "source_event_id": "PRRC_codex_450",
+            "body": "착지 애니메이션이 끝나기 전에 shared value를 덮어쓰지 마세요.",
+            "source_url": (
+                "https://github.com/silviahealth/content/pull/450"
+                "#discussion_r3681771634"
+            ),
+            "path": "packages/game/tower.view.tsx",
+            "line": 92,
+            "review_id": "4817597705",
+            "commit_id": None,
+        }
+    ]
+
+
+class _TwoAIReviewsBehindLabelClient(_CodexReviewBehindLabelClient):
+    def fetch_pull_reviews(
+        self, url: str, *, repository: str, limit: int = 50
+    ) -> tuple[dict[str, Any], ...]:
+        self.calls.append("reviews")
+        codex = self._ai_event()
+        coderabbit = {
+            **codex,
+            "id": 4817596922,
+            "node_id": "PRR_coderabbit_450",
+            "body": "CodeRabbit review summary",
+            "submitted_at": "2026-07-29T10:02:50Z",
+            "created_at": "2026-07-29T10:02:50Z",
+            "updated_at": "2026-07-29T10:02:50Z",
+            "user": {
+                "login": "coderabbitai[bot]",
+                "node_id": "B_coderabbit",
+                "type": "Bot",
+            },
+        }
+        return coderabbit, codex
+
+
+def test_runtime_processes_each_independent_semantic_review_once(
+    tmp_path: Path,
+) -> None:
+    result, store = _poll(tmp_path, _TwoAIReviewsBehindLabelClient())
+
+    assert result.created == 2
+    connection = sqlite3.connect(store.path)
+    source_event_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT source_event_id FROM mention_events"
+        ).fetchall()
+    }
+    connection.close()
+    assert source_event_ids == {"PRR_coderabbit_450", "PRR_codex_450"}
+    assert store.pending_delivery_count() == 2
+
+
+class _LabelOnlyOwnedPullClient(_AIReviewClient):
+    def __init__(self) -> None:
+        super().__init__("review")
+
+    def fetch_pull_reviews(self, url: str, *, repository: str, limit: int = 50):
+        self.calls.append("reviews")
+        return ()
+
+    def fetch_latest_event(
+        self, url: str, *, repository: str
+    ) -> dict[str, Any] | None:
+        self.calls.append("latest")
+        return None
+
+    def fetch_pull_timeline(
+        self, url: str, *, repository: str, limit: int = 50
+    ) -> tuple[dict[str, Any], ...]:
+        self.calls.append("timeline")
+        return (
+            {
+                "id": 28713245231,
+                "node_id": "LE_label_only",
+                "event_type": "labeled",
+                "created_at": "2026-07-29T10:03:25Z",
+                "actor": {
+                    "login": "github-actions[bot]",
+                    "node_id": "B_actions",
+                    "type": "Bot",
+                },
+            },
+        )
+
+
+def test_runtime_does_not_emit_label_only_owned_pr_activity(tmp_path: Path) -> None:
+    result, store = _poll(tmp_path, _LabelOnlyOwnedPullClient())
+
+    assert result.created == 0
+    assert result.selected == 1
+    assert result.skipped == 2
+    assert store.count() == 0
