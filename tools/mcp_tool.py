@@ -1161,6 +1161,40 @@ def _enforce_mcp_cross_origin_redirect_boundary(
         )
 
 
+def _find_mcp_credential_redirect_error(
+    exc: BaseException, _seen: Optional[set] = None
+) -> Optional[McpCredentialRedirectError]:
+    """Locate a credential-redirect error inside nested exception groups.
+
+    The MCP SDK runs its transport inside an AnyIO task group, so an error
+    raised from an httpx response hook reaches the reconnect loop wrapped in a
+    (possibly nested) ``ExceptionGroup`` rather than as itself. A flat
+    ``isinstance`` check misses that shape and lets the blocked credential
+    redirect fall through to normal retry/backoff, which re-attempts it.
+    """
+    if _seen is None:
+        _seen = set()
+    if id(exc) in _seen:
+        return None
+    _seen.add(id(exc))
+    if isinstance(exc, McpCredentialRedirectError):
+        return exc
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        for child in nested:
+            if isinstance(child, BaseException):
+                found = _find_mcp_credential_redirect_error(child, _seen)
+                if found is not None:
+                    return found
+    for attr in ("__cause__", "__context__"):
+        nested_exc = getattr(exc, attr, None)
+        if isinstance(nested_exc, BaseException):
+            found = _find_mcp_credential_redirect_error(nested_exc, _seen)
+            if found is not None:
+                return found
+    return None
+
+
 def _format_connect_error(exc: BaseException) -> str:
     """Render nested MCP connection errors into an actionable short message."""
 
@@ -2733,13 +2767,13 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
-            requires_sse_factory = (
-                client_cert is not None
-                or ssl_verify is not True
-                or not follow_redirects
-                or bool(configured_header_names)
-                or _oauth_auth is not None
-            )
+            # Always install our SSE client factory. Even when configuration
+            # contains no credentials, the shared client can acquire ambient
+            # Authorization, Proxy-Authorization, or Cookie headers at runtime;
+            # without the response hook a later cross-origin redirect can carry
+            # them to another origin. The same factory also enforces TLS,
+            # redirect, configured-header, OAuth, and mTLS policy.
+            requires_sse_factory = True
             if requires_sse_factory and not _callable_accepts_keyword(
                 sse_client, "httpx_client_factory"
             ):
@@ -3142,9 +3176,10 @@ class MCPServerTask:
                 raise
             except Exception as exc:
                 self.session = None
-                if isinstance(exc, McpCredentialRedirectError):
-                    logger.warning("%s", exc)
-                    self._error = exc
+                redirect_error = _find_mcp_credential_redirect_error(exc)
+                if redirect_error is not None:
+                    logger.warning("%s", redirect_error)
+                    self._error = redirect_error
                     self._ready.set()
                     self._deregister_tools()
                     return

@@ -519,32 +519,84 @@ def patch_sse_client():
 
 
 class TestSSEClientCert:
-    def test_no_factory_when_defaults(self, patch_sse_client):
-        """With no cert and ssl_verify=True (default), the SDK's own factory is
-        used — we don't inject one."""
+    @pytest.mark.parametrize(
+        "credential_header,credential_value",
+        [
+            ("Authorization", "Bearer synthetic"),
+            ("Proxy-Authorization", "Basic synthetic"),
+            ("Cookie", "session=synthetic"),
+        ],
+    )
+    def test_default_factory_blocks_ambient_credentials_on_cross_origin_redirect(
+        self,
+        patch_sse_client,
+        credential_header,
+        credential_value,
+    ):
+        """Default SSE still needs a redirect guard for ambient credentials.
+
+        Even without configured headers, auth, mTLS, or custom TLS settings, a
+        shared SDK client can acquire Authorization, Proxy-Authorization, or a
+        Cookie at runtime. The client factory (and its hook) must therefore be
+        installed for the default redirect-following path too.
+        """
         from tools.mcp_tool import MCPServerTask
 
-        server = MCPServerTask("sse-test")
+        server = MCPServerTask("sse-default-ambient")
         server._auth_type = ""
         server._sampling = None
 
         async def drive():
-            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
-                              new=AsyncMock(return_value="shutdown")), \
-                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
-                try:
-                    await asyncio.wait_for(
-                        server._run_http({
-                            "url": "https://example.com/mcp/sse",
-                            "transport": "sse",
-                        }),
-                        timeout=2.0,
-                    )
-                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
-                    pass
+            with patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http(
+                    {
+                        "url": "https://origin.example/mcp/sse",
+                        "transport": "sse",
+                    }
+                )
 
         asyncio.run(drive())
-        assert "httpx_client_factory" not in patch_sse_client
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers={}, timeout=httpx.Timeout(30.0), auth=None)
+
+        hook = captured_client_kwargs["event_hooks"]["response"][0]
+        benign = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={"MCP-Protocol-Version": "2025-03-26"},
+            ),
+        )
+        asyncio.run(hook(benign))
+
+        credential_bearing = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={credential_header: credential_value},
+            ),
+        )
+        with pytest.raises(RuntimeError, match="cross-origin.*credential"):
+            asyncio.run(hook(credential_bearing))
 
     def test_factory_blocks_custom_headers_on_cross_origin_redirect(
         self, patch_sse_client
