@@ -5632,6 +5632,54 @@ class DiscordAdapter(BasePlatformAdapter):
             raise RuntimeError("Discord thread participation tracker is unavailable")
         tracker.mark(value)
 
+    async def handle_message(self, event: MessageEvent) -> bool:
+        """Replay queued Discord ingress through late-bound thread routers."""
+        source = getattr(event, "source", None)
+        is_startup_replay = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+        )
+        is_external_discord_thread = bool(
+            source is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and getattr(source, "chat_type", None) == "thread"
+            and not getattr(event, "internal", False)
+        )
+        if is_startup_replay and is_external_discord_thread:
+            thread_id = str(
+                getattr(source, "thread_id", None)
+                or getattr(source, "chat_id", "")
+                or ""
+            )
+            raw_message = getattr(event, "raw_message", None)
+            metadata = getattr(event, "metadata", {})
+            original_content = (
+                metadata.get("discord_original_content")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(original_content, str):
+                original_content = str(
+                    getattr(raw_message, "content", None)
+                    or getattr(event, "text", "")
+                    or ""
+                )
+            if (
+                thread_id
+                and raw_message is not None
+                and await self._route_mention_inbox_message(
+                    raw_message,
+                    thread_id=thread_id,
+                    raw_content=original_content,
+                )
+            ):
+                return True
+
+        # Internal approved-execution events and ordinary Discord events stay
+        # on the shared adapter rail. Returning True records successful
+        # admission for enqueue_mention_inbox_execution().
+        await super().handle_message(event)
+        return True
+
     def set_mention_inbox_router(self, router: Any | None) -> None:
         """Install or clear the dedicated registered-work-thread router."""
         self._mention_inbox_router = router
@@ -7781,7 +7829,13 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
-            metadata={"gateway_ingress_monotonic": gateway_ingress_monotonic},
+            metadata={
+                "gateway_ingress_monotonic": gateway_ingress_monotonic,
+                # Discord ingress strips the bot mention from message.content
+                # before normalization. Startup replay needs the untouched
+                # form so exact mention-inbox control syntax remains exact.
+                "discord_original_content": raw_content,
+            },
         )
 
         # Track thread participation so the bot won't require @mention for

@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 from types import SimpleNamespace
 
-from gateway.platforms.base import Platform
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    Platform,
+)
+from gateway.session import SessionSource
 from plugins.mention_inbox.proposals import build_work_proposal
 from plugins.mention_inbox.router import InboxProposalRouter, InboxRouteResult
 from plugins.mention_inbox.store import MentionInboxStore
@@ -175,6 +181,99 @@ async def test_unregistered_thread_reply_falls_through() -> None:
         )
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_startup_replayed_event_reenters_registered_thread_router(
+    monkeypatch,
+) -> None:
+    """Normalized startup replay must not fall through to the general agent."""
+
+    adapter = _adapter(_Message(99))
+    adapter._client.user = SimpleNamespace(id=777)
+    router = _Router()
+    adapter.set_mention_inbox_router(router)
+    raw = SimpleNamespace(
+        id=123,
+        content="승인",
+        author=SimpleNamespace(id=456),
+        reference=SimpleNamespace(message_id=321),
+        channel=SimpleNamespace(),
+    )
+    event = MessageEvent(
+        text="승인",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="99",
+            chat_type="thread",
+            thread_id="99",
+            user_id="456",
+            message_id="123",
+        ),
+        raw_message=raw,
+        message_id="123",
+        reply_to_message_id="321",
+        metadata={"discord_original_content": "<@!777> 승인"},
+    )
+    setattr(event, "_hermes_startup_restore_replay", True)
+    general_agent_events: list[MessageEvent] = []
+
+    async def fake_base_handle(self, replayed: MessageEvent) -> None:
+        general_agent_events.append(replayed)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_base_handle)
+
+    await adapter.handle_message(event)
+
+    assert general_agent_events == []
+    assert len(router.messages) == 1
+    envelope = router.messages[0]
+    assert envelope.text == "<@777> 승인"
+    assert envelope.reply_to_message_id == "321"
+
+
+@pytest.mark.asyncio
+async def test_startup_replayed_internal_event_stays_on_general_adapter_rail(
+    monkeypatch,
+) -> None:
+    """Approved execution must never be reinterpreted as user thread control."""
+
+    adapter = _adapter(_Message(99))
+    router = _Router()
+    adapter.set_mention_inbox_router(router)
+    event = MessageEvent(
+        text="approved execution envelope",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="99",
+            chat_type="thread",
+            thread_id="99",
+            user_id="456",
+            message_id="123",
+        ),
+        raw_message=SimpleNamespace(
+            id=123,
+            author=SimpleNamespace(id=456),
+            reference=None,
+            channel=SimpleNamespace(),
+        ),
+        internal=True,
+        metadata={"discord_original_content": "<@777> 승인"},
+    )
+    setattr(event, "_hermes_startup_restore_replay", True)
+    general_agent_events: list[MessageEvent] = []
+
+    async def fake_base_handle(self, replayed: MessageEvent) -> None:
+        general_agent_events.append(replayed)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_base_handle)
+
+    await adapter.handle_message(event)
+
+    assert general_agent_events == [event]
+    assert router.messages == []
 
 
 @pytest.mark.asyncio

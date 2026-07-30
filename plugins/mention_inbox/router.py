@@ -347,7 +347,12 @@ class InboxProposalRouter:
         kind = "conversation_response"
         if not content:
             kind = "conversation_fallback"
-            content = render_conversation_fallback(latest, self._bot_mention)
+            content = render_conversation_fallback(
+                latest,
+                self._bot_mention,
+                brief_summary=context.brief_summary,
+                findings=context.findings,
+            )
         return await self._notice_result(
             message,
             kind=kind,

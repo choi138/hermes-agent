@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from plugins.mention_inbox import ingest_event
 from plugins.mention_inbox.proposals import ProposalStatus, build_work_proposal
 from plugins.mention_inbox.router import (
     InboxDiscordMessage,
@@ -83,16 +84,24 @@ class _Responder:
 
 
 def _seed(
-    path: Path, *, approval_offered: bool = True
+    path: Path,
+    *,
+    approval_offered: bool = True,
+    with_preapproval_evidence: bool = False,
 ) -> tuple[MentionInboxStore, object]:
     store = MentionInboxStore(path, clock=lambda: NOW)
+    source_dedupe_key = "github:RC_123:U_recent"
+    if with_preapproval_evidence:
+        event = _preapproval_event()
+        source_dedupe_key = event.dedupe_key
+        store.upsert(event, source_revision="2026-07-29T10:01:00Z")
     store.reserve_work_item_session(
-        SUBJECT, "github:RC_123:U_recent", "2026-07-29T10:01:00Z"
+        SUBJECT, source_dedupe_key, "2026-07-29T10:01:00Z"
     )
     store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
     proposal = build_work_proposal(
         revision=1,
-        source_dedupe_key="github:RC_123:U_recent",
+        source_dedupe_key=source_dedupe_key,
         source_revision="2026-07-29T10:01:00Z",
         subject_key=SUBJECT,
         head_sha="head-1",
@@ -156,6 +165,60 @@ def _mutation_counts(store: MentionInboxStore) -> tuple[int, int]:
         return int(approvals[0]), int(executions[0])
     finally:
         connection.close()
+
+
+def _preapproval_event():
+    return ingest_event(
+        {
+            "schema_version": "1",
+            "source": {"platform": "github", "event_id": "RC_123"},
+            "actor": {"actor_id": "U_reviewer", "kind": "user"},
+            "target": {"target_id": "U_recent", "kind": "user"},
+            "thread": {
+                "thread_id": SUBJECT,
+                "container_id": "R_repo",
+            },
+            "requested_action": "reply",
+            "deadline": None,
+            "untrusted": {
+                "title": "Mention inbox fallback",
+                "body": "fallback 답변을 고쳐 주세요.",
+                "action_detail": "own_pr_review_comment",
+                "source_url": (
+                    "https://github.com/silviahealth/content/pull/7"
+                    "#discussion_r123"
+                ),
+                "metadata": {
+                    "repository": "silviahealth/content",
+                    "preapproval_brief": {
+                        "schema_version": 1,
+                        "disposition": "action_required",
+                        "summary": "질문에 실제 리뷰 근거로 답해야 해요.",
+                        "findings": [
+                            {
+                                "source_event_id": "RC_123",
+                                "body": (
+                                    "실제 코멘트는 fallback이 질문에 답하지 "
+                                    "못한다는 점입니다."
+                                ),
+                                "source_url": (
+                                    "https://github.com/silviahealth/content/pull/7"
+                                    "#discussion_r123"
+                                ),
+                                "path": "plugins/mention_inbox/router.py",
+                                "line": 334,
+                                "review_id": "991",
+                                "commit_id": "head-1",
+                            }
+                        ],
+                        "source_revision": "2026-07-29T10:01:00Z",
+                        "head_sha": "head-1",
+                        "approvable": True,
+                    },
+                },
+            },
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -345,6 +408,33 @@ async def test_conversation_failure_returns_visible_deterministic_fallback(
     assert result.kind == "conversation_fallback"
     assert "저장된 현재 제안" in discord.messages[-1][1]
     assert "리뷰 의견을 확인한다" in discord.messages[-1][1]
+    assert store.get_latest_proposal(SUBJECT).revision == 1
+
+
+@pytest.mark.asyncio
+async def test_conversation_failure_uses_stored_preflight_evidence(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(
+        tmp_path / "inbox.db",
+        with_preapproval_evidence=True,
+    )
+    discord = _Discord()
+    responder = _Responder(error=RuntimeError("all model routes unavailable"))
+    before = _mutation_counts(store)
+
+    result = await _router(store, discord, responder=responder).handle_message(
+        _message("그 코멘트 정확히 뭐임")
+    )
+
+    content = discord.messages[-1][1]
+    assert result.kind == "conversation_fallback"
+    assert "질문에 실제 리뷰 근거로 답해야 해요" in content
+    assert "실제 코멘트는 fallback이 질문에 답하지 못한다는 점입니다" in content
+    assert "plugins/mention‗inbox/router.py:334" in content
+    assert "현재 제안: revision 1 · status pending" in content
+    assert "제안 수정:" not in content
+    assert _mutation_counts(store) == before == (0, 0)
     assert store.get_latest_proposal(SUBJECT).revision == 1
 
 

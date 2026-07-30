@@ -226,18 +226,50 @@ def render_revision_instruction(bot_mention: str) -> str:
 
 
 def render_conversation_fallback(
-    proposal: WorkProposal, bot_mention: str
+    proposal: WorkProposal,
+    bot_mention: str,
+    *,
+    brief_summary: str | None = None,
+    findings: tuple[object, ...] = (),
 ) -> str:
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")
-    summary = _compact_untrusted(proposal.goal, 500)
-    return (
-        "지금은 추가 설명을 생성하지 못했어요. 저장된 현재 제안은 다음과 같아요.\n"
-        f"- revision: {proposal.revision}\n"
-        f"- status: {proposal.status.value}\n"
-        f"- 확인된 내용: {summary}\n"
-        "이 응답으로 제안이나 실행 상태는 바뀌지 않았어요. 제안 자체를 바꾸려면 "
-        f"`{bot_mention} 제안 수정: 바꿀 내용`처럼 남겨 주세요."
+    summary = _compact_untrusted(brief_summary, 400)
+    evidence_lines: list[str] = []
+    if summary:
+        evidence_lines.append(f"- preflight 요약: {summary}")
+    for index, finding in enumerate(findings[:4], start=1):
+        getter = (
+            finding.get
+            if isinstance(finding, Mapping)
+            else lambda key, default=None: getattr(finding, key, default)
+        )
+        body = _compact_untrusted(getter("body"), 300)
+        path = _compact_untrusted(getter("path"), 300)
+        raw_line = getter("line")
+        line = raw_line if isinstance(raw_line, int) and not isinstance(raw_line, bool) else None
+        if body:
+            evidence_lines.append(f"- 실제 코멘트 {index}: {body}")
+        if path:
+            location = f"{path}:{line}" if line is not None else path
+            evidence_lines.append(f"  위치: {location}")
+
+    if evidence_lines:
+        lines = [
+            "지금은 모델 설명을 생성하지 못해 저장된 preflight 근거를 그대로 알려드릴게요.",
+            *evidence_lines,
+        ]
+    else:
+        lines = [
+            "지금은 추가 설명을 생성하지 못했어요. 저장된 현재 제안은 다음과 같아요.",
+            f"- 확인된 내용: {_compact_untrusted(proposal.goal, 500)}",
+        ]
+    return _render_bounded_with_footer(
+        lines,
+        (
+            f"현재 제안: revision {proposal.revision} · status {proposal.status.value}",
+            "이 답변으로 제안이나 실행 상태는 바뀌지 않았어요.",
+        ),
     )
 
 

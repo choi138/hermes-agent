@@ -161,7 +161,7 @@ async def test_responder_sends_untrusted_json_with_no_tools() -> None:
     assert "router.py:334" in answer
     assert len(calls) == 1
     call = calls[0]
-    assert call["task"] is None
+    assert call["task"] == "mention_inbox"
     assert call["tools"] == []
     assert call["max_tokens"] == 450
     messages = call["messages"]

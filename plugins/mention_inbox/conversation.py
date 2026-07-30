@@ -346,7 +346,7 @@ class HostReadOnlyConversationResponder:
             with _profile_llm_scope(self._hermes_home):
                 response = await asyncio.wait_for(
                     caller(
-                        task=None,
+                        task="mention_inbox",
                         messages=messages,
                         temperature=0.1,
                         max_tokens=450,

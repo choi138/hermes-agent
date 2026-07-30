@@ -7342,6 +7342,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
+    async def _release_startup_restore_gate(self) -> None:
+        """Activate late-bound inbound routers before queued events replay."""
+        await self._start_mention_inbox_services()
+        await self._finish_startup_restore()
+
     async def _redeliver_pending_obligations(self) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
@@ -8291,7 +8296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the whole turn.
         await self._redeliver_pending_obligations()
         self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
+        await self._release_startup_restore_gate()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -8384,10 +8389,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
-
-        # Optional GitHub→Discord mention inbox. Configuration is disabled by
-        # default and startup failures are isolated as degraded service health.
-        await self._start_mention_inbox_services()
 
         logger.info("Press Ctrl+C to stop")
         
