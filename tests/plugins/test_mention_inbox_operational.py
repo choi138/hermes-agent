@@ -727,6 +727,7 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
     await service.start()
 
     assert adapter.router is not None
+    assert adapter.router._conversation_responder is not None
     assert (adapter.router._approval_handler is not None) is expected_handler
     assert (adapter.execution_observer is not None) is execution_enabled
     assert service._runtime is not None

@@ -225,14 +225,18 @@ def render_revision_instruction(bot_mention: str) -> str:
     )
 
 
-def render_proposal_question(proposal: WorkProposal, bot_mention: str) -> str:
+def render_conversation_fallback(
+    proposal: WorkProposal, bot_mention: str
+) -> str:
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")
     summary = _compact_untrusted(proposal.goal, 500)
     return (
-        "질문으로 확인했어요. 제안 revision은 바꾸지 않았어요.\n"
-        f"현재 확인된 내용: {summary}\n"
-        "제안 자체를 바꾸려면 "
+        "지금은 추가 설명을 생성하지 못했어요. 저장된 현재 제안은 다음과 같아요.\n"
+        f"- revision: {proposal.revision}\n"
+        f"- status: {proposal.status.value}\n"
+        f"- 확인된 내용: {summary}\n"
+        "이 응답으로 제안이나 실행 상태는 바뀌지 않았어요. 제안 자체를 바꾸려면 "
         f"`{bot_mention} 제안 수정: 바꿀 내용`처럼 남겨 주세요."
     )
 

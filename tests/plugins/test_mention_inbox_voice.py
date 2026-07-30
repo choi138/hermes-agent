@@ -10,6 +10,7 @@ from plugins.mention_inbox.voice import (
     CompletionReceipt,
     render_action_alert,
     render_completed,
+    render_conversation_fallback,
     render_proposal,
     render_queued,
     render_thread_opened,
@@ -152,6 +153,17 @@ def test_thread_opened_voice_states_no_changes_started() -> None:
     assert "아직" in text
     assert "변경" in text
     assert "시작" in text
+
+
+def test_conversation_fallback_is_visible_and_preserves_state_language() -> None:
+    text = render_conversation_fallback(
+        _proposal(), bot_mention="<@1525050525641805886>"
+    )
+
+    assert "저장된 현재 제안" in text
+    assert "리뷰 의견을 확인하고" in text
+    assert "제안이나 실행 상태는 바뀌지 않았어요" in text
+    assert "<@1525050525641805886> 제안 수정:" in text
 
 
 def test_proposal_and_status_messages_hide_internal_ids() -> None:

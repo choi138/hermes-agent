@@ -258,6 +258,15 @@ class _ApprovalHandler:
         return InboxRouteResult(True, "approval_queued", proposal)
 
 
+class _ConversationResponder:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def answer(self, *, message, context, bot_mention) -> str:
+        self.calls.append((message, context, bot_mention))
+        return "현재 코멘트는 router의 질문 fallback을 고치라는 내용이에요."
+
+
 def _real_router(tmp_path, transport, handler):
     subject = "github:R_repo:PR_7"
     store = MentionInboxStore(tmp_path / "inbox.db")
@@ -285,14 +294,16 @@ def _real_router(tmp_path, transport, handler):
         "321",
         approval_offered=True,
     )
+    responder = _ConversationResponder()
     router = InboxProposalRouter(
         store=store,
         discord=transport,
         bot_mention="<@777>",
         authorized_approver_ids=frozenset({"456"}),
         approval_handler=handler,
+        conversation_responder=responder,
     )
-    return store, proposal, router
+    return store, proposal, router, responder
 
 
 @pytest.mark.asyncio
@@ -301,7 +312,7 @@ async def test_adapter_reference_reaches_real_router_and_exact_handler(tmp_path)
     adapter._client.user = SimpleNamespace(id=777)
     transport = _ProposalTransport()
     handler = _ApprovalHandler()
-    store, proposal, router = _real_router(tmp_path, transport, handler)
+    store, proposal, router, responder = _real_router(tmp_path, transport, handler)
     adapter.set_mention_inbox_router(router)
     raw = SimpleNamespace(
         id=123,
@@ -324,6 +335,7 @@ async def test_adapter_reference_reaches_real_router_and_exact_handler(tmp_path)
     assert routed_proposal == proposal
     assert store.get_latest_proposal(proposal.subject_key).revision == 1
     assert transport.messages == []
+    assert responder.calls == []
 
 
 @pytest.mark.asyncio
@@ -332,7 +344,7 @@ async def test_adapter_wrong_reference_is_visible_without_revision(tmp_path) -> 
     adapter._client.user = SimpleNamespace(id=777)
     transport = _ProposalTransport()
     handler = _ApprovalHandler()
-    store, proposal, router = _real_router(tmp_path, transport, handler)
+    store, proposal, router, responder = _real_router(tmp_path, transport, handler)
     adapter.set_mention_inbox_router(router)
     raw = SimpleNamespace(
         id=124,
@@ -352,6 +364,7 @@ async def test_adapter_wrong_reference_is_visible_without_revision(tmp_path) -> 
 
     assert handled is True
     assert handler.calls == []
+    assert responder.calls == []
     assert store.get_latest_proposal(proposal.subject_key).revision == 1
     assert "최신 제안 메시지와 일치하지 않아요" in transport.messages[-1][1]
 
@@ -362,7 +375,7 @@ async def test_adapter_distinct_questions_receive_distinct_replies(tmp_path) -> 
     adapter._client.user = SimpleNamespace(id=777)
     transport = _ProposalTransport()
     handler = _ApprovalHandler()
-    store, proposal, router = _real_router(tmp_path, transport, handler)
+    store, proposal, router, responder = _real_router(tmp_path, transport, handler)
     adapter.set_mention_inbox_router(router)
     first = SimpleNamespace(
         id=124,
@@ -391,6 +404,8 @@ async def test_adapter_distinct_questions_receive_distinct_replies(tmp_path) -> 
     assert first_handled is second_handled is True
     assert len(transport.messages) == 2
     assert transport.messages[0][1] == transport.messages[1][1]
+    assert "질문 fallback을 고치라는 내용" in transport.messages[0][1]
     assert transport.reply_to_message_ids == ["124", "125"]
+    assert len(responder.calls) == 2
     assert store.get_latest_proposal(proposal.subject_key).revision == 1
     assert handler.calls == []

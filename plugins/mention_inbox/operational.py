@@ -658,6 +658,9 @@ class MentionInboxGatewayService:
 
                 if self.config.proposal_bot_mention is None:
                     raise ValueError("action session bot mention is required")
+                from plugins.mention_inbox.conversation import (
+                    HostReadOnlyConversationResponder,
+                )
                 from plugins.mention_inbox.router import InboxProposalRouter
 
                 approval_handler = None
@@ -700,6 +703,7 @@ class MentionInboxGatewayService:
                         self.config.authorized_approver_ids
                     ),
                     approval_handler=approval_handler,
+                    conversation_responder=HostReadOnlyConversationResponder(),
                 )
                 self._discord_adapter.set_mention_inbox_router(router)
                 self._router_installed = True

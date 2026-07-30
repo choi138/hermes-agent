@@ -401,9 +401,15 @@ Approval is accepted only when all of these conditions hold:
 
 A missing or stale reply reference, an approval-like non-reply, an unauthorized
 user, or an unavailable execution handler receives a user-visible explanation.
-It never becomes proposal feedback and never creates a new revision. Questions
-also leave the revision unchanged. To change a proposal, an authorized user must
-use the explicit command `<@bot_id> 제안 수정: 바꿀 내용`.
+It never becomes proposal feedback and never creates a new revision. Every other
+non-empty message is answered by a bounded, stateless completion that receives
+only the current proposal and HEAD-bound preapproval evidence as untrusted JSON
+data. That completion has no tools, store handle, approval handler, execution
+dispatcher, memory, or general-agent fallthrough. A model failure returns a
+deterministic current-proposal summary instead of opening a mutation-capable
+path. Ordinary conversation always leaves proposal, approval, and execution
+state unchanged. To change a proposal, an authorized user must use the explicit
+command `<@bot_id> 제안 수정: 바꿀 내용`.
 
 Historical proposals are not retroactively enabled by a configuration toggle.
 Rows migrated from older schemas remain `approval_offered=false`; after fresh
