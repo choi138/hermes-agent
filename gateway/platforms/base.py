@@ -2946,7 +2946,7 @@ class BasePlatformAdapter(ABC):
         self,
         validator: Optional[Callable[[MessageEvent, str], bool]],
     ) -> None:
-        """Install the runner-owned durable completion admission validator."""
+        """Install the runner-owned synthetic completion admission validator."""
         self._completion_admission_validator = validator
 
     def _completion_admission_allowed(
@@ -2956,10 +2956,10 @@ class BasePlatformAdapter(ABC):
     ) -> bool:
         """Validate a tokenized completion at its real admission boundary.
 
-        Normal user messages and non-durable synthetic events carry no token
-        and remain unaffected. Tokenized events fail closed when the runner
-        validator is absent or raises, so a completion that never entered a
-        queue or task is not acknowledged as successfully admitted.
+        Normal user messages and untokenized synthetic events remain
+        unaffected. Tokenized events fail closed when the runner validator is
+        absent or raises, so a completion that never entered a queue or task is
+        not acknowledged as successfully admitted.
         """
         metadata = getattr(event, "metadata", None)
         if not isinstance(metadata, dict) or _COMPLETION_ADMISSION_TOKEN_KEY not in metadata:
@@ -2972,14 +2972,15 @@ class BasePlatformAdapter(ABC):
                 allowed = bool(validator(event, session_key))
             except Exception:
                 logger.warning(
-                    "[%s] Durable completion admission validation failed for %s",
+                    "[%s] Completion admission validation failed for %s",
                     self.name,
                     session_key,
                     exc_info=True,
                 )
         else:
             logger.warning(
-                "[%s] Rejecting durable completion for %s: no admission validator",
+                "[%s] Rejecting synthetic completion for %s: "
+                "no admission validator",
                 self.name,
                 session_key,
             )
@@ -2987,7 +2988,7 @@ class BasePlatformAdapter(ABC):
         if not allowed:
             metadata[_COMPLETION_ADMISSION_REJECTED_KEY] = True
             logger.info(
-                "[%s] Dropping stale durable completion admission for %s",
+                "[%s] Dropping stale synthetic completion admission for %s",
                 self.name,
                 session_key,
             )
@@ -4848,10 +4849,10 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
-        # Durable completion claims are revalidated by GatewayRunner before
-        # this call, but topic recovery above is an await boundary.  Recheck
-        # the captured cancellation epoch here, after that boundary and before
-        # this event can enter any adapter queue or task.
+        # Synthetic completions are prepared by GatewayRunner before this call,
+        # but topic recovery above is an await boundary. Recheck the captured
+        # cancellation epoch here, after that boundary and before this event can
+        # enter any adapter queue or task.
         if not self._completion_admission_allowed(event, session_key):
             return
 
