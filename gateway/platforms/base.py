@@ -34,6 +34,8 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+_COMPLETION_ADMISSION_TOKEN_KEY = "_hermes_completion_admission"
+_COMPLETION_ADMISSION_REJECTED_KEY = "_hermes_completion_admission_rejected"
 
 
 def _platform_name(platform) -> str:
@@ -2487,6 +2489,14 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # GatewayRunner installs a validator for durable async-completion
+        # events.  The event carries the cancellation epoch captured before
+        # its final durable-claim revalidation; the adapter checks it at the
+        # actual queue/task admission boundary so /stop cannot slip through
+        # an earlier TOCTOU read.
+        self._completion_admission_validator: Optional[
+            Callable[[MessageEvent, str], bool]
+        ] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -2931,6 +2941,57 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_completion_admission_validator(
+        self,
+        validator: Optional[Callable[[MessageEvent, str], bool]],
+    ) -> None:
+        """Install the runner-owned durable completion admission validator."""
+        self._completion_admission_validator = validator
+
+    def _completion_admission_allowed(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Validate a tokenized completion at its real admission boundary.
+
+        Normal user messages and non-durable synthetic events carry no token
+        and remain unaffected. Tokenized events fail closed when the runner
+        validator is absent or raises, so a completion that never entered a
+        queue or task is not acknowledged as successfully admitted.
+        """
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or _COMPLETION_ADMISSION_TOKEN_KEY not in metadata:
+            return True
+
+        validator = getattr(self, "_completion_admission_validator", None)
+        allowed = False
+        if callable(validator):
+            try:
+                allowed = bool(validator(event, session_key))
+            except Exception:
+                logger.warning(
+                    "[%s] Durable completion admission validation failed for %s",
+                    self.name,
+                    session_key,
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                "[%s] Rejecting durable completion for %s: no admission validator",
+                self.name,
+                session_key,
+            )
+
+        if not allowed:
+            metadata[_COMPLETION_ADMISSION_REJECTED_KEY] = True
+            logger.info(
+                "[%s] Dropping stale durable completion admission for %s",
+                self.name,
+                session_key,
+            )
+        return allowed
 
     def set_authorization_check(
         self,
@@ -4595,6 +4656,9 @@ class BasePlatformAdapter(ABC):
         False is returned so the caller isn't left holding a half-installed
         session lock.
         """
+        if not self._completion_admission_allowed(event, session_key):
+            return False
+
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
 
@@ -4784,6 +4848,13 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+        # Durable completion claims are revalidated by GatewayRunner before
+        # this call, but topic recovery above is an await boundary.  Recheck
+        # the captured cancellation epoch here, after that boundary and before
+        # this event can enter any adapter queue or task.
+        if not self._completion_admission_allowed(event, session_key):
+            return
+
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
         # cancelled), the lock is stale.  Clear it and fall through to
@@ -4864,7 +4935,7 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd:
+            if not cmd and not getattr(event, "internal", False):
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
@@ -4913,6 +4984,12 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+
+            # The busy handler is awaitable. Recheck after it returns so a
+            # /stop that advanced the session epoch while it ran wins before
+            # this completion reaches any pending queue.
+            if not self._completion_admission_allowed(event, session_key):
+                return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
@@ -5423,6 +5500,11 @@ class BasePlatformAdapter(ABC):
                 if _active is not None:
                     _active.clear()
                 await _stop_typing_task()
+                if not self._completion_admission_allowed(
+                    pending_event,
+                    session_key,
+                ):
+                    return
                 # Spawn a fresh task for the pending message instead of
                 # recursing.  Issue #17758: `await
                 # self._process_message_background(...)` here grew the
@@ -5532,6 +5614,14 @@ class BasePlatformAdapter(ABC):
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
             late_pending = self._pending_messages.pop(session_key, None)
+            if (
+                late_pending is not None
+                and not self._completion_admission_allowed(
+                    late_pending,
+                    session_key,
+                )
+            ):
+                late_pending = None
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
