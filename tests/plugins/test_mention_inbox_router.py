@@ -701,6 +701,8 @@ async def test_exact_authorized_reply_routes_to_handler(tmp_path: Path) -> None:
         "네가 이 작업 직접 처리해 주세요",
         "이거 알아서 수정해줘",
         "Codex 리뷰 반영해서 수정해줘",
+        "너의 계획대로 작업 진행해줘",
+        "아니 너가 수정까지 하라고",
         f"{BOT_MENTION} 해당 작업 진행해주세요",
     ),
 )
@@ -752,10 +754,19 @@ async def test_natural_execution_request_rejects_stale_explicit_reply(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    (
+        "이 작업 네가 수행하면 어떤 변경을 하게 돼?",
+        "너의 계획대로 작업 진행하면 어떤 파일이 바뀌어?",
+        "아니 너가 수정한 건 아니지?",
+    ),
+)
 async def test_natural_execution_question_stays_conversational(
     tmp_path: Path,
+    text: str,
 ) -> None:
-    store, _ = _seed(tmp_path / "natural-question.db")
+    store, _ = _seed(tmp_path / f"natural-question-{abs(hash(text))}.db")
     discord = _Discord()
     handler = _Handler()
     responder = _Responder("수행 전에는 변경 범위와 검증 계획만 설명해요.")
@@ -765,7 +776,7 @@ async def test_natural_execution_question_stays_conversational(
         discord,
         handler=handler,
         responder=responder,
-    ).handle_message(_message("이 작업 네가 수행하면 어떤 변경을 하게 돼?"))
+    ).handle_message(_message(text))
 
     assert result.kind == "conversation_response"
     assert handler.calls == []
