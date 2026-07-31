@@ -702,6 +702,95 @@ class TestSpawnRewriteCompoundBackground:
 
 
 # =========================================================================
+# Session-scoped cancellation
+# =========================================================================
+
+class TestSessionCancellation:
+    def test_kill_failure_still_suppresses_all_notifications(
+        self, registry, monkeypatch
+    ):
+        session = _make_session(sid="proc_stop_failure")
+        session.session_key = "session-a"
+        session.process = MagicMock(pid=4242)
+        session.notify_on_complete = True
+        session.watcher_interval = 5
+        session.watch_patterns = ["READY"]
+        registry._running[session.id] = session
+        registry.pending_watchers = [
+            {"session_id": session.id, "session_key": "session-a"},
+            {"session_id": "proc_other", "session_key": "session-b"},
+        ]
+        registry.completion_queue.put(
+            {
+                "type": "watch_match",
+                "session_id": session.id,
+                "session_key": "session-a",
+            }
+        )
+        other_event = {
+            "type": "completion",
+            "session_id": "proc_other",
+            "session_key": "session-b",
+        }
+        registry.completion_queue.put(other_event)
+        monkeypatch.setattr(
+            registry,
+            "_terminate_host_pid",
+            MagicMock(side_effect=OSError("permission denied")),
+        )
+
+        with patch.object(registry, "_write_checkpoint"):
+            affected = registry.cancel_for_session(
+                "session-a",
+                reason="stop_command",
+            )
+
+            assert affected == 1
+            assert session.exited is False
+            assert session.completion_suppressed is True
+            assert session.notify_on_complete is False
+            assert session.watcher_interval == 0
+            assert session.watch_patterns == []
+            assert registry.pending_watchers == [
+                {"session_id": "proc_other", "session_key": "session-b"}
+            ]
+            assert registry.completion_queue.get_nowait() == other_event
+            assert registry.completion_queue.empty()
+
+            # Even if the backend exits later and a stale code path restores
+            # notify_on_complete, the authoritative suppression fence wins.
+            session.notify_on_complete = True
+            session.exited = True
+            session.exit_code = 1
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
+
+    def test_finished_process_with_pending_completion_counts_once(self, registry):
+        session = _make_session(
+            sid="proc_finished_pending",
+            exited=True,
+            exit_code=0,
+        )
+        session.session_key = "session-a"
+        session.notify_on_complete = True
+        registry._finished[session.id] = session
+        registry.completion_queue.put(
+            {
+                "type": "completion",
+                "session_id": session.id,
+                "session_key": "session-a",
+            }
+        )
+
+        with patch.object(registry, "_write_checkpoint"):
+            assert registry.cancel_for_session("session-a") == 1
+            assert registry.cancel_for_session("session-a") == 0
+
+        assert session.completion_suppressed is True
+        assert registry.completion_queue.empty()
+
+
+# =========================================================================
 # Checkpoint
 # =========================================================================
 
@@ -737,6 +826,48 @@ class TestCheckpoint:
 
             data = json.loads(checkpoint.read_text())
             assert data == []
+
+    def test_recovery_preserves_stop_suppression_without_replaying_watcher(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_stopped_recovery",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": 123,
+            "task_id": "t1",
+            "session_key": "session-a",
+            "watcher_interval": 5,
+            "notify_on_complete": True,
+            "watch_patterns": ["READY"],
+            "completion_suppressed": True,
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch.object(registry, "_host_pid_is_ours", return_value=True):
+            recovered = registry.recover_from_checkpoint()
+
+            assert recovered == 1
+            session = registry.get("proc_stopped_recovery")
+            assert session is not None
+            assert session.completion_suppressed is True
+            assert session.notify_on_complete is False
+            assert session.watcher_interval == 0
+            assert session.watch_patterns == []
+            assert registry.pending_watchers == []
+
+            persisted = json.loads(checkpoint.read_text())
+            assert persisted[0]["completion_suppressed"] is True
+            assert persisted[0]["notify_on_complete"] is False
+            assert persisted[0]["watcher_interval"] == 0
+            assert persisted[0]["watch_patterns"] == []
+
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
 
 # =========================================================================
 # Kill process
@@ -1368,4 +1499,3 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-

@@ -1391,8 +1391,9 @@ class GatewaySlashCommandsMixin:
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No foreground run under the caller's own session key. Detached
-        # delegate_task workers live outside _running_agents, so cancel them
-        # explicitly before looking for an authorized sibling run.
+        # delegate_task workers and terminal background processes live outside
+        # _running_agents, so cancel them explicitly before looking for an
+        # authorized sibling run.
         background_cancelled = await self._cancel_session_background_work(
             session_key,
             parent_session_id=str(getattr(session_entry, "session_id", "") or ""),
@@ -1425,7 +1426,7 @@ class GatewaySlashCommandsMixin:
         if background_cancelled:
             logger.info(
                 "STOP (background-only) for session %s — cancelled %d "
-                "async delegation(s)",
+                "background job(s)",
                 session_key,
                 background_cancelled,
             )

@@ -16933,7 +16933,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
                         try:
-                            await self._inject_watch_notification(synth_text, evt)
+                            await self._deliver_completion_notification(
+                                synth_text,
+                                evt,
+                            )
                         except Exception as e2:
                             logger.error("Watch notification injection error: %s", e2)
             except Exception as e:
@@ -21094,14 +21097,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         accepted = False
         completion_admission = None
         try:
-            if durable_claim_id:
-                # Capture immediately before the final durable-claim read.
-                # If /stop wins after that read but before the adapter's real
-                # queue/task boundary, its synchronous epoch bump makes this
-                # token stale and the adapter rejects the synthetic event.
-                completion_admission = self._capture_completion_admission(
-                    str(evt.get("session_key") or "").strip()
+            event_session_key = str(evt.get("session_key") or "").strip()
+            # Capture an admission epoch for every routed synthetic process
+            # event, not just durable async delegations. A /stop that wins after
+            # this point invalidates the token at the adapter's actual
+            # queue/task boundary.
+            completion_admission = self._capture_completion_admission(
+                event_session_key
+            )
+
+            if evt.get("type", "completion") in {
+                "completion",
+                "watch_match",
+                "watch_disabled",
+            }:
+                from tools.process_registry import process_registry
+
+                is_suppressed = getattr(
+                    process_registry,
+                    "is_completion_suppressed",
+                    None,
                 )
+                if callable(is_suppressed) and is_suppressed(
+                    str(evt.get("session_id") or "")
+                ):
+                    return None
+
+            if durable_claim_id:
+                # Revalidate after capturing the epoch and checking ordinary
+                # process suppression. If /stop wins after this final read but
+                # before the adapter's queue/task boundary, the older token is
+                # rejected there.
                 try:
                     from tools.async_delegation import (
                         is_completion_delivery_claim_active,
@@ -21265,15 +21291,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_id = str(watcher.get("message_id") or "").strip() or None
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
+        is_completion_suppressed = getattr(
+            process_registry,
+            "is_completion_suppressed",
+            lambda _session_id: False,
+        )
 
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
+
+        if is_completion_suppressed(session_id):
+            logger.debug("Process watcher suppressed by session stop: %s", session_id)
+            return
 
         if notify_mode == "off" and not agent_notify:
             # Still wait for the process to exit so we can log it, but don't
             # push any messages to the user.
             while True:
                 await asyncio.sleep(interval)
+                if is_completion_suppressed(session_id):
+                    break
                 session = process_registry.get(session_id)
                 if session is None or session.exited:
                     break
@@ -21283,6 +21320,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_output_len = 0
         while True:
             await asyncio.sleep(interval)
+
+            if is_completion_suppressed(session_id):
+                logger.debug(
+                    "Process watcher suppressed by session stop: %s",
+                    session_id,
+                )
+                break
 
             session = process_registry.get(session_id)
             if session is None:
@@ -21388,6 +21432,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             break
                     if adapter and chat_id:
                         try:
+                            if is_completion_suppressed(session_id):
+                                break
                             send_meta = {"thread_id": thread_id} if thread_id else None
                             await adapter.send(
                                 chat_id,
@@ -21418,6 +21464,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                 if adapter and chat_id:
                     try:
+                        if is_completion_suppressed(session_id):
+                            break
                         send_meta = {"thread_id": thread_id} if thread_id else None
                         await adapter.send(
                             chat_id,
@@ -22063,10 +22111,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         parent_session_id: str = "",
         reason: str = "session_end",
     ) -> int:
-        """Cancel detached delegations and stale restart recovery for a session.
+        """Cancel detached work and stale restart recovery for a session.
 
         ``delegate_task(background=true)`` is intentionally detached from the
         foreground AIAgent, so ``running_agent.interrupt()`` cannot reach it.
+        The same is true of ``terminal(background=true)`` processes tracked by
+        the process registry.
         Keep this as the single gateway cancellation funnel used by both the
         active-run fast path and the idle /stop handler.
         """
@@ -22085,9 +22135,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         cancelled = 0
         try:
+            from tools.process_registry import process_registry
+
+            cancelled += process_registry.cancel_for_session(
+                session_key,
+                reason=reason,
+            )
+        except Exception as exc:
+            # Notification suppression and process termination are best-effort
+            # here so a degraded process backend cannot prevent the foreground
+            # session lock from being released.
+            logger.warning(
+                "Failed to cancel background processes for %s (%s): %s",
+                session_key,
+                reason,
+                exc,
+            )
+
+        try:
             from tools.async_delegation import interrupt_for_session
 
-            cancelled = interrupt_for_session(
+            cancelled += interrupt_for_session(
                 session_key=session_key,
                 parent_session_id=str(parent_session_id or ""),
                 reason=reason,
