@@ -4,6 +4,8 @@ import sqlite3
 import threading
 import time
 import json
+from unittest import mock
+
 import pytest
 
 import hermes_state
@@ -793,24 +795,50 @@ class TestSessionLifecycle:
     def test_v11_migration_backfills_base_fts_when_trigram_unavailable(
         self, tmp_path, monkeypatch
     ):
-        """Regression: v11 migration must backfill base FTS even when trigram is unavailable."""
+        """A legacy inline-FTS DB opened under a no-trigram runtime keeps its
+        base FTS searchable (and is flagged optimizable) without crashing.
+
+        Opt-in model: opening never auto-migrates. The legacy single-column
+        index keeps working for content search; the trigram tokenizer being
+        unavailable must not break base FTS or the open itself.
+        """
         real_connect = sqlite3.connect
         db_path = tmp_path / "state.db"
 
-        # Phase 1: create a DB at schema v10 with messages.
-        db = SessionDB(db_path=db_path)
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="legacy message alpha")
-        db.append_message("s1", role="assistant", content="legacy reply beta")
-        # Force schema version to v10 so migration runs on next open.
-        db._conn.execute(
-            "UPDATE schema_version SET version = 10"
+        # Phase 1: build a genuine legacy inline DB by hand (single-column
+        # messages_fts, no trigram table), at an old schema version.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(SCHEMA_SQL)
+        conn.executescript("""
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS messages_fts_trigram;
+            DROP VIEW IF EXISTS messages_fts_trigram_src;
+            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, COALESCE(new.content,''));
+            END;
+        """)
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version) VALUES (10)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', ?)",
+            (time.time(),),
         )
-        db._conn.commit()
-        db.close()
+        for role, content in (
+            ("user", "legacy message alpha"),
+            ("assistant", "legacy reply beta"),
+        ):
+            conn.execute(
+                "INSERT INTO messages (session_id, timestamp, role, content) "
+                "VALUES ('s1', ?, ?, ?)",
+                (time.time(), role, content),
+            )
+        conn.commit()
+        conn.close()
 
-        # Phase 2: reopen with trigram disabled — migration should still
-        # backfill base FTS and make existing messages searchable.
+        # Phase 2: reopen with trigram disabled — must NOT crash, base FTS
+        # keeps working, and the DB is flagged optimizable (opt-in, so no
+        # auto-migration and the version stays put).
         def connect_without_trigram(*args, **kwargs):
             kwargs["factory"] = _NoTrigramConnection
             return real_connect(*args, **kwargs)
@@ -822,6 +850,7 @@ class TestSessionLifecycle:
             assert migrated_db._trigram_available is False
             assert migrated_db._fts_table_exists("messages_fts") is True
             assert migrated_db._fts_table_exists("messages_fts_trigram") is False
+            assert migrated_db.fts_optimize_available() is True
 
             # Existing messages must be searchable via base FTS.
             results = migrated_db.search_messages("legacy message")
@@ -2190,6 +2219,46 @@ class TestCJKSearchFallback:
         # fallback handles the substring correctly.
         results = db.search_messages("Agent通信")
         assert len(results) == 1
+
+    def test_pure_latin_word_embedded_in_cjk_is_found(self, db):
+        """Regression for #54242.
+
+        A pure-Latin query (no CJK chars) routes to the unicode61 ``messages_fts``
+        table, whose tokenizer fuses a Latin run onto the adjacent CJK characters
+        ("修改youer服务端" is indexed as a single token), so MATCH "youer" returns
+        nothing. The zero-result trigram fallback must recover the match.
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="修改youer服务端的计划")
+        results = db.search_messages("youer")
+        assert len(results) == 1
+        assert results[0]["session_id"] == "s1"
+
+    def test_pure_latin_query_with_normal_match_is_unaffected(self, db):
+        """A normal space-delimited Latin query still resolves on the unicode61
+        path; the zero-result trigram fallback only fires when it misses."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="deploy the docker container")
+        results = db.search_messages("docker")
+        assert len(results) == 1
+        assert results[0]["session_id"] == "s1"
+
+    def test_pure_latin_query_absent_term_returns_empty(self, db):
+        """A Latin term that is genuinely absent must still return nothing,
+        even with the trigram fallback enabled."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="修改youer服务端的计划")
+        assert db.search_messages("kubernetes") == []
+
+    def test_pure_latin_embedded_fallback_preserves_source_filter(self, db):
+        """The embedded-Latin trigram fallback must honour source_filter."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="telegram")
+        db.append_message("s1", role="user", content="修改youer服务端cli")
+        db.append_message("s2", role="user", content="修改youer服务端telegram")
+        results = db.search_messages("youer", source_filter=["telegram"])
+        assert len(results) == 1
+        assert results[0]["source"] == "telegram"
 
     def test_cjk_partial_fts5_results_supplemented_by_like(self, db):
         """When FTS5 returns *some* CJK results, LIKE must still find all matches.
@@ -3885,11 +3954,15 @@ class TestSchemaInit:
         migrated_db.close()
 
     def test_v9_migration_skips_v10_trigram_backfill_before_v11_rebuild(self, tmp_path, monkeypatch):
-        """Direct v9→current migration should do only the v11 FTS rebuild.
+        """Direct v9→current migration should do only the v23 FTS rebuild.
 
-        v10 backfilled ``messages_fts_trigram`` with content-only rows. Current
-        v11+ migration immediately drops and rebuilds both FTS tables with
-        content + tool metadata, so running the v10 insert first is wasted work.
+        v10 backfilled ``messages_fts_trigram`` with content-only rows. The
+        current migration immediately drops and rebuilds both FTS tables in
+        external-content form, so running the v10 insert first is wasted work.
+
+        v23 contract: tool rows are excluded from the trigram index (they
+        remain fully searchable via the standard index); non-tool rows are
+        indexed in both.
         """
         db_path = tmp_path / "v9_fts.db"
         conn = sqlite3.connect(str(db_path))
@@ -3904,6 +3977,11 @@ class TestSchemaInit:
             "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             ("s1", "tool", "plain content", "browser_snapshot", '{"name":"browser_snapshot"}', 1001.0),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES (?, ?, ?, ?)",
+            ("s1", "assistant", "assistant summary of the snapshot", 1002.0),
         )
         conn.commit()
         conn.close()
@@ -3930,16 +4008,37 @@ class TestSchemaInit:
         try:
             assert trigram_content_only_inserts == []
             version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            # This DB was built via SCHEMA_SQL, so its FTS is already the v23
+            # external-content shape — not a legacy inline install. Opening it
+            # therefore advances the version to current (no opt-in gate) and
+            # runs no backfill (rows were indexed live by the v23 triggers).
             assert version == SCHEMA_VERSION
-            normal_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
-            trigram_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0]
-            assert normal_count == 1
+            assert migrated_db.fts_optimize_available() is False
+            assert migrated_db.fts_rebuild_status() is None
+            # Standard FTS indexes every row, including tool output (MATCH
+            # probes the index; COUNT(*) on external-content tables doesn't).
+            normal_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'snapshot'"
+            ).fetchone()[0]
+            assert normal_count == 2
+            # Trigram excludes role='tool' rows (v23) but keeps non-tool rows.
+            trigram_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'snapshot'"
+            ).fetchone()[0]
             assert trigram_count == 1
+            # Tool metadata stays searchable via the standard index (#16751).
             tool_hit = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts "
+                "WHERE messages_fts MATCH 'browser_snapshot'"
+            ).fetchone()[0]
+            assert tool_hit == 1
+            # And is intentionally absent from the trigram index.
+            tri_tool_hit = migrated_db._conn.execute(
                 "SELECT COUNT(*) FROM messages_fts_trigram "
                 "WHERE messages_fts_trigram MATCH 'browser_snapshot'"
             ).fetchone()[0]
-            assert tool_hit == 1
+            assert tri_tool_hit == 0
         finally:
             migrated_db.close()
 
@@ -4924,7 +5023,15 @@ class TestOptimizeFts:
         """A fresh DB has both FTS indexes; optimize merges both."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello world")
-        assert db.optimize_fts() == 2
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            assert db.optimize_fts() == 2
+        finally:
+            db._conn.set_trace_callback(None)
+        optimize_sql = [sql for sql in statements if "'optimize'" in sql]
+        assert len(optimize_sql) == 2
+        assert not any("'merge'" in sql for sql in optimize_sql)
 
     def test_optimize_preserves_search_and_snippet(self, db):
         """Optimize is layout-only: MATCH results + snippets are unchanged."""
@@ -4976,39 +5083,200 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
-        calls = {"n": 0}
-        real_optimize = db.optimize_fts
-
-        def _counting_optimize():
-            calls["n"] += 1
-            return real_optimize()
-
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
-        # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
+    def test_incremental_merge_bounded_commands_per_present_index(self, db):
+        """Each pass issues bounded 'merge' commands, never 'optimize'."""
         db.create_session(session_id="s1", source="cli")
-        for i in range(9):
+        db.append_message(session_id="s1", role="user", content="bounded merge")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            executed = db._merge_fts_incrementally(max_pages=37)
+        finally:
+            db._conn.set_trace_callback(None)
+
+        # At least one merge command per present FTS index, and never more
+        # than the per-pass command cap per index.
+        present = [t for t in db._FTS_TABLES if db._fts_table_exists(t)]
+        assert len(present) >= 2  # messages_fts + trigram on a fresh DB
+        merge_sql = [sql for sql in statements if "VALUES('merge', 37)" in sql]
+        assert len(merge_sql) == executed
+        assert len(present) <= executed <= (
+            len(present) * db._FTS_MERGE_COMMANDS_PER_PASS
+        )
+        for tbl in present:
+            n = sum(f"{tbl}({tbl}, rank)" in sql for sql in merge_sql)
+            assert 1 <= n <= db._FTS_MERGE_COMMANDS_PER_PASS
+        # The usermerge floor is applied so positive merges can make
+        # progress on levels with >= 2 segments (SQLite FTS5 §6.8).
+        assert any("VALUES('usermerge', 2)" in sql for sql in statements)
+        assert not any("'optimize'" in sql for sql in statements)
+
+    def test_incremental_merge_converges_on_fragmented_index(self, db):
+        """Bounded passes make real progress on a fragmented index and
+        reach a no-more-work steady state — the failure mode of a bare
+        positive-rank merge (usermerge default 4) is that it never merges
+        anything and the index stays fragmented forever."""
+        db.create_session(session_id="s1", source="cli")
+        # Suppress automerge so every insert leaves its own level-0 segment
+        # — a deliberately fragmented index that only explicit merge
+        # commands can compact. Config is scoped to this test's temp DB.
+        with db._lock:
+            for tbl in ("messages_fts", "messages_fts_trigram"):
+                db._conn.execute(
+                    f"INSERT INTO {tbl}({tbl}, rank) VALUES('automerge', 0)"
+                )
+        for i in range(60):
+            db.append_message(
+                session_id="s1", role="user",
+                content=f"fragment needle {i} lorem ipsum dolor",
+            )
+
+        # First pass must do real merge work (shadow-table rows change).
+        before = db._conn.total_changes
+        executed_first = db._merge_fts_incrementally(max_pages=500)
+        assert executed_first >= 2
+        assert db._conn.total_changes - before > executed_first  # real work
+
+        # Repeated passes converge: eventually a pass issues exactly one
+        # no-progress command per present index and stops early.
+        present = sum(1 for t in db._FTS_TABLES if db._fts_table_exists(t))
+        for _ in range(50):
+            if db._merge_fts_incrementally(max_pages=500) == present:
+                break
+        else:
+            pytest.fail("bounded merge passes never converged")
+
+        # Merging is layout-only: every row is still searchable.
+        assert len(db.search_messages("fragment", limit=100)) == 60
+
+    def test_incremental_merge_compacts_below_default_usermerge(self, db):
+        """A level with only 2-3 segments — below FTS5's default usermerge
+        threshold of 4 — must still get merged. A bare positive-rank
+        'merge' skips such levels entirely (SQLite FTS5 §6.8), which is
+        why the cadence lowers usermerge to 2 first; without the floor,
+        light fragmentation persists forever and every MATCH pays for it."""
+
+        def _segment_count(tbl: str) -> int:
+            # FTS5 structure record: id=10 in the %_data shadow table.
+            # Format: 4-byte cookie, then varint nlevel, varint nsegment...
+            # nsegment fits in one varint byte for small indexes; parse the
+            # second varint (single-byte values < 128 read directly).
+            blob = db._conn.execute(
+                f"SELECT block FROM {tbl}_data WHERE id=10"
+            ).fetchone()[0]
+            pos = 4
+            for _ in range(1):  # skip nlevel varint (single byte here)
+                assert blob[pos] < 0x80
+                pos += 1
+            assert blob[pos] < 0x80
+            return blob[pos]
+
+        db.create_session(session_id="s1", source="cli")
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) "
+                "VALUES('automerge', 0)"
+            )
+        # Exactly 3 level-0 segments: below the default usermerge of 4.
+        for i in range(3):
+            db.append_message(
+                session_id="s1", role="user", content=f"sparse token{i}"
+            )
+        assert _segment_count("messages_fts") == 3
+
+        for _ in range(10):
+            db._merge_fts_incrementally(max_pages=500)
+
+        assert _segment_count("messages_fts") == 1, (
+            "3-segment level was not compacted — usermerge floor missing?"
+        )
+        assert len(db.search_messages("sparse")) == 3
+
+    def test_incremental_merge_skips_absent_optional_index(self, db):
+        with db._lock:
+            for trigger in (
+                "messages_fts_trigram_insert",
+                "messages_fts_trigram_delete",
+                "messages_fts_trigram_update",
+            ):
+                db._conn.execute(f"DROP TRIGGER {trigger}")
+            db._conn.execute("DROP TABLE messages_fts_trigram")
+
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            assert db._merge_fts_incrementally(max_pages=19) >= 1
+        finally:
+            db._conn.set_trace_callback(None)
+        merge_sql = [sql for sql in statements if "VALUES('merge', 19)" in sql]
+        assert merge_sql
+        assert all("messages_fts(messages_fts, rank)" in sql for sql in merge_sql)
+
+    def test_incremental_merge_skips_missing_primary_index(self, db):
+        """A missing messages_fts is a valid transient state (chunked
+        optimize-storage rebuild drops + backfills it while writers keep
+        running) — the cadence must skip it, not raise a warning every
+        1000 writes for the whole backfill window."""
+        with db._lock:
+            for trigger in (
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            ):
+                db._conn.execute(f"DROP TRIGGER {trigger}")
+            db._conn.execute("DROP TABLE messages_fts")
+
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            executed = db._merge_fts_incrementally(max_pages=19)
+        finally:
+            db._conn.set_trace_callback(None)
+        assert executed >= 1  # trigram index still present and merged
+        assert not any(
+            "messages_fts(messages_fts, rank)" in sql for sql in statements
+        )
+
+    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """Routine writes use bounded merge and never full optimize."""
+        db._FTS_MERGE_EVERY_N_WRITES = 5
+        calls = []
+
+        def _counting_merge(*, max_pages):
+            calls.append(max_pages)
+            return 0
+
+        def _unexpected_optimize():
+            raise AssertionError("routine cadence must not call optimize")
+
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _counting_merge)
+        monkeypatch.setattr(db, "optimize_fts", _unexpected_optimize)
+        db.create_session(session_id="s1", source="cli")
+        for i in range(3):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls["n"] == 2
-        # The auto-merge is layout-only: search is unaffected.
+        assert calls == []  # Four successful writes are below the boundary.
+        db.append_message(session_id="s1", role="user", content="needle 3")
+        assert calls == [500]  # The fifth write gets the production page budget.
+        for i in range(4, 8):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls == [500]
+        db.append_message(session_id="s1", role="user", content="needle 8")
+        assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
+    def test_write_path_merge_failure_is_logged_without_breaking_write(
+        self, db, monkeypatch, caplog
+    ):
+        db._FTS_MERGE_EVERY_N_WRITES = 2
 
-        def _boom():
-            raise sqlite3.OperationalError("simulated optimize failure")
+        def _boom(*, max_pages):
+            raise sqlite3.OperationalError("simulated merge failure")
 
-        monkeypatch.setattr(db, "optimize_fts", _boom)
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _boom)
         db.create_session(session_id="s1", source="cli")  # write #1
-        # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
+        assert "FTS incremental merge failed: simulated merge failure" in caplog.text
 
 
 class TestAutoMaintenance:
@@ -5336,14 +5604,22 @@ class TestFTS5ToolCallMigration:
         assert legacy_hits == [], "sanity: legacy FTS must NOT contain tool_name"
         conn.close()
 
-        # Now open via SessionDB — migration runs.
+        # Open via SessionDB — the legacy DB is detected as optimizable but
+        # NOT auto-migrated (opt-in). Its old content-only index still works
+        # for content, but doesn't yet cover tool_name/tool_calls (#16751).
         session_db = SessionDB(db_path=db_path)
         try:
+            assert session_db.fts_optimize_available() is True
+
+            # `hermes db optimize` performs the v23 transition; afterwards the
+            # tool fields are searchable.
+            result = session_db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
             assert len(session_db.search_messages("LEGACYTOOL")) == 1, \
-                "v11 migration must backfill tool_name into FTS"
+                "v23 optimize must index tool_name into FTS"
             assert len(session_db.search_messages("LEGACYARG")) == 1, \
-                "v11 migration must backfill tool_calls JSON into FTS"
-            # schema_version bumped
+                "v23 optimize must index tool_calls JSON into FTS"
+            # schema_version bumped once the FTS layer is v23
             from hermes_state import SCHEMA_VERSION
             row = session_db._conn.execute(
                 "SELECT version FROM schema_version LIMIT 1"
@@ -5352,6 +5628,430 @@ class TestFTS5ToolCallMigration:
             assert version == SCHEMA_VERSION
         finally:
             session_db.close()
+
+
+class TestFTSExternalContentMigration:
+    """v23 migration: inline-mode FTS tables (v11-v22) are rebuilt as
+    external-content tables, and role='tool' rows are excluded from the
+    trigram index while remaining searchable via the standard index."""
+
+    @staticmethod
+    def _build_v22_db(db_path):
+        """Build a v22-shaped DB by hand: inline FTS tables + concat triggers."""
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(SCHEMA_SQL)
+        # Replace the current (v23) FTS objects with the v22 inline shape.
+        conn.executescript("""
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS messages_fts_trigram;
+            DROP VIEW IF EXISTS messages_fts_trigram_src;
+
+            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (
+                    new.id,
+                    COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+                );
+            END;
+
+            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
+            CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                    new.id,
+                    COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+                );
+            END;
+        """)
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version) VALUES (22)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', ?)",
+            (time.time(),),
+        )
+        rows = [
+            ("user", "find the 大别山项目 deployment notes", None, None),
+            ("assistant", "关于大别山项目的总结在这里", None,
+             '{"function":{"name":"send_message","arguments":"{}"}}'),
+            ("tool", "TOOLBLOB " + "x" * 5000 + " 项目文件内容测试", "read_file", None),
+        ]
+        for role, content, tool_name, tool_calls in rows:
+            conn.execute(
+                "INSERT INTO messages (session_id, timestamp, role, content, tool_name, tool_calls) "
+                "VALUES ('s1', ?, ?, ?, ?, ?)",
+                (time.time(), role, content, tool_name, tool_calls),
+            )
+        conn.commit()
+        # Sanity: v22 inline tables have their own content shadow tables.
+        shadow = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'messages_fts_content'"
+        ).fetchall()
+        assert shadow, "sanity: v22 inline FTS must have a content shadow table"
+        conn.close()
+
+    def test_v22_open_leaves_legacy_untouched_and_advertises(self, tmp_path):
+        """Opening a legacy v22 DB must NOT auto-migrate the FTS layout, but
+        the main schema_version DOES advance (decoupled) so future non-FTS
+        migrations aren't blocked. The inline index keeps working and the
+        opt-in flag is set."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            # DECOUPLED: the main schema_version advances to current even though
+            # the FTS layout stays legacy — future migrations must not be gated
+            # behind the FTS opt-in.
+            version = db._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0]
+            assert version == SCHEMA_VERSION, "main schema version must advance"
+            # But the FTS storage layout is NOT stamped current — it's legacy.
+            assert db.get_meta("fts_storage_version") is None
+            assert db.fts_optimize_available() is True
+            assert db.get_meta("fts_optimize_available") == "1"
+
+            # Legacy inline shape is intact (content shadow table still there).
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'messages_fts_content'"
+            ).fetchone() is not None
+
+            # Search still works on the legacy index (no deferred rebuild).
+            assert db.fts_rebuild_status() is None
+            assert len(db.search_messages("deployment")) == 1
+            assert len(db.search_messages("send_message")) == 1  # #16751 held
+
+            # A new write is indexed live by the legacy triggers.
+            db.append_message("s1", role="user", content="AFTEROPEN token")
+            assert len(db.search_messages("AFTEROPEN")) == 1
+        finally:
+            db.close()
+
+    def test_optimize_fts_storage_transitions_to_v23(self, tmp_path):
+        """`optimize_fts_storage()` migrates a legacy DB to v23 external-content
+        to completion: no shadow copies, tool rows excluded from trigram,
+        version bumped, everything searchable exactly once."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db.fts_optimize_available() is True
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+
+            # Layout stamped current; flag cleared; no longer "available".
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+            assert db.fts_optimize_available() is False
+            assert db.fts_rebuild_status() is None
+
+            # External-content: no *_content shadow tables, no trash left.
+            for shadow in ("messages_fts_content", "messages_fts_trigram_content"):
+                assert db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name = ?", (shadow,)
+                ).fetchone() is None
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_v22_trash%'"
+            ).fetchall() == []
+
+            # Standard FTS: all rows incl tool metadata (#16751).
+            assert len(db.search_messages("TOOLBLOB")) == 1
+            assert len(db.search_messages("send_message")) == 1
+            # Trigram excludes tool rows; CJK conversation search works.
+            assert len(db.search_messages("大别山项目")) == 2
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH '\"项目文件内容\"'"
+            ).fetchone()[0] == 0
+            assert db.search_messages("项目文件内容", role_filter=["tool"]) != []
+            # No duplicate index entries; integrity clean.
+            for term in ("TOOLBLOB", "deployment"):
+                assert db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                    (term,),
+                ).fetchone()[0] == 1
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_optimize_fts_storage_vacuum_reports_truthful_size(self, tmp_path):
+        """``logical_size_bytes()`` must be truthful the moment optimize returns.
+
+        In WAL mode VACUUM's rewrite lands in the ``-wal`` file, and the
+        checkpoint that folds it back is REFUSED (SQLITE_BUSY) while another
+        connection — a live gateway — holds a read-mark. A caller that sizes
+        the result with ``os.path.getsize()`` therefore reads the stale,
+        still-growing main file: that is how `hermes sessions optimize-storage`
+        reported "reclaimed -3820.1 MB" on a DB that had actually shrunk 60%.
+        SQLite's own page accounting is correct immediately.
+        """
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        # Bulk the DB up so VACUUM actually has pages to move: with only a
+        # handful of rows the whole file fits in the WAL's first frames and the
+        # stale-stat() bug is invisible.
+        bulk = sqlite3.connect(str(db_path))
+        bulk.executemany(
+            "INSERT INTO messages (session_id, timestamp, role, content) "
+            "VALUES ('s1', ?, 'user', ?)",
+            [(time.time(), "filler " + "q" * 2000) for _ in range(4000)],
+        )
+        bulk.commit()
+        bulk.close()
+
+        db = SessionDB(db_path=db_path)
+        reader = None
+        try:
+            if db._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                pytest.skip("WAL unavailable on this SQLite build")
+
+            # A live gateway/CLI session pinning a WAL read-mark, which is what
+            # blocks the post-VACUUM checkpoint.
+            reader = sqlite3.connect(str(db_path))
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM messages").fetchone()
+
+            assert db.optimize_fts_storage(vacuum=True)["ok"] is True
+
+            reported = db.logical_size_bytes()
+            assert reported is not None
+            stat_size = db_path.stat().st_size
+
+            # Settle for real: release the reader, then checkpoint.
+            reader.rollback()
+            reader.close()
+            reader = None
+            db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            settled = db_path.stat().st_size
+
+            page_size = db._conn.execute("PRAGMA page_size").fetchone()[0]
+
+            # Precondition for this test to mean anything: stat() must actually
+            # be lagging here, otherwise it isn't exercising the bug.
+            assert stat_size > settled + page_size, (
+                "test precondition failed: stat() did not lag the settled size, "
+                "so this case does not exercise the reporting bug"
+            )
+
+            # The contract: the reported size tracks where the file lands, not
+            # the stale on-disk size.
+            assert abs(reported - settled) <= page_size, (
+                f"logical_size_bytes() reported {reported} but the file settled "
+                f"at {settled} (stale stat() read {stat_size}) — a "
+                f"reclaimed-bytes delta built on this would be wrong"
+            )
+        finally:
+            if reader is not None:
+                reader.close()
+            db.close()
+
+    def test_logical_size_bytes_matches_page_accounting(self, tmp_path):
+        """Sanity: the helper returns page_count * page_size, or None if closed."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            pc = db._conn.execute("PRAGMA page_count").fetchone()[0]
+            ps = db._conn.execute("PRAGMA page_size").fetchone()[0]
+            assert db.logical_size_bytes() == pc * ps
+        finally:
+            db.close()
+        # After close the connection is gone — must degrade to None, not raise,
+        # so callers can fall back to stat().
+        assert db.logical_size_bytes() is None
+
+    def test_optimize_fts_storage_resumable_after_interrupt(self, tmp_path):
+        """A partially-completed optimize resumes on re-run: after demote +
+        one chunk, re-invoking finishes without duplicating rows."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            # Simulate an interrupted run: demote + a single backfill chunk,
+            # then stop (as if the process died mid-optimize).
+            db._demote_legacy_fts_to_trash()
+            assert db.fts_rebuild_status() is not None
+            db.fts_rebuild_step()  # one chunk only
+
+            # Old rows not yet backfilled are still findable via gap supplement.
+            assert len(db.search_messages("TOOLBLOB")) == 1
+
+            # Re-run the full command — must resume, not restart or duplicate.
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.fts_rebuild_status() is None
+            assert db._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+            for term in ("TOOLBLOB", "deployment"):
+                assert db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                    (term,),
+                ).fetchone()[0] == 1
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_interrupted_optimize_reopen_still_reports_available(self, tmp_path):
+        """An interrupted optimize followed by a process restart must keep
+        offering the resume: the legacy vtables are gone (demoted), so the
+        legacy-shape check alone would say "already compact" — the gate has
+        to accept pending rebuild markers / trash tables too. And the reopen
+        must NOT stamp fts_storage_version (the transition isn't done)."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db._demote_legacy_fts_to_trash()
+            db.fts_rebuild_step()  # one chunk, then "the process dies"
+        finally:
+            db.close()
+
+        # Fresh open, as the CLI would after the interrupt.
+        db = SessionDB(db_path=db_path)
+        try:
+            # The CLI gate must still offer optimize-storage (resume).
+            assert db.fts_optimize_available() is True
+            # The layout must NOT be stamped current mid-transition.
+            assert db.get_meta("fts_storage_version") is None
+            # Search stays complete through the gap supplement meanwhile.
+            assert len(db.search_messages("TOOLBLOB")) == 1
+
+            # Re-running the command resumes and completes the transition.
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.fts_optimize_available() is False
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_v22_trash%'"
+            ).fetchall() == []
+            for term in ("TOOLBLOB", "deployment"):
+                assert db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                    (term,),
+                ).fetchone()[0] == 1
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_v23_fresh_db_born_optimized(self, tmp_path):
+        """A brand-new DB is born on v23 — no legacy layout, no opt-in flag,
+        no pending rebuild."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            assert db.fts_optimize_available() is False
+            assert db.fts_rebuild_status() is None
+            assert db.get_meta("fts_optimize_available") is None
+            # Already external-content: no shadow copy tables.
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'messages_fts_content'"
+            ).fetchone() is None
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="hello fresh world")
+            assert len(db.search_messages("fresh")) == 1
+        finally:
+            db.close()
+
+    def test_v23_trigram_stays_in_sync_on_write_paths(self, tmp_path):
+        """INSERT/UPDATE/DELETE through SessionDB keep both indexes coherent
+        under the new trigger shape (integrity-check verifies external
+        content agreement)."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="搜索大别山项目相关资料")
+            db.append_message("s1", role="tool", content="工具输出的大段内容在这里",
+                              tool_name="web_search")
+            db.append_message("s1", role="assistant", content="assistant reply")
+
+            # Trigram: user+assistant only; standard: everything.
+            assert db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0] == 2
+            assert db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 3
+
+            # Rewind-style UPDATE (active=0) must not desync the index — the
+            # triggers only fire on content/tool column changes.
+            def _deactivate(conn):
+                conn.execute("UPDATE messages SET active = 0 WHERE role = 'assistant'")
+            db._execute_write(_deactivate)
+
+            # FTS5 integrity-check raises SQLITE_CORRUPT_VTAB on any
+            # index/content disagreement; passing = indexes are coherent.
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+            db._conn.execute(
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram, rank) "
+                "VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_v23_cjk_tool_role_filter_uses_like_fallback(self, tmp_path):
+        """A CJK query with role_filter=['tool'] must bypass the trigram index
+        (tool rows aren't in it) and still find matches via LIKE."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="tool", content="错误日志：数据库连接超时",
+                              tool_name="terminal")
+            hits = db.search_messages("数据库连接", role_filter=["tool"])
+            assert len(hits) == 1
+            assert hits[0]["role"] == "tool"
+        finally:
+            db.close()
+
+    def test_cjk_like_fallback_hides_rewound_messages(self, tmp_path):
+        """The CJK LIKE fallback must honor the same visibility rule as the
+        FTS5 paths: rewound rows (active=0, compacted=0) are hidden unless
+        include_inactive=True; compaction-archived rows (active=0,
+        compacted=1) stay discoverable (#38763)."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="被撤销的搜索目标内容")
+            db.append_message("s1", role="user", content="被压缩归档的搜索目标内容")
+
+            def _flags(conn):
+                # First row: rewound (active=0, compacted=0) — hidden.
+                conn.execute(
+                    "UPDATE messages SET active = 0 WHERE content LIKE '%撤销%'"
+                )
+                # Second row: compaction-archived (active=0, compacted=1) — visible.
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE content LIKE '%归档%'"
+                )
+            db._execute_write(_flags)
+
+            # Short-CJK query (2 chars — below the 3-char trigram minimum)
+            # forces the LIKE fallback; both rows contain the token 内容.
+            # search_messages strips full content from results — assert on
+            # the snippet column instead.
+            hits = db.search_messages("内容")
+            snippets = [h["snippet"] or "" for h in hits]
+            assert any("归档" in s for s in snippets), "archived row must stay visible"
+            assert not any("撤销" in s for s in snippets), "rewound row must be hidden"
+
+            # include_inactive=True surfaces everything.
+            all_hits = db.search_messages("内容", include_inactive=True)
+            assert len(all_hits) == 2
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
