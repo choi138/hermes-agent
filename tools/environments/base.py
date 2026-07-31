@@ -71,6 +71,72 @@ def suppress_pre_execute_hooks() -> Iterator[None]:
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 
+def _build_process_tree_kill_command(
+    *,
+    root_pid: int | None = None,
+    pid_file: str | None = None,
+) -> str:
+    """Build a Bash command that stops and terminates one POSIX process tree.
+
+    Exactly one root source must be supplied. ``root_pid`` is used for tracked
+    sandbox background processes, while ``pid_file`` lets an SSH transport
+    clean up the remote wrapper whose PID is only known after launch.
+
+    The root is stopped before descendants are enumerated, and each descendant
+    is stopped before its own children are inspected. This closes the fork
+    race that otherwise lets killing only the wrapper orphan a still-running
+    child under PID 1. The ``ps`` form works on both Linux and macOS.
+    """
+    if (root_pid is None) == (pid_file is None):
+        raise ValueError("exactly one of root_pid or pid_file is required")
+
+    cleanup = ""
+    if root_pid is not None:
+        try:
+            normalized_pid = int(root_pid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("root_pid must be an integer") from exc
+        if normalized_pid <= 1:
+            raise ValueError("root_pid must be greater than 1")
+        root_setup = f"__hermes_root={normalized_pid}; "
+    else:
+        if not isinstance(pid_file, str) or not pid_file:
+            raise ValueError("pid_file must be a non-empty path")
+        marker = shlex.quote(pid_file)
+        root_setup = (
+            f"__hermes_marker={marker}; "
+            "__hermes_root=; "
+            "if [ -r \"$__hermes_marker\" ]; then "
+            "__hermes_root=$(sed -n '1{s/[^0-9].*$//;p;}' "
+            "\"$__hermes_marker\"); "
+            "fi; "
+        )
+        cleanup = "rm -f -- \"$__hermes_marker\""
+
+    return (
+        root_setup
+        + "case \"$__hermes_root\" in ''|*[!0-9]*) ;; *) "
+        "__hermes_children() { "
+        "ps -eo pid=,ppid= 2>/dev/null | "
+        "awk -v parent=\"$1\" '$2 == parent { print $1 }'; "
+        "}; "
+        "__hermes_collect() { "
+        "kill -STOP \"$1\" 2>/dev/null || true; "
+        "for __hermes_child in $(__hermes_children \"$1\"); do "
+        "__hermes_collect \"$__hermes_child\"; done; "
+        "printf '%s\\n' \"$1\"; "
+        "}; "
+        "__hermes_pids=$(__hermes_collect \"$__hermes_root\"); "
+        "if [ -n \"$__hermes_pids\" ]; then "
+        "kill -TERM $__hermes_pids 2>/dev/null || true; "
+        "kill -CONT $__hermes_pids 2>/dev/null || true; "
+        "sleep 0.5; "
+        "kill -KILL $__hermes_pids 2>/dev/null || true; "
+        "fi ;; esac; "
+        + cleanup
+    )
+
+
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text."""
     def __init__(self, max_chars: int):
@@ -1001,6 +1067,23 @@ class BaseEnvironment(ABC):
             proc.kill()
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+    def terminate_process_tree(self, pid: int, *, timeout: int = 5) -> dict:
+        """Terminate a tracked process and every descendant inside this backend."""
+        command = _build_process_tree_kill_command(root_pid=pid)
+        result = self.execute(
+            command,
+            timeout=timeout,
+            rewrite_compound_background=False,
+        )
+        returncode = result.get("returncode")
+        if returncode not in (None, 0):
+            detail = str(result.get("output") or "").strip()
+            raise RuntimeError(
+                f"process-tree termination failed (rc={returncode})"
+                + (f": {detail}" if detail else "")
+            )
+        return result
 
     # ------------------------------------------------------------------
     # CWD extraction

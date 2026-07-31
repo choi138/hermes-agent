@@ -16,7 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.base import (
+    BaseEnvironment,
+    _build_process_tree_kill_command,
+    _popen_bash,
+)
 from tools.environments.file_sync import (
     FileSyncManager,
     FileSyncState,
@@ -1216,31 +1220,32 @@ class SSHEnvironment(BaseEnvironment):
     @staticmethod
     def _remote_tree_kill_command(pid_file: str) -> str:
         """Build a Linux/macOS-compatible descendant-first kill script."""
-        marker = shlex.quote(pid_file)
-        return (
-            f"__hermes_marker={marker}; "
-            "if [ -r \"$__hermes_marker\" ]; then "
-            "__hermes_root=$(sed -n '1{s/[^0-9].*$//;p;}' \"$__hermes_marker\"); "
-            "case \"$__hermes_root\" in ''|*[!0-9]*) ;; *) "
-            "__hermes_children() { "
-            "ps -eo pid=,ppid= 2>/dev/null | "
-            "awk -v parent=\"$1\" '$2 == parent { print $1 }'; "
-            "}; "
-            "__hermes_collect() { "
-            "kill -STOP \"$1\" 2>/dev/null || true; "
-            "for __hermes_child in $(__hermes_children \"$1\"); do "
-            "__hermes_collect \"$__hermes_child\"; done; "
-            "printf '%s\\n' \"$1\"; "
-            "}; "
-            "__hermes_pids=$(__hermes_collect \"$__hermes_root\"); "
-            "if [ -n \"$__hermes_pids\" ]; then "
-            "kill -TERM $__hermes_pids 2>/dev/null || true; "
-            "kill -CONT $__hermes_pids 2>/dev/null || true; "
-            "sleep 0.5; "
-            "kill -KILL $__hermes_pids 2>/dev/null || true; "
-            "fi ;; esac; fi; "
-            "rm -f -- \"$__hermes_marker\""
+        return _build_process_tree_kill_command(pid_file=pid_file)
+
+    def terminate_process_tree(self, pid: int, *, timeout: int = 5) -> dict:
+        """Terminate a tracked remote tree over the dedicated management SSH."""
+        cmd = self._build_ssh_command(management=True)
+        cmd.extend(
+            [
+                "bash",
+                "-c",
+                shlex.quote(_build_process_tree_kill_command(root_pid=pid)),
+            ]
         )
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                f"SSH process-tree termination failed (rc={result.returncode})"
+                + (f": {detail}" if detail else "")
+            )
+        return {"output": result.stdout, "returncode": result.returncode}
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
