@@ -42,6 +42,14 @@ _monotonic = time.monotonic
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
 
+# Delegation live logs are an append-only observability stream owned by the
+# gateway process.  They change while remote tar/scp operations are reading
+# them, are never consumed by terminal commands, and were the dominant source
+# of "file changed as we read it" sync failures.  Keep durable delegation
+# artifacts mirrored, but leave this volatile subtree on its authoritative
+# host.
+_VOLATILE_REMOTE_PATH_PARTS = ("/cache/delegation/live/",)
+
 # Transport callbacks provided by each backend
 UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
 BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_path), ...] -> raises on failure
@@ -93,7 +101,10 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     for entry in iter_skills_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
     for entry in iter_cache_files(container_base=container_base):
-        files.append((entry["host_path"], entry["container_path"]))
+        remote_path = entry["container_path"]
+        if any(part in remote_path for part in _VOLATILE_REMOTE_PATH_PARTS):
+            continue
+        files.append((entry["host_path"], remote_path))
     return files
 
 
@@ -149,6 +160,46 @@ _SYNC_BACK_BACKOFF = (2, 4, 8)  # seconds between retries
 _SYNC_BACK_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB — refuse to extract larger tars
 
 
+class FileSyncState:
+    """Mutable sync snapshot that may be shared by equivalent backends.
+
+    Transport callbacks stay on each environment-specific manager. Only the
+    target/profile file snapshot and its lock are shared, so a newly-created
+    SSH environment can verify local mtimes without uploading the same corpus
+    again.
+    """
+
+    def __init__(self):
+        self.synced_files: dict[str, tuple[float, int]] = {}
+        self.pushed_hashes: dict[str, str] = {}
+        self.upload_only_host_paths: set[str] = set()
+        self.last_sync_time: float = 0.0
+        self.lock = threading.RLock()
+
+    def export_snapshot(self) -> dict:
+        """Return a JSON-serializable copy under the shared lock."""
+        with self.lock:
+            return {
+                "synced_files": {
+                    path: [mtime, size]
+                    for path, (mtime, size) in self.synced_files.items()
+                },
+                "pushed_hashes": dict(self.pushed_hashes),
+            }
+
+    def restore_snapshot(
+        self,
+        synced_files: dict[str, tuple[float, int]],
+        pushed_hashes: dict[str, str],
+    ) -> None:
+        """Replace the snapshot atomically; force the next manager to scan."""
+        with self.lock:
+            self.synced_files = dict(synced_files)
+            self.pushed_hashes = dict(pushed_hashes)
+            self.upload_only_host_paths = set()
+            self.last_sync_time = 0.0
+
+
 class FileSyncManager:
     """Tracks local file changes and syncs to a remote environment.
 
@@ -168,19 +219,62 @@ class FileSyncManager:
         sync_interval: float = _SYNC_INTERVAL_SECONDS,
         bulk_upload_fn: BulkUploadFn | None = None,
         bulk_download_fn: BulkDownloadFn | None = None,
+        shared_state: FileSyncState | None = None,
     ):
         self._get_files_fn = get_files_fn
         self._upload_fn = upload_fn
         self._bulk_upload_fn = bulk_upload_fn
         self._bulk_download_fn = bulk_download_fn
         self._delete_fn = delete_fn
-        self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
-        self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
-        self._upload_only_host_paths: set[str] = set()
-        self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
+        self._shared_state = shared_state or FileSyncState()
         self._sync_interval = sync_interval
+        # Equivalent managers share this lock and snapshot across task-scoped
+        # SSH environments. Only preparation is serialized; commands remain
+        # fully concurrent once the one upload cycle completes.
+        self._sync_lock = self._shared_state.lock
 
-    def sync(self, *, force: bool = False) -> None:
+    @property
+    def shared_state(self) -> FileSyncState:
+        return self._shared_state
+
+    @property
+    def _synced_files(self) -> dict[str, tuple[float, int]]:
+        return self._shared_state.synced_files
+
+    @_synced_files.setter
+    def _synced_files(self, value: dict[str, tuple[float, int]]) -> None:
+        self._shared_state.synced_files = value
+
+    @property
+    def _pushed_hashes(self) -> dict[str, str]:
+        return self._shared_state.pushed_hashes
+
+    @_pushed_hashes.setter
+    def _pushed_hashes(self, value: dict[str, str]) -> None:
+        self._shared_state.pushed_hashes = value
+
+    @property
+    def _upload_only_host_paths(self) -> set[str]:
+        return self._shared_state.upload_only_host_paths
+
+    @_upload_only_host_paths.setter
+    def _upload_only_host_paths(self, value: set[str]) -> None:
+        self._shared_state.upload_only_host_paths = value
+
+    @property
+    def _last_sync_time(self) -> float:
+        return self._shared_state.last_sync_time
+
+    @_last_sync_time.setter
+    def _last_sync_time(self, value: float) -> None:
+        self._shared_state.last_sync_time = value
+
+    def sync(self, *, force: bool = False) -> bool:
+        """Single-flight wrapper around one transactional upload cycle."""
+        with self._sync_lock:
+            return self._sync_once(force=force)
+
+    def _sync_once(self, *, force: bool = False) -> bool:
         """Run a sync cycle: upload changed files, delete removed files.
 
         Rate-limited to once per ``sync_interval`` unless *force* is True
@@ -192,7 +286,7 @@ class FileSyncManager:
         if not force and not os.environ.get(_FORCE_SYNC_ENV):
             now = _monotonic()
             if now - self._last_sync_time < self._sync_interval:
-                return
+                return True
 
         current_files = self._get_files_fn()
         self._upload_only_host_paths.update(_credential_host_paths())
@@ -215,7 +309,7 @@ class FileSyncManager:
 
         if not to_upload and not to_delete:
             self._last_sync_time = _monotonic()
-            return
+            return True
 
         # Snapshot for rollback (only when there's work to do)
         prev_files = dict(self._synced_files)
@@ -249,6 +343,7 @@ class FileSyncManager:
 
             self._synced_files = new_files
             self._last_sync_time = _monotonic()
+            return True
 
         except Exception as exc:
             self._synced_files = prev_files
@@ -260,6 +355,7 @@ class FileSyncManager:
             # leaving the remote with stale files — contradicting this method's
             # documented "next cycle retries everything" contract.
             logger.warning("file_sync: sync failed, rolled back state: %s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # Sync-back: pull remote changes to host on teardown
@@ -272,7 +368,24 @@ class FileSyncManager:
         max_attempts: int | None = None,
         bulk_download_fn: BulkDownloadFn | None = None,
         deadline: float | None = None,
-    ) -> None:
+    ) -> bool:
+        """Single-flight wrapper around remote-to-host synchronization."""
+        with self._sync_lock:
+            return self._sync_back_once_serialized(
+                hermes_home,
+                max_attempts=max_attempts,
+                bulk_download_fn=bulk_download_fn,
+                deadline=deadline,
+            )
+
+    def _sync_back_once_serialized(
+        self,
+        hermes_home: Path | None = None,
+        *,
+        max_attempts: int | None = None,
+        bulk_download_fn: BulkDownloadFn | None = None,
+        deadline: float | None = None,
+    ) -> bool:
         """Pull remote changes back to the host filesystem.
 
         Downloads the remote ``.hermes/`` directory as a tar archive,
@@ -294,14 +407,14 @@ class FileSyncManager:
             else bulk_download_fn
         )
         if download_fn is None:
-            return
+            return True
 
         # Nothing was ever committed through this manager — the initial
         # push failed or never ran. Skip sync_back to avoid retry storms
         # against an uninitialized remote .hermes/ directory.
         if not self._pushed_hashes and not self._synced_files:
             logger.debug("sync_back: no prior push state — skipping")
-            return
+            return True
 
         lock_path = (hermes_home or get_hermes_home()) / ".sync.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,7 +434,7 @@ class FileSyncManager:
             try:
                 attempts_run += 1
                 self._sync_back_once(lock_path, download_fn, deadline)
-                return
+                return True
             except Exception as exc:
                 last_exc = exc
                 if attempt < attempt_limit - 1:
@@ -344,6 +457,7 @@ class FileSyncManager:
             attempts_run,
             last_exc,
         )
+        return False
 
     def _sync_back_once(
         self,

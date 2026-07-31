@@ -972,7 +972,10 @@ Background: Set background=true to get a session_id. Almost always pair with not
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
-Use process(action="poll") for progress checks, process(action="wait") to block until done.
+For bounded background work, continue useful work or end the turn and let
+notify_on_complete resume you. Do not loop short poll/wait calls. If the next step
+truly depends on completion, call process(action="wait") once with timeout omitted;
+it uses the configured terminal timeout and still returns immediately on exit.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
@@ -1435,6 +1438,11 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        # Independent ControlMaster connections preserve high command
+        # concurrency without hitting one server-side MaxSessions ceiling.
+        "ssh_connection_pool_size": _parse_env_var(
+            "TERMINAL_SSH_CONNECTION_POOL_SIZE", "3"
+        ),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -1629,6 +1637,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             cwd=cwd,
             timeout=timeout,
             sync_files=not probe_only,
+            persistent=bool(ssh_config.get("persistent", False)),
+            connection_pool_size=ssh_config.get("connection_pool_size", 3),
         )
 
     else:
@@ -1661,6 +1671,14 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
+                env = _active_environments.get(task_id)
+                has_active_commands = getattr(env, "has_active_commands", None)
+                if callable(has_active_commands) and has_active_commands():
+                    # A persistent SSH command can legitimately run longer than
+                    # the idle lifetime.  Refresh activity instead of syncing
+                    # and closing its ControlMasters underneath live work.
+                    _last_activity[task_id] = current_time
+                    continue
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
                 if env is not None:
@@ -2330,6 +2348,9 @@ def terminal_tool(
                                 "port": config.get("ssh_port", 22),
                                 "key": config.get("ssh_key", ""),
                                 "persistent": config.get("ssh_persistent", False),
+                                "connection_pool_size": config.get(
+                                    "ssh_connection_pool_size", 3
+                                ),
                             }
 
                         container_config = None

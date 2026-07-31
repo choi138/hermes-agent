@@ -300,7 +300,24 @@ def test_memory_nudge_fires_at_interval():
     agent._memory_store = object()
     ctx = _build(agent)
     assert ctx.should_review_memory is True
-    assert agent._turns_since_memory == 0  # reset after firing
+    # A trigger is only a due marker. The finalizer resets it after a healthy
+    # foreground turn successfully queues/deduplicates the review; a failed
+    # turn must leave the learning opportunity due.
+    assert agent._turns_since_memory == 1
+
+
+def test_subagent_does_not_tick_memory_review_cadence():
+    agent = _FakeAgent()
+    agent._delegate_depth = 1
+    agent.platform = "subagent"
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"memory"}
+    agent._memory_store = object()
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is False
+    assert agent._turns_since_memory == 0
 
 
 def test_no_review_when_memory_disabled():

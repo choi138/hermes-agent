@@ -1338,6 +1338,10 @@ DEFAULT_CONFIG = {
         # Enabled by default for non-local backends (SSH); local is always opt-in
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
+        # Spread concurrent SSH commands over independent ControlMaster
+        # connections.  This preserves delegation throughput while avoiding a
+        # single sshd connection's MaxSessions ceiling.
+        "ssh_connection_pool_size": 3,
     },
 
     "web": {
@@ -1865,6 +1869,12 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            # Automatic reviews are process-wide single-flight. Wait briefly
+            # after foreground work, dedupe identical snapshots for an hour,
+            # and retain a bounded backlog if several sessions finish together.
+            "idle_grace_seconds": 2.0,
+            "dedupe_ttl_seconds": 3600,
+            "queue_limit": 64,
         },
         "moa_reference": {
             "provider": "auto",
@@ -7307,6 +7317,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
     "ssh_key": "TERMINAL_SSH_KEY",
+    "ssh_connection_pool_size": "TERMINAL_SSH_CONNECTION_POOL_SIZE",
     "container_cpu": "TERMINAL_CONTAINER_CPU",
     "container_memory": "TERMINAL_CONTAINER_MEMORY",
     "container_disk": "TERMINAL_CONTAINER_DISK",

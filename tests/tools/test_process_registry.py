@@ -12,12 +12,24 @@ from unittest.mock import MagicMock, patch
 
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
+    PROCESS_SCHEMA,
     ProcessRegistry,
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
 )
+
+
+def test_process_schema_steers_bounded_jobs_away_from_short_wait_loops():
+    description = PROCESS_SCHEMA["description"].lower()
+    timeout_description = PROCESS_SCHEMA["parameters"]["properties"]["timeout"][
+        "description"
+    ].lower()
+
+    assert "instead of repeatedly polling" in description
+    assert "call 'wait' once with timeout omitted" in description
+    assert "180s by default" in timeout_description
 
 
 @pytest.fixture()

@@ -222,6 +222,131 @@ def test_discord_core_compaction_preserves_every_non_description_contract():
     assert apply_gateway_tool_schema_policy("discord-ops", schemas) == schemas
 
 
+def test_compact_delegation_guidance_keeps_parallelism_contract():
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "description": "verbose",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    compacted = apply_gateway_tool_schema_policy("discord-core", schemas)
+    description = compacted[0]["function"]["description"].lower()
+
+    assert "independent direct tool calls" in description
+    assert "one response" in description
+    assert "data-dependent sequencing" in description
+
+
+def test_compact_core_guidance_preserves_quality_and_wait_boundaries():
+    from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+    from tools.skills_tool import SKILL_VIEW_SCHEMA
+    from tools.todo_tool import TODO_SCHEMA
+    from tools.vision_tools import VISION_ANALYZE_SCHEMA
+
+    schemas = [
+        {"type": "function", "function": schema}
+        for schema in (
+            COMPUTER_USE_SCHEMA,
+            SKILL_VIEW_SCHEMA,
+            TODO_SCHEMA,
+            VISION_ANALYZE_SCHEMA,
+        )
+    ]
+    original = deepcopy(schemas)
+
+    compacted = apply_gateway_tool_schema_policy("discord-core", schemas)
+
+    assert _without_descriptions(compacted) == _without_descriptions(original)
+    by_name = {
+        tool["function"]["name"]: tool["function"] for tool in compacted
+    }
+    delivery = by_name["computer_use"]["parameters"]["properties"][
+        "delivery_mode"
+    ]["description"]
+    assert "requires approval" in delivery
+    assert "background_unavailable" in delivery
+    assert "only one may be in_progress" in by_name["todo"]["description"]
+    assert "linked-file index" in by_name["skill_view"]["description"]
+    assert "native-vision" in by_name["vision_analyze"]["description"].lower()
+
+
+def test_compact_process_guidance_avoids_short_wait_loops():
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "process",
+                "description": "verbose",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "description": "verbose"},
+                        "timeout": {"type": "integer", "description": "verbose"},
+                    },
+                },
+            },
+        }
+    ]
+
+    compacted = apply_gateway_tool_schema_policy("discord-core", schemas)
+    function = compacted[0]["function"]
+    description = function["description"].lower()
+    timeout_description = function["parameters"]["properties"]["timeout"][
+        "description"
+    ].lower()
+
+    assert "do not create short poll/wait loops" in description
+    assert "call wait once" in description
+    assert "timeout omitted" in description
+    assert "180s by default" in timeout_description
+
+
+def test_optional_gateway_tools_compact_without_losing_contracts():
+    from tools.browser_cdp_tool import BROWSER_CDP_SCHEMA
+    from tools.browser_dialog_tool import BROWSER_DIALOG_SCHEMA
+    from tools.close_terminal_tool import CLOSE_TERMINAL_SCHEMA
+    from tools.image_generation_tool import IMAGE_GENERATE_SCHEMA
+    from tools.read_terminal_tool import READ_TERMINAL_SCHEMA
+    from tools.web_tools import WEB_EXTRACT_SCHEMA, WEB_SEARCH_SCHEMA
+
+    schemas = [
+        {"type": "function", "function": schema}
+        for schema in (
+            WEB_SEARCH_SCHEMA,
+            WEB_EXTRACT_SCHEMA,
+            IMAGE_GENERATE_SCHEMA,
+            BROWSER_CDP_SCHEMA,
+            BROWSER_DIALOG_SCHEMA,
+            READ_TERMINAL_SCHEMA,
+            CLOSE_TERMINAL_SCHEMA,
+        )
+    ]
+    original = deepcopy(schemas)
+
+    compacted = apply_gateway_tool_schema_policy("discord-core", schemas)
+
+    assert schemas == original
+    assert _without_descriptions(compacted) == _without_descriptions(original)
+    assert canonical_tool_schema_metrics(compacted).json_bytes < (
+        canonical_tool_schema_metrics(original).json_bytes - 3_000
+    )
+    by_name = {
+        tool["function"]["name"]: tool["function"] for tool in compacted
+    }
+    # Dynamic image capability text must remain exact; only static property
+    # descriptions are shortened.
+    assert by_name["image_generate"]["description"] == IMAGE_GENERATE_SCHEMA[
+        "description"
+    ]
+    assert "cross-origin oopif" in by_name["browser_cdp"]["description"].lower()
+    assert "saved path" in by_name["web_extract"]["description"].lower()
+
+
 def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
     monkeypatch,
 ):
@@ -335,7 +460,7 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
         assert "update allows title/body/priority" in kanban_function["description"]
         assert final_by_name["patch"]["parameters"]["properties"]["mode"][
             "enum"
-        ] == ["replace", "patch"]
+        ] == ["replace", "append", "patch"]
         for property_name in ("tasks", "role"):
             assert final_by_name["delegate_task"]["parameters"]["properties"][
                 property_name

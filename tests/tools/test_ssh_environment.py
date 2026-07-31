@@ -3,6 +3,8 @@
 import json
 import os
 import subprocess
+import threading
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -65,6 +67,216 @@ class TestBuildSSHCommand:
     def test_user_host_suffix(self):
         env = SSHEnvironment(host="h", user="u")
         assert env._build_ssh_command()[-1] == "u@h"
+
+    def test_connection_pool_distributes_commands_across_masters(self):
+        env = SSHEnvironment(
+            host="h", user="u", sync_files=False, connection_pool_size=3
+        )
+
+        commands = [env._build_ssh_command() for _ in range(6)]
+        paths = [
+            next(part.split("=", 1)[1] for part in cmd if part.startswith("ControlPath="))
+            for cmd in commands
+        ]
+
+        assert len(set(paths)) == 3
+        assert sorted(paths.count(path) for path in set(paths)) == [2, 2, 2]
+
+    def test_management_channel_is_outside_work_pool(self):
+        env = SSHEnvironment(
+            host="h", user="u", sync_files=False, connection_pool_size=3
+        )
+        work_paths = {str(path) for path in env._control_sockets}
+        management = " ".join(env._build_ssh_command(management=True))
+
+        assert all(path not in management for path in work_paths)
+        assert str(env._management_control_socket) in management
+
+    def test_sync_state_is_shared_only_for_the_same_target_and_profile(
+        self, tmp_path
+    ):
+        host = f"target-{uuid.uuid4().hex}"
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+
+        first = ssh_env._target_sync_state(
+            "alice", host, 22, "/home/alice", profile_home=profile_a
+        )
+        same = ssh_env._target_sync_state(
+            "alice", host, 22, "/home/alice", profile_home=profile_a
+        )
+        other_profile = ssh_env._target_sync_state(
+            "alice", host, 22, "/home/alice", profile_home=profile_b
+        )
+        other_target = ssh_env._target_sync_state(
+            "alice", host + "-other", 22, "/home/alice", profile_home=profile_a
+        )
+
+        assert same is first
+        assert other_profile is not first
+        assert other_target is not first
+
+
+class TestPersistentSSHSyncState:
+    @staticmethod
+    def _make_env(tmp_path):
+        env = object.__new__(SSHEnvironment)
+        env.user = "alice"
+        env.host = "example.test"
+        env.port = 22
+        env._remote_home = "/home/alice"
+        env._session_id = "session-test"
+        env._sync_state_key = ssh_env._target_sync_key(
+            env.user,
+            env.host,
+            env.port,
+            env._remote_home,
+            profile_home=tmp_path,
+        )
+        env._sync_lease_path = None
+        env._sync_lease_registered = False
+        env._build_ssh_command = MagicMock(return_value=["ssh", "alice@example.test"])
+        return env
+
+    def test_cross_process_leases_publish_only_for_actual_last_owner(
+        self, tmp_path
+    ):
+        first = self._make_env(tmp_path)
+        first._session_id = "session-first"
+        second = self._make_env(tmp_path)
+        second._session_id = "session-second"
+
+        assert first._register_persistent_sync_lease() is False
+        assert second._register_persistent_sync_lease() is True
+
+        finalized = []
+        assert second._release_persistent_sync_lease(
+            finalize=lambda: finalized.append("second")
+        ) is False
+        assert finalized == []
+        assert first._release_persistent_sync_lease(
+            finalize=lambda: finalized.append("first")
+        ) is True
+        assert finalized == ["first"]
+
+    def test_dead_cross_process_lease_is_pruned(self, monkeypatch, tmp_path):
+        env = self._make_env(tmp_path)
+        lock_path, lease_dir, _ = env._sync_lease_locations()
+        stale = lease_dir / "stale.json"
+        ssh_env.atomic_json_write(
+            stale,
+            {
+                "pid": 987654321,
+                "process_nonce": "dead",
+                "session_id": "stale",
+            },
+        )
+        monkeypatch.setattr(
+            ssh_env,
+            "_pid_is_alive",
+            lambda pid: False if pid == 987654321 else True,
+        )
+
+        assert env._register_persistent_sync_lease() is False
+        assert not stale.exists()
+        env._release_persistent_sync_lease()
+        assert lock_path.exists()
+
+    def test_unreadable_cross_process_lease_fails_closed(self, tmp_path):
+        env = self._make_env(tmp_path)
+        _, lease_dir, _ = env._sync_lease_locations()
+        lease_dir.mkdir(parents=True, exist_ok=True)
+        corrupt = lease_dir / "corrupt.json"
+        corrupt.write_text("not json", encoding="utf-8")
+
+        assert env._register_persistent_sync_lease() is True
+        env._release_persistent_sync_lease()
+        corrupt.unlink()
+
+    def test_clean_marker_restores_snapshot(self, monkeypatch, tmp_path):
+        env = self._make_env(tmp_path)
+        state = ssh_env.FileSyncState()
+        remote_path = "/home/alice/.hermes/skills/example/SKILL.md"
+        state.restore_snapshot(
+            {remote_path: (123.5, 42)},
+            {remote_path: "a" * 64},
+        )
+        run = MagicMock(
+            return_value=subprocess.CompletedProcess([], 0, "", "")
+        )
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        assert env._persist_sync_state(state) is True
+        _, cache_path, _ = env._sync_state_locations()
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, payload["token"], ""
+        )
+
+        restored = ssh_env.FileSyncState()
+        assert env._restore_persistent_sync_state(restored) is True
+        assert restored.synced_files == state.synced_files
+        assert restored.pushed_hashes == state.pushed_hashes
+        assert "rm -f" in run.call_args.args[0][-1]
+
+    def test_marker_write_honors_cleanup_timeout(self, monkeypatch, tmp_path):
+        env = self._make_env(tmp_path)
+        state = ssh_env.FileSyncState()
+        state.restore_snapshot(
+            {"/home/alice/.hermes/skills/a.txt": (1.0, 1)},
+            {},
+        )
+        run = MagicMock(
+            return_value=subprocess.CompletedProcess([], 0, "", "")
+        )
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        assert env._persist_sync_state(state, timeout=1.25) is True
+        assert run.call_args.kwargs["timeout"] == 1.25
+
+    def test_failed_remote_marker_discard_drops_local_snapshot(
+        self, monkeypatch, tmp_path
+    ):
+        env = self._make_env(tmp_path)
+        _, cache_path, _ = env._sync_state_locations()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text('{"stale": true}', encoding="utf-8")
+        run = MagicMock(
+            return_value=subprocess.CompletedProcess([], 255, "", "offline")
+        )
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        env._discard_persistent_sync_marker()
+
+        assert not cache_path.exists()
+        assert "rm -f" in run.call_args.args[0][-1]
+
+    def test_snapshot_with_remote_path_escape_is_rejected(
+        self, monkeypatch, tmp_path
+    ):
+        env = self._make_env(tmp_path)
+        state = ssh_env.FileSyncState()
+        state.restore_snapshot(
+            {"/home/alice/.hermes/skills/good.txt": (1.0, 1)},
+            {},
+        )
+        run = MagicMock(
+            return_value=subprocess.CompletedProcess([], 0, "", "")
+        )
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+        assert env._persist_sync_state(state) is True
+
+        _, cache_path, _ = env._sync_state_locations()
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        payload["synced_files"] = {"/tmp/outside": [1.0, 1]}
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, payload["token"], ""
+        )
+
+        restored = ssh_env.FileSyncState()
+        assert env._restore_persistent_sync_state(restored) is False
+        assert restored.synced_files == {}
 
 
 class TestControlSocketPath:
@@ -216,6 +428,7 @@ class TestSSHPreflight:
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", _fake_establish)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_create_sync_baseline", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
         monkeypatch.setattr(ssh_env, "FileSyncManager", lambda **kw: type("M", (), {"sync": lambda self, **k: None})())
 
@@ -224,6 +437,35 @@ class TestSSHPreflight:
         assert called["count"] == 1
         assert env.host == "example.com"
         assert env.user == "alice"
+
+    def test_environment_factory_wires_persistence_and_pool(self, monkeypatch):
+        from tools import terminal_tool as terminal_mod
+
+        captured = {}
+        sentinel = object()
+
+        def _fake_ssh_environment(**kwargs):
+            captured.update(kwargs)
+            return sentinel
+
+        monkeypatch.setattr(terminal_mod, "_SSHEnvironment", _fake_ssh_environment)
+
+        result = terminal_mod._create_environment(
+            env_type="ssh",
+            image="",
+            cwd="~",
+            timeout=30,
+            ssh_config={
+                "host": "example.com",
+                "user": "alice",
+                "persistent": True,
+                "connection_pool_size": 4,
+            },
+        )
+
+        assert result is sentinel
+        assert captured["persistent"] is True
+        assert captured["connection_pool_size"] == 4
 
     def test_probe_mode_skips_hermes_file_sync(self, monkeypatch):
         monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
@@ -274,6 +516,58 @@ class TestSSHPreflight:
 
         assert result is sentinel
         assert captured["sync_files"] is False
+
+
+class TestSSHRemoteProcessCleanup:
+    def test_execute_marks_command_active_for_its_full_lifetime(self, monkeypatch):
+        env = object.__new__(SSHEnvironment)
+        env._active_commands_lock = threading.Lock()
+        env._active_commands = 0
+
+        def _fake_base_execute(self, *_args, **_kwargs):
+            assert self.has_active_commands() is True
+            return {"output": "ok", "returncode": 0}
+
+        monkeypatch.setattr(ssh_env.BaseEnvironment, "execute", _fake_base_execute)
+
+        assert env.execute("true")["returncode"] == 0
+        assert env.has_active_commands() is False
+
+    def test_idle_reaper_preserves_environment_with_active_command(self, monkeypatch):
+        from tools import terminal_tool as terminal_mod
+
+        env = MagicMock()
+        env.has_active_commands.return_value = True
+        active = {"default": env}
+        activity = {"default": 0.0}
+        monkeypatch.setattr(terminal_mod, "_active_environments", active)
+        monkeypatch.setattr(terminal_mod, "_last_activity", activity)
+
+        terminal_mod._cleanup_inactive_envs(lifetime_seconds=1)
+
+        assert terminal_mod._active_environments["default"] is env
+        assert terminal_mod._last_activity["default"] > 0
+        env.cleanup.assert_not_called()
+
+    def test_kill_process_uses_dedicated_remote_tree_cleanup(self, monkeypatch):
+        env = object.__new__(SSHEnvironment)
+        env._build_ssh_command = MagicMock(return_value=["ssh", "u@h"])
+
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc._hermes_remote_pid_file = "/tmp/hermes-remote-test.pid"
+        run = MagicMock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        env._kill_process(proc)
+
+        env._build_ssh_command.assert_called_once_with(management=True)
+        remote_command = run.call_args.args[0][-1]
+        assert "ps -eo pid=,ppid=" in remote_command
+        assert "kill -TERM" in remote_command
+        assert "kill -KILL" in remote_command
+        proc.kill.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=2)
 
 
 def _setup_ssh_env(monkeypatch, persistent: bool):
@@ -355,6 +649,22 @@ class TestPersistentSSH:
         r = _run("echo alive")
         assert r["exit_code"] == 0
         assert "alive" in r["output"]
+
+    def test_timeout_kills_remote_child_tree(self):
+        marker = f"/tmp/hermes-timeout-child-{uuid.uuid4().hex}.pid"
+        r = _run(
+            f"sleep 999 & child=$!; echo $child > {marker}; wait $child",
+            timeout=2,
+        )
+        assert r["exit_code"] == 124
+
+        check = _run(
+            f"pid=$(cat {marker}); "
+            f"if kill -0 $pid 2>/dev/null; then echo alive; else echo dead; fi; "
+            f"rm -f {marker}",
+            timeout=10,
+        )
+        assert check["output"].strip() == "dead"
 
     def test_large_output(self):
         r = _run("seq 1 1000")

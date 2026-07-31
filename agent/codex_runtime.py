@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.background_review_policy import is_successful_review_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -762,26 +763,39 @@ def run_codex_app_server_turn(
     # _turns_since_memory and _user_turn_count are ALREADY incremented
     # in the run_conversation() pre-loop block (lines ~11793-11817) so we
     # do NOT touch them here — that would double-count.
-    # Only _iters_since_skill needs explicit increment, since the
-    # chat_completions loop bumps it per tool iteration (line ~12110)
-    # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+    # Commit cadence only after a successful primary turn. This prevents
+    # delegated Codex workers and errored/partial transcripts from creating
+    # automatic review work.
+    review_eligible = is_successful_review_outcome(
+        agent,
+        final_response=turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+        failed=turn.error is not None,
+        interrupted=turn.interrupted,
     )
+    if (
+        review_eligible
+        and agent._skill_nudge_interval > 0
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        agent._iters_since_skill = (
+            getattr(agent, "_iters_since_skill", 0) + max(int(turn.tool_iterations or 0), 1)
+        )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
 
-    # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
+    # Check the skill nudge after successful work was committed.
     should_review_skills = False
     if (
-        agent._skill_nudge_interval > 0
+        review_eligible
+        and agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
         and "skill_manage" in agent.valid_tool_names
     ):
         should_review_skills = True
-        agent._iters_since_skill = 0
+
+    should_review_memory = bool(should_review_memory and review_eligible)
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
@@ -800,16 +814,20 @@ def run_codex_app_server_turn(
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
-        and not turn.interrupted
+        review_eligible
         and (should_review_memory or should_review_skills)
     ):
         try:
-            agent._spawn_background_review(
+            accepted = agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )
+            if accepted is not False:
+                if should_review_memory:
+                    agent._turns_since_memory = 0
+                if should_review_skills:
+                    agent._iters_since_skill = 0
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 

@@ -1649,29 +1649,82 @@ class AIAgent:
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
-    ) -> None:
-        """Spawn the background memory/skill review thread.
+    ) -> bool:
+        """Queue a deduplicated background memory/skill review.
 
-        Thin wrapper — the heavy lifting lives in
+        The review fork itself still lives in
         ``agent.background_review.spawn_background_review_thread`` which
-        returns the thread target.  ``threading.Thread`` is constructed
-        here so existing tests that patch ``run_agent.threading.Thread``
-        keep working.
+        returns the executable target.  A process-wide coordinator owns the
+        daemon worker so concurrent sessions cannot start a review storm.
         """
+        from agent.background_review_policy import is_primary_foreground_agent
+
+        # Defense in depth: trigger sites use the same gate, but callers may
+        # invoke this method directly.  Never let delegated workers or an
+        # internal review fork schedule another self-improvement review.
+        if not is_primary_foreground_agent(self):
+            return False
+        if not review_memory and not review_skills:
+            return False
+
         from agent.background_review import spawn_background_review_thread
+        from agent.background_review_coordinator import (
+            ensure_background_review_owner_token,
+            get_background_review_coordinator,
+        )
         from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
+
+        snapshot = list(messages_snapshot)
+        # Build all possible targets while the foreground profile Context is
+        # still active.  ``propagate_context_to_thread`` captures that Context
+        # now, so a queued review writes to the right profile later (#54937).
+        targets = {}
+        for memory_flag, skills_flag in ((True, False), (False, True), (True, True)):
+            target, _prompt = spawn_background_review_thread(
+                self,
+                snapshot,
+                review_memory=memory_flag,
+                review_skills=skills_flag,
+            )
+            targets[(memory_flag, skills_flag)] = propagate_context_to_thread(target)
+
+        def _target_factory(memory_flag: bool, skills_flag: bool):
+            return targets[(memory_flag, skills_flag)]
+
+        coordinator = get_background_review_coordinator()
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+            review_cfg = (
+                auxiliary.get("background_review", {})
+                if isinstance(auxiliary, dict)
+                else {}
+            )
+            if not isinstance(review_cfg, dict):
+                review_cfg = {}
+            coordinator.configure(
+                idle_grace_seconds=float(review_cfg.get("idle_grace_seconds", 2.0)),
+                dedupe_ttl_seconds=float(review_cfg.get("dedupe_ttl_seconds", 3600.0)),
+                queue_limit=int(review_cfg.get("queue_limit", 64)),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid auxiliary.background_review coordinator settings; "
+                "using the last valid values"
+            )
+        except Exception:
+            logger.debug("Background review coordinator config load failed", exc_info=True)
+
+        disposition = coordinator.submit(
+            owner_token=ensure_background_review_owner_token(self),
+            messages_snapshot=snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            target_factory=_target_factory,
         )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+        return disposition != "queue_full"
 
     def _build_memory_write_metadata(
         self,
@@ -6419,27 +6472,29 @@ class AIAgent:
             getattr(self, "_session_db", None), getattr(self, "session_id", None)
         )
         from agent.auxiliary_client import scoped_runtime_main
+        from agent.background_review_coordinator import foreground_turn_scope
 
         # The outer token restores the caller's Context even though turn setup
         # replaces the value with the live runtime after fallback restoration.
         # Keep the scope local instead of storing ContextVar tokens on the agent,
         # which may be observed from another thread.
-        with scoped_runtime_main({}):
-            try:
-                return run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    moa_config=moa_config,
-                )
-            finally:
-                reset_accounting_context(acct_token)
-                reset_conversation_context(token)
+        with foreground_turn_scope(self):
+            with scoped_runtime_main({}):
+                try:
+                    return run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        moa_config=moa_config,
+                    )
+                finally:
+                    reset_accounting_context(acct_token)
+                    reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

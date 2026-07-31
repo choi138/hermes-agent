@@ -6799,6 +6799,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        include_context: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -6809,8 +6810,10 @@ class SessionDB:
           - Boolean: "docker OR kubernetes", "python NOT java"
           - Prefix: "deploy*"
 
-        Returns matching messages with session metadata, content snippet,
-        and surrounding context (1 message before and after the match).
+        Returns matching messages with session metadata and a content snippet.
+        By default, each result also includes surrounding context (1 message
+        before and after the match). Pass ``include_context=False`` when the
+        caller will hydrate its own window; this skips one extra query per hit.
 
         ``sort`` controls temporal ordering:
           - ``None`` (default): FTS5 BM25 relevance only. Time-neutral.
@@ -7231,67 +7234,68 @@ class SessionDB:
                 if tri_matches:
                     matches = tri_matches
 
-        # Add surrounding context (1 message before + after each match).
-        # Done outside the lock so we don't hold it across N sequential queries.
-        for match in matches:
-            try:
-                with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
+        if include_context:
+            # Add surrounding context (1 message before + after each match).
+            # Done outside the lock so we don't hold it across N sequential queries.
+            for match in matches:
+                try:
+                    with self._lock:
+                        ctx_cursor = self._conn.execute(
+                            """WITH target AS (
+                                   SELECT session_id, timestamp, id
+                                   FROM messages
+                                   WHERE id = ?
+                               )
+                               SELECT role, content
+                               FROM (
+                                   SELECT m.id, m.timestamp, m.role, m.content
+                                   FROM messages m
+                                   JOIN target t ON t.session_id = m.session_id
+                                   WHERE (m.timestamp < t.timestamp)
+                                      OR (m.timestamp = t.timestamp AND m.id < t.id)
+                                   ORDER BY m.timestamp DESC, m.id DESC
+                                   LIMIT 1
+                               )
+                               UNION ALL
+                               SELECT role, content
                                FROM messages
                                WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
-                           FROM messages
-                           WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
-                    )
-                    context_msgs = []
-                    for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
+                               UNION ALL
+                               SELECT role, content
+                               FROM (
+                                   SELECT m.id, m.timestamp, m.role, m.content
+                                   FROM messages m
+                                   JOIN target t ON t.session_id = m.session_id
+                                   WHERE (m.timestamp > t.timestamp)
+                                      OR (m.timestamp = t.timestamp AND m.id > t.id)
+                                   ORDER BY m.timestamp ASC, m.id ASC
+                                   LIMIT 1
+                               )""",
+                            (match["id"], match["id"]),
                         )
-                match["context"] = context_msgs
-            except Exception:
-                match["context"] = []
+                        context_msgs = []
+                        for r in ctx_cursor.fetchall():
+                            raw = r["content"]
+                            decoded = self._decode_content(raw)
+                            # Multimodal context: render a compact text-only
+                            # summary for search previews.
+                            if isinstance(decoded, list):
+                                text_parts = [
+                                    p.get("text", "") for p in decoded
+                                    if isinstance(p, dict) and p.get("type") == "text"
+                                ]
+                                text = " ".join(t for t in text_parts if t).strip()
+                                preview = text or "[multimodal content]"
+                            elif isinstance(decoded, str):
+                                preview = decoded
+                            else:
+                                preview = ""
+                            context_msgs.append(
+                                {"role": r["role"], "content": preview[:200]}
+                            )
+                    match["context"] = context_msgs
+                except Exception:
+                    match["context"] = []
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:

@@ -396,3 +396,60 @@ def test_pending_response_fences_kanban_timeout_to_worker_run(monkeypatch):
     )
 
     assert record.call_args.kwargs["expected_run_id"] == 42
+
+
+def test_normal_primary_turn_commits_cadence_and_queues_review(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=59)
+    agent._skill_nudge_interval = 1
+    agent.valid_tool_names = {"skill_manage"}
+    agent._spawn_background_review = MagicMock(return_value=True)
+
+    _finalize(
+        agent,
+        final_response="done",
+        exit_reason="text_response(finish_reason=stop)",
+        api_call_count=1,
+    )
+
+    agent._spawn_background_review.assert_called_once()
+    assert agent._spawn_background_review.call_args.kwargs["review_skills"] is True
+    assert agent._iters_since_skill == 0
+
+
+def test_delegated_turn_never_commits_or_queues_review(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=59)
+    agent._delegate_depth = 1
+    agent.platform = "subagent"
+    agent._skill_nudge_interval = 1
+    agent.valid_tool_names = {"skill_manage"}
+    agent._spawn_background_review = MagicMock(return_value=True)
+
+    _finalize(
+        agent,
+        final_response="review complete",
+        exit_reason="text_response(finish_reason=stop)",
+        api_call_count=12,
+    )
+
+    agent._spawn_background_review.assert_not_called()
+    assert agent._iters_since_skill == 0
+
+
+def test_tool_persistence_failure_text_never_queues_review(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=59)
+    agent._skill_nudge_interval = 1
+    agent.valid_tool_names = {"skill_manage"}
+    agent._spawn_background_review = MagicMock(return_value=True)
+
+    _finalize(
+        agent,
+        final_response="Tool execution failed to persist.",
+        exit_reason="tool_persistence_failure",
+        api_call_count=8,
+    )
+
+    agent._spawn_background_review.assert_not_called()
+    assert agent._iters_since_skill == 0

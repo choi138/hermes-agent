@@ -333,6 +333,54 @@ class TestRunConversationCodexPath:
         )
         assert "messages_snapshot" in call.kwargs
 
+    def test_subagent_never_ticks_or_spawns_automatic_review(self, fake_session):
+        agent = _make_codex_agent()
+        agent._delegate_depth = 1
+        agent.platform = "subagent"
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 0
+        agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        agent.valid_tool_names.add("skill_manage")
+
+        with patch.object(agent, "_spawn_background_review", return_value=True) as spawn:
+            agent.run_conversation("delegated review task")
+
+        assert not spawn.called
+        assert agent._iters_since_skill == 0
+
+    def test_codex_error_with_fallback_text_does_not_spawn_review(self, monkeypatch):
+        def fake_error_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="partial fallback",
+                projected_messages=[
+                    {"role": "assistant", "content": "partial fallback"},
+                ],
+                tool_iterations=20,
+                interrupted=False,
+                error="transport failed",
+                turn_id="turn-error",
+                thread_id="thread-error",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_error_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-error",
+        )
+        agent = _make_codex_agent()
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 0
+        agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        agent.valid_tool_names.add("skill_manage")
+
+        with patch.object(agent, "_spawn_background_review", return_value=True) as spawn:
+            result = agent.run_conversation("fail after work")
+
+        assert result["completed"] is False
+        assert not spawn.called
+        assert agent._iters_since_skill == 0
+
     def test_chat_completions_loop_is_not_entered(self, fake_session):
         """The early-return must bypass the regular API call loop entirely.
         We confirm by patching the SDK call and asserting it's never invoked."""
@@ -786,4 +834,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-
