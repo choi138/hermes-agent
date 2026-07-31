@@ -16,6 +16,7 @@ from hermes_state import FTS_CJK_STALE_KEY, SessionDB
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "native" / "fts5_cjk" / "fts5_cjk.c"
 VENDOR = REPO / "native" / "fts5_cjk" / "vendor"
+BUILD = REPO / "native" / "fts5_cjk" / "build.sh"
 
 
 @pytest.fixture(scope="session")
@@ -41,6 +42,29 @@ def cjk_so(tmp_path_factory):
     finally:
         probe.close()
     return out
+
+
+def test_build_script_installs_loadable_extension(tmp_path):
+    bash = shutil.which("bash")
+    if shutil.which("gcc") is None or bash is None:
+        pytest.skip("no C toolchain / bash")
+
+    dest = tmp_path / "lib"
+    subprocess.run(
+        [bash, str(BUILD), str(dest)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    installed = dest / "libfts5_cjk.so"
+    assert installed.is_file()
+
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.enable_load_extension(True)
+        probe.load_extension(str(installed))
+    finally:
+        probe.close()
 
 
 @pytest.fixture()
