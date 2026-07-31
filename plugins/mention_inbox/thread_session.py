@@ -24,6 +24,7 @@ from plugins.mention_inbox.voice import (
     render_needs_reapproval,
     render_proposal,
     render_thread_opened,
+    render_thread_update,
 )
 
 
@@ -109,7 +110,7 @@ def _read_only_content(
         "goal": f"{repository}의 ‘{title}’에서 {explanation}",
         "steps": (
             "먼저 읽기 전용으로 원문과 현재 HEAD를 다시 확인한다.",
-            "근거가 결속된 새 제안을 만든 뒤에만 변경 승인을 요청한다.",
+            "근거가 결속되면 필요한 작업과 검증 범위를 갱신한다.",
         ),
         "allowed_actions": ("read_repository",),
         "forbidden_actions": (
@@ -123,7 +124,7 @@ def _read_only_content(
         ),
         "verification": (
             "원문 event와 현재 HEAD 재결속",
-            "변경 시작 전 새 제안 확인",
+            "변경 전 최신 작업 범위 확인",
         ),
         "executor_hint": "direct",
     }
@@ -176,7 +177,7 @@ def _proposal_content(
             steps.append(f"원문: {_bounded(finding.source_url, 480)}")
     if not steps:
         steps.append(f"확인된 요청: {_bounded(brief.summary, 400)}")
-    steps.append("승인된 범위 안에서만 수정하고 대상 테스트로 검증한다.")
+    steps.append("확인된 범위 안에서만 수정하고 대상 테스트로 검증한다.")
     allowed_actions = [
         "read_repository",
         "edit_scoped_files",
@@ -198,7 +199,7 @@ def _proposal_content(
         )
         verification.extend(
             (
-                "현재 PR branch와 승인 HEAD 일치",
+                "현재 PR branch와 요청 시점 HEAD 일치",
                 "선택 파일 commit SHA 확인",
                 "현재 PR branch non-force push 성공",
             )
@@ -220,6 +221,26 @@ def _proposal_content(
         "verification": tuple(verification),
         "executor_hint": "direct",
     }
+
+
+def _matches_proposal_content(
+    proposal: WorkProposal,
+    *,
+    head_sha: str | None,
+    content: Mapping[str, object],
+    executor_hint: str,
+) -> bool:
+    """Compare user-visible work meaning independently of event identity."""
+
+    return (
+        proposal.head_sha == head_sha
+        and proposal.goal == content["goal"]
+        and proposal.steps == tuple(content["steps"])
+        and proposal.allowed_actions == tuple(content["allowed_actions"])
+        and proposal.forbidden_actions == tuple(content["forbidden_actions"])
+        and proposal.verification == tuple(content["verification"])
+        and proposal.executor_hint == executor_hint
+    )
 
 
 class MentionInboxThreadCoordinator:
@@ -288,22 +309,37 @@ class MentionInboxThreadCoordinator:
                 **content,
             )
             return proposal, None, False
+        binding = self._store.get_proposal_message_binding(
+            latest.proposal_id, latest.revision
+        )
+        capability_upgrade = bool(
+            approval_offered
+            and latest.status is ProposalStatus.PENDING
+            and binding is not None
+            and not binding.approval_offered
+        )
+        brief = _bound_brief(event, source_revision=source_revision)
+        if (
+            brief is not None
+            and brief.disposition is PreApprovalDisposition.INFORMATIONAL
+            and not capability_upgrade
+        ):
+            return latest, latest, False
+        if _matches_proposal_content(
+            latest,
+            head_sha=head_sha,
+            content=content,
+            executor_hint=self._executor_hint,
+        ) and not capability_upgrade:
+            return latest, latest, False
         if (
             latest.source_dedupe_key == event.dedupe_key
             and latest.source_revision == source_revision
             and latest.head_sha == head_sha
+            and not capability_upgrade
         ):
-            binding = self._store.get_proposal_message_binding(
-                latest.proposal_id, latest.revision
-            )
-            capability_upgrade = bool(
-                approval_offered
-                and latest.status is ProposalStatus.PENDING
-                and binding is not None
-                and not binding.approval_offered
-            )
-            if not capability_upgrade:
-                return latest, latest, False
+            return latest, latest, False
+        if capability_upgrade:
             proposal = revise_work_proposal(
                 latest,
                 source_dedupe_key=event.dedupe_key,
@@ -351,9 +387,9 @@ class MentionInboxThreadCoordinator:
                         _thread_name(event),
                         self._auto_archive_duration,
                     )
-                session = self._store.record_work_item_thread(
-                    subject, parent, thread_id
-                )
+            session = self._store.record_work_item_thread(
+                subject, parent, thread_id
+            )
             self._discord.mark_thread_participation(thread_id)
 
             approval_offered, unavailable_reason = self._approval_offer(
@@ -364,7 +400,11 @@ class MentionInboxThreadCoordinator:
                 source_revision=source_revision,
                 approval_offered=approval_offered,
             )
-            self._store.create_proposal(proposal)
+            is_new_proposal = (
+                previous is None or proposal.revision != previous.revision
+            )
+            if is_new_proposal:
+                self._store.create_proposal(proposal)
             message_id = self._store.get_proposal_message_id(
                 proposal.proposal_id, proposal.revision
             )
@@ -401,6 +441,57 @@ class MentionInboxThreadCoordinator:
             if restored is None:
                 raise RuntimeError("work item session disappeared")
             return restored
+
+    async def deliver_to_existing_thread(
+        self,
+        event: MentionEvent,
+        *,
+        source_revision: str,
+    ) -> str | None:
+        """Route a later event through the subject's one durable PR thread."""
+
+        if not isinstance(event, MentionEvent):
+            raise ValueError("event must be a MentionEvent")
+        subject = _subject_key(event)
+        session = self._store.get_work_item_session(subject)
+        if (
+            session is None
+            or session.parent_message_id is None
+            or session.discord_thread_id is None
+        ):
+            return None
+        before = self._store.get_latest_proposal(subject)
+        await self.ensure_thread(
+            event,
+            parent_message_id=session.parent_message_id,
+            source_revision=source_revision,
+        )
+        latest = self._store.get_latest_proposal(subject)
+        if latest is None:
+            raise RuntimeError("work item proposal disappeared")
+        brief = _bound_brief(event, source_revision=source_revision)
+        if (
+            before is not None
+            and latest.proposal_id == before.proposal_id
+            and latest.revision == before.revision
+            and brief is not None
+            and brief.disposition is PreApprovalDisposition.INFORMATIONAL
+        ):
+            content = render_thread_update(event)
+            message_id = await self._discord.find_message_content(
+                session.discord_thread_id, content, limit=100
+            )
+            if message_id is None:
+                message_id = await self._discord.send_to_thread(
+                    session.discord_thread_id, content
+                )
+            return message_id
+        binding = self._store.get_proposal_message_binding(
+            latest.proposal_id, latest.revision
+        )
+        if binding is None:
+            raise RuntimeError("work item proposal message disappeared")
+        return binding.message_id
 
     async def reconcile_execution_activation(self, *, limit: int = 100) -> int:
         if not self._approval_available:

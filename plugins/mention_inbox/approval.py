@@ -1171,7 +1171,7 @@ class ExecutionLifecycleObserver:
     def _safe_agent_summary(agent_result: Mapping[str, Any]) -> str:
         raw = agent_result.get("final_response")
         if not isinstance(raw, str) or not raw.strip() or raw.strip() == "NO_REPLY":
-            return "승인된 범위의 작업과 검증을 마쳤습니다."
+            return "요청된 범위의 작업과 검증을 마쳤습니다."
         redacted = redact_sensitive_text(
             raw,
             force=True,
@@ -1179,7 +1179,7 @@ class ExecutionLifecycleObserver:
         )
         summary = " ".join(redacted.split())
         if not summary:
-            return "승인된 범위의 작업과 검증을 마쳤습니다."
+            return "요청된 범위의 작업과 검증을 마쳤습니다."
         return summary if len(summary) <= 500 else summary[:499].rstrip() + "…"
 
     @classmethod
@@ -1188,11 +1188,11 @@ class ExecutionLifecycleObserver:
         commit_sha = cls._successful_action_detail(
             evidence_json, "git_verify_commit"
         )
-        evidence = ["승인 후 실제 도구 실행 receipt"]
+        evidence = ["실행 요청 후 실제 도구 실행 receipt"]
         descriptions = (
             ("git_verify_origin", "origin repository 검증 성공"),
             ("git_verify_branch", "현재 PR branch 검증 성공"),
-            ("git_verify_head", "승인 시점 PR HEAD 검증 성공"),
+            ("git_verify_head", "요청 시점 PR HEAD 검증 성공"),
             ("verification", "대상 테스트 또는 검증 명령 성공"),
             ("git_commit", "선택 파일 commit 명령 성공"),
             (

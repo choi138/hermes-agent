@@ -136,6 +136,15 @@ class _Router:
         return SimpleNamespace(handled=True)
 
 
+class _PassthroughRouter(_Router):
+    async def handle_message(self, message):
+        self.messages.append(message)
+        return SimpleNamespace(
+            handled=False,
+            agent_text="bounded work-item context for the full agent",
+        )
+
+
 @pytest.mark.asyncio
 async def test_registered_thread_reply_is_routed_with_exact_reply_target() -> None:
     adapter = _adapter(_Message(99))
@@ -231,6 +240,51 @@ async def test_startup_replayed_event_reenters_registered_thread_router(
     envelope = router.messages[0]
     assert envelope.text == "<@777> 승인"
     assert envelope.reply_to_message_id == "321"
+
+
+@pytest.mark.asyncio
+async def test_startup_replayed_tool_request_reaches_general_agent_with_context(
+    monkeypatch,
+) -> None:
+    adapter = _adapter(_Message(99))
+    adapter._client.user = SimpleNamespace(id=777)
+    router = _PassthroughRouter()
+    adapter.set_mention_inbox_router(router)
+    raw = SimpleNamespace(
+        id=123,
+        content="~/Desktop/content-v2 확인해서 말해줘",
+        author=SimpleNamespace(id=456),
+        reference=None,
+        channel=SimpleNamespace(),
+    )
+    event = MessageEvent(
+        text="~/Desktop/content-v2 확인해서 말해줘",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="99",
+            chat_type="thread",
+            thread_id="99",
+            user_id="456",
+            message_id="123",
+        ),
+        raw_message=raw,
+        message_id="123",
+        metadata={"discord_original_content": raw.content},
+    )
+    setattr(event, "_hermes_startup_restore_replay", True)
+    general_agent_events: list[MessageEvent] = []
+
+    async def fake_base_handle(self, replayed: MessageEvent) -> None:
+        general_agent_events.append(replayed)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_base_handle)
+
+    await adapter.handle_message(event)
+
+    assert general_agent_events == [event]
+    assert event.text == "bounded work-item context for the full agent"
+    assert len(router.messages) == 1
 
 
 @pytest.mark.asyncio

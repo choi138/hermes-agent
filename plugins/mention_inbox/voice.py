@@ -9,6 +9,10 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from plugins.mention_inbox.contract import MentionEvent
+from plugins.mention_inbox.preflight import (
+    PreApprovalDisposition,
+    brief_from_metadata,
+)
 from plugins.mention_inbox.proposals import WorkProposal
 
 _ALLOWED_MENTIONS: dict[str, Any] = {
@@ -18,6 +22,13 @@ _ALLOWED_MENTIONS: dict[str, Any] = {
     "replied_user": False,
 }
 _BOT_MENTION_RE = re.compile(r"<@[0-9]{1,30}>")
+_STATUS_LABELS = {
+    PreApprovalDisposition.ACTION_REQUIRED: "🔴 Needs action",
+    PreApprovalDisposition.REVIEW_NEEDED: "🟠 Review needed",
+    PreApprovalDisposition.POSSIBLY_STALE: "🟡 Check current HEAD",
+    PreApprovalDisposition.INFORMATIONAL: "🟢 No action",
+    PreApprovalDisposition.INSUFFICIENT_EVIDENCE: "🟡 Needs inspection",
+}
 
 
 @dataclass(frozen=True)
@@ -116,6 +127,10 @@ def _action_phrase(kind: str, actor: str) -> str:
     return actor_name + phrases.get(kind, "확인이 필요한 요청을 남겼어요.")
 
 
+def _status_label(disposition: PreApprovalDisposition | None) -> str:
+    return _STATUS_LABELS.get(disposition, "🟠 Review needed")
+
+
 def render_action_alert(
     event: MentionEvent, *, revision_number: int, destination: str
 ) -> RenderedDiscordEvent:
@@ -126,20 +141,29 @@ def render_action_alert(
     excerpt = _compact_untrusted(event.untrusted.body, 240)
     source_url = _trusted_github_url(event.untrusted.source_url)
     marker = _delivery_marker(event, revision_number, destination)
+    brief = brief_from_metadata(metadata.get("preapproval_brief"))
+    status = _status_label(None if brief is None else brief.disposition)
 
     lines = [
-        "GitHub에서 확인이 필요한 일이 왔어요.",
-        f"대상: {_subject_label(event)} · {title}",
-        f"요청: {_action_phrase(kind, actor)}",
+        f"{status} · {_subject_label(event)}",
+        title,
+        f"요약: {_compact_untrusted(brief.summary, 400) if brief is not None else excerpt}",
+        f"출처: {_action_phrase(kind, actor)}",
     ]
-    if excerpt:
-        lines.append(f"맥락: {excerpt}")
+    if brief is not None and brief.findings:
+        lines.append("확인된 작업:")
+        for finding in brief.findings[:4]:
+            location = _compact_untrusted(finding.path, 140) or "review"
+            if finding.line is not None:
+                location = f"{location}:{finding.line}"
+            lines.append(
+                f"- {location} · {_compact_untrusted(finding.body, 260)}"
+            )
+        if len(brief.findings) > 4:
+            lines.append(f"- 외 {len(brief.findings) - 4}개")
     if source_url:
-        lines.append(f"바로가기: {source_url}")
-    lines.extend((
-        "아직 변경 작업은 시작하지 않았어요. 이어서 확인할 thread를 열게요.",
-        marker,
-    ))
+        lines.append(f"원문: {source_url}")
+    lines.append(marker)
     content = "\n".join(lines)
     if len(content) > 1900:
         content = content[: 1900 - len(marker) - 2].rstrip() + "\n" + marker
@@ -150,11 +174,33 @@ def render_action_alert(
     )
 
 
+def render_thread_update(event: MentionEvent) -> str:
+    """Render a non-proposal GitHub update inside an existing work thread."""
+
+    metadata = _metadata(event)
+    kind = str(metadata.get("actionable_kind") or event.untrusted.action_detail)
+    actor = _compact_untrusted(metadata.get("actor_login"), 80)
+    brief = brief_from_metadata(metadata.get("preapproval_brief"))
+    summary = (
+        _compact_untrusted(brief.summary, 400)
+        if brief is not None
+        else _compact_untrusted(event.untrusted.body, 400)
+    )
+    lines = [
+        f"{_status_label(None if brief is None else brief.disposition)} · GitHub 업데이트",
+        f"요약: {summary}",
+        f"출처: {_action_phrase(kind, actor)}",
+    ]
+    source_url = _trusted_github_url(event.untrusted.source_url)
+    if source_url:
+        lines.append(f"원문: {source_url}")
+    return "\n".join(lines)[:1700]
+
+
 def render_thread_opened(event: MentionEvent) -> str:
     label = _subject_label(event)
     return (
-        f"{label} 이야기는 이 thread에서 이어갈게요. "
-        "아직 변경 작업은 시작하지 않았어요. 먼저 확인 범위와 검증 방법을 제안하겠습니다."
+        f"{label}의 새 리뷰와 코멘트는 이 thread에 모아서 이어갈게요."
     )
 
 
@@ -214,6 +260,20 @@ def render_approval_not_enabled() -> str:
 
 def render_approval_unauthorized() -> str:
     return "이 제안을 승인할 권한이 없어요. 실제 변경은 시작되지 않았어요."
+
+
+def render_agent_tools_unauthorized() -> str:
+    return (
+        "이 work thread에서 코드나 로컬 작업공간을 확인할 권한이 없어요. "
+        "요청을 실행하지 않았습니다."
+    )
+
+
+def render_agent_tools_not_enabled() -> str:
+    return (
+        "이 work thread의 도구 실행 기능이 현재 연결되지 않았어요. "
+        "요청을 실행하지 않았습니다."
+    )
 
 
 def render_revision_instruction(bot_mention: str) -> str:
@@ -298,55 +358,42 @@ def render_proposal(
     }:
         raise ValueError("invalid approval unavailable reason")
 
-    action_heading = (
-        "승인 후 진행할 작업:" if approval_offered else "읽기 전용 확인 범위:"
-    )
     lines = [
-        "이렇게 확인했어요.",
-        f"이번 제안은 {proposal.revision}번째 검토안이에요.",
-        "확인한 내용:",
+        "요약",
         f"- {_compact_untrusted(proposal.goal, 500)}",
-        action_heading,
+        "해야 할 일",
         *_proposal_lines(proposal.steps),
-        "가능한 작업:",
-        *_proposal_lines(proposal.allowed_actions, item_limit=140),
-        "하지 않을 작업:",
-        *_proposal_lines(proposal.forbidden_actions, item_limit=140),
-        "확인 방법:",
+        "완료 확인",
         *_proposal_lines(proposal.verification, item_limit=180),
     ]
     if approval_offered:
         footer = (
-            f"진행해도 된다면 이 메시지에 답장으로 `{bot_mention} 승인`이라고 남겨 주세요.",
-            "그 전에는 읽기와 제안만 하고 실제 변경은 시작하지 않아요.",
+            "이 thread에서 `리뷰 반영해서 수정해줘`처럼 자연어로 요청할 수 있어요.",
         )
     elif approval_unavailable_reason == "execution_unavailable":
         footer = (
-            "현재 실행 기능이 꺼져 있어 이 메시지에서는 승인을 받지 않아요.",
-            "위 내용은 검토용이며 실제 변경은 시작되지 않아요.",
+            "현재 자동 실행이 연결되지 않아 분석 결과만 갱신했습니다.",
         )
     elif approval_unavailable_reason == "preflight_not_approvable":
         footer = (
-            "현재 근거로는 변경 승인을 받을 수 없어요.",
-            "먼저 읽기 전용 확인을 마친 뒤 새 제안을 올릴게요.",
+            "현재 근거만으로 자동 변경하지 않고 추가 확인이 필요합니다.",
         )
     else:
         footer = (
-            "현재 이 메시지에서는 변경 승인을 받을 수 없어요.",
-            "실제 변경은 시작되지 않아요.",
+            "현재는 분석 결과만 갱신했습니다.",
         )
     return _render_bounded_with_footer(lines, footer)
 
 
 def render_queued(proposal: WorkProposal) -> str:
     return (
-        "승인을 확인했습니다. 실행 순서를 기다리고 있어요. "
+        "작업 요청을 확인했습니다. 실행 순서를 기다리고 있어요. "
         "아직 시작되지 않았고, 실제로 시작되면 이 thread에 바로 남기겠습니다."
     )
 
 
 def render_running(proposal: WorkProposal) -> str:
-    return "지금 작업을 시작했습니다. 승인된 범위와 검증 방법 안에서만 진행하겠습니다."
+    return "지금 작업을 시작했습니다. 요청된 범위와 검증 방법 안에서만 진행하겠습니다."
 
 
 def render_verifying(proposal: WorkProposal) -> str:
@@ -354,7 +401,7 @@ def render_verifying(proposal: WorkProposal) -> str:
 
 
 def render_kanban_registering(proposal: WorkProposal) -> str:
-    return "승인된 범위를 Kanban의 durable queue에 등록하고 있어요. 아직 구현을 시작한 상태는 아닙니다."
+    return "요청된 범위를 Kanban의 durable queue에 등록하고 있어요. 아직 구현을 시작한 상태는 아닙니다."
 
 
 def render_kanban_queued(proposal: WorkProposal) -> str:
@@ -369,7 +416,7 @@ _BLOCKED_REASONS = {
     "verification_missing": "필수 검증·commit·push 근거가 모두 확인되지 않았습니다.",
     "agent_failed": "실행 agent가 정상 완료 상태를 반환하지 않았습니다.",
     "kanban_receipt_missing": "durable Kanban 등록 근거를 확인하지 못했습니다.",
-    "dispatch_failed": "승인된 실행 session을 시작하지 못했습니다.",
+    "dispatch_failed": "요청된 실행 session을 시작하지 못했습니다.",
     "recovery_dispatch_failed": "재시작 후 실행 session 복구에 실패했습니다.",
     "execution_scope_changed": "저장된 workspace 또는 PR branch 범위가 달라졌습니다.",
 }
@@ -379,7 +426,7 @@ def render_blocked(
     proposal: WorkProposal, *, category: str | None = None
 ) -> str:
     message = (
-        "승인 기록은 보존했지만 작업을 시작하지 못했어요. "
+        "실행 요청 기록은 보존했지만 작업을 시작하지 못했어요. "
         "범위를 넓히거나 자동으로 다시 시도하지 않고, 이 thread에서 상태를 확인하겠습니다."
     )
     if category is None:
@@ -398,15 +445,14 @@ def render_blocked(
 
 def render_execution_enabled_reproposal(proposal: WorkProposal) -> str:
     return (
-        "실행 기능이 활성화되어, 같은 원본과 PR HEAD에 결속된 새 실행 가능 제안을 "
-        "올립니다. 이전 읽기 전용 제안은 승인 대상으로 사용하지 않습니다."
+        "실행 기능이 활성화되어 같은 원본과 PR HEAD에 결속된 실행 범위를 갱신합니다."
     )
 
 
 def render_needs_reapproval(proposal: WorkProposal) -> str:
     return (
-        "제안 뒤에 원본 내용이나 PR HEAD가 달라졌어요. 이전 승인은 사용하지 않고, "
-        "최신 상태를 반영한 제안을 다시 올리겠습니다."
+        "원본 내용이나 PR HEAD가 달라졌어요. 이전 실행 요청은 사용하지 않고 "
+        "최신 상태를 반영해 작업 범위를 다시 계산하겠습니다."
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -243,7 +244,8 @@ async def test_only_explicit_revision_command_creates_new_proposal(
     assert "API 회귀" in latest.goal
     binding = store.get_proposal_message_binding(latest.proposal_id, latest.revision)
     assert binding is not None and binding.approval_offered is True
-    assert f"{BOT_MENTION} 승인" in discord.messages[-1][1]
+    assert "리뷰 반영해서 수정해줘" in discord.messages[-1][1]
+    assert f"{BOT_MENTION} 승인" not in discord.messages[-1][1]
     assert handler.calls == []
     assert responder.calls == []
 
@@ -269,6 +271,103 @@ async def test_ordinary_message_gets_read_only_answer_without_revision(
     assert _mutation_counts(store) == before == (0, 0)
     assert "API 회귀 테스트" in discord.messages[-1][1]
     assert responder.calls[0]["message"] == "테스트 범위에 API 회귀도 포함해줘"
+
+
+@pytest.mark.asyncio
+async def test_local_workspace_inspection_routes_to_full_agent_with_bounded_context(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(
+        tmp_path / "agent-passthrough.db",
+        with_preapproval_evidence=True,
+    )
+    discord = _Discord()
+    responder = _Responder()
+    request = (
+        "내가 실제로 반영해야 하는 것들 내 코드 "
+        "~/Desktop/content-v2 확인해서 말해줘"
+    )
+    before = _mutation_counts(store)
+
+    result = await _router(
+        store,
+        discord,
+        handler=_Handler(),
+        responder=responder,
+    ).handle_message(_message(request))
+
+    assert result.handled is False
+    assert result.kind == "agent_passthrough"
+    assert result.agent_text is not None
+    _, encoded = result.agent_text.split("\n\n", 1)
+    payload = json.loads(encoded)
+    assert payload["user_request"] == request
+    source = payload["work_item"]["source"]
+    assert source["repository"] == "silviahealth/content"
+    assert source["source_url"].endswith("#discussion_r123")
+    assert source["findings"][0]["path"] == "plugins/mention_inbox/router.py"
+    assert "fallback이 질문에 답하지 못한다" in source["findings"][0]["body"]
+    assert "~/Desktop/content-v2" in result.agent_text
+    assert responder.calls == []
+    assert discord.messages == []
+    assert _mutation_counts(store) == before == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_local_workspace_passthrough_requires_authorized_user(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "agent-unauthorized.db")
+    discord = _Discord()
+    handler = _Handler()
+
+    result = await _router(store, discord, handler=handler).handle_message(
+        _message(
+            "~/Desktop/content-v2 확인해서 말해줘",
+            user_id=OTHER_USER,
+        )
+    )
+
+    assert result.handled is True
+    assert result.kind == "agent_passthrough_unauthorized"
+    assert result.agent_text is None
+    assert "권한이 없어요" in discord.messages[-1][1]
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_local_workspace_passthrough_requires_execution_feature(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "agent-disabled.db")
+    discord = _Discord()
+
+    result = await _router(store, discord).handle_message(
+        _message("~/Desktop/content-v2 확인해서 말해줘")
+    )
+
+    assert result.handled is True
+    assert result.kind == "agent_passthrough_not_enabled"
+    assert result.agent_text is None
+    assert "도구 실행 기능" in discord.messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_code_explanation_without_tool_action_stays_read_only(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "code-explanation.db")
+    discord = _Discord()
+    responder = _Responder("저장된 finding을 근거로 문제를 설명했어요.")
+
+    result = await _router(store, discord, responder=responder).handle_message(
+        _message("이 코드가 왜 문제야?")
+    )
+
+    assert result.kind == "conversation_response"
+    assert result.agent_text is None
+    assert len(responder.calls) == 1
+    assert store.get_latest_proposal(SUBJECT).revision == 1
 
 
 @pytest.mark.asyncio
@@ -601,6 +700,7 @@ async def test_exact_authorized_reply_routes_to_handler(tmp_path: Path) -> None:
         "이 작업 네가 수행해줘",
         "네가 이 작업 직접 처리해 주세요",
         "이거 알아서 수정해줘",
+        "Codex 리뷰 반영해서 수정해줘",
         f"{BOT_MENTION} 해당 작업 진행해주세요",
     ),
 )

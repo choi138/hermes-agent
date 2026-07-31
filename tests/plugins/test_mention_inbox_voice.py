@@ -106,10 +106,10 @@ def test_alert_excerpt_is_bounded_to_240_characters() -> None:
     rendered = render_action_alert(
         _event(body="x" * 1000), revision_number=1, destination=DESTINATION
     )
-    context_line = next(
-        line for line in rendered.content.splitlines() if line.startswith("맥락:")
+    summary_line = next(
+        line for line in rendered.content.splitlines() if line.startswith("요약:")
     )
-    assert len(context_line.removeprefix("맥락: ")) <= 240
+    assert len(summary_line.removeprefix("요약: ")) <= 240
 
 
 def test_alert_neutralizes_discord_mentions() -> None:
@@ -148,11 +148,11 @@ def test_queued_voice_says_actual_waiting_state_naturally() -> None:
     assert "아직 시작" in text
 
 
-def test_thread_opened_voice_states_no_changes_started() -> None:
+def test_thread_opened_voice_explains_pr_activity_is_collected_here() -> None:
     text = render_thread_opened(_event())
-    assert "아직" in text
-    assert "변경" in text
-    assert "시작" in text
+    assert "silviahealth/content PR #7" in text
+    assert "리뷰와 코멘트" in text
+    assert "thread" in text
 
 
 def test_conversation_fallback_is_visible_and_preserves_state_language() -> None:
@@ -179,9 +179,11 @@ def test_proposal_and_status_messages_hide_internal_ids() -> None:
     assert proposal.proposal_id not in combined
     assert proposal.content_hash not in combined
     assert proposal.subject_key not in combined
-    assert "확인한 내용" in combined
-    assert "승인 후 진행할 작업" in combined
-    assert "승인" in combined
+    assert "요약" in combined
+    assert "해야 할 일" in combined
+    assert "완료 확인" in combined
+    assert "리뷰 반영해서 수정해줘" in combined
+    assert "승인" not in combined
 
 
 def test_review_only_proposal_never_renders_approval_cta() -> None:
@@ -193,10 +195,10 @@ def test_review_only_proposal_never_renders_approval_cta() -> None:
     )
 
     assert "<@1525050525641805886> 승인" not in rendered
-    assert "현재 실행 기능이 꺼져 있어" in rendered
+    assert "자동 실행이 연결되지 않아" in rendered
 
 
-def test_proposal_message_is_bounded_without_dropping_approval_instruction() -> None:
+def test_proposal_message_is_bounded_without_dropping_natural_request_hint() -> None:
     proposal = build_work_proposal(
         revision=1,
         source_dedupe_key="github:RC_123:U_recent",
@@ -218,7 +220,9 @@ def test_proposal_message_is_bounded_without_dropping_approval_instruction() -> 
     )
 
     assert len(rendered) <= 1900
-    assert "<@1525050525641805886> 승인" in rendered
+    assert "리뷰 반영해서 수정해줘" in rendered
+    assert "<@1525050525641805886>" not in rendered
+    assert "승인" not in rendered
 
 
 def test_completed_voice_requires_verified_evidence() -> None:

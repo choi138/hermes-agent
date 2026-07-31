@@ -263,6 +263,33 @@ class DiscordMentionDelivery:
         )
         if claim is None:
             return "idle"
+        if self._thread_coordinator is not None:
+            route_existing = getattr(
+                self._thread_coordinator,
+                "deliver_to_existing_thread",
+                None,
+            )
+            if callable(route_existing):
+                try:
+                    thread_message_id = await route_existing(
+                        claim.event,
+                        source_revision=claim.source_revision,
+                    )
+                except Exception:
+                    # The coordinator is idempotent against proposal bindings.
+                    # Keep the lease so an uncertain thread send is reconciled
+                    # after expiry instead of posting a second channel card.
+                    return "error"
+                if thread_message_id is not None:
+                    self._store.mark_delivery_sent(
+                        claim.delivery_id,
+                        message_id=thread_message_id,
+                    )
+                    return (
+                        "reconciled"
+                        if claim.requires_reconciliation
+                        else "threaded"
+                    )
         rendered = render_discord_event(
             claim.event,
             revision_number=claim.revision_number,

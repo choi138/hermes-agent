@@ -116,7 +116,7 @@ def test_changes_requested_with_matching_inline_comment_requires_action() -> Non
 
     assert brief.disposition is PreApprovalDisposition.ACTION_REQUIRED
     assert brief.approvable is True
-    assert brief.summary == "Please update the lifecycle guard."
+    assert brief.summary == "Handle the disabled capability before rendering the CTA."
     assert len(brief.findings) == 1
     assert brief.findings[0].path == "plugins/mention_inbox/voice.py"
     assert brief.findings[0].line == 181

@@ -889,6 +889,20 @@ class MentionInboxStore:
         finally:
             connection.close()
 
+    def get_work_item_session(self, subject_key: str) -> WorkItemSession | None:
+        """Return a subject card even when its latest execution is terminal."""
+
+        subject = _require_stable_text(subject_key, "subject_key")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                (subject,),
+            ).fetchone()
+            return None if row is None else _work_item_session(row)
+        finally:
+            connection.close()
+
     def list_active_work_item_sessions(
         self, *, limit: int = 100
     ) -> tuple[WorkItemSession, ...]:

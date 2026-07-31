@@ -5663,16 +5663,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     or getattr(event, "text", "")
                     or ""
                 )
-            if (
-                thread_id
-                and raw_message is not None
-                and await self._route_mention_inbox_message(
+            route_result = None
+            if thread_id and raw_message is not None:
+                route_result = await self._route_mention_inbox_message_result(
                     raw_message,
                     thread_id=thread_id,
                     raw_content=original_content,
                 )
-            ):
+            if route_result is not None and bool(route_result.handled):
                 return True
+            agent_text = (
+                None
+                if route_result is None
+                else getattr(route_result, "agent_text", None)
+            )
+            if isinstance(agent_text, str) and agent_text.strip():
+                event.text = agent_text
 
         # Internal approved-execution events and ordinary Discord events stay
         # on the shared adapter rail. Returning True records successful
@@ -5770,13 +5776,16 @@ class DiscordAdapter(BasePlatformAdapter):
             raise RuntimeError("approved execution event was not admitted")
         return f"{mode}:{execution_id}"
 
-    async def _route_mention_inbox_message(
+    async def _route_mention_inbox_message_result(
         self, message: Any, *, thread_id: str, raw_content: str
-    ) -> bool:
+    ) -> Any | None:
         router = getattr(self, "_mention_inbox_router", None)
         if router is None or not router.is_work_thread(thread_id):
-            return False
-        from plugins.mention_inbox.router import InboxDiscordMessage
+            return None
+        from plugins.mention_inbox.router import (
+            InboxDiscordMessage,
+            InboxRouteResult,
+        )
 
         reference = getattr(message, "reference", None)
         reply_to = getattr(reference, "message_id", None)
@@ -5790,7 +5799,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if bot_id is not None:
             content = content.replace(f"<@!{bot_id}>", f"<@{bot_id}>")
         try:
-            result = await router.handle_message(
+            return await router.handle_message(
                 InboxDiscordMessage(
                     thread_id=thread_id,
                     message_id=message_id,
@@ -5799,7 +5808,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     reply_to_message_id=(None if reply_to is None else str(reply_to)),
                 )
             )
-            return bool(result.handled)
         except Exception:
             logger.warning(
                 "[%s] Mention-inbox work-thread router failed closed",
@@ -5813,7 +5821,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 pass
-            return True
+            return InboxRouteResult(True, "router_failed_closed")
+
+    async def _route_mention_inbox_message(
+        self, message: Any, *, thread_id: str, raw_content: str
+    ) -> bool:
+        """Compatibility wrapper for deterministic handled/not-handled checks."""
+
+        result = await self._route_mention_inbox_message_result(
+            message,
+            thread_id=thread_id,
+            raw_content=raw_content,
+        )
+        return bool(result is not None and result.handled)
 
     async def _handle_thread_create_slash(
         self,
@@ -7448,12 +7468,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         if is_thread and thread_id is not None:
-            if await self._route_mention_inbox_message(
+            route_result = await self._route_mention_inbox_message_result(
                 message,
                 thread_id=thread_id,
                 raw_content=raw_content,
-            ):
+            )
+            if route_result is not None and bool(route_result.handled):
                 return True
+            agent_text = (
+                None
+                if route_result is None
+                else getattr(route_result, "agent_text", None)
+            )
+            if isinstance(agent_text, str) and agent_text.strip():
+                normalized_content = agent_text
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.

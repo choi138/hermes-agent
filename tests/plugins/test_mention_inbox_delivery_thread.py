@@ -14,6 +14,7 @@ from plugins.mention_inbox.operational import (
     DiscordMentionDelivery,
     render_discord_event,
 )
+from plugins.mention_inbox.proposals import ProposalStatus
 from plugins.mention_inbox.thread_session import (
     MentionInboxThreadCoordinator,
     _proposal_content,
@@ -25,9 +26,11 @@ DESTINATION = "discord:1531851208858275860"
 
 def _event(
     *,
+    event_id: str = "RC_123",
     kind: str = "own_pr_review_comment",
     body: str = "이 줄을 확인해 주세요.",
     source_revision: str = "2026-07-29T10:01:00Z",
+    disposition: str = "review_needed",
     include_source_revision_metadata: bool = True,
 ):
     metadata = {
@@ -43,29 +46,33 @@ def _event(
         metadata["source_revision"] = source_revision
         metadata["preapproval_brief"] = {
             "schema_version": 1,
-            "disposition": "review_needed",
+            "disposition": disposition,
             "summary": body,
-            "findings": [
-                {
-                    "source_event_id": "RC_123",
-                    "body": body,
-                    "source_url": (
-                        "https://github.com/silviahealth/content/pull/7"
-                        "#discussion_r123"
-                    ),
-                    "path": "plugins/mention_inbox/voice.py",
-                    "line": 181,
-                    "review_id": None,
-                    "commit_id": "head-1",
-                }
-            ],
+            "findings": (
+                []
+                if disposition == "informational"
+                else [
+                    {
+                        "source_event_id": event_id,
+                        "body": body,
+                        "source_url": (
+                            "https://github.com/silviahealth/content/pull/7"
+                            "#discussion_r123"
+                        ),
+                        "path": "plugins/mention_inbox/voice.py",
+                        "line": 181,
+                        "review_id": None,
+                        "commit_id": "head-1",
+                    }
+                ]
+            ),
             "source_revision": source_revision,
             "head_sha": "head-1",
-            "approvable": True,
+            "approvable": disposition in {"action_required", "review_needed"},
         }
     return ingest_event({
         "schema_version": "1",
-        "source": {"platform": "github", "event_id": "RC_123"},
+        "source": {"platform": "github", "event_id": event_id},
         "actor": {"actor_id": "U_alice", "kind": "user"},
         "target": {"target_id": "U_recent", "kind": "user"},
         "thread": {"thread_id": "github:R_repo:PR_7", "container_id": "R_repo"},
@@ -322,3 +329,172 @@ async def test_delivery_uses_exact_outbox_source_revision_for_thread_bootstrap(
     assert proposal is not None
     assert proposal.source_revision == first_revision
     assert store.pending_delivery_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_later_pr_event_uses_existing_thread_without_second_parent_card(
+    tmp_path: Path,
+) -> None:
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: NOW)
+    first = _event()
+    second = _event(
+        event_id="RC_124",
+        body="두 번째 finding을 반영해 주세요.",
+        source_revision="2026-07-29T10:02:00Z",
+    )
+    store.upsert(first, source_revision="2026-07-29T10:01:00Z")
+    store.upsert(second, source_revision="2026-07-29T10:02:00Z")
+    parent_discord = _Discord()
+    thread_discord = _ThreadDiscord()
+    coordinator = MentionInboxThreadCoordinator(
+        store=store,
+        discord=thread_discord,
+        bot_mention="<@1525050460166426694>",
+        approval_available=True,
+    )
+    delivery = DiscordMentionDelivery(
+        store=store,
+        discord=parent_discord,
+        destination=DESTINATION,
+        lease_seconds=10,
+        thread_coordinator=coordinator,
+    )
+
+    assert await delivery.deliver_once() == "sent"
+    assert await delivery.deliver_once() == "threaded"
+
+    latest = store.get_latest_proposal("github:R_repo:PR_7")
+    assert latest is not None and latest.revision == 2
+    assert len(parent_discord.sends) == 1
+    assert len(thread_discord.messages) == 2
+    assert thread_discord.thread_id == "thread-1"
+    assert store.pending_delivery_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_same_finding_and_head_do_not_advance_proposal_revision(
+    tmp_path: Path,
+) -> None:
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: NOW)
+    first = _event()
+    duplicate = _event(
+        event_id="RC_124",
+        source_revision="2026-07-29T10:02:00Z",
+    )
+    store.upsert(first, source_revision="2026-07-29T10:01:00Z")
+    store.upsert(duplicate, source_revision="2026-07-29T10:02:00Z")
+    parent_discord = _Discord()
+    thread_discord = _ThreadDiscord()
+    coordinator = MentionInboxThreadCoordinator(
+        store=store,
+        discord=thread_discord,
+        bot_mention="<@1525050460166426694>",
+        approval_available=True,
+    )
+    delivery = DiscordMentionDelivery(
+        store=store,
+        discord=parent_discord,
+        destination=DESTINATION,
+        lease_seconds=10,
+        thread_coordinator=coordinator,
+    )
+
+    assert await delivery.deliver_once() == "sent"
+    assert await delivery.deliver_once() == "threaded"
+
+    latest = store.get_latest_proposal("github:R_repo:PR_7")
+    assert latest is not None and latest.revision == 1
+    assert len(parent_discord.sends) == 1
+    assert len(thread_discord.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_informational_event_is_threaded_without_replacing_actionable_proposal(
+    tmp_path: Path,
+) -> None:
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: NOW)
+    actionable = _event()
+    informational = _event(
+        event_id="PRR_approved",
+        kind="own_pr_review_summary",
+        body="Looks good",
+        source_revision="2026-07-29T10:02:00Z",
+        disposition="informational",
+    )
+    store.upsert(actionable, source_revision="2026-07-29T10:01:00Z")
+    store.upsert(informational, source_revision="2026-07-29T10:02:00Z")
+    parent_discord = _Discord()
+    thread_discord = _ThreadDiscord()
+    coordinator = MentionInboxThreadCoordinator(
+        store=store,
+        discord=thread_discord,
+        bot_mention="<@1525050460166426694>",
+        approval_available=True,
+    )
+    delivery = DiscordMentionDelivery(
+        store=store,
+        discord=parent_discord,
+        destination=DESTINATION,
+        lease_seconds=10,
+        thread_coordinator=coordinator,
+    )
+
+    assert await delivery.deliver_once() == "sent"
+    original = store.get_latest_proposal("github:R_repo:PR_7")
+    assert original is not None
+    assert await delivery.deliver_once() == "threaded"
+
+    latest = store.get_latest_proposal("github:R_repo:PR_7")
+    assert latest == original
+    assert len(parent_discord.sends) == 1
+    assert len(thread_discord.messages) == 2
+    assert "🟢 No action" in thread_discord.messages[-1][1]
+    assert "Looks good" in thread_discord.messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_terminal_work_item_reuses_original_parent_and_thread(
+    tmp_path: Path,
+) -> None:
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: NOW)
+    first = _event()
+    duplicate = _event(
+        event_id="RC_124",
+        source_revision="2026-07-29T10:02:00Z",
+    )
+    store.upsert(first, source_revision="2026-07-29T10:01:00Z")
+    store.upsert(duplicate, source_revision="2026-07-29T10:02:00Z")
+    parent_discord = _Discord()
+    thread_discord = _ThreadDiscord()
+    coordinator = MentionInboxThreadCoordinator(
+        store=store,
+        discord=thread_discord,
+        bot_mention="<@1525050460166426694>",
+        approval_available=True,
+    )
+    delivery = DiscordMentionDelivery(
+        store=store,
+        discord=parent_discord,
+        destination=DESTINATION,
+        lease_seconds=10,
+        thread_coordinator=coordinator,
+    )
+    assert await delivery.deliver_once() == "sent"
+    original = store.get_latest_proposal("github:R_repo:PR_7")
+    assert original is not None
+    store.transition_proposal_status(
+        original.proposal_id,
+        original.revision,
+        ProposalStatus.REJECTED,
+        expected_statuses=(ProposalStatus.PENDING,),
+    )
+
+    assert await delivery.deliver_once() == "threaded"
+
+    latest = store.get_latest_proposal("github:R_repo:PR_7")
+    assert latest is not None
+    assert latest.revision == 1
+    assert latest.status is ProposalStatus.REJECTED
+    assert len(parent_discord.sends) == 1
+    assert len(thread_discord.messages) == 1
+    assert thread_discord.thread_id == "thread-1"

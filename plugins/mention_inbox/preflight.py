@@ -232,6 +232,18 @@ def _generic_summary(kind: GitHubActionKind) -> str:
     }.get(kind, "")
 
 
+def _review_findings_summary(findings: Sequence[ReviewFinding]) -> str:
+    """Prefer concrete inline findings over bot review boilerplate."""
+
+    if not findings:
+        return ""
+    first = findings[0].body
+    if len(findings) == 1:
+        return first
+    prefix = f"리뷰에서 수정 요청 {len(findings)}개를 확인했어요: "
+    return _compact(prefix + first, _MAX_SUMMARY_CHARS)
+
+
 def build_preapproval_brief(
     *,
     kind: GitHubActionKind,
@@ -288,6 +300,7 @@ def build_preapproval_brief(
             findings.append(finding)
             remaining -= len(finding.body)
             stale = stale or _is_outdated(comment, head_sha=normalized_head)
+        summary = _review_findings_summary(findings) or summary
     else:
         # A concrete comment/mention is itself the evidence.  Explicit review
         # request and assignment events can be described without a body.

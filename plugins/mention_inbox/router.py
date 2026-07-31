@@ -9,6 +9,7 @@ from typing import Protocol
 
 from plugins.mention_inbox.conversation import (
     ReadOnlyConversationResponder,
+    build_agent_passthrough_message,
     build_conversation_context,
     normalize_conversation_response,
 )
@@ -24,6 +25,8 @@ from plugins.mention_inbox.voice import (
     render_approval_reference_mismatch,
     render_approval_reply_required,
     render_approval_unauthorized,
+    render_agent_tools_not_enabled,
+    render_agent_tools_unauthorized,
     render_conversation_fallback,
     render_proposal,
     render_revision_instruction,
@@ -64,6 +67,29 @@ _EXECUTION_REQUEST_PATTERNS = (
         r"(?:해|해줘|해주세요|해\s*주세요|해라)$",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"^(?:(?:이|그|해당)\s*)?"
+        r"(?:(?:codex|코덱스|coderabbit|코드래빗)\s*)?"
+        r"(?:리뷰|코멘트|피드백|요청)"
+        r"(?:은|는|을|를)?\s*"
+        r"(?:코드에\s*)?"
+        r"(?:반영|적용|처리)"
+        r"(?:해서|하고)?\s*"
+        r"(?:수정|해결|처리)?"
+        r"(?:해|해줘|해주세요|해\s*주세요|해라)$",
+        re.IGNORECASE,
+    ),
+)
+_AGENT_TOOL_TARGET_RE = re.compile(
+    r"(?:~/(?:\S+)|/(?:Users|home|private|tmp)/\S+|"
+    r"\b(?:github|repo|repository|pr|diff|test|tests)\b|"
+    r"코드|파일|경로|레포|리포지토리|브랜치|커밋|테스트|변경사항)",
+    re.IGNORECASE,
+)
+_AGENT_TOOL_ACTION_RE = re.compile(
+    r"(?:확인|읽|열어|분석|검사|비교|찾아|실행|수정|반영|적용|"
+    r"고쳐|해결|구현|작성|말해|알려)",
+    re.IGNORECASE,
 )
 
 
@@ -82,6 +108,7 @@ class InboxRouteResult:
     kind: str
     proposal: WorkProposal | None = None
     response_message_id: str | None = None
+    agent_text: str | None = None
 
 
 class ProposalReplyTransport(Protocol):
@@ -145,6 +172,13 @@ class InboxProposalRouter:
             command = command[len(self._bot_mention) :].strip()
         command = command.rstrip(" \t.!")
         return any(pattern.fullmatch(command) for pattern in _EXECUTION_REQUEST_PATTERNS)
+
+    @staticmethod
+    def _needs_agent_tools(feedback: str) -> bool:
+        return bool(
+            _AGENT_TOOL_TARGET_RE.search(feedback)
+            and _AGENT_TOOL_ACTION_RE.search(feedback)
+        )
 
     async def _post_notice(
         self, message: InboxDiscordMessage, content: str
@@ -442,6 +476,46 @@ class InboxProposalRouter:
             content=content,
         )
 
+    async def _route_agent_tools(
+        self,
+        message: InboxDiscordMessage,
+        latest: WorkProposal,
+        binding: ProposalMessageBinding | None,
+        feedback: str,
+    ) -> InboxRouteResult:
+        if message.user_id not in self._authorized_approver_ids:
+            return await self._notice_result(
+                message,
+                kind="agent_passthrough_unauthorized",
+                proposal=latest,
+                content=render_agent_tools_unauthorized(),
+            )
+        if self._approval_handler is None:
+            return await self._notice_result(
+                message,
+                kind="agent_passthrough_not_enabled",
+                proposal=latest,
+                content=render_agent_tools_not_enabled(),
+            )
+        stored = self._store.get(latest.source_dedupe_key)
+        context = build_conversation_context(
+            stored=stored,
+            proposal=latest,
+            approval_offered=bool(
+                binding is not None and binding.approval_offered
+            ),
+            execution_available=self._approval_handler is not None,
+        )
+        return InboxRouteResult(
+            False,
+            "agent_passthrough",
+            latest,
+            agent_text=build_agent_passthrough_message(
+                message=feedback,
+                context=context,
+            ),
+        )
+
     async def handle_message(self, message: InboxDiscordMessage) -> InboxRouteResult:
         if not isinstance(message, InboxDiscordMessage):
             raise ValueError("message must be an InboxDiscordMessage")
@@ -473,6 +547,11 @@ class InboxProposalRouter:
 
         if self._is_execution_request(feedback):
             return await self._route_execution_request(message, latest, binding)
+
+        if self._needs_agent_tools(feedback):
+            return await self._route_agent_tools(
+                message, latest, binding, feedback
+            )
 
         return await self._route_conversation(
             message, latest, binding, feedback

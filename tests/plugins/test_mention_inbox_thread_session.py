@@ -169,7 +169,8 @@ async def test_approval_offer_is_bound_only_when_execution_and_preflight_allow_i
     binding = MentionInboxStore(path).get_proposal_message_binding(
         proposal.proposal_id, proposal.revision
     )
-    assert f"{BOT_MENTION} 승인" in content
+    assert f"{BOT_MENTION} 승인" not in content
+    assert "리뷰 반영해서 수정해줘" in content
     assert binding is not None and binding.approval_offered is True
 
 
@@ -192,7 +193,7 @@ async def test_execution_unavailable_renders_review_only_and_binds_false(
         proposal.proposal_id, proposal.revision
     )
     assert f"{BOT_MENTION} 승인" not in content
-    assert "현재 실행 기능이 꺼져 있어" in content
+    assert "자동 실행이 연결되지 않아" in content
     assert binding is not None and binding.approval_offered is False
 
 
@@ -253,7 +254,7 @@ async def test_non_approvable_preflight_stays_review_only_when_execution_exists(
         proposal.proposal_id, proposal.revision
     )
     assert f"{BOT_MENTION} 승인" not in content
-    assert "현재 근거로는 변경 승인을 받을 수 없어요" in content
+    assert "현재 근거만으로 자동 변경하지 않고" in content
     assert binding is not None and binding.approval_offered is False
 
 
@@ -406,8 +407,9 @@ async def test_pending_proposal_is_local_no_tools_and_omits_full_body(
     )
     content = discord.messages["thread-1"][0][1]
     assert "FULL_BODY_SENTINEL" not in content
-    assert "승인 후 진행할 작업" in content
-    assert BOT_MENTION in content
+    assert "해야 할 일" in content
+    assert "리뷰 반영해서 수정해줘" in content
+    assert BOT_MENTION not in content
     assert not hasattr(discord, "run_agent")
     assert not hasattr(discord, "execute_tool")
 
@@ -486,5 +488,11 @@ async def test_legacy_pending_is_reconciled_once_from_new_hydration(
     assert latest_binding.approval_offered is expected_new_offer
     assert len(discord.messages["thread-1"]) == 1
     rendered = discord.messages["thread-1"][0][1]
-    assert "이전 승인은 사용하지 않고" in rendered
-    assert (f"{BOT_MENTION} 승인" in rendered) is expected_new_offer
+    expected_notice = (
+        "실행 기능이 활성화되어"
+        if expected_new_offer
+        else "이전 실행 요청은 사용하지 않고"
+    )
+    assert expected_notice in rendered
+    assert f"{BOT_MENTION} 승인" not in rendered
+    assert ("리뷰 반영해서 수정해줘" in rendered) is expected_new_offer

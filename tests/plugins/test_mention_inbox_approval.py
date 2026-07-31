@@ -258,7 +258,7 @@ async def test_changed_head_requires_new_approval_without_dispatch(
     assert dispatcher.requests == []
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.NEEDS_REAPPROVAL
     assert len(discord.sent) == 1
-    assert "이전 승인은 사용하지 않고" in discord.sent[0][1]
+    assert "이전 실행 요청은 사용하지 않고" in discord.sent[0][1]
 
 
 @pytest.mark.asyncio
@@ -1004,7 +1004,7 @@ async def test_recovery_marks_stale_head_for_reapproval_without_dispatch(
     assert store.get_execution(execution.execution_id).status == "blocked"
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.NEEDS_REAPPROVAL
     assert len(discord.sent) == 1
-    assert "이전 승인은 사용하지 않고" in discord.sent[0][1]
+    assert "이전 실행 요청은 사용하지 않고" in discord.sent[0][1]
 
 
 @pytest.mark.asyncio
