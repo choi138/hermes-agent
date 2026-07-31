@@ -157,9 +157,12 @@ def test_thread_opened_voice_explains_pr_activity_is_collected_here() -> None:
 
 def test_conversation_fallback_is_visible_and_preserves_state_language() -> None:
     text = render_conversation_fallback(
-        _proposal(), bot_mention="<@1525050525641805886>"
+        _proposal(),
+        bot_mention="<@1525050525641805886>",
+        failure_reason="timeout",
     )
 
+    assert "제한 시간 안에 완료되지 않" in text
     assert "저장된 현재 제안" in text
     assert "리뷰 의견을 확인하고" in text
     assert "제안이나 실행 상태는 바뀌지 않았어요" in text

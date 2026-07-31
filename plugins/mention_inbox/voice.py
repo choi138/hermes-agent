@@ -291,6 +291,7 @@ def render_conversation_fallback(
     *,
     brief_summary: str | None = None,
     findings: tuple[object, ...] = (),
+    failure_reason: str | None = None,
 ) -> str:
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")
@@ -314,14 +315,45 @@ def render_conversation_fallback(
             location = f"{path}:{line}" if line is not None else path
             evidence_lines.append(f"  위치: {location}")
 
+    if failure_reason == "timeout":
+        intro = (
+            "설명 모델 호출이 제한 시간 안에 완료되지 않아 저장된 preflight "
+            "근거를 그대로 알려드릴게요."
+        )
+    elif failure_reason == "error":
+        intro = (
+            "설명 모델 호출이 실패해 저장된 preflight 근거를 그대로 "
+            "알려드릴게요."
+        )
+    else:
+        intro = (
+            "지금은 모델 설명을 생성하지 못해 저장된 preflight 근거를 "
+            "그대로 알려드릴게요."
+        )
+
     if evidence_lines:
         lines = [
-            "지금은 모델 설명을 생성하지 못해 저장된 preflight 근거를 그대로 알려드릴게요.",
+            intro,
             *evidence_lines,
         ]
     else:
+        if failure_reason == "timeout":
+            fallback_intro = (
+                "설명 모델 호출이 제한 시간 안에 완료되지 않았어요. "
+                "저장된 현재 제안은 다음과 같아요."
+            )
+        elif failure_reason == "error":
+            fallback_intro = (
+                "설명 모델 호출이 실패했어요. 저장된 현재 제안은 "
+                "다음과 같아요."
+            )
+        else:
+            fallback_intro = (
+                "지금은 추가 설명을 생성하지 못했어요. 저장된 현재 "
+                "제안은 다음과 같아요."
+            )
         lines = [
-            "지금은 추가 설명을 생성하지 못했어요. 저장된 현재 제안은 다음과 같아요.",
+            fallback_intro,
             f"- 확인된 내용: {_compact_untrusted(proposal.goal, 500)}",
         ]
     return _render_bounded_with_footer(

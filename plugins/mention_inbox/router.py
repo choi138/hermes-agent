@@ -110,6 +110,19 @@ _AGENT_TOOL_ACTION_RE = re.compile(
     r"고쳐|해결|구현|작성|말해|알려)",
     re.IGNORECASE,
 )
+_RUNTIME_DIAGNOSTIC_TARGET_RE = re.compile(
+    r"(?:모델\s*(?:설명|답변|응답)|"
+    r"(?:설명|답변|응답)\s*(?:생성|전송)|"
+    r"conversation\s*responder|"
+    r"읽기\s*전용\s*설명자|"
+    r"도구(?:를|\s*)?\s*호출)",
+    re.IGNORECASE,
+)
+_RUNTIME_DIAGNOSTIC_INTENT_RE = re.compile(
+    r"(?:왜|못|않|안\s*(?:돼|되|됐)|할\s*수\s*없|실패|오류|에러|"
+    r"타임\s*아웃|timeout|원인|로그|진단|그러는데)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -194,10 +207,15 @@ class InboxProposalRouter:
 
     @staticmethod
     def _needs_agent_tools(feedback: str) -> bool:
-        return bool(
+        repository_request = bool(
             _AGENT_TOOL_TARGET_RE.search(feedback)
             and _AGENT_TOOL_ACTION_RE.search(feedback)
         )
+        runtime_diagnostic = bool(
+            _RUNTIME_DIAGNOSTIC_TARGET_RE.search(feedback)
+            and _RUNTIME_DIAGNOSTIC_INTENT_RE.search(feedback)
+        )
+        return repository_request or runtime_diagnostic
 
     async def _post_notice(
         self, message: InboxDiscordMessage, content: str
@@ -464,6 +482,7 @@ class InboxProposalRouter:
             execution_available=self._approval_handler is not None,
         )
         content = ""
+        failure_reason: str | None = None
         responder = self._conversation_responder
         if responder is not None:
             try:
@@ -474,7 +493,10 @@ class InboxProposalRouter:
                         bot_mention=self._bot_mention,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                failure_reason = (
+                    "timeout" if isinstance(exc, TimeoutError) else "error"
+                )
                 logger.warning(
                     "Mention-inbox read-only conversation responder failed",
                     exc_info=True,
@@ -487,6 +509,7 @@ class InboxProposalRouter:
                 self._bot_mention,
                 brief_summary=context.brief_summary,
                 findings=context.findings,
+                failure_reason=failure_reason,
             )
         return await self._notice_result(
             message,

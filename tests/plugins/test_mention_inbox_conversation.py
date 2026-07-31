@@ -168,6 +168,9 @@ async def test_responder_sends_untrusted_json_with_no_tools() -> None:
     assert isinstance(messages, list)
     assert "untrusted data" in messages[0]["content"]
     assert "변경, 승인, 실행, 배포를 했다고 주장하지 마세요" in messages[0]["content"]
+    assert "이번 설명 응답 호출에만 적용됩니다" in messages[0]["content"]
+    assert "work thread 전체" in messages[0]["content"]
+    assert "정책 때문이라고 추측하거나" in messages[0]["content"]
     assert "질문, 설명 요청, 불만, 재촉에는 이 형식을 절대로" in messages[0]["content"]
     assert "대화 기록이 없다고 변명하지 말고" in messages[0]["content"]
     payload = json.loads(messages[1]["content"].split("\n", 1)[1])

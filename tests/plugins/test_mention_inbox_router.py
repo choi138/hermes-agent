@@ -314,6 +314,42 @@ async def test_local_workspace_inspection_routes_to_full_agent_with_bounded_cont
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    (
+        "모델 설명을 왜 설성하지 못함?",
+        "방금 답변이 왜 읽기 전용 설명자라고 한 거야?",
+        '이 스레드에서 "읽기 전용 설명자라 도구를 호출하지 않는다"고 그러는데?',
+        "conversation responder timeout 원인 로그 확인해줘",
+    ),
+)
+async def test_runtime_diagnostic_routes_to_full_agent(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    store, _ = _seed(tmp_path / f"runtime-diagnostic-{abs(hash(text))}.db")
+    discord = _Discord()
+    responder = _Responder()
+    before = _mutation_counts(store)
+
+    result = await _router(
+        store,
+        discord,
+        handler=_Handler(),
+        responder=responder,
+    ).handle_message(_message(text))
+
+    assert result.handled is False
+    assert result.kind == "agent_passthrough"
+    assert result.agent_text is not None
+    _, encoded = result.agent_text.split("\n\n", 1)
+    assert json.loads(encoded)["user_request"] == text
+    assert responder.calls == []
+    assert discord.messages == []
+    assert _mutation_counts(store) == before == (0, 0)
+
+
+@pytest.mark.asyncio
 async def test_local_workspace_passthrough_requires_authorized_user(
     tmp_path: Path,
 ) -> None:
@@ -505,6 +541,7 @@ async def test_conversation_failure_returns_visible_deterministic_fallback(
     )
 
     assert result.kind == "conversation_fallback"
+    assert "제한 시간 안에 완료되지 않" in discord.messages[-1][1]
     assert "저장된 현재 제안" in discord.messages[-1][1]
     assert "리뷰 의견을 확인한다" in discord.messages[-1][1]
     assert store.get_latest_proposal(SUBJECT).revision == 1
