@@ -881,6 +881,30 @@ class TestKillProcess:
         assert result["status"] == "already_exited"
 
 
+    def test_kill_sandbox_process_uses_environment_tree_terminator(
+        self, registry, monkeypatch
+    ):
+        class FakeEnvironment:
+            def __init__(self):
+                self.calls = []
+
+            def terminate_process_tree(self, pid, *, timeout):
+                self.calls.append((pid, timeout))
+                return {"output": "", "returncode": 0}
+
+        env = FakeEnvironment()
+        s = _make_session(sid="proc_remote", command="sleep 999")
+        s.pid = 82477
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert env.calls == [(82477, 5)]
+
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242

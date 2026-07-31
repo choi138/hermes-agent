@@ -1664,8 +1664,23 @@ class ProcessRegistry:
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # Non-local -- terminate descendants before their tracked root.
+                # Killing only the wrapper reparents its still-running children
+                # to PID 1, which is especially visible through the SSH backend.
+                terminate_tree = getattr(
+                    session.env_ref,
+                    "terminate_process_tree",
+                    None,
+                )
+                if callable(terminate_tree):
+                    terminate_tree(session.pid, timeout=5)
+                else:
+                    # Compatibility for third-party environments that do not yet
+                    # inherit the BaseEnvironment tree-termination primitive.
+                    session.env_ref.execute(
+                        f"kill {session.pid} 2>/dev/null",
+                        timeout=5,
+                    )
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
