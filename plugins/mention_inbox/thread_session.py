@@ -428,6 +428,25 @@ class MentionInboxThreadCoordinator:
                 message_id = await self._discord.find_message_content(
                     thread_id, content, limit=100
                 )
+                if message_id is not None:
+                    existing_binding = (
+                        self._store.get_proposal_message_binding_by_message_id(
+                            message_id
+                        )
+                    )
+                    if (
+                        existing_binding is not None
+                        and (
+                            existing_binding.proposal.proposal_id
+                            != proposal.proposal_id
+                            or existing_binding.proposal.revision
+                            != proposal.revision
+                        )
+                    ):
+                        # Two HEAD revisions can intentionally render the same
+                        # user-facing text.  A message already bound to the
+                        # older revision cannot also identify this proposal.
+                        message_id = None
                 if message_id is None:
                     message_id = await self._discord.send_to_thread(thread_id, content)
                 self._store.record_proposal_message(

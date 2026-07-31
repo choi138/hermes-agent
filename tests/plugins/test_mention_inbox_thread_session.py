@@ -374,6 +374,64 @@ async def test_new_source_revision_reuses_thread_and_posts_r2(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_same_rendered_text_does_not_reuse_an_older_revision_message(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.db"
+    discord = _Discord()
+    coordinator = _coordinator(path, discord)
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    await coordinator.ensure_thread(
+        _event(
+            event_id="RC_124",
+            source_revision="2026-07-29T10:02:00Z",
+            head_sha="head-2",
+        ),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:02:00Z",
+    )
+    third_event = _event(
+        event_id="RC_125",
+        source_revision="2026-07-29T10:03:00Z",
+        head_sha="head-3",
+    )
+    await coordinator.ensure_thread(
+        third_event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:03:00Z",
+    )
+    await coordinator.ensure_thread(
+        third_event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:03:00Z",
+    )
+
+    store = MentionInboxStore(path, clock=lambda: NOW)
+    latest = store.get_latest_proposal("github:R_repo:PR_7")
+    assert latest is not None and latest.revision == 3
+    previous = store.get_proposal(latest.proposal_id, 2)
+    assert previous is not None
+    previous_binding = store.get_proposal_message_binding(
+        previous.proposal_id, previous.revision
+    )
+    latest_binding = store.get_proposal_message_binding(
+        latest.proposal_id, latest.revision
+    )
+    assert previous_binding is not None
+    assert latest_binding is not None
+    assert latest_binding.message_id != previous_binding.message_id
+    assert len(discord.messages["thread-1"]) == 3
+    assert (
+        discord.messages["thread-1"][1][1]
+        == discord.messages["thread-1"][2][1]
+    )
+
+
+@pytest.mark.asyncio
 async def test_different_subjects_create_different_threads(tmp_path: Path) -> None:
     discord = _Discord()
     coordinator = _coordinator(tmp_path / "inbox.db", discord)
