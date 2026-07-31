@@ -2215,6 +2215,8 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _COMPLETION_ADMISSION_REJECTED_KEY,
+    _COMPLETION_ADMISSION_TOKEN_KEY,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -8365,6 +8367,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        # --- Internal synthetic events must never interrupt/steer ---
+        # Keep this before every awaitable busy-path branch. Durable completion
+        # admission is linearized by the base adapter immediately after this
+        # synchronous return; letting an internal event enter draining,
+        # approval, or clarify I/O would reopen a post-validation race.
+        if getattr(event, "internal", False):
+            return False
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
@@ -8472,20 +8482,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
-
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
-        if getattr(event, "internal", False):
-            return False
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -10612,6 +10608,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            adapter.set_completion_admission_validator(
+                self._validate_completion_admission
+            )
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -11713,6 +11712,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    adapter.set_completion_admission_validator(
+                        self._validate_completion_admission
+                    )
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -12655,6 +12657,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        adapter.set_completion_admission_validator(
+            self._validate_completion_admission
+        )
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -20809,7 +20814,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _inject_watch_notification(
-        self, synth_text: str, evt: dict,
+        self,
+        synth_text: str,
+        evt: dict,
+        *,
+        completion_admission: Optional[Dict[str, Any]] = None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -20901,6 +20910,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if completion_admission is not None:
+                metadata[_COMPLETION_ADMISSION_TOKEN_KEY] = completion_admission
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -20916,6 +20927,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.thread_id,
             )
             await adapter.handle_message(synth_event)
+            if synth_event.metadata.get(_COMPLETION_ADMISSION_REJECTED_KEY):
+                return None
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
@@ -21079,8 +21092,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._completion_deliveries_inflight.add(identity)
 
         accepted = False
+        completion_admission = None
         try:
             if durable_claim_id:
+                # Capture immediately before the final durable-claim read.
+                # If /stop wins after that read but before the adapter's real
+                # queue/task boundary, its synchronous epoch bump makes this
+                # token stale and the adapter rejects the synthetic event.
+                completion_admission = self._capture_completion_admission(
+                    str(evt.get("session_key") or "").strip()
+                )
                 try:
                     from tools.async_delegation import (
                         is_completion_delivery_claim_active,
@@ -21098,7 +21119,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc,
                     )
                     return False
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            injection_result = await self._inject_watch_notification(
+                synth_text,
+                evt,
+                completion_admission=completion_admission,
+            )
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -21961,6 +21986,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         current = state.persistent.run_generation if state is not None else 0
         return int(current) == int(generation)
 
+    def _current_completion_admission_epoch(self, session_key: str) -> int:
+        """Return the cancellation epoch used by durable completion admission."""
+        if not session_key:
+            return 0
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return 0
+        return int(state.persistent.completion_cancellation_epoch)
+
+    def _capture_completion_admission(
+        self,
+        session_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Capture a session epoch before the final durable-claim check."""
+        if not session_key:
+            return None
+        return {
+            "session_key": session_key,
+            "epoch": self._current_completion_admission_epoch(session_key),
+        }
+
+    def _invalidate_completion_admission_epoch(
+        self,
+        session_key: str,
+        *,
+        reason: str = "",
+    ) -> int:
+        """Invalidate synthetic completions not yet admitted for a session."""
+        if not session_key:
+            return 0
+        persistent = self._session_state(session_key).persistent
+        persistent.completion_cancellation_epoch = (
+            int(persistent.completion_cancellation_epoch) + 1
+        )
+        epoch = persistent.completion_cancellation_epoch
+        if reason:
+            logger.info(
+                "Invalidated completion admission epoch for %s → %d (%s)",
+                session_key,
+                epoch,
+                reason,
+            )
+        return epoch
+
+    def _validate_completion_admission(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Validate an adapter-bound completion token against current state."""
+        metadata = getattr(event, "metadata", None)
+        token = (
+            metadata.get(_COMPLETION_ADMISSION_TOKEN_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(token, dict):
+            return False
+        token_session_key = str(token.get("session_key") or "")
+        if not token_session_key or token_session_key != session_key:
+            return False
+        try:
+            expected_epoch = int(token["epoch"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (
+            self._current_completion_admission_epoch(session_key)
+            == expected_epoch
+        )
+
     async def _cancel_session_background_work(
         self,
         session_key: str,
@@ -21977,6 +22072,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return 0
+
+        # Linearization point for /stop and /new versus synthetic completion
+        # admission. This is deliberately synchronous and happens before the
+        # durable cancellation write or any await below. A completion that
+        # already passed its claim read must still present the older epoch to
+        # the adapter and will be rejected at queue/task admission.
+        self._invalidate_completion_admission_epoch(
+            session_key,
+            reason=reason,
+        )
 
         cancelled = 0
         try:
