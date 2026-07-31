@@ -123,6 +123,13 @@ class GatewaySlashCommandsMixin:
         # Get existing session key
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
+        # Linearize /new against any durable completion that already passed
+        # its final claim read. This must happen before resource cleanup or any
+        # other await so the adapter rejects the old completion at admission.
+        self._invalidate_completion_admission_epoch(
+            session_key,
+            reason="session_reset",
+        )
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
         # False and leave its dead agent behind; clearing here keeps the slot

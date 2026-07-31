@@ -6,15 +6,25 @@ cancel both lanes, drop an already-queued completion, and clear any restart
 auto-resume marker without affecting another thread.
 """
 
+import asyncio
 import queue
 import threading
 import time
 from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.platforms.base import MessageEvent, MessageType, Platform
+from gateway.config import PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    Platform,
+    _COMPLETION_ADMISSION_REJECTED_KEY,
+    _COMPLETION_ADMISSION_TOKEN_KEY,
+)
 from gateway.run import GatewayRunner, _INTERRUPT_REASON_STOP
 from gateway.session import SessionSource, build_session_key
 from tools import async_delegation as ad
@@ -54,6 +64,20 @@ class _SessionStore:
         return changed
 
 
+class _AdmissionAdapter(BasePlatformAdapter):
+    async def connect(self, *, is_reconnect: bool = False):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, **kwargs):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
 def _source(thread_id):
     return SessionSource(
         platform=Platform.DISCORD,
@@ -70,19 +94,56 @@ def _wait_for_inactive(timeout=5):
         time.sleep(0.02)
 
 
-def _delivery_runner():
+def _take_completion(delegation_id):
+    while not process_registry.completion_queue.empty():
+        candidate = process_registry.completion_queue.get_nowait()
+        if candidate.get("delegation_id") == delegation_id:
+            return candidate
+    return None
+
+
+def _delivery_runner(*, mock_injection=True):
     runner = object.__new__(GatewayRunner)
     runner._completion_delivery_lock = threading.Lock()
     runner._completion_deliveries_inflight = set()
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 16
-    runner._inject_watch_notification = AsyncMock(return_value=True)
+    if mock_injection:
+        runner._inject_watch_notification = AsyncMock(return_value=True)
     session_db = MagicMock()
     session_db.get_session = AsyncMock(
         return_value={"id": "parent-a", "ended_at": None}
     )
     runner._session_db = session_db
     return runner
+
+
+def _admission_adapter(runner):
+    adapter = _AdmissionAdapter(
+        PlatformConfig(enabled=True, token="test-token"),
+        Platform.DISCORD,
+    )
+    handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(handler)
+    adapter.set_completion_admission_validator(
+        runner._validate_completion_admission
+    )
+    return adapter, handler
+
+
+def _tokenized_completion(runner, source):
+    session_key = build_session_key(source)
+    return MessageEvent(
+        text="[SYSTEM: background delegation completed]",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        metadata={
+            _COMPLETION_ADMISSION_TOKEN_KEY: (
+                runner._capture_completion_admission(session_key)
+            )
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -248,12 +309,7 @@ async def test_gateway_drops_completion_cancelled_by_stop(tmp_path, monkeypatch)
         reason="stop_command",
     ) == 1
 
-    evt = None
-    while not process_registry.completion_queue.empty():
-        candidate = process_registry.completion_queue.get_nowait()
-        if candidate.get("delegation_id") == dispatched["delegation_id"]:
-            evt = candidate
-            break
+    evt = _take_completion(dispatched["delegation_id"])
     assert evt is not None
 
     runner = _delivery_runner()
@@ -281,12 +337,7 @@ async def test_gateway_revalidates_claim_when_stop_wins_delivery_race(
     _wait_for_inactive()
     assert ad.active_count() == 0
 
-    evt = None
-    while not process_registry.completion_queue.empty():
-        candidate = process_registry.completion_queue.get_nowait()
-        if candidate.get("delegation_id") == dispatched["delegation_id"]:
-            evt = candidate
-            break
+    evt = _take_completion(dispatched["delegation_id"])
     assert evt is not None
 
     real_claim = ad.claim_completion_delivery
@@ -308,3 +359,139 @@ async def test_gateway_revalidates_claim_when_stop_wins_delivery_race(
     durable = ad.get_durable_delegation(dispatched["delegation_id"])
     assert durable["state"] == "cancelled"
     assert durable["delivery_state"] == "dropped"
+
+
+@pytest.mark.asyncio
+async def test_stop_after_claim_revalidation_blocks_adapter_admission(
+    tmp_path, monkeypatch
+):
+    """A stop during topic recovery wins after the final durable-claim read."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    dispatched = ad.dispatch_async_delegation(
+        goal="post-claim race",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key=session_key,
+        parent_session_id="parent-a",
+        runner=lambda: {"status": "completed", "summary": "must not re-enter"},
+    )
+    _wait_for_inactive()
+    evt = _take_completion(dispatched["delegation_id"])
+    assert evt is not None
+
+    runner = _delivery_runner(mock_injection=False)
+    adapter, handler = _admission_adapter(runner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={session_key: SimpleNamespace(origin=source)},
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        clear_resume_pending=AsyncMock(return_value=False),
+    )
+
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+
+    def blocking_topic_recovery(_source):
+        recovery_entered.set()
+        release_recovery.wait(timeout=5)
+        return None
+
+    adapter.set_topic_recovery_fn(blocking_topic_recovery)
+    delivery_task = asyncio.create_task(
+        runner._deliver_completion_notification("synthetic", evt)
+    )
+
+    entered = await asyncio.wait_for(
+        asyncio.to_thread(recovery_entered.wait, 3),
+        timeout=4,
+    )
+    cancelled = -1
+    if entered:
+        try:
+            cancelled = await runner._cancel_session_background_work(
+                session_key,
+                parent_session_id="parent-a",
+                reason="stop_command",
+            )
+        finally:
+            release_recovery.set()
+    else:
+        release_recovery.set()
+
+    result = await asyncio.wait_for(delivery_task, timeout=5)
+    await adapter.cancel_background_tasks()
+
+    assert entered is True
+    assert cancelled == 1
+    assert result is None
+    handler.assert_not_awaited()
+    assert session_key not in adapter._active_sessions
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert durable["state"] == "cancelled"
+    assert durable["delivery_state"] == "dropped"
+
+
+@pytest.mark.asyncio
+async def test_stale_queued_completion_is_not_drained_after_stop_epoch():
+    runner = object.__new__(GatewayRunner)
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    adapter, handler = _admission_adapter(runner)
+    command_guard = asyncio.Event()
+    adapter._active_sessions[session_key] = command_guard
+    event = _tokenized_completion(runner, source)
+
+    await adapter.handle_message(event)
+    assert adapter._pending_messages[session_key] is event
+
+    runner._invalidate_completion_admission_epoch(
+        session_key,
+        reason="stop_command",
+    )
+    await adapter._drain_pending_after_session_command(
+        session_key,
+        command_guard,
+    )
+    await asyncio.sleep(0)
+
+    handler.assert_not_awaited()
+    assert event.metadata[_COMPLETION_ADMISSION_REJECTED_KEY] is True
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
+
+
+@pytest.mark.asyncio
+async def test_current_queued_completion_drains_normally():
+    runner = object.__new__(GatewayRunner)
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    adapter, handler = _admission_adapter(runner)
+    processed = asyncio.Event()
+
+    async def mark_processed(_event):
+        processed.set()
+
+    handler.side_effect = mark_processed
+    command_guard = asyncio.Event()
+    adapter._active_sessions[session_key] = command_guard
+    event = _tokenized_completion(runner, source)
+
+    await adapter.handle_message(event)
+    assert adapter._pending_messages[session_key] is event
+
+    await adapter._drain_pending_after_session_command(
+        session_key,
+        command_guard,
+    )
+    await asyncio.wait_for(processed.wait(), timeout=2)
+    await adapter.cancel_background_tasks()
+
+    handler.assert_awaited_once_with(event)
+    assert _COMPLETION_ADMISSION_REJECTED_KEY not in event.metadata
