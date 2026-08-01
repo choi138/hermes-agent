@@ -29,6 +29,8 @@ Remote execution additionally requires Python 3 in the terminal backend.
 """
 
 import base64
+import binascii
+from contextlib import ExitStack
 import functools
 import json
 import logging
@@ -47,6 +49,7 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.environments.base import BaseEnvironment, suppress_pre_execute_hooks
 from tools.thread_context import propagate_context_to_thread
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
@@ -333,9 +336,9 @@ _TOOL_STUBS = {
     ),
     "write_file": (
         "write_file",
-        "path: str, content: str, cross_profile: bool = False",
-        '"""Write content to a file (always overwrites). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard."""',
-        '{"path": path, "content": content, "cross_profile": cross_profile}',
+        "path: str, content: str, cross_profile: bool = False, expected_sha256: str = None, allow_destructive_overwrite: bool = False",
+        '"""Write a complete file. Large destructive shrinks require the refusal\'s expected_sha256 plus allow_destructive_overwrite=True. cross_profile=True opts out of the cross-profile soft guard."""',
+        '{"path": path, "content": content, "cross_profile": cross_profile, "expected_sha256": expected_sha256, "allow_destructive_overwrite": allow_destructive_overwrite}',
     ),
     "search_files": (
         "search_files",
@@ -345,9 +348,9 @@ _TOOL_STUBS = {
     ),
     "patch": (
         "patch",
-        'path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False',
-        '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard."""',
-        '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile}',
+        'path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False, content: str = None, expected_sha256: str = None',
+        '"""Targeted replacement, atomic EOF append, or V4A multi-file patch. cross_profile=True opts out of the cross-profile soft guard."""',
+        '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile, "content": content, "expected_sha256": expected_sha256}',
     ),
     "terminal": (
         "terminal",
@@ -876,43 +879,57 @@ def _rpc_poll_loop(
     quoted_rpc_dir = shlex.quote(rpc_dir)
     while not stop_event.is_set():
         try:
-            # List pending request files (skip .tmp partials)
-            ls_result = env.execute(
-                f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
+            # Fetch every ready request in one SSH round trip. The old
+            # ls-then-cat flow spawned two remote commands per tool call
+            # (plus response write and request removal), which dominated
+            # short commands over SSH. Paths in this private UUID directory
+            # cannot contain tabs, so one tab-delimited base64 line is safe.
+            scan_result = env.execute(
+                f"for f in {quoted_rpc_dir}/req_*; do "
+                "[ -f \"$f\" ] || continue; "
+                "case \"$f\" in *.tmp) continue ;; esac; "
+                "printf '%s\\t' \"$f\"; "
+                "base64 < \"$f\" | tr -d '\\n'; "
+                "printf '\\n'; "
+                "done",
                 cwd="/",
                 timeout=10,
             )
-            output = ls_result.get("output", "").strip()
+            output = scan_result.get("output", "").strip()
             if not output:
                 stop_event.wait(poll_interval)
                 continue
 
-            req_files = sorted([
-                f.strip() for f in output.split("\n")
-                if f.strip()
-                and not f.strip().endswith(".tmp")
-                and "/req_" in f.strip()
-            ])
+            request_lines = sorted(
+                line for line in output.splitlines() if "\t" in line
+            )
 
-            for req_file in req_files:
+            for request_line in request_lines:
                 if stop_event.is_set():
                     break
 
                 call_start = time.monotonic()
-
-                quoted_req_file = shlex.quote(req_file)
-                # Read request
-                read_result = env.execute(
-                    f"cat {quoted_req_file}",
-                    cwd="/",
-                    timeout=10,
-                )
+                req_file = ""
                 try:
-                    request = json.loads(read_result.get("output", ""))
-                except (json.JSONDecodeError, ValueError):
+                    req_file, encoded_request = request_line.split("\t", 1)
+                    quoted_req_file = shlex.quote(req_file)
+                    request = json.loads(
+                        base64.b64decode(
+                            encoded_request.encode("ascii"), validate=True
+                        ).decode("utf-8")
+                    )
+                except (
+                    binascii.Error,
+                    UnicodeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
                     logger.debug("Malformed RPC request in %s", req_file)
                     # Remove bad request to avoid infinite retry
-                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    if "/req_" in req_file:
+                        env.execute(
+                            f"rm -f {shlex.quote(req_file)}", cwd="/", timeout=5
+                        )
                     continue
 
                 if not rpc_token or not secrets.compare_digest(
@@ -985,13 +1002,13 @@ def _rpc_poll_loop(
                 ).decode("ascii")
                 env.execute(
                     f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
+                    f" && mv {quoted_res_file}.tmp {quoted_res_file}; "
+                    "__hermes_rpc_rc=$?; "
+                    f"rm -f {quoted_req_file}; "
+                    "exit $__hermes_rpc_rc",
                     cwd="/",
                     timeout=60,
                 )
-
-                # Remove the request file
-                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
 
         except Exception as e:
             if not stop_event.is_set():
@@ -1036,8 +1053,18 @@ def _execute_remote(
     exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
+    pre_execute_scope = ExitStack()
 
     try:
+        # SSH normally scans/synchronizes the profile before every command.
+        # execute_code issues many housekeeping commands and proxies inner
+        # terminal calls on a second thread, but they all belong to one
+        # compound operation over the same filesystem snapshot. Prepare that
+        # snapshot once, then propagate suppression to the RPC worker.
+        if env_type == "ssh" and isinstance(env, BaseEnvironment):
+            env._before_execute()
+            pre_execute_scope.enter_context(suppress_pre_execute_hooks())
+
         # Verify Python is available on the remote
         py_check = env.execute(
             "command -v python3 >/dev/null 2>&1 && echo OK",
@@ -1138,6 +1165,7 @@ def _execute_remote(
             )
         except Exception:
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
+        pre_execute_scope.close()
 
     duration = round(time.monotonic() - exec_start, 2)
 
@@ -1889,14 +1917,14 @@ _TOOL_DOC_LINES = [
      "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
     ("write_file",
-     "  write_file(path: str, content: str) -> dict\n"
-     "    Always overwrites the entire file."),
+     "  write_file(path: str, content: str, expected_sha256=None, allow_destructive_overwrite=False) -> dict\n"
+     "    Replaces the file; guarded large shrinks require the returned SHA-256."),
     ("search_files",
      "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50) -> dict\n"
      "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
     ("patch",
-     "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
-     "    Replaces old_string with new_string in the file."),
+     "  patch(path=None, old_string=None, new_string=None, mode='replace', content=None, patch=None, expected_sha256=None) -> dict\n"
+     "    Supports targeted replace, atomic EOF append, and V4A patch modes."),
     ("terminal",
      "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
      "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
@@ -1952,12 +1980,14 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 
     description = (
         "Run a Python script that can call Hermes tools programmatically. "
-        "Use this when you need 3+ tool calls with processing logic between them, "
+        "Use this when later tool calls depend on earlier results, "
         "need to filter/reduce large tool outputs before they enter your context, "
         "need conditional branching (if X then Y else Z), or need to loop "
         "(fetch N pages, process N files, retry on failure).\n\n"
-        "Use normal tool calls instead when: single tool call with no processing, "
-        "you need to see the full result and apply complex reasoning, "
+        "Do not use this tool merely to batch independent calls: request independent "
+        "normal tool calls together in one assistant response so Hermes can run them "
+        "concurrently. Also use normal tool calls when you need to see the full result "
+        "and apply complex reasoning, "
         "or the task requires interactive user input.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"

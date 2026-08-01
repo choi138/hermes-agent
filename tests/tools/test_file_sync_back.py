@@ -238,6 +238,54 @@ class TestSyncBackRetries:
         mock_sleep.assert_any_call(_SYNC_BACK_BACKOFF[1])
 
     @patch("tools.environments.file_sync._sleep")
+    def test_sync_back_supports_single_attempt_with_download_override(
+        self, mock_sleep, tmp_path
+    ):
+        default_download = MagicMock()
+        bounded_download = MagicMock(side_effect=RuntimeError("shutdown timeout"))
+        mgr = _make_manager(tmp_path, bulk_download_fn=default_download)
+
+        mgr.sync_back(
+            hermes_home=tmp_path / ".hermes",
+            max_attempts=1,
+            bulk_download_fn=bounded_download,
+        )
+
+        bounded_download.assert_called_once()
+        default_download.assert_not_called()
+        mock_sleep.assert_not_called()
+
+    @patch("tools.environments.file_sync.fcntl.flock")
+    def test_sync_back_deadline_bounds_file_lock_wait(
+        self, mock_flock, tmp_path, monkeypatch
+    ):
+        clock = [0.0]
+        download = MagicMock()
+
+        def always_locked(_fd, operation):
+            if operation & fcntl.LOCK_NB:
+                raise BlockingIOError
+
+        def advance(delay):
+            clock[0] += delay
+
+        mock_flock.side_effect = always_locked
+        monkeypatch.setattr(
+            "tools.environments.file_sync._monotonic", lambda: clock[0]
+        )
+        monkeypatch.setattr("tools.environments.file_sync._sleep", advance)
+        mgr = _make_manager(tmp_path, bulk_download_fn=download)
+
+        mgr.sync_back(
+            hermes_home=tmp_path / ".hermes",
+            max_attempts=1,
+            deadline=0.1,
+        )
+
+        download.assert_not_called()
+        assert clock[0] >= 0.1
+
+    @patch("tools.environments.file_sync._sleep")
     def test_sync_back_all_retries_exhausted(self, mock_sleep, tmp_path, caplog):
         def always_fail(dest: Path):
             raise RuntimeError("persistent failure")

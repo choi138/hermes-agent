@@ -583,11 +583,14 @@ def build_turn_context(
     should_review_memory = False
     if (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
-            and agent._memory_store):
+            and agent._memory_store
+            and is_primary_foreground_agent(agent)):
         agent._turns_since_memory += 1
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             should_review_memory = True
-            agent._turns_since_memory = 0
+            # Reset only after a successful foreground turn has actually
+            # queued (or deduplicated) its review.  Failed/partial turns keep
+            # the nudge due for the next healthy outcome.
 
     # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
     # and notify the host so it can play hearts. Token-free, never touches the

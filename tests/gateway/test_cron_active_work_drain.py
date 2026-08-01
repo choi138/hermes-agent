@@ -90,7 +90,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         sched._running_job_ids.add("job-1")
 
         monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
-        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda **_kwargs: None)
         monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
 
         marked_calls = []

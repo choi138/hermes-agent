@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
 import json
 from unittest import mock

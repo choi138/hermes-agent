@@ -15,6 +15,7 @@ import threading
 import time
 import types
 import unittest
+from contextvars import ContextVar
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -858,6 +859,40 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_child_conversation_worker_inherits_contextvars(self):
+        from tools.delegate_tool import _run_single_child
+
+        marker = ContextVar("delegate_child_marker", default="missing")
+        token = marker.set("profile-a")
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_saved_tool_names = []
+        child.tool_progress_callback = None
+        child.get_activity_summary.return_value = {
+            "api_call_count": 0,
+            "max_iterations": 1,
+        }
+        child.run_conversation.side_effect = lambda **kwargs: {
+            "final_response": marker.get(),
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 0,
+            "messages": [],
+        }
+
+        try:
+            result = _run_single_child(
+                task_index=0,
+                goal="Keep profile context",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+        finally:
+            marker.reset(token)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "profile-a")
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 

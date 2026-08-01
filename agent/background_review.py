@@ -179,10 +179,11 @@ _MEMORY_REVIEW_PROMPT = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be "
-    "ACTIVE — most sessions produce at least one skill update, even if "
-    "small. A pass that does nothing is a missed learning opportunity, "
-    "not a neutral outcome.\n\n"
+    "Review the conversation above for durable, reusable improvements to "
+    "the skill library. Update a skill only when the transcript contains "
+    "concrete evidence for a correction or technique. Making no change is "
+    "the correct outcome when there is no such evidence; do not manufacture "
+    "an update from task length, reviewer count, or transient failures.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries. This "
@@ -203,8 +204,8 @@ _SKILL_REVIEW_PROMPT = (
     "from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out "
     "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do "
-    "pick one when a signal above fired:\n"
+    "Preference order — use the earliest action that fits when a concrete "
+    "signal above fired:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
     "conversation for skills the user loaded via /skill-name or you "
     "read via skill_view. If any of them covers the territory of the "
@@ -297,10 +298,9 @@ _SKILL_REVIEW_PROMPT = (
     "command, config step, env var to set) under an existing setup or "
     "troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "'Nothing to save.' is a real option but should NOT be the "
-    "default. If the session ran smoothly with no corrections and "
-    "produced no new technique, just say 'Nothing to save.' and stop. "
-    "Otherwise, act."
+    "If the session ran smoothly with no corrections and produced no new "
+    "reusable technique, say 'Nothing to save.' and stop. Otherwise, act "
+    "only on the evidenced improvement."
 )
 
 _COMBINED_REVIEW_PROMPT = (
@@ -309,9 +309,10 @@ _COMBINED_REVIEW_PROMPT = (
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
-    "sessions produce at least one skill update. A pass that does "
-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
+    "**Skills**: how to do this class of task. Update a skill only when "
+    "the transcript contains concrete evidence for a durable correction or "
+    "reusable technique. Making no change is a correct outcome; do not infer "
+    "an update from task length, reviewer count, or transient failures.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
@@ -399,9 +400,8 @@ _COMBINED_REVIEW_PROMPT = (
     "command, config step, env var to set) under an existing setup or "
     "troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "Act on whichever of the two dimensions has real signal. If "
-    "genuinely nothing stands out on either, say 'Nothing to save.' "
-    "and stop — but don't reach for that conclusion as a default."
+    "Act on whichever of the two dimensions has real evidence. If nothing "
+    "stands out on either, say 'Nothing to save.' and stop."
 )
 
 
@@ -654,7 +654,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
-) -> None:
+) -> bool:
     """Worker function executed in the background-review daemon thread.
 
     Spawns a forked ``AIAgent`` inheriting the parent's runtime, runs the
@@ -683,6 +683,7 @@ def _run_review_in_thread(
 
     review_agent = None
     review_messages: List[Dict] = []
+    review_succeeded = False
     try:
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
@@ -893,6 +894,7 @@ def _run_review_in_thread(
                     ),
                     conversation_history=_review_history,
                 )
+                review_succeeded = True
             finally:
                 clear_thread_tool_whitelist()
 
@@ -987,6 +989,7 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+    return review_succeeded
 
 
 def spawn_background_review_thread(
@@ -1011,8 +1014,8 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
-    def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+    def _target() -> bool:
+        return _run_review_in_thread(agent, messages_snapshot, prompt)
 
     return _target, prompt
 

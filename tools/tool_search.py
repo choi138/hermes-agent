@@ -8,7 +8,8 @@ Design constraints this module is built around (see ``openclaw-tool-search-repor
 for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+  A narrow, policy-gated static toolset may also opt out explicitly with
+  ``defer_to_tool_search: False`` without expanding the global core surface.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -201,13 +202,28 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
+def _toolset_keeps_tools_eager(toolset_name: str) -> bool:
+    """Return whether a static toolset explicitly opts out of deferral."""
+    try:
+        from toolsets import TOOLSETS
+
+        definition = TOOLSETS.get(toolset_name)
+        return (
+            isinstance(definition, dict)
+            and definition.get("defer_to_tool_search") is False
+        )
+    except Exception:
+        return False
+
+
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    A tool is deferrable iff it is registered with an MCP toolset prefix OR
+    it is neither in ``_HERMES_CORE_TOOLS`` nor in a static toolset that
+    explicitly sets ``defer_to_tool_search: False``. Core tools are never
+    deferred even when their toolset is technically plugin-provided (this
+    protects against accidental shadowing).
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
@@ -221,6 +237,8 @@ def is_deferrable_tool_name(name: str) -> bool:
             return False
         if entry.toolset.startswith("mcp-"):
             return True
+        if _toolset_keeps_tools_eager(entry.toolset):
+            return False
         # Non-MCP, non-core → plugin tool, eligible.
         return True
     except Exception:

@@ -40,6 +40,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import propagate_context_to_thread
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -2898,6 +2899,10 @@ def delegate_task(
 
     overall_start = time.monotonic()
     results = []
+    # Set by the async-delegation registry when its owning session ends.
+    # This is separate from parent_agent._interrupt_requested because a
+    # detached batch may outlive the foreground parent turn.
+    _batch_cancel_requested = threading.Event()
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -2994,11 +2999,14 @@ def delegate_task(
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-            # Daemon workers (tools.daemon_pool): the `with` block still joins
-            # normally, but if the parent is interrupted while a child is
-            # wedged, the abandoned worker must not block interpreter exit.
+            # Daemon workers (tools.daemon_pool) can be abandoned safely when
+            # interrupted. Do not use the executor as a context manager here:
+            # ThreadPoolExecutor.__exit__ calls shutdown(wait=True), which
+            # would turn the "abandon pending children" branch below into an
+            # unbounded join on an uncooperative child.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            try:
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
@@ -3048,11 +3056,12 @@ def delegate_task(
                                         ),
                                     }
                             else:
+                                f.cancel()
                                 entry = {
                                     "task_index": idx,
                                     "status": "interrupted",
                                     "summary": None,
-                                    "error": "Parent agent interrupted — child did not finish in time",
+                                    "error": interruption_error,
                                     "api_calls": 0,
                                     "duration_seconds": 0,
                                     "_child_role": getattr(
@@ -3113,6 +3122,11 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:  # pragma: no cover — Python < 3.9
+                    executor.shutdown(wait=False)
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
@@ -3273,6 +3287,7 @@ def delegate_task(
             return _execute_and_aggregate(honor_parent_interrupt=False)
 
         def _batch_interrupt():
+            _batch_cancel_requested.set()
             for _c in _child_agents:
                 try:
                     if hasattr(_c, "interrupt"):

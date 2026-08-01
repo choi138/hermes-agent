@@ -728,6 +728,44 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     assert runner._startup_restore_in_progress is False
 
 
+@pytest.mark.asyncio
+async def test_startup_restore_activates_inbound_routers_before_replay():
+    """Late-bound routers must be ready before queued inbound is released."""
+
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    source = make_restart_source(chat_id="registered-work-thread")
+    inbound = MessageEvent(
+        text="그 코멘트가 정확히 뭐야?",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    runner._startup_restore_queue = [inbound]
+    runner._startup_restore_tasks = []
+    router_ready = False
+    dedicated: list[MessageEvent] = []
+    general: list[MessageEvent] = []
+
+    async def start_inbound_routers() -> None:
+        nonlocal router_ready
+        router_ready = True
+
+    async def replay(event: MessageEvent) -> None:
+        if router_ready and event.source.chat_id == "registered-work-thread":
+            dedicated.append(event)
+        else:
+            general.append(event)
+
+    runner._start_mention_inbox_services = start_inbound_routers
+    adapter.handle_message = replay
+
+    await runner._release_startup_restore_gate()
+
+    assert dedicated == [inbound]
+    assert general == []
+    assert runner._startup_restore_in_progress is False
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------

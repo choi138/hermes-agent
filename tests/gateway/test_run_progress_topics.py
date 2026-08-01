@@ -176,6 +176,8 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
 
 
 class FakeAgent:
+    last_kwargs = None
+
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
         # freeze it — production now assigns tool_progress_callback after
@@ -183,6 +185,7 @@ class FakeAgent:
         # so we must read it at call time, not at init.
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
+        type(self).last_kwargs = kwargs
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         cb = self.tool_progress_callback
@@ -675,6 +678,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    runner_setup=None,
 ):
     if config_data:
         import yaml
@@ -690,7 +694,12 @@ async def _run_with_agent(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = adapter_cls(platform=platform)
+    if hasattr(agent_cls, "adapter_probe"):
+        agent_cls.adapter_probe = adapter
+        agent_cls.initial_visible_before_init = False
     runner = _make_runner(adapter)
+    if runner_setup is not None:
+        runner_setup(runner)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -921,17 +930,17 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     session_key = "agent:main:discord:dm:dm-1"
     runner._session_run_generation[session_key] = 1
 
-    original_send = adapter.send
+    original_edit = adapter.edit_message
     invalidated = {"done": False}
 
-    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
-        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
-        if "first command" in content and not invalidated["done"]:
+    async def edit_and_invalidate(chat_id, message_id, content):
+        result = await original_edit(chat_id, message_id, content)
+        if "Inspecting the current state" in content and not invalidated["done"]:
             invalidated["done"] = True
             runner._invalidate_session_run_generation(session_key, reason="test_stop")
         return result
 
-    adapter.send = send_and_invalidate
+    adapter.edit_message = edit_and_invalidate
 
     result = await runner._run_agent(
         message="hello",
@@ -946,8 +955,20 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     all_progress_text = " ".join(call["content"] for call in adapter.sent)
     all_progress_text += " ".join(call["content"] for call in adapter.edits)
     assert result["final_response"] == "done"
-    assert 'first command' in all_progress_text
-    assert 'second command' not in all_progress_text
+    assert invalidated["done"] is True
+    assert "Preparing the request" in all_progress_text
+    assert "Inspecting the current state" in all_progress_text
+    assert "first command" not in all_progress_text
+    assert "second command" not in all_progress_text
+    # Cancellation may perform one final idempotent flush of the current
+    # snapshot, but no later semantic state may be rendered.
+    assert {
+        call["content"] for call in adapter.edits
+    } == {
+        "**Current stage:** Inspecting the current state\n"
+        "**Confirmed:** Request received\n"
+        "**Next:** Use this step's result to choose the next safe action"
+    }
 
 
 @pytest.mark.asyncio

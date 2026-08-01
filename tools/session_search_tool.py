@@ -55,6 +55,12 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
+# Cumulative row targets for adaptive discovery. Most queries find enough
+# distinct interactive lineages in the first 25 rows. Cron-heavy or highly
+# duplicated result sets keep expanding, preserving the historical 300-row
+# recall ceiling without paying that cost on every query.
+_DISCOVER_SCAN_TARGETS = (25, 50, 100, 200, _DISCOVER_SCAN_LIMIT)
+
 # Prefixes that identify generated context-compaction handoff summaries.
 # These are inserted by agent/context_compressor.py as normal user/assistant
 # messages but contain machine-generated summary metadata — not user content.
@@ -99,7 +105,11 @@ def _is_compaction_summary(content: str) -> bool:
     return any(stripped.startswith(p) for p in _COMPACTION_PREFIXES)
 
 
-def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
+def _resolve_to_parent(
+    db,
+    session_id: str,
+    cache: Optional[Dict[str, tuple[str, bool]]] = None,
+) -> tuple[str, bool]:
     """Walk parent_session_id chain to the lineage root.
 
     Returns ``(root_id, has_compression_hop)`` where ``has_compression_hop`` is
@@ -113,30 +123,57 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     """
     if not session_id:
         return session_id, False
-    visited: set[str] = set()
+    if cache is not None and session_id in cache:
+        return cache[session_id]
+
+    visited: List[tuple[str, bool]] = []
+    seen: set[str] = set()
     cur = session_id
-    has_compression = False
-    while cur and cur not in visited:
-        visited.add(cur)
+    root = session_id
+    inherited_compression = False
+    while cur and cur not in seen:
+        if cache is not None and cur in cache:
+            root, inherited_compression = cache[cur]
+            break
+        seen.add(cur)
         try:
             s = db.get_session(cur)
             if not s:
+                root = cur
                 break
-            if s.get("end_reason") == "compression":
-                has_compression = True
+            visited.append((cur, s.get("end_reason") == "compression"))
             parent = s.get("parent_session_id")
             if not parent:
+                root = cur
                 break
             cur = parent
         except Exception as e:
             logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
+            root = cur
             break
-    return cur, has_compression
+    else:
+        root = cur
+
+    has_compression = inherited_compression
+    for visited_id, ended_by_compression in reversed(visited):
+        has_compression = ended_by_compression or has_compression
+        if cache is not None:
+            cache[visited_id] = (root, has_compression)
+
+    result = (root, has_compression)
+    if cache is not None:
+        cache.setdefault(session_id, result)
+        return cache[session_id]
+    return result
 
 
-def _resolve_lineage(db, session_id: str) -> str:
+def _resolve_lineage(
+    db,
+    session_id: str,
+    cache: Optional[Dict[str, tuple[str, bool]]] = None,
+) -> str:
     """Convenience: return only the lineage root (ignores compression hop)."""
-    return _resolve_to_parent(db, session_id)[0]
+    return _resolve_to_parent(db, session_id, cache=cache)[0]
 
 
 def _is_compression_ended(db, session_id: str) -> bool:
@@ -196,6 +233,44 @@ def _is_compacted_message(db, message_id) -> bool:
     return state is not None and state["active"] == 0 and state["compacted"] == 1
 
 
+def _discovery_lineage_for_hit(
+    db,
+    row: Dict[str, Any],
+    current_session_id: Optional[str],
+    current_lineage_root: Optional[str],
+    lineage_cache: Dict[str, tuple[str, bool]],
+) -> Optional[str]:
+    """Return the eligible lineage root for an FTS hit, or ``None``.
+
+    Live hits from the current lineage are already in the model context and
+    stay hidden. Compression-ended sessions and in-place compacted rows are no
+    longer live context, so those hits remain discoverable.
+    """
+    raw_sid = row.get("session_id")
+    if not raw_sid:
+        return None
+
+    lineage_root, _ = _resolve_to_parent(db, raw_sid, cache=lineage_cache)
+    is_current_lineage = bool(
+        current_lineage_root and lineage_root == current_lineage_root
+    )
+    is_current_session = bool(current_session_id and raw_sid == current_session_id)
+
+    is_compacted_hit = False
+    if is_current_lineage or is_current_session:
+        is_compacted_hit = _is_compacted_message(db, row.get("id"))
+
+    if is_current_lineage:
+        is_ended_session = _is_compression_ended(db, raw_sid)
+        if not (is_ended_session or is_compacted_hit):
+            return None
+
+    if is_current_session and not is_compacted_hit:
+        return None
+
+    return lineage_root
+
+
 def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
     """Add a rebuild-progress note when the deferred FTS backfill (schema
     v23) is still running, so the agent can tell the user why older results
@@ -233,6 +308,71 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         raw_results,
         key=lambda r: 1 if (r.get("source") or "") in _DEMOTED_SESSION_SOURCES else 0,
     )
+
+
+def _search_discovery_rows(
+    db,
+    query: str,
+    role_list: List[str],
+    limit: int,
+    sort: Optional[str],
+    current_session_id: Optional[str],
+    current_lineage_root: Optional[str],
+    lineage_cache: Dict[str, tuple[str, bool]],
+    title_result: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Page through FTS rows until recall is safe or 300 rows are scanned.
+
+    Cron-only pages do not stop the scan because an interactive match may be
+    buried behind automation results. Early exit requires ``limit`` distinct,
+    eligible, non-demoted lineages after applying current-session rules.
+    """
+    interactive_lineages = set()
+    if title_result and title_result.get("source") not in _DEMOTED_SESSION_SOURCES:
+        title_lineage = title_result.get("_lineage_root")
+        if title_lineage:
+            interactive_lineages.add(title_lineage)
+
+    raw_results: List[Dict[str, Any]] = []
+    offset = 0
+    for target in _DISCOVER_SCAN_TARGETS:
+        target = min(target, _DISCOVER_SCAN_LIMIT)
+        if target <= offset:
+            continue
+
+        page_limit = target - offset
+        page = db.search_messages(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=page_limit,
+            offset=offset,
+            sort=sort,
+            include_context=False,
+        )
+        raw_results.extend(page)
+        offset += len(page)
+
+        for row in page:
+            lineage_root = _discovery_lineage_for_hit(
+                db,
+                row,
+                current_session_id=current_session_id,
+                current_lineage_root=current_lineage_root,
+                lineage_cache=lineage_cache,
+            )
+            if lineage_root is None:
+                continue
+            if (row.get("source") or "") in _DEMOTED_SESSION_SOURCES:
+                continue
+            interactive_lineages.add(lineage_root)
+
+        if len(interactive_lineages) >= limit:
+            break
+        if len(page) < page_limit:
+            break
+
+    return raw_results
 
 
 def _shape_message(
@@ -606,6 +746,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    lineage_cache: Optional[Dict[str, tuple[str, bool]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -620,7 +761,7 @@ def _title_match_result(
     if not session_id:
         return None
 
-    lineage_root = _resolve_lineage(db, session_id)
+    lineage_root = _resolve_lineage(db, session_id, cache=lineage_cache)
     if current_lineage_root and lineage_root == current_lineage_root:
         return None
 
@@ -633,7 +774,9 @@ def _title_match_result(
         return None
 
     try:
-        messages = db.get_messages(session_id)
+        # Only the first message id is needed as the anchor. The anchored view
+        # below fetches the bounded window and bookends directly in SQL.
+        messages = db.get_messages(session_id, limit=1)
     except Exception:
         logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
         messages = []
@@ -680,19 +823,30 @@ def _discover(
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    lineage_cache: Dict[str, tuple[str, bool]] = {}
+    current_lineage_root = (
+        _resolve_lineage(db, current_session_id, cache=lineage_cache)
+        if current_session_id
+        else None
+    )
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        lineage_cache=lineage_cache,
+    )
 
     try:
-        raw_results = db.search_messages(
+        raw_results = _search_discovery_rows(
+            db=db,
             query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
-            offset=0,
+            role_list=role_list,
+            limit=limit,
             sort=sort,
+            current_session_id=current_session_id,
+            current_lineage_root=current_lineage_root,
+            lineage_cache=lineage_cache,
+            title_result=title_result,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -732,33 +886,15 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid, _ = _resolve_to_parent(db, raw_sid)
-        # Skip the current session lineage — UNLESS the content has been
-        # compression-summarised out of the live context (memory black hole
-        # after compression). Two sub-cases:
-        #
-        # Legacy rotation: the FTS hit lives in a session that itself ended
-        # with end_reason='compression'. That session's content has been
-        # replaced by a summary in the continuation child, so it must stay
-        # discoverable. A delegation child living under a compression
-        # continuation does NOT have end_reason='compression' itself, so it
-        # stays excluded.
-        #
-        # In-place compaction: the FTS hit lives on the SAME session_id as the
-        # current session, but the matched message row is an archived
-        # (active=0, compacted=1) row. The live-context load filters active=1,
-        # so that content is no longer in context — let it through.
-        is_compacted_hit = _is_compacted_message(db, r.get("id"))
-        is_ended_session = _is_compression_ended(db, raw_sid)
-        if current_lineage_root and resolved_sid == current_lineage_root:
-            if not (is_ended_session or is_compacted_hit):
-                continue
-        if current_session_id and raw_sid == current_session_id:
-            # Same-session hit: only skip if the matched message is still live
-            # (active=1). Archived/compacted rows are pre-compaction content
-            # that's been summarised away — let them through.
-            if not is_compacted_hit:
-                continue
+        resolved_sid = _discovery_lineage_for_hit(
+            db,
+            r,
+            current_session_id=current_session_id,
+            current_lineage_root=current_lineage_root,
+            lineage_cache=lineage_cache,
+        )
+        if resolved_sid is None:
+            continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
             row["_lineage_root"] = resolved_sid

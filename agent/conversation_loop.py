@@ -25,7 +25,10 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.codex_responses_adapter import (
+    CodexStreamIncompleteError,
+    _summarize_user_message_for_log,
+)
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -73,6 +76,7 @@ from agent.prompt_caching import (
     apply_anthropic_cache_control,
     strip_anthropic_cache_control,
 )
+from agent.request_footprint import canonical_tool_schema_metrics, text_metrics
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -87,6 +91,8 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_CODEX_STREAM_RECOVERY_LIMIT = 2
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -1245,6 +1251,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    codex_stream_recovery_attempts = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -1368,12 +1375,6 @@ def run_conversation(
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
-        # Track tool-calling iterations for skill nudge.
-        # Counter resets whenever skill_manage is actually used.
-        if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
-            agent._iters_since_skill += 1
-        
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
         # was thinking), drain it now — before we build api_messages — so
@@ -1813,6 +1814,30 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
+        if not getattr(agent, "_first_request_footprint_logged", False):
+            system_metrics = text_metrics(effective_system)
+            schema_metrics = canonical_tool_schema_metrics(agent.tools or ())
+            logger.info(
+                "First request footprint: platform=%s policy=%s "
+                "identity_profile=%s messages=%d tools=%d schema_bytes=%d "
+                "schema_tokens_est=%d schema_hash=%s system_chars=%d "
+                "system_bytes=%d system_tokens_est=%d system_hash=%s "
+                "input_tokens_est=%d",
+                agent.platform or "none",
+                getattr(agent, "_gateway_tool_policy_name", "none"),
+                getattr(agent, "_gateway_identity_profile", "none"),
+                len(api_messages),
+                schema_metrics.count,
+                schema_metrics.json_bytes,
+                schema_metrics.estimated_tokens,
+                schema_metrics.schema_hash,
+                system_metrics.chars,
+                system_metrics.utf8_bytes,
+                system_metrics.estimated_tokens,
+                system_metrics.content_hash,
+                request_pressure_tokens,
+            )
+            agent._first_request_footprint_logged = True
         total_chars = approx_tokens * 4
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -3171,6 +3196,19 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
+                    if not getattr(agent, "_first_request_usage_logged", False):
+                        logger.info(
+                            "First request usage: platform=%s policy=%s "
+                            "provider_prompt_tokens=%d billable_input_tokens=%d "
+                            "cache_read_tokens=%d cache_write_tokens=%d",
+                            agent.platform or "none",
+                            getattr(agent, "_gateway_tool_policy_name", "none"),
+                            prompt_tokens,
+                            canonical_usage.input_tokens,
+                            canonical_usage.cache_read_tokens,
+                            canonical_usage.cache_write_tokens,
+                        )
+                        agent._first_request_usage_logged = True
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
@@ -3358,6 +3396,35 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
+                else:
+                    # Some OpenAI-compatible providers return a valid response
+                    # without usage metadata. The call still counts for session
+                    # analytics even though there are no token deltas to record.
+                    agent.session_api_calls += 1
+                    logger.info(
+                        "API call #%d: model=%s provider=%s usage=unavailable latency=%.1fs",
+                        agent.session_api_calls,
+                        agent.model,
+                        agent.provider or "unknown",
+                        api_duration,
+                    )
+                    if agent._session_db and agent.session_id:
+                        try:
+                            if not agent._session_db_created:
+                                agent._ensure_db_session()
+                            agent._session_db.update_token_counts(
+                                agent.session_id,
+                                model=agent.model,
+                                billing_provider=agent.provider,
+                                billing_base_url=agent.base_url,
+                                api_call_count=1,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                "API-call persistence failed (session=%s): %s",
+                                agent.session_id,
+                                e,
+                            )
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
@@ -5532,6 +5599,7 @@ def run_conversation(
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
+            codex_stream_recovery_attempts = 0
             assistant_message = normalized
             finish_reason = normalized.finish_reason
             
@@ -6153,6 +6221,7 @@ def run_conversation(
                         agent.session_id or "none",
                         exc,
                     )
+                    agent._incremental_persistence_failed = True
 
                 if _tool_turn_persisted is False:
                     # The canonical append failed. Do not project the row or
@@ -6823,15 +6892,22 @@ def run_conversation(
 
                 try:
                     from agent.verification_stop import (
+                        VERIFY_ON_STOP_NUDGE_CAP,
                         build_verify_on_stop_nudge,
                         verify_on_stop_enabled,
                     )
+                    from agent.verify_hooks import max_verify_nudges
 
                     if verify_on_stop_enabled():
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            max_attempts=min(
+                                VERIFY_ON_STOP_NUDGE_CAP,
+                                max_verify_nudges(),
+                            ),
+                            workspace_cwd=resolve_agent_cwd(),
                         )
                     else:
                         _verify_nudge = None
@@ -6844,12 +6920,11 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Persist the candidate for provider role alternation and
+                    # budget-exhaustion recovery, but do not emit it as an
+                    # interim assistant message. It is not final yet: showing a
+                    # completed-looking report here makes every later verify
+                    # tool call appear to happen *after* completion.
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
@@ -6870,9 +6945,10 @@ def run_conversation(
                     # continuation-budget exhaustion.  ``final_response`` itself
                     # must be cleared so the finalizer can distinguish this gate
                     # from unrelated error/recovery exits. (#61631)
-                    # Track whether this candidate was already streamed so the
-                    # finalizer can mark the turn previewed only if the
-                    # candidate is actually reused as the final response.
+                    # A provider stream may already have exposed the candidate
+                    # before this local gate ran. Track that independently so
+                    # the finalizer only suppresses a duplicate when the same
+                    # candidate is reused at budget exhaustion.
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
@@ -6916,12 +6992,8 @@ def run_conversation(
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Like verify-on-stop above, this is a durable continuation
+                    # candidate, not a completed UI response.
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
@@ -6999,6 +7071,87 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except CodexStreamIncompleteError as e:
+            if e.safe_to_retry and codex_stream_recovery_attempts < _CODEX_STREAM_RECOVERY_LIMIT:
+                codex_stream_recovery_attempts += 1
+                wait_time = jittered_backoff(
+                    codex_stream_recovery_attempts,
+                    base_delay=0.5,
+                    max_delay=2.0,
+                )
+                logger.warning(
+                    "Retryable Codex stream interruption "
+                    "(attempt=%d/%d code=%s status=%s streamed_chars=%d "
+                    "output_items=%d tool_items=%s backoff=%.2fs)",
+                    codex_stream_recovery_attempts,
+                    _CODEX_STREAM_RECOVERY_LIMIT,
+                    e.code,
+                    e.status,
+                    e.streamed_chars,
+                    e.output_item_count,
+                    e.has_tool_items,
+                    wait_time,
+                )
+                agent._buffer_status(
+                    "⚠️ Model stream disconnected before producing output — retrying safely..."
+                )
+                # A zero-output transport retry is one logical model step, like
+                # run_codex_stream's internal connection retry. Preserve the
+                # physical attempt in logs while refunding loop/budget counts.
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                agent.iteration_budget.refund()
+                if not agent._interrupt_requested and wait_time > 0:
+                    agent._touch_activity(
+                        f"Codex stream recovery ({codex_stream_recovery_attempts}/"
+                        f"{_CODEX_STREAM_RECOVERY_LIMIT})"
+                    )
+                    time.sleep(wait_time)
+                continue
+
+            if e.safe_to_retry:
+                failure_text = (
+                    "Codex response stream ended before completion after "
+                    f"{_CODEX_STREAM_RECOVERY_LIMIT} safe retries."
+                )
+                logger.warning(
+                    "Codex stream recovery limit exhausted "
+                    "(code=%s status=%s streamed_chars=%d output_items=%d)",
+                    e.code,
+                    e.status,
+                    e.streamed_chars,
+                    e.output_item_count,
+                )
+            else:
+                failure_text = e.partial_text or (
+                    "Codex response stream ended after partial output; "
+                    "automatic retry was skipped to avoid duplicate actions."
+                )
+                logger.warning(
+                    "Codex stream interruption not retried after partial output "
+                    "(code=%s status=%s streamed_chars=%d output_items=%d "
+                    "tool_items=%s)",
+                    e.code,
+                    e.status,
+                    e.streamed_chars,
+                    e.output_item_count,
+                    e.has_tool_items,
+                )
+
+            agent._emit_status(
+                "⚠️ Model stream ended before completion; no unsafe retry was performed."
+            )
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": failure_text,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "partial": True,
+                "failed": True,
+                "error": str(e),
+            }
+
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the

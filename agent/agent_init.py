@@ -1412,15 +1412,17 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    # Kanban worker/orchestrator guidance is session-static. Workers receive
+    # the task lifecycle protocol; configured orchestrators receive a routing
+    # preflight instead of the misleading "you own one board task" contract.
+    # Looking at enabled_toolsets as well as the filtered tool snapshot keeps
+    # the fail-closed routing contract available when a configured Kanban tool
+    # is unexpectedly absent from the current session schema.
+    from agent.prompt_builder import select_kanban_session_guidance
+    agent._kanban_worker_guidance = select_kanban_session_guidance(
+        enabled_toolsets=enabled_toolsets,
+        valid_tool_names=agent.valid_tool_names,
+        task_id=os.environ.get("HERMES_KANBAN_TASK"),
     )
 
     # Check tool requirements
@@ -1619,6 +1621,9 @@ def init_agent(
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
+    # Historical attribute name retained for compatibility. The counter now
+    # commits model-work units only when a top-level turn completes normally;
+    # delegated and failed turns never contribute to automatic review cadence.
     agent._iters_since_skill = 0
     # A flush/background agent may pass skip_memory=True to avoid spinning up an
     # external memory *provider*, but if the caller also explicitly enables the

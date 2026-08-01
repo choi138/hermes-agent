@@ -26,6 +26,7 @@ import http.server
 import socketserver
 import threading
 from contextlib import contextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -284,3 +285,65 @@ def test_post_probe_not_attempted_for_valid_head():
         asyncio.run(task._preflight_content_type(f"{base}/mcp", timeout=5.0))
     assert record == ["HEAD"]
     assert "POST" not in record
+
+
+def test_run_records_credential_redirect_error_wrapped_in_exception_group(
+    monkeypatch,
+):
+    """A hook error wrapped by the SDK task group must still be fatal.
+
+    The real MCP SDK runs the transport inside an AnyIO task group, so a
+    ``McpCredentialRedirectError`` raised from an httpx response hook surfaces
+    as a (possibly nested) ``ExceptionGroup``. A flat ``isinstance`` check on
+    the caught exception misses that shape and falls through to the normal
+    initial-connection retry/backoff path, which re-attempts the blocked
+    credential redirect instead of failing closed.
+    """
+    import tools.mcp_tool as _mcp
+
+    attempts = 0
+    slept: list[float] = []
+
+    async def _inner():
+        async def _wrapped_transport(self, _config):
+            nonlocal attempts
+            attempts += 1
+            raise BaseExceptionGroup(
+                "unhandled errors in a TaskGroup",
+                [
+                    BaseExceptionGroup(
+                        "nested",
+                        [_mcp.McpCredentialRedirectError("blocked redirect")],
+                    )
+                ],
+            )
+
+        async def _no_sleep(delay):
+            slept.append(delay)
+
+        monkeypatch.setattr(_mcp, "_MCP_NEW_HTTP", True)
+        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda _n, _u: None)
+        monkeypatch.setattr(_mcp.asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(
+            _mcp.MCPServerTask,
+            "_preflight_content_type",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _wrapped_transport)
+
+        task = _mcp.MCPServerTask("credential-redirect-group")
+        await asyncio.wait_for(
+            task.run(
+                {
+                    "url": "https://origin.example/mcp",
+                    "headers": {"X-Api-Key": "synthetic-secret"},
+                }
+            ),
+            timeout=5.0,
+        )
+        assert isinstance(task._error, _mcp.McpCredentialRedirectError)
+        assert task._ready.is_set()
+
+    asyncio.run(_inner())
+    assert attempts == 1, "credential redirect must not be retried"
+    assert slept == [], "credential redirect must not enter backoff"

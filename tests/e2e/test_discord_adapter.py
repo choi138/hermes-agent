@@ -153,3 +153,6 @@ class TestRepliedToMediaDispatch:
         assert event.media_urls == [cached_path]
         assert event.media_types == ["image/png"]
         assert event.message_type.value == "photo"
+        assert event.metadata["discord_original_content"] == (
+            f"<@{BOT_USER_ID}> what's in this image?"
+        )

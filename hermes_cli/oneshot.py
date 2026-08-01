@@ -310,6 +310,97 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _apply_oneshot_terminal_config(config: dict) -> None:
+    """Mirror classic CLI terminal config before importing/creating the agent.
+
+    ``-z`` bypasses ``cli.load_cli_config()``, whose import-time bridge normally
+    exports ``terminal.*`` as the ``TERMINAL_*`` variables consumed by the tool
+    backends.  Without an equivalent bridge, a stale value inherited from
+    ``~/.hermes/.env`` can silently route oneshot tools to a different machine.
+
+    A local CLI turn always belongs to the directory where Hermes was launched,
+    regardless of a stale configured ``terminal.cwd``.  Remote backends keep
+    their explicit configured cwd.
+    """
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        apply_terminal_config_to_env(config=config)
+    except Exception:
+        logging.debug("Oneshot terminal config bridge failed", exc_info=True)
+
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if backend in {"", "local"}:
+        try:
+            os.environ["TERMINAL_CWD"] = os.getcwd()
+        except OSError:
+            pass
+
+
+def _cleanup_oneshot_resources(agent: object = None, session_db: object = None) -> None:
+    """Release process-global and agent-owned resources created by ``-z``.
+
+    Normal interactive CLI sessions run ``cli._run_cleanup`` on exit.  Oneshot
+    deliberately bypasses ``cli.py``, so relying on interpreter teardown leaves
+    MCP loops, auxiliary HTTP clients, memory workers, and agent subprocesses
+    alive.  In particular, Python's executor atexit hook can then keep an
+    otherwise-complete ``hermes -z`` process alive indefinitely.
+
+    Every step is best-effort and idempotent.  Keep this local to the oneshot
+    process rather than importing ``cli._run_cleanup``: that routine owns
+    interactive terminal state and a different global active-agent reference.
+    """
+    try:
+        from tools.async_delegation import interrupt_all
+
+        interrupt_all(reason="oneshot shutdown")
+    except Exception:
+        pass
+
+    if agent is not None:
+        try:
+            shutdown_memory = getattr(agent, "shutdown_memory_provider", None)
+            if callable(shutdown_memory):
+                messages = getattr(agent, "_session_messages", None)
+                if isinstance(messages, list):
+                    shutdown_memory(messages)
+                else:
+                    shutdown_memory()
+        except Exception:
+            pass
+
+        try:
+            close_agent = getattr(agent, "close", None)
+            if callable(close_agent):
+                close_agent()
+        except Exception:
+            pass
+
+    try:
+        close_db = getattr(session_db, "close", None)
+        if callable(close_db):
+            close_db()
+    except Exception:
+        pass
+
+    # MCP connections and cached auxiliary clients are process-global.  A
+    # standalone oneshot owns the process, so it must tear them down after its
+    # only turn; otherwise their background loops/executors outlive the agent.
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+
+        shutdown_mcp_servers()
+    except BaseException:  # anyio cancellation can derive outside Exception
+        pass
+
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+
+        shutdown_cached_clients()
+    except Exception:
+        pass
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -325,9 +416,13 @@ def _run_agent(
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
-    from run_agent import AIAgent
 
     cfg = load_config()
+    _apply_oneshot_terminal_config(cfg)
+
+    # Import after terminal config is bridged. Some run_agent dependencies read
+    # TERMINAL_* during import, and oneshot must not freeze stale .env values.
+    from run_agent import AIAgent
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -395,6 +490,20 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
+    # Oneshot bypasses HermesCLI, which normally translates
+    # ``agent.max_turns`` into AIAgent.max_iterations. Keep the same bound here
+    # instead of silently falling back to AIAgent's constructor default (90).
+    default_max_iterations = 90
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    try:
+        configured_max_iterations = int(
+            agent_cfg.get("max_turns", default_max_iterations)
+        )
+    except (TypeError, ValueError):
+        configured_max_iterations = default_max_iterations
+    if configured_max_iterations < 1:
+        configured_max_iterations = default_max_iterations
+
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
@@ -414,6 +523,7 @@ def _run_agent(
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            max_iterations=configured_max_iterations,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
@@ -443,30 +553,7 @@ def _run_agent(
         result = agent.run_conversation(prompt)
         return (result.get("final_response") or "", result)
     finally:
-        # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
-        # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must
-        # close the agent explicitly because the hard-exit path skips finalizers.
-        if agent is not None:
-            try:
-                session_messages = getattr(agent, "_session_messages", None)
-                if isinstance(session_messages, list):
-                    agent.shutdown_memory_provider(session_messages)
-                else:
-                    agent.shutdown_memory_provider()
-            except Exception:
-                logging.debug("oneshot memory/context cleanup failed", exc_info=True)
-            try:
-                agent.close()
-            except Exception:
-                logging.debug("oneshot agent cleanup failed", exc_info=True)
-        # agent.close() calls session_db.end_session() but leaves the connection
-        # open; close it here to checkpoint the WAL before os._exit skips
-        # finalizers.
-        if session_db is not None:
-            try:
-                session_db.close()
-            except Exception:
-                logging.debug("oneshot session store cleanup failed", exc_info=True)
+        _cleanup_oneshot_resources(agent, session_db)
 
 
 def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:

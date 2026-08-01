@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str = "w"):
     return kb.Task(

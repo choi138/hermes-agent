@@ -926,6 +926,11 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
+    # Skip repository context files (AGENTS.md, CLAUDE.md, etc.) when creating
+    # conversational gateway agents. Useful when the messaging gateway runs
+    # from a large source checkout whose developer instructions are irrelevant
+    # to ordinary chat. Kanban workers and CLI sessions are unaffected.
+    skip_context_files: bool = False
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
@@ -1070,6 +1075,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "skip_context_files": self.skip_context_files,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1152,6 +1158,9 @@ class GatewayConfig:
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
             multiplex_profiles = nested_gateway.get("multiplex_profiles")
+        skip_context_files = data.get("skip_context_files")
+        if skip_context_files is None and isinstance(nested_gateway, dict):
+            skip_context_files = nested_gateway.get("skip_context_files")
         # Operator override: GATEWAY_MULTIPLEX_PROFILES wins over config.yaml when
         # set to a recognized value. Hosted deployments (Nous Portal / Fly) stamp
         # it on the container so the single multiplexed gateway — which the
@@ -1207,6 +1216,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            skip_context_files=_coerce_bool(skip_context_files, False),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
@@ -1350,6 +1360,8 @@ def load_gateway_config() -> GatewayConfig:
             if "multiplex_profiles" in yaml_cfg:
                 gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
 
+            if "skip_context_files" in yaml_cfg:
+                gw_data["skip_context_files"] = yaml_cfg["skip_context_files"]
             # Profile-based routing rules: accept either top-level
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form
             # (matching the multiplex_profiles parity above).
@@ -1363,6 +1375,11 @@ def load_gateway_config() -> GatewayConfig:
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
+                if (
+                    "skip_context_files" in gateway_section
+                    and "skip_context_files" not in gw_data
+                ):
+                    gw_data["skip_context_files"] = gateway_section["skip_context_files"]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
                 if "systemd_watchdog_seconds" in gateway_section:

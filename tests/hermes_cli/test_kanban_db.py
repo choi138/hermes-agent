@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -85,11 +88,12 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     migration adds those columns, or boards predating the column fail to
     open before migration can run.
 
-    Covers all four indexes that sit on additive columns:
+    Covers all five indexes that sit on additive columns:
     - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
     - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
     - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
     - ``task_events.run_id``     -> ``idx_events_run``          (#17805)
+    - ``shadow_evidence_audit.task_id`` -> ``idx_shadow_evidence_task``
     """
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))
@@ -124,6 +128,16 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             created_at INTEGER NOT NULL
         )
     """)
+    # Pre-task-ownership shadow audit shape: both ownership columns are absent.
+    # This mirrors production boards created before shadow decisions became
+    # task-scoped.
+    conn.execute("""
+        CREATE TABLE shadow_evidence_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_digest TEXT NOT NULL UNIQUE,
+            observed_at INTEGER NOT NULL
+        )
+    """)
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
         "VALUES ('legacy', 'old board task', 'ready', 1)"
@@ -139,6 +153,12 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             row["name"]
             for row in migrated.execute("PRAGMA table_info(task_events)")
         }
+        shadow_columns = {
+            row["name"]
+            for row in migrated.execute(
+                "PRAGMA table_info(shadow_evidence_audit)"
+            )
+        }
         indexes = {
             row["name"]
             for row in migrated.execute(
@@ -151,11 +171,164 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
+    assert "task_id" in shadow_columns
+    assert "terminal_intent_id" in shadow_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+    assert "idx_shadow_evidence_task" in indexes
+
+
+def test_connect_backfills_legacy_goal_mode_without_budget(tmp_path):
+    db_path = tmp_path / "legacy-goal.db"
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy implicit goal budget",
+            goal_mode=True,
+            goal_max_turns=20,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET goal_max_turns=NULL WHERE id=?",
+                (task_id,),
+            )
+
+    # Simulate a process restart so additive migrations run again.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as migrated:
+        task = kb.get_task(migrated, task_id)
+
+    assert task is not None
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 20
+
+
+def test_connect_migrates_populated_correction_lineages_to_tenant_scope(tmp_path):
+    db_path = tmp_path / "legacy-correction-lineage.db"
+    identity = {
+        "root_cause_id": "legacy-shared-root",
+        "affected_scope_digest": "a" * 64,
+        "policy_or_test_plan_version": "v1",
+        "independent_variant": "primary",
+    }
+    with kb.connect(db_path) as conn:
+        leader = kb.create_task(
+            conn, title="legacy tenant leader", tenant="tenant-a",
+        )
+        lineage = kb.acquire_correction_lineage(
+            conn, owner_task_id=leader, **identity,
+        )
+        resolved_leader = kb.create_task(
+            conn, title="legacy resolved leader", tenant="tenant-b",
+        )
+        resolved_lineage = kb.acquire_correction_lineage(
+            conn,
+            owner_task_id=resolved_leader,
+            **{**identity, "independent_variant": "resolved-history"},
+        )
+        kb.resolve_correction_lineage(
+            conn,
+            resolved_lineage["lineage_id"],
+            owner_task_id=resolved_leader,
+        )
+        with kb.write_txn(conn):
+            conn.execute("DROP INDEX IF EXISTS idx_correction_lineage_active")
+            conn.execute(
+                "CREATE TABLE correction_lineages_legacy ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "root_cause_id TEXT NOT NULL, "
+                "affected_scope_digest TEXT NOT NULL, "
+                "policy_or_test_plan_version TEXT NOT NULL, "
+                "independent_variant TEXT NOT NULL, "
+                "leader_task_id TEXT NOT NULL, "
+                "status TEXT NOT NULL DEFAULT 'active' "
+                "CHECK(status IN ('active', 'resolved')), "
+                "created_at INTEGER NOT NULL, resolved_at INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO correction_lineages_legacy "
+                "SELECT id, root_cause_id, affected_scope_digest, "
+                "policy_or_test_plan_version, independent_variant, "
+                "leader_task_id, status, created_at, resolved_at "
+                "FROM correction_lineages"
+            )
+            conn.execute("DROP TABLE correction_lineages")
+            conn.execute(
+                "ALTER TABLE correction_lineages_legacy "
+                "RENAME TO correction_lineages"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_correction_lineage_active "
+                "ON correction_lineages(root_cause_id, affected_scope_digest, "
+                "policy_or_test_plan_version, independent_variant) "
+                "WHERE status='active'"
+            )
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as migrated:
+        columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(correction_lineages)")
+        }
+        row = migrated.execute(
+            "SELECT tenant, leader_task_id FROM correction_lineages WHERE id=?",
+            (lineage["lineage_id"],),
+        ).fetchone()
+        resolved_row = migrated.execute(
+            "SELECT tenant, leader_task_id, status, resolved_at "
+            "FROM correction_lineages WHERE id=?",
+            (resolved_lineage["lineage_id"],),
+        ).fetchone()
+        index_sql = migrated.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' AND name='idx_correction_lineage_active'"
+        ).fetchone()[0]
+
+    assert "tenant" in columns
+    assert tuple(row) == ("tenant-a", leader)
+    assert tuple(resolved_row[:3]) == (
+        "tenant-b", resolved_leader, "resolved",
+    )
+    assert resolved_row["resolved_at"] is not None
+    assert "tenant" in index_sql.split("(", 1)[1].split(")", 1)[0]
+
+
+def test_connect_fails_closed_on_orphaned_correction_lineage(tmp_path):
+    db_path = tmp_path / "orphaned-correction-lineage.db"
+    identity = {
+        "root_cause_id": "orphaned-root",
+        "affected_scope_digest": "b" * 64,
+        "policy_or_test_plan_version": "v1",
+        "independent_variant": "primary",
+    }
+    with kb.connect(db_path) as conn:
+        leader = kb.create_task(conn, title="orphaned leader", tenant="tenant-a")
+        lineage = kb.acquire_correction_lineage(
+            conn, owner_task_id=leader, **identity,
+        )
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id=?", (leader,))
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="cannot migrate orphaned correction lineage",
+    ):
+        kb.connect(db_path)
+
+    raw = sqlite3.connect(db_path)
+    try:
+        row = raw.execute(
+            "SELECT tenant, leader_task_id, status "
+            "FROM correction_lineages WHERE id=?",
+            (lineage["lineage_id"],),
+        ).fetchone()
+    finally:
+        raw.close()
+    assert row == ("tenant-a", leader, "active")
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +597,197 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 
 
+def test_failure_accounting_is_idempotent_for_same_run_across_connections(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="failure race", assignee="a")
+        kb.claim_task(conn, task_id)
+        run_id = kb.get_task(conn, task_id).current_run_id
+    assert run_id is not None
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def contender():
+        other = kb.connect()
+        try:
+            barrier.wait(timeout=5)
+            kb._record_task_failure(
+                other,
+                task_id,
+                error="same run timed out",
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+                expected_run_id=run_id,
+                failure_limit=5,
+            )
+        except BaseException as exc:  # pragma: no cover - thread handoff
+            errors.append(exc)
+        finally:
+            other.close()
+
+    threads = [threading.Thread(target=contender) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.consecutive_failures == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_failure_accounting "
+            "WHERE task_id=? AND run_id=?",
+            (task_id, run_id),
+        ).fetchone()[0] == 1
+
+
+def test_failure_counter_tracks_total_and_same_root_independently(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="typed retry", assignee="a")
+        kb.claim_task(conn, task_id)
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            error="provider connection reset by peer",
+            outcome="crashed",
+            release_claim=True,
+            end_run=True,
+            failure_limit=4,
+        ) is False
+        task = kb.get_task(conn, task_id)
+        assert task.consecutive_failures == 1
+        assert task.same_root_failures == 1
+
+        kb.claim_task(conn, task_id)
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            error="worker killed by signal 9",
+            outcome="crashed",
+            release_claim=True,
+            end_run=True,
+            failure_limit=4,
+        ) is False
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 2
+        assert task.same_root_failures == 1
+
+        kb.claim_task(conn, task_id)
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            error="worker killed by signal 9",
+            outcome="crashed",
+            release_claim=True,
+            end_run=True,
+            failure_limit=4,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 3
+        assert task.same_root_failures == 2
+
+        gave_up = [event for event in kb.list_events(conn, task_id) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert gave_up[0].payload["failures"] == 3
+        assert gave_up[0].payload["same_root_observations"] == 2
+        assert gave_up[0].payload["root_cause_id"]
+        assert gave_up[0].payload["breaker"] == "same_root"
+
+
+def test_total_failure_breaker_stops_alternating_roots_and_preserves_legacy_count(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="alternating failures", assignee="a")
+        errors = [
+            "provider connection reset by peer",
+            "worker killed by signal 9",
+            "HTTP status 503 from upstream",
+        ]
+        for index, error in enumerate(errors, start=1):
+            kb.claim_task(conn, task_id)
+            blocked = kb._record_task_failure(
+                conn,
+                task_id,
+                error=error,
+                outcome="crashed",
+                release_claim=True,
+                end_run=True,
+                failure_limit=3,
+            )
+            assert blocked is (index == 3)
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 3
+        assert task.same_root_failures == 1
+
+        legacy_id = kb.create_task(conn, title="legacy counter", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=2, "
+            "last_failure_root_cause=NULL, same_root_failures=0 WHERE id=?",
+            (legacy_id,),
+        )
+        conn.commit()
+        kb.claim_task(conn, legacy_id)
+        assert kb._record_task_failure(
+            conn,
+            legacy_id,
+            error="new structured failure",
+            outcome="crashed",
+            release_claim=True,
+            end_run=True,
+            failure_limit=3,
+        ) is True
+        legacy = kb.get_task(conn, legacy_id)
+        assert legacy.consecutive_failures == 3
+        assert legacy.same_root_failures == 1
+
+
+def test_failure_root_normalizes_volatile_values_without_collapsing_subsystems():
+    first = kb._failure_root_cause_id(
+        "provider pid 123 connection reset at 1700000000", "crashed",
+    )
+    second = kb._failure_root_cause_id(
+        "provider pid 999 connection reset at 1800000000", "crashed",
+    )
+    database = kb._failure_root_cause_id(
+        "sqlite connection reset at 1800000000", "crashed",
+    )
+    assert first == second
+    assert database != first
+
+
+def test_failure_root_keeps_distinct_structured_codes(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="distinct codes", assignee="a")
+        kb.claim_task(conn, task_id)
+        assert not kb._record_task_failure(
+            conn, task_id, error="HTTP status 429 from provider",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=5,
+        )
+        first = kb.get_task(conn, task_id)
+        first_root = first.last_failure_root_cause
+
+        kb.claim_task(conn, task_id)
+        assert not kb._record_task_failure(
+            conn, task_id, error="HTTP status 503 from provider",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=5,
+        )
+        second = kb.get_task(conn, task_id)
+        assert second.last_failure_root_cause != first_root
+        assert second.same_root_failures == 1
+        assert second.consecutive_failures == 2
+
+
 # ---------------------------------------------------------------------------
 # Parent-completion invariant at the claim gate (RCA t_a6acd07d)
 # ---------------------------------------------------------------------------
@@ -439,6 +803,72 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 
 
+
+
+@pytest.mark.parametrize("terminal_action", ["archive", "delete"])
+def test_terminal_removal_resolves_active_correction_lineage(
+    kanban_home, terminal_action,
+):
+    identity = {
+        "root_cause_id": f"tenant-a:{terminal_action}-root",
+        "affected_scope_digest": "d" * 64,
+        "policy_or_test_plan_version": "qa-v2",
+        "independent_variant": "primary",
+    }
+    with kb.connect() as conn:
+        leader = kb.create_task(conn, title=f"{terminal_action} leader")
+        lineage = kb.acquire_correction_lineage(
+            conn,
+            **identity,
+            owner_task_id=leader,
+        )
+        assert lineage["role"] == "leader"
+        assert lineage["leader_task_id"] == leader
+
+        if terminal_action == "archive":
+            assert kb.archive_task(conn, leader) is True
+        else:
+            assert kb.delete_task(conn, leader) is True
+
+        assert kb.active_correction_lineage(conn, **identity) is None
+
+        replacement = kb.create_task(conn, title=f"{terminal_action} replacement")
+        next_lineage = kb.acquire_correction_lineage(
+            conn,
+            **identity,
+            owner_task_id=replacement,
+        )
+        assert next_lineage["role"] == "leader"
+        assert next_lineage["leader_task_id"] == replacement
+        assert next_lineage["lineage_id"] != lineage["lineage_id"]
+
+
+def test_acquire_correction_lineage_self_heals_legacy_stale_leader(kanban_home):
+    identity = {
+        "root_cause_id": "tenant-a:legacy-root",
+        "affected_scope_digest": "e" * 64,
+        "policy_or_test_plan_version": "qa-v2",
+        "independent_variant": "primary",
+    }
+    with kb.connect() as conn:
+        stale_leader = kb.create_task(conn, title="legacy stale leader")
+        stale_lineage = kb.acquire_correction_lineage(
+            conn, **identity, owner_task_id=stale_leader,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='archived' WHERE id=?",
+                (stale_leader,),
+            )
+
+        assert kb.active_correction_lineage(conn, **identity) is None
+        replacement = kb.create_task(conn, title="legacy replacement")
+        next_lineage = kb.acquire_correction_lineage(
+            conn, **identity, owner_task_id=replacement,
+        )
+        assert next_lineage["role"] == "leader"
+        assert next_lineage["leader_task_id"] == replacement
+        assert next_lineage["lineage_id"] != stale_lineage["lineage_id"]
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):
@@ -822,7 +1252,7 @@ class TestSharedBoardPaths:
             title="x",
             body=None,
             assignee="coder",
-            status="ready",
+            status="running",
             priority=0,
             created_by=None,
             created_at=0,
@@ -830,12 +1260,15 @@ class TestSharedBoardPaths:
             completed_at=None,
             workspace_kind="worktree",
             workspace_path=str(tmp_path / "ws"),
-            claim_lock=None,
+            claim_lock="dispatcher-claim-capability",
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            current_run_id=42,
         )
-        kb._default_spawn(task, str(tmp_path / "ws"))
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        kb._default_spawn(task, str(workspace))
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")

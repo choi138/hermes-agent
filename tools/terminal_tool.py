@@ -50,6 +50,7 @@ from typing import Optional, Dict, Any, List
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1038,10 @@ Background: Set background=true to get a session_id. Almost always pair with not
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
-Use process(action="poll") for progress checks, process(action="wait") to block until done.
+For bounded background work, continue useful work or end the turn and let
+notify_on_complete resume you. Do not loop short poll/wait calls. If the next step
+truly depends on completion, call process(action="wait") once with timeout omitted;
+it uses the configured terminal timeout and still returns immediately on exit.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
@@ -1505,6 +1509,11 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        # Independent ControlMaster connections preserve high command
+        # concurrency without hitting one server-side MaxSessions ceiling.
+        "ssh_connection_pool_size": _parse_env_var(
+            "TERMINAL_SSH_CONNECTION_POOL_SIZE", "3"
+        ),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -1557,7 +1566,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: str = None,
+                        probe_only: bool = False):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -1571,6 +1581,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         container_config: Resource config for container backends (cpu, memory, disk, persistent)
         task_id: Task identifier for environment reuse and snapshot keying
         host_cwd: Optional host working directory to bind into Docker when explicitly enabled
+        probe_only: Build only enough environment state for a metadata probe.
+            SSH probes skip credential/skill/cache sync in this mode.
         
     Returns:
         Environment instance with execute() method
@@ -1712,6 +1724,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             key_path=ssh_config.get("key", ""),
             cwd=cwd,
             timeout=timeout,
+            sync_files=not probe_only,
+            persistent=bool(ssh_config.get("persistent", False)),
+            connection_pool_size=ssh_config.get("connection_pool_size", 3),
         )
 
     else:
@@ -1744,6 +1759,14 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
+                env = _active_environments.get(task_id)
+                has_active_commands = getattr(env, "has_active_commands", None)
+                if callable(has_active_commands) and has_active_commands():
+                    # A persistent SSH command can legitimately run longer than
+                    # the idle lifetime.  Refresh activity instead of syncing
+                    # and closing its ControlMasters underneath live work.
+                    _last_activity[task_id] = current_time
+                    continue
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
                 if env is not None:
@@ -1846,18 +1869,45 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 
-def cleanup_all_environments():
-    """Clean up ALL active environments. Use with caution."""
-    task_ids = list(_active_environments.keys())
+def cleanup_all_environments(*, shutdown_budget_seconds: float | None = None):
+    """Clean up ALL active environments. Use with caution.
+
+    When *shutdown_budget_seconds* is provided, every environment shares one
+    monotonic deadline. Shutdown-aware backends use their remaining slice
+    rather than each consuming a full transport timeout.
+    """
+    with _env_lock:
+        task_ids = list(_active_environments.keys())
+    shutdown_deadline = None
+    if shutdown_budget_seconds is not None:
+        shutdown_deadline = _monotonic() + max(
+            0.0, float(shutdown_budget_seconds)
+        )
     cleaned = 0
     
     for task_id in task_ids:
         try:
-            cleanup_vm(task_id)
+            remaining = None
+            if shutdown_deadline is not None:
+                remaining = max(0.0, shutdown_deadline - _monotonic())
+            cleanup_vm(task_id, shutdown_timeout_seconds=remaining)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
-    
+
+    # Orphan directory reclamation is not required for process correctness and
+    # can be arbitrarily expensive. Leave it to normal cleanup / next startup
+    # when gateway shutdown is operating under a service-manager deadline.
+    if shutdown_deadline is not None:
+        if _monotonic() >= shutdown_deadline:
+            logger.warning(
+                "Environment shutdown cleanup exhausted its %.1fs budget",
+                max(0.0, float(shutdown_budget_seconds)),
+            )
+        if cleaned > 0:
+            logger.info("Cleaned %d environments", cleaned)
+        return cleaned
+
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
     import glob
@@ -1873,7 +1923,12 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str, *, force_remove: bool = False):
+def cleanup_vm(
+    task_id: str,
+    *,
+    force_remove: bool = False,
+    shutdown_timeout_seconds: float | None = None,
+):
     """Manually clean up a specific environment by task_id.
 
     *force_remove* (default False) is forwarded to backends that accept it
@@ -1922,10 +1977,17 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
             # (DockerEnvironment after issue #20561; other backends don't).
             import inspect
             sig = inspect.signature(env.cleanup)
+            cleanup_kwargs = {}
             if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
-            else:
-                env.cleanup()
+                cleanup_kwargs["force_remove"] = force_remove
+            if (
+                shutdown_timeout_seconds is not None
+                and "shutdown_timeout_seconds" in sig.parameters
+            ):
+                cleanup_kwargs["shutdown_timeout_seconds"] = (
+                    shutdown_timeout_seconds
+                )
+            env.cleanup(**cleanup_kwargs)
         elif hasattr(env, 'stop'):
             env.stop()
         elif hasattr(env, 'terminate'):
@@ -2372,6 +2434,9 @@ def terminal_tool(
                                 "port": config.get("ssh_port", 22),
                                 "key": config.get("ssh_key", ""),
                                 "persistent": config.get("ssh_persistent", False),
+                                "connection_pool_size": config.get(
+                                    "ssh_connection_pool_size", 3
+                                ),
                             }
 
                         container_config = None

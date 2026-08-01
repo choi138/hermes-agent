@@ -34,12 +34,6 @@ def _fake_aux_response(content: str):
     return resp
 
 
-def _mock_client_returning(content: str):
-    client = MagicMock()
-    client.chat.completions.create = MagicMock(return_value=_fake_aux_response(content))
-    return client
-
-
 def _patch_aux_client(content: str, *, model: str = "test-model"):
     # decompose_task now routes through call_llm (see #35566) — mock it at
     # the source module so task config, extra_body, and retries stay out of
@@ -82,9 +76,22 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     llm_payload = jsonlib.dumps({
         "fanout": True,
         "rationale": "test split",
+        "coordination_reasons": ["durable_handoff"],
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {
+                "title": "research",
+                "body": "look it up",
+                "assignee": "researcher",
+                "parents": [],
+                "role": "implementation",
+            },
+            {
+                "title": "build",
+                "body": "code it",
+                "assignee": "engineer",
+                "parents": [0],
+                "role": "final_owner",
+            },
         ],
     })
 

@@ -1011,6 +1011,7 @@ class SessionSearchMixin:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        include_context: bool = True,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -1032,6 +1033,7 @@ class SessionSearchMixin:
                 offset=offset,
                 sort=sort,
                 include_inactive=include_inactive,
+                include_context=include_context,
             )
             return rows
         finally:
@@ -1081,6 +1083,7 @@ class SessionSearchMixin:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        include_context: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1109,6 +1112,11 @@ class SessionSearchMixin:
         the live context but remain part of the conversation's record, so the
         pre-compaction transcript stays discoverable after in-place compaction
         (#38763). Pass ``include_inactive=True`` to search every row regardless.
+
+        Pass ``include_context=False`` when the caller will hydrate its own
+        bounded window (for example, ``session_search`` discovery). This skips
+        the per-match surrounding-context query while preserving the default
+        response shape for existing callers.
         """
         if not self._fts_enabled:
             return []
@@ -1558,68 +1566,69 @@ class SessionSearchMixin:
                 if tri_matches:
                     matches = tri_matches
 
-        # Add surrounding context (1 message before + after each match).
-        # Each query takes its own fresh read transaction via _read_ctx, so
-        # we never hold a lock across N sequential queries.
-        for match in matches:
-            try:
-                with self._read_ctx() as conn:
-                    ctx_cursor = conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
+        if include_context:
+            # Add surrounding context (1 message before + after each match).
+            # Each query takes its own fresh read transaction via _read_ctx, so
+            # we never hold a lock across N sequential queries.
+            for match in matches:
+                try:
+                    with self._read_ctx() as conn:
+                        ctx_cursor = conn.execute(
+                            """WITH target AS (
+                                   SELECT session_id, timestamp, id
+                                   FROM messages
+                                   WHERE id = ?
+                               )
+                               SELECT role, content
+                               FROM (
+                                   SELECT m.id, m.timestamp, m.role, m.content
+                                   FROM messages m
+                                   JOIN target t ON t.session_id = m.session_id
+                                   WHERE (m.timestamp < t.timestamp)
+                                      OR (m.timestamp = t.timestamp AND m.id < t.id)
+                                   ORDER BY m.timestamp DESC, m.id DESC
+                                   LIMIT 1
+                               )
+                               UNION ALL
+                               SELECT role, content
                                FROM messages
                                WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
-                           FROM messages
-                           WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
-                    )
-                    context_msgs = []
-                    for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
+                               UNION ALL
+                               SELECT role, content
+                               FROM (
+                                   SELECT m.id, m.timestamp, m.role, m.content
+                                   FROM messages m
+                                   JOIN target t ON t.session_id = m.session_id
+                                   WHERE (m.timestamp > t.timestamp)
+                                      OR (m.timestamp = t.timestamp AND m.id > t.id)
+                                   ORDER BY m.timestamp ASC, m.id ASC
+                                   LIMIT 1
+                               )""",
+                            (match["id"], match["id"]),
                         )
-                match["context"] = context_msgs
-            except Exception:
-                match["context"] = []
+                        context_msgs = []
+                        for r in ctx_cursor.fetchall():
+                            raw = r["content"]
+                            decoded = self._decode_content(raw)
+                            # Multimodal context: render a compact text-only
+                            # summary for search previews.
+                            if isinstance(decoded, list):
+                                text_parts = [
+                                    p.get("text", "") for p in decoded
+                                    if isinstance(p, dict) and p.get("type") == "text"
+                                ]
+                                text = " ".join(t for t in text_parts if t).strip()
+                                preview = text or "[multimodal content]"
+                            elif isinstance(decoded, str):
+                                preview = decoded
+                            else:
+                                preview = ""
+                            context_msgs.append(
+                                {"role": r["role"], "content": preview[:200]}
+                            )
+                    match["context"] = context_msgs
+                except Exception:
+                    match["context"] = []
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:

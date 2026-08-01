@@ -4,8 +4,10 @@ Tests verify tool schemas, handler dispatch, validation logic, and error
 handling without requiring a running terminal environment.
 """
 
+import hashlib
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -52,7 +54,9 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once_with(
+            str(Path("/tmp/out.txt").resolve()), "hello world!\n"
+        )
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -143,7 +147,9 @@ class TestPatchHandler:
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once_with(
+            str(Path("/tmp/f.py").resolve()), "foo", "bar", False
+        )
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -159,6 +165,73 @@ class TestPatchHandler:
         assert result["status"] == "ok"
         mock_ops.patch_v4a.assert_called_once()
 
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_append_mode_calls_atomic_append(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"success": True, "diff": "diff"}
+        mock_ops.patch_append.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="append",
+            path="/tmp/f.py",
+            content="\nnew_test()\n",
+            expected_sha256="abc123",
+        ))
+
+        assert result["success"] is True
+        mock_ops.patch_append.assert_called_once_with(
+            str(Path("/tmp/f.py").resolve()),
+            "\nnew_test()\n",
+            expected_sha256="abc123",
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_append_mode_requires_path_and_content(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        missing_path = json.loads(patch_tool(mode="append", content="x"))
+        missing_content = json.loads(patch_tool(mode="append", path="/tmp/f.py"))
+
+        assert "error" in missing_path
+        assert "error" in missing_content
+        mock_get.return_value.patch_append.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_mode_rejects_context_elision_tombstone(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        tombstone = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(patch_tool(
+            mode="replace",
+            path="/tmp/f.py",
+            old_string="old",
+            new_string=tombstone,
+        ))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.return_value.patch_replace.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_mode_rejects_context_elision_tombstone(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        tombstone = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=tombstone))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.return_value.patch_v4a.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
     def test_unknown_mode_errors(self, mock_get):
@@ -483,10 +556,13 @@ class TestPatchSchemaShape:
         desc = PATCH_SCHEMA["description"]
         assert "REQUIRED PARAMETERS: mode, path, old_string, new_string" in desc
         assert "REQUIRED PARAMETERS: mode, patch" in desc
+        assert "REQUIRED PARAMETERS: mode, path, content" in desc
         props = PATCH_SCHEMA["parameters"]["properties"]
         for name in ("path", "old_string", "new_string"):
             assert "REQUIRED when mode='replace'" in props[name]["description"]
         assert "REQUIRED when mode='patch'" in props["patch"]["description"]
+        assert "REQUIRED when mode='append'" in props["content"]["description"]
+        assert "append" in props["mode"]["enum"]
 
     def test_no_anyof_required_stays_mode_only(self):
         # anyOf/oneOf at parameters level break Anthropic, Fireworks, and the
@@ -651,7 +727,7 @@ class TestSilentFileMisplacementE2E:
 
         # 3) The next relative write must still land in the project dir.
         res = json.loads(ft.write_file_tool("report.txt", "hello\n", task_id))
-        assert res.get("resolved_path") == str(project / "report.txt"), res
+        assert res.get("resolved_path") == str((project / "report.txt").resolve()), res
         assert (project / "report.txt").exists(), "file should be in the user's cwd"
         assert not (config_default / "report.txt").exists(), \
             "file silently misplaced into config default (the #26211 bug)"

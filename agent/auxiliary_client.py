@@ -8516,6 +8516,7 @@ def call_llm(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -8539,6 +8540,7 @@ def call_llm(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -8561,8 +8563,10 @@ def call_llm(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
-            else:
+            elif _is_connection_error(first_err):
                 reason = "connection error"
+            else:
+                reason = "server error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
@@ -9124,6 +9128,7 @@ async def async_call_llm(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -9139,6 +9144,7 @@ async def async_call_llm(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -9157,8 +9163,10 @@ async def async_call_llm(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
-            else:
+            elif _is_connection_error(first_err):
                 reason = "connection error"
+            else:
+                reason = "server error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 

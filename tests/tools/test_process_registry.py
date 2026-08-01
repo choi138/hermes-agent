@@ -12,12 +12,24 @@ from unittest.mock import MagicMock, patch
 
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
+    PROCESS_SCHEMA,
     ProcessRegistry,
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
 )
+
+
+def test_process_schema_steers_bounded_jobs_away_from_short_wait_loops():
+    description = PROCESS_SCHEMA["description"].lower()
+    timeout_description = PROCESS_SCHEMA["parameters"]["properties"]["timeout"][
+        "description"
+    ].lower()
+
+    assert "instead of repeatedly polling" in description
+    assert "call 'wait' once with timeout omitted" in description
+    assert "180s by default" in timeout_description
 
 
 @pytest.fixture()
@@ -803,6 +815,95 @@ class TestSpawnRewriteCompoundBackground:
 
 
 # =========================================================================
+# Session-scoped cancellation
+# =========================================================================
+
+class TestSessionCancellation:
+    def test_kill_failure_still_suppresses_all_notifications(
+        self, registry, monkeypatch
+    ):
+        session = _make_session(sid="proc_stop_failure")
+        session.session_key = "session-a"
+        session.process = MagicMock(pid=4242)
+        session.notify_on_complete = True
+        session.watcher_interval = 5
+        session.watch_patterns = ["READY"]
+        registry._running[session.id] = session
+        registry.pending_watchers = [
+            {"session_id": session.id, "session_key": "session-a"},
+            {"session_id": "proc_other", "session_key": "session-b"},
+        ]
+        registry.completion_queue.put(
+            {
+                "type": "watch_match",
+                "session_id": session.id,
+                "session_key": "session-a",
+            }
+        )
+        other_event = {
+            "type": "completion",
+            "session_id": "proc_other",
+            "session_key": "session-b",
+        }
+        registry.completion_queue.put(other_event)
+        monkeypatch.setattr(
+            registry,
+            "_terminate_host_pid",
+            MagicMock(side_effect=OSError("permission denied")),
+        )
+
+        with patch.object(registry, "_write_checkpoint"):
+            affected = registry.cancel_for_session(
+                "session-a",
+                reason="stop_command",
+            )
+
+            assert affected == 1
+            assert session.exited is False
+            assert session.completion_suppressed is True
+            assert session.notify_on_complete is False
+            assert session.watcher_interval == 0
+            assert session.watch_patterns == []
+            assert registry.pending_watchers == [
+                {"session_id": "proc_other", "session_key": "session-b"}
+            ]
+            assert registry.completion_queue.get_nowait() == other_event
+            assert registry.completion_queue.empty()
+
+            # Even if the backend exits later and a stale code path restores
+            # notify_on_complete, the authoritative suppression fence wins.
+            session.notify_on_complete = True
+            session.exited = True
+            session.exit_code = 1
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
+
+    def test_finished_process_with_pending_completion_counts_once(self, registry):
+        session = _make_session(
+            sid="proc_finished_pending",
+            exited=True,
+            exit_code=0,
+        )
+        session.session_key = "session-a"
+        session.notify_on_complete = True
+        registry._finished[session.id] = session
+        registry.completion_queue.put(
+            {
+                "type": "completion",
+                "session_id": session.id,
+                "session_key": "session-a",
+            }
+        )
+
+        with patch.object(registry, "_write_checkpoint"):
+            assert registry.cancel_for_session("session-a") == 1
+            assert registry.cancel_for_session("session-a") == 0
+
+        assert session.completion_suppressed is True
+        assert registry.completion_queue.empty()
+
+
+# =========================================================================
 # Checkpoint
 # =========================================================================
 
@@ -850,6 +951,30 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
+
+    def test_kill_sandbox_process_uses_environment_tree_terminator(
+        self, registry, monkeypatch
+    ):
+        class FakeEnvironment:
+            def __init__(self):
+                self.calls = []
+
+            def terminate_process_tree(self, pid, *, timeout):
+                self.calls.append((pid, timeout))
+                return {"output": "", "returncode": 0}
+
+        env = FakeEnvironment()
+        s = _make_session(sid="proc_remote", command="sleep 999")
+        s.pid = 82477
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert env.calls == [(82477, 5)]
 
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")

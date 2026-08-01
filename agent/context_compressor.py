@@ -35,6 +35,7 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.tool_arg_elision import make_tool_arg_elision
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -891,12 +892,15 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     and the session gets stuck re-sending the same broken history on every
     turn. See issue #11762 for the observed loop.
 
-    This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
-    to begin with — some model backends use non-JSON tool arguments — the
-    original string is returned unchanged rather than replaced with
-    something neither we nor the backend can parse.
+    This helper parses the arguments, replaces long string leaves with an
+    explicit non-replayable tombstone, and re-serialises. Keeping a literal
+    prefix is unsafe for mutating tools: a compacted ``write_file.content``
+    prefix was later mistaken for complete file bytes and overwrote a
+    633-line source file with a 246-byte preview. Non-string values and short
+    strings (paths, ints, booleans) are preserved intact. If the arguments are
+    not valid JSON to begin with — some model backends use non-JSON tool
+    arguments — the original string is returned unchanged rather than
+    replaced with something neither we nor the backend can parse.
     """
     try:
         parsed = json.loads(args)
@@ -906,7 +910,7 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                return make_tool_arg_elision(obj)
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
@@ -2764,15 +2768,21 @@ class ContextCompressor(ContextEngine):
                 return False
             new_tcs = []
             modified = False
-            for tc in msg["tool_calls"]:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
+            for tool_call in msg["tool_calls"]:
+                if isinstance(tool_call, dict):
+                    args = tool_call.get("function", {}).get("arguments", "")
                     if len(args) > 500:
                         new_args = _truncate_tool_call_args_json(args)
                         if new_args != args:
-                            tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
+                            tool_call = {
+                                **tool_call,
+                                "function": {
+                                    **tool_call["function"],
+                                    "arguments": new_args,
+                                },
+                            }
                             modified = True
-                new_tcs.append(tc)
+                new_tcs.append(tool_call)
             if modified:
                 result[idx] = {**msg, "tool_calls": new_tcs}
             return modified

@@ -161,10 +161,17 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
+            self._session_messages = ["turn"]
 
         def run_conversation(self, prompt, **_kwargs):
             captured["prompt"] = prompt
             return {"final_response": "ok", "failed": False, "partial": False}
+
+        def shutdown_memory_provider(self, messages):
+            captured["memory_shutdown_messages"] = messages
+
+        def close(self):
+            captured["agent_closed"] = True
 
     class FakeSessionDB:
         def __new__(cls):
@@ -181,7 +188,13 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
-        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {
+                "model": {"default": "m"},
+                "agent": {"max_turns": 7},
+            },
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -207,13 +220,69 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         "hermes_cli.tools_config",
         mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.async_delegation",
+        mod(
+            "tools.async_delegation",
+            interrupt_all=lambda **_kwargs: captured.update(async_delegations_interrupted=True),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        mod(
+            "tools.mcp_tool",
+            shutdown_mcp_servers=lambda: captured.update(mcp_shutdown=True),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.auxiliary_client",
+        mod(
+            "agent.auxiliary_client",
+            shutdown_cached_clients=lambda: captured.update(aux_clients_shutdown=True),
+        ),
+    )
 
     text, result = _run_agent("recall this")
     assert text == "ok"
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert captured["max_iterations"] == 7
     assert captured["prompt"] == "recall this"
+    assert captured["memory_shutdown_messages"] == ["turn"]
+    assert captured["agent_closed"] is True
+    assert captured["async_delegations_interrupted"] is True
+    assert captured["mcp_shutdown"] is True
+    assert captured["aux_clients_shutdown"] is True
+
+
+def test_oneshot_terminal_bridge_forces_launch_cwd_for_local(monkeypatch, tmp_path):
+    import hermes_cli.config as config_mod
+    import hermes_cli.oneshot as oneshot_mod
+
+    configured_cwd = tmp_path / "stale-config-cwd"
+    launch_cwd = tmp_path / "launch-cwd"
+    launch_cwd.mkdir()
+    monkeypatch.chdir(launch_cwd)
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "/stale/inherited/cwd")
+
+    def _fake_bridge(*, config):
+        assert config == {"terminal": {"backend": "local", "cwd": str(configured_cwd)}}
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(configured_cwd))
+
+    monkeypatch.setattr(config_mod, "apply_terminal_config_to_env", _fake_bridge)
+
+    oneshot_mod._apply_oneshot_terminal_config(
+        {"terminal": {"backend": "local", "cwd": str(configured_cwd)}}
+    )
+
+    assert os.environ["TERMINAL_ENV"] == "local"
+    assert os.environ["TERMINAL_CWD"] == str(launch_cwd)
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
@@ -282,7 +351,6 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
 
 
 

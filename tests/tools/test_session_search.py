@@ -135,6 +135,93 @@ class TestDiscoveryShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_discovery_skips_raw_context_but_keeps_anchored_view(
+        self, db, monkeypatch
+    ):
+        _seed_modpack_sessions(db)
+        calls = []
+        original = db.search_messages
+
+        def tracked_search(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(db, "search_messages", tracked_search)
+
+        result = json.loads(session_search(query="modpack", limit=1, db=db))
+
+        assert calls
+        assert all(call.get("include_context") is False for call in calls)
+        hit = result["results"][0]
+        assert hit["match_message_id"] in [m["id"] for m in hit["messages"]]
+        assert "bookend_start" in hit
+        assert "bookend_end" in hit
+
+    def test_title_match_reads_only_anchor_and_keeps_bookends(
+        self, db, monkeypatch
+    ):
+        db.create_session("s_title", source="cli")
+        db.set_session_title("s_title", "bounded-title")
+        for i in range(12):
+            db.append_message(
+                "s_title",
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"ordinary message {i}",
+            )
+
+        calls = []
+        original = db.get_messages
+
+        def tracked_get_messages(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(db, "get_messages", tracked_get_messages)
+
+        result = json.loads(
+            session_search(query="bounded-title", limit=1, db=db)
+        )
+
+        assert calls == [{"limit": 1}]
+        hit = result["results"][0]
+        assert hit["matched_role"] == "session_title"
+        assert hit["messages"][0]["content"] == "ordinary message 0"
+        assert hit["bookend_end"][-1]["content"] == "ordinary message 11"
+
+
+class TestSearchMessageContextHydration:
+    @staticmethod
+    def _seed(db):
+        db.create_session("s_context", source="cli")
+        db.append_message("s_context", role="user", content="before")
+        db.append_message("s_context", role="assistant", content="needle")
+        db.append_message("s_context", role="user", content="after")
+
+    def test_default_search_still_returns_context(self, db):
+        self._seed(db)
+
+        results = db.search_messages("needle")
+
+        assert len(results) == 1
+        assert [m["content"] for m in results[0]["context"]] == [
+            "before",
+            "needle",
+            "after",
+        ]
+
+    def test_context_can_be_skipped_without_enrichment_query(self, db):
+        self._seed(db)
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            results = db.search_messages("needle", include_context=False)
+        finally:
+            db._conn.set_trace_callback(None)
+
+        assert len(results) == 1
+        assert "context" not in results[0]
+        assert not any("WITH TARGET AS" in sql.upper() for sql in statements)
+
 
 class TestDiscoverySort:
     def test_sort_newest_orders_by_recency(self, db):
@@ -421,6 +508,159 @@ class TestCronDemotion:
         assert result["success"] is True
         assert result["count"] == 1
         assert result["results"][0]["source"] == "cron"
+
+
+def _search_row(index, session_id, source):
+    return {
+        "id": index + 1,
+        "session_id": session_id,
+        "role": "user",
+        "snippet": f"hit {index}",
+        "source": source,
+        "model": "test-model",
+        "session_started": index,
+    }
+
+
+class _PagedDiscoveryDB:
+    """Behavioral fake that records paging and supplies bounded hydration."""
+
+    def __init__(self, rows, parents=None):
+        self.rows = rows
+        self.parents = parents or {}
+        self.search_calls = []
+        self.get_session_calls = []
+        self.sources = {}
+        for row in rows:
+            self.sources.setdefault(row["session_id"], row["source"])
+        for child, parent in self.parents.items():
+            self.sources.setdefault(parent, self.sources.get(child, "cli"))
+
+    def resolve_session_by_title(self, title):
+        return None
+
+    def search_messages(self, query, **kwargs):
+        self.search_calls.append(dict(kwargs))
+        offset = kwargs["offset"]
+        limit = kwargs["limit"]
+        return [dict(row) for row in self.rows[offset:offset + limit]]
+
+    def get_session(self, session_id):
+        self.get_session_calls.append(session_id)
+        if session_id not in self.sources:
+            return None
+        return {
+            "id": session_id,
+            "parent_session_id": self.parents.get(session_id),
+            "source": self.sources[session_id],
+            "model": "test-model",
+            "started_at": 1,
+            "title": None,
+        }
+
+    def get_anchored_view(self, session_id, message_id, window, bookend):
+        message = {
+            "id": message_id,
+            "role": "user",
+            "content": f"message {message_id}",
+            "timestamp": message_id,
+        }
+        return {
+            "window": [message],
+            "bookend_start": [],
+            "bookend_end": [],
+            "messages_before": 0,
+            "messages_after": 0,
+        }
+
+
+class TestAdaptiveDiscoveryScan:
+    @staticmethod
+    def _paging_calls(db):
+        return [(call["offset"], call["limit"]) for call in db.search_calls]
+
+    def test_cron_first_page_does_not_hide_later_interactive_hit(self):
+        rows = [_search_row(i, "cron_wall", "cron") for i in range(25)]
+        rows.append(_search_row(25, "interactive", "telegram"))
+        db = _PagedDiscoveryDB(rows)
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert self._paging_calls(db) == [(0, 25), (25, 25)]
+        assert result["results"][0]["session_id"] == "interactive"
+        assert result["results"][0]["source"] == "telegram"
+        assert all(
+            call["include_context"] is False for call in db.search_calls
+        )
+
+    def test_enough_interactive_lineages_stop_after_first_page(self):
+        rows = [
+            _search_row(i, f"interactive_{i}", "cli")
+            for i in range(300)
+        ]
+        db = _PagedDiscoveryDB(rows)
+
+        result = json.loads(session_search(query="needle", limit=3, db=db))
+
+        assert self._paging_calls(db) == [(0, 25)]
+        assert result["count"] == 3
+        assert [r["session_id"] for r in result["results"]] == [
+            "interactive_0",
+            "interactive_1",
+            "interactive_2",
+        ]
+
+    def test_cron_only_results_expand_until_exhausted_and_remain_reachable(self):
+        rows = [_search_row(i, "cron_only", "cron") for i in range(30)]
+        db = _PagedDiscoveryDB(rows)
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert self._paging_calls(db) == [(0, 25), (25, 25)]
+        assert result["count"] == 1
+        assert result["results"][0]["source"] == "cron"
+
+    def test_cron_only_scan_never_exceeds_historical_300_row_cap(self):
+        rows = [_search_row(i, "cron_only", "cron") for i in range(325)]
+        db = _PagedDiscoveryDB(rows)
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert self._paging_calls(db) == [
+            (0, 25),
+            (25, 25),
+            (50, 50),
+            (100, 100),
+            (200, 100),
+        ]
+        assert sum(call["limit"] for call in db.search_calls) == 300
+        assert result["results"][0]["source"] == "cron"
+
+    def test_current_lineage_hits_do_not_stop_scan_early(self):
+        rows = [_search_row(i, "current", "cli") for i in range(25)]
+        rows.append(_search_row(25, "other", "cli"))
+        db = _PagedDiscoveryDB(rows)
+
+        result = json.loads(session_search(
+            query="needle",
+            limit=1,
+            current_session_id="current",
+            db=db,
+        ))
+
+        assert self._paging_calls(db) == [(0, 25), (25, 25)]
+        assert result["results"][0]["session_id"] == "other"
+
+    def test_lineage_resolution_is_memoized_across_repeated_hits(self):
+        rows = [_search_row(i, "child", "cli") for i in range(25)]
+        db = _PagedDiscoveryDB(rows, parents={"child": "root"})
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert result["results"][0]["parent_session_id"] == "root"
+        assert db.get_session_calls.count("child") == 1
+        # Once to resolve the root and once to hydrate result metadata.
+        assert db.get_session_calls.count("root") == 2
 
 
 # =========================================================================

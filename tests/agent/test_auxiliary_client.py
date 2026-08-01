@@ -1922,6 +1922,113 @@ class TestTransientTransportRetry:
         assert client.chat.completions.create.call_count == 1
 
 
+    def test_repeated_5xx_escalates_to_provider_fallback(self):
+        """A reachable but unavailable provider must not trap an aux call.
+
+        Pure 5xx errors are transient transport failures but deliberately are
+        not classified as connection errors. Once the bounded same-provider
+        retries are exhausted, they still represent temporary capacity loss
+        and must continue through the configured provider fallback chain.
+        """
+
+        class _Err500(Exception):
+            status_code = 500
+
+        primary = MagicMock()
+        primary.base_url = "https://primary.example/v1"
+        primary.chat.completions.create.side_effect = _Err500(
+            "MODEL_TEMPORARILY_UNAVAILABLE"
+        )
+
+        fallback = MagicMock()
+        fallback.base_url = "https://fallback.example/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1,
+            p2,
+            p3,
+            patch(
+                "agent.auxiliary_client._transient_retry_count",
+                return_value=1,
+            ),
+            patch(
+                "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE",
+                0.0,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fallback, "fallback-model", "fallback"),
+            ),
+        ):
+            result = call_llm(
+                task="mention_inbox",
+                messages=[{"role": "user", "content": "질문"}],
+            )
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_count == 2
+        assert fallback.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_repeated_5xx_escalates_to_provider_fallback(self):
+        """The async auxiliary path has the same exhausted-5xx contract."""
+
+        class _Err500(Exception):
+            status_code = 500
+
+        primary = MagicMock()
+        primary.base_url = "https://primary.example/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=_Err500("MODEL_TEMPORARILY_UNAVAILABLE")
+        )
+
+        fallback = MagicMock()
+        fallback.base_url = "https://fallback.example/v1"
+        fallback.chat.completions.create = AsyncMock(
+            return_value={"fallback": True}
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "primary-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "primary-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda response, _task, **_kwargs: response,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_fallback_chain",
+                return_value=(object(), "fallback-model", "fallback"),
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "fallback-model"),
+            ),
+        ):
+            result = await async_call_llm(
+                task="mention_inbox",
+                messages=[{"role": "user", "content": "질문"}],
+            )
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.await_count == 2
+        assert fallback.chat.completions.create.await_count == 1
+
     def test_compression_skips_same_provider_retry_on_timeout(self):
         """A timeout on the critical compression path must NOT retry the same
         provider (that doubles the user-visible stall, issue #54465) — it

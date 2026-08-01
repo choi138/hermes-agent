@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -118,6 +118,7 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
+        runner.config = GatewayConfig(skip_context_files=True)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -165,6 +166,7 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+        assert MockAgent.call_args.kwargs["skip_context_files"] is True
 
 
 # ---------------------------------------------------------------------------

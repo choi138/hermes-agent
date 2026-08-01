@@ -50,6 +50,69 @@ gateway:
   config_read_failed: "⚠️ تعذّر قراءة config.yaml: {error}"
   config_save_failed: "⚠️ تعذّر حفظ الإعدادات: {error}"
 
+  progress:
+    template: "**المرحلة الحالية:** {stage}\n**المؤكّد:** {confirmed}\n**التالي:** {next_action}"
+    long_running: "⏳ لا يزال العمل جارياً (مرّت {minutes} دقيقة)."
+    stage:
+      preparing: "جارٍ تجهيز الطلب"
+      inspect: "جارٍ فحص الحالة الحالية"
+      diagnose: "جارٍ تشخيص المشكلة"
+      modify: "جارٍ تطبيق التغيير"
+      verify: "جارٍ التحقق من التغييرات"
+      deploy: "جارٍ نشر التغيير المتحقق منه"
+      observe: "جارٍ مراقبة سلامة التشغيل"
+      failure: "كشفت الخطوة الحالية عن مشكلة"
+      stopped: "تم إيقاف الطلب"
+    confirmed:
+      request_received: "تم استلام الطلب"
+      inspect: "اكتمل الفحص بنجاح"
+      diagnose: "اكتملت خطوة التشخيص بنجاح"
+      modify: "تم تطبيق التغيير بنجاح"
+      verify: "اكتمل التحقق بنجاح"
+      deploy: "اكتملت خطوة النشر بنجاح"
+      observe: "اكتملت مراقبة التشغيل بنجاح"
+      no_work_started: "لم يبدأ أي عمل"
+    next:
+      initial: "افحص الحالة ذات الصلة واجمع الأدلة"
+      active: "استخدم نتيجة هذه الخطوة لاختيار الإجراء الآمن التالي"
+      success: "تابع إلى الخطوة التالية باستخدام النتيجة المؤكدة"
+      failure: "راجع الفشل واختر إعادة محاولة آمنة أو بديلاً"
+      retry_request: "أرسل الطلب مجدداً عندما تكون مستعداً"
+
+  kanban_role:
+    heading:
+      running: "قيد التشغيل"
+      progress: "التقدّم"
+      completed: "مكتمل"
+      blocked: "محظور"
+      stopped: "متوقف"
+      retrying: "إعادة المحاولة"
+      timed_out: "انتهت المهلة"
+    field:
+      current_stage: "المرحلة الحالية"
+      confirmed: "المؤكّد"
+      next: "التالي"
+      task: "المهمة"
+      update: "التحديث"
+      result: "النتيجة"
+      needs_input: "يحتاج إلى إدخال"
+      waiting_on: "ينتظر"
+      retry_issue: "مشكلة إعادة المحاولة"
+      limitation: "القيد"
+      blocked_by: "محظور بسبب"
+      state: "الحالة"
+      error: "الخطأ"
+    state:
+      repeated_spawn_failures: "فشل بدء المهمة بشكل متكرر"
+      worker_crashed_retry: "توقفت المهمة بشكل غير متوقع؛ ستتم إعادة المحاولة تلقائياً."
+      runtime_limit_retry: "تم تجاوز حد التشغيل البالغ {limit_seconds} ثانية؛ ستتم إعادة المحاولة تلقائياً."
+    goal:
+      reviewing: "جارٍ مراجعة معايير إكمال المهمة"
+      confirmed_continue: "لم تُستوفَ معايير الإكمال بعد"
+      confirmed_done: "يبدو أن معايير الإكمال مستوفاة"
+      next_continue: "تابع العمل نحو معايير إكمال البطاقة"
+      next_done: "سجّل النتيجة المتحقق منها وأكمل المهمة"
+
   model:
     error_prefix:           "خطأ: {error}"
     switched:               "تم التبديل إلى النموذج `{model}`"

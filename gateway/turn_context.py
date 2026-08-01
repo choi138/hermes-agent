@@ -42,6 +42,9 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    semantic_progress_enabled: bool = False
+    semantic_progress_tracker: Any = None
+    semantic_progress_text: Optional[str] = None
 
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
@@ -54,6 +57,9 @@ class TurnContext:
     repeat_count: list = field(default_factory=lambda: [0])
     long_tool_hint_fired: list = field(default_factory=lambda: [False])
     agent_holder: list = field(default_factory=lambda: [None])
+    semantic_progress_message_id_ref: list = field(
+        default_factory=lambda: [None]
+    )
 
     # --- constants / cleanup bookkeeping ---------------------------------
     _LONG_TOOL_THRESHOLD_S: float = 30.0
@@ -92,6 +98,9 @@ class TurnContext:
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
+    tool_policy: Any = None
+    mention_inbox_execution_id: Optional[str] = None
+    mention_inbox_execution_observer: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False

@@ -35,6 +35,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -69,16 +70,17 @@ from hermes_constants import get_hermes_home
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
-    Only local CLI sessions get a recorded cwd: the directory the process was
-    launched from is meaningful for ``hermes -c`` / ``--resume`` (relaunch
-    where you left off). Gateway/cron/remote-backend sessions have no stable
-    host cwd to restore, so they record nothing.
+    Only local CLI and dispatcher-spawned Kanban sessions get a recorded cwd:
+    the directory the process was launched from is meaningful for ``hermes
+    -c`` / ``--resume`` and identifies a worker's bound workspace.
+    Gateway/cron/remote-backend sessions have no stable host cwd to restore,
+    so they record nothing.
 
     ``TERMINAL_ENV`` is set by the CLI's config bridge (``load_cli_config``);
     a non-"local" backend (docker/ssh/modal/...) means the host cwd is
     irrelevant to the agent's tools, so we skip it there too.
     """
-    if source != "cli":
+    if source not in {"cli", "kanban"}:
         return None
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     if backend and backend != "local":
@@ -100,6 +102,8 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     source = str(source or "").strip()
     if source:
         return source
+    if str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return "kanban"
     return platform or "cli"
 
 
@@ -1745,29 +1749,82 @@ class AIAgent:
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
-    ) -> None:
-        """Spawn the background memory/skill review thread.
+    ) -> bool:
+        """Queue a deduplicated background memory/skill review.
 
-        Thin wrapper — the heavy lifting lives in
+        The review fork itself still lives in
         ``agent.background_review.spawn_background_review_thread`` which
-        returns the thread target.  ``threading.Thread`` is constructed
-        here so existing tests that patch ``run_agent.threading.Thread``
-        keep working.
+        returns the executable target.  A process-wide coordinator owns the
+        daemon worker so concurrent sessions cannot start a review storm.
         """
+        from agent.background_review_policy import is_primary_foreground_agent
+
+        # Defense in depth: trigger sites use the same gate, but callers may
+        # invoke this method directly.  Never let delegated workers or an
+        # internal review fork schedule another self-improvement review.
+        if not is_primary_foreground_agent(self):
+            return False
+        if not review_memory and not review_skills:
+            return False
+
         from agent.background_review import spawn_background_review_thread
+        from agent.background_review_coordinator import (
+            ensure_background_review_owner_token,
+            get_background_review_coordinator,
+        )
         from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
+
+        snapshot = list(messages_snapshot)
+        # Build all possible targets while the foreground profile Context is
+        # still active.  ``propagate_context_to_thread`` captures that Context
+        # now, so a queued review writes to the right profile later (#54937).
+        targets = {}
+        for memory_flag, skills_flag in ((True, False), (False, True), (True, True)):
+            target, _prompt = spawn_background_review_thread(
+                self,
+                snapshot,
+                review_memory=memory_flag,
+                review_skills=skills_flag,
+            )
+            targets[(memory_flag, skills_flag)] = propagate_context_to_thread(target)
+
+        def _target_factory(memory_flag: bool, skills_flag: bool):
+            return targets[(memory_flag, skills_flag)]
+
+        coordinator = get_background_review_coordinator()
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+            review_cfg = (
+                auxiliary.get("background_review", {})
+                if isinstance(auxiliary, dict)
+                else {}
+            )
+            if not isinstance(review_cfg, dict):
+                review_cfg = {}
+            coordinator.configure(
+                idle_grace_seconds=float(review_cfg.get("idle_grace_seconds", 2.0)),
+                dedupe_ttl_seconds=float(review_cfg.get("dedupe_ttl_seconds", 3600.0)),
+                queue_limit=int(review_cfg.get("queue_limit", 64)),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid auxiliary.background_review coordinator settings; "
+                "using the last valid values"
+            )
+        except Exception:
+            logger.debug("Background review coordinator config load failed", exc_info=True)
+
+        disposition = coordinator.submit(
+            owner_token=ensure_background_review_owner_token(self),
+            messages_snapshot=snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            target_factory=_target_factory,
         )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+        return disposition != "queue_full"
 
     def _build_memory_write_metadata(
         self,
@@ -3971,7 +4028,7 @@ class AIAgent:
         except Exception:
             pass
 
-    def close(self) -> None:
+    def close(self, *, shutdown_deadline: float | None = None) -> None:
         """Release all resources held by this agent instance.
 
         Cleans up subprocess resources that would otherwise become orphans:
@@ -3984,6 +4041,8 @@ class AIAgent:
 
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
+        During gateway shutdown, *shutdown_deadline* bounds terminal sandbox
+        sync-back without changing the normal session-close timeout policy.
         """
         task_id = getattr(self, "session_id", None) or ""
 
@@ -3996,7 +4055,15 @@ class AIAgent:
 
         # 2. Clean terminal sandbox environments
         try:
-            cleanup_vm(task_id)
+            if shutdown_deadline is None:
+                cleanup_vm(task_id)
+            else:
+                cleanup_vm(
+                    task_id,
+                    shutdown_timeout_seconds=max(
+                        0.0, shutdown_deadline - time.monotonic()
+                    ),
+                )
         except Exception:
             pass
 
@@ -4025,7 +4092,20 @@ class AIAgent:
                 self._active_children.clear()
             for child in children:
                 try:
-                    child.close()
+                    close_fn = child.close
+                    supports_shutdown_deadline = False
+                    if shutdown_deadline is not None:
+                        try:
+                            supports_shutdown_deadline = (
+                                "shutdown_deadline"
+                                in inspect.signature(close_fn).parameters
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if supports_shutdown_deadline:
+                        close_fn(shutdown_deadline=shutdown_deadline)
+                    else:
+                        close_fn()
                 except Exception:
                     pass
         except Exception:
@@ -6289,7 +6369,11 @@ class AIAgent:
         the agent has a chance to recover.
         """
         if not _is_multimodal_tool_result(result):
-            return result
+            # Provenance-bearing string subclasses are only needed while the
+            # executor evaluates trusted control metadata. Canonical model
+            # history must contain plain strings so copy/serialization paths do
+            # not retain out-of-band registry objects.
+            return str(result) if isinstance(result, str) else result
 
         content = result.get("content") or []
         if not self._content_has_image_parts(content):
@@ -6969,11 +7053,15 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+        self._kanban_terminal_transition = None
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if len(tool_calls) <= 1:
+            if len(tool_calls) <= 1 or any(
+                call.function.name in {"kanban_complete", "kanban_block"}
+                for call in tool_calls
+            ):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )

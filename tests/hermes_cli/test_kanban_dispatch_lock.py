@@ -13,6 +13,7 @@ empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -62,6 +63,25 @@ def test_held_lock_skips_the_tick_without_writes(conn):
     assert spawn_calls == [], "spawn_fn must not run while the tick is locked out"
 
 
+
+
+def test_lock_path_resolution_failure_skips_without_dispatch(conn, monkeypatch):
+    """Failure to identify the board lock must never dispatch unlocked."""
+    monkeypatch.setattr(
+        kb,
+        "kanban_db_path",
+        MagicMock(side_effect=RuntimeError("board path unavailable")),
+    )
+    unlocked_dispatch = MagicMock(
+        side_effect=AssertionError("unguarded dispatch must not run"),
+    )
+    monkeypatch.setattr(kb, "_dispatch_once_locked", unlocked_dispatch)
+
+    result = kb.dispatch_once(conn)
+
+    assert result.skipped_locked is True
+    assert result.spawned == []
+    unlocked_dispatch.assert_not_called()
 
 
 def test_lock_is_board_scoped(conn):

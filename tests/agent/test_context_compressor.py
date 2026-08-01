@@ -1842,13 +1842,24 @@ class TestTruncateToolCallArgsJson:
     The previous implementation produced invalid JSON by slicing
     ``function.arguments`` mid-string, which caused non-retryable 400s from
     strict providers (observed on MiniMax) and stuck long sessions in a
-    re-send loop. The helper here must always emit parseable JSON whose
-    shape matches the original — shrunken, not corrupted.
+    re-send loop. A later regression showed that preserving a replayable
+    prefix inside ``write_file.content`` is also unsafe: the model can mistake
+    the compacted history for complete file bytes and overwrite a large file
+    with the preview. The helper must therefore emit parseable JSON whose
+    long string leaves are explicit, non-replayable tombstones.
     """
+
+    _ELISION_PREFIX = "[HERMES_CONTEXT_ELIDED "
 
     def _helper(self):
         from agent.context_compressor import _truncate_tool_call_args_json
         return _truncate_tool_call_args_json
+
+    def _assert_elided(self, value):
+        assert isinstance(value, str)
+        assert value.startswith(self._ELISION_PREFIX)
+        assert "DO_NOT_REUSE_AS_INPUT" in value
+        assert "...[truncated]" not in value
 
     def test_shrunken_args_remain_valid_json(self):
         import json as _json
@@ -1861,7 +1872,8 @@ class TestTruncateToolCallArgsJson:
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["content"])
+        assert "# Shopping Browser Setup Notes" not in parsed["content"]
         assert len(shrunk) < len(original)
 
 
@@ -1882,7 +1894,7 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        self._assert_elided(parsed["note"])
 
 
 
@@ -1920,7 +1932,8 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["content"])
+        assert "# Shopping Browser Setup Notes" not in parsed["content"]
 
 
 class TestLazyContextResolution:

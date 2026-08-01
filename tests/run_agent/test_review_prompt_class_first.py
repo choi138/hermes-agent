@@ -1,7 +1,7 @@
 """Behavior tests for the skill review / combined review prompts.
 
-The review prompts steer the background review agent toward actively updating
-the skill library after most sessions, with a strong bias toward:
+The review prompts require transcript evidence before updating the skill
+library, with a preference for:
   1. Patching currently-loaded skills first,
   2. Patching existing umbrellas next,
   3. Adding references/ files under an existing umbrella,
@@ -21,15 +21,18 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_requires_evidence_before_updates():
+    """Prompt must not manufacture skill updates without transcript evidence."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
+    lower = prompt.lower()
+    assert "concrete evidence" in lower, (
+        "must require concrete transcript evidence"
     )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
+    assert "making no change is the correct outcome" in lower, (
+        "must allow a no-change result when evidence is absent"
+    )
+    assert "do not manufacture" in lower, (
+        "must reject updates inferred from activity rather than evidence"
     )
 
 

@@ -34,6 +34,27 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+
+class TrustedToolResult(str):
+    """Model-facing tool text carrying an out-of-band raw registry result."""
+
+    def __new__(cls, value: str, trusted_raw_result: Any):
+        instance = super().__new__(cls, value)
+        instance.trusted_raw_result = trusted_raw_result
+        return instance
+
+    def __getnewargs_ex__(self):
+        """Preserve provenance when copy/pickle reconstructs this immutable value."""
+        return (str(self), self.trusted_raw_result), {}
+
+
+def get_trusted_raw_tool_result(result: Any) -> Any:
+    """Return the pre-middleware/plugin registry result when available."""
+    if isinstance(result, TrustedToolResult):
+        return result.trusted_raw_result
+    return result
+
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -448,6 +469,20 @@ def _compute_tool_definitions(
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        # Task workers inherit the assignee profile's normal tools, but their
+        # Kanban authority is always the task-scoped lifecycle surface. Apply
+        # this after enabled/disabled resolution so a profile-level `kanban`,
+        # `kanban_submit`, composite toolset, or explicit deny cannot either
+        # restore orchestrator/intake tools or strip completion handoff.
+        worker_tools = set(resolve_toolset("kanban_worker"))
+        non_worker_kanban_tools = (
+            set(resolve_toolset("kanban"))
+            | set(resolve_toolset("kanban_submit"))
+        ) - worker_tools
+        tools_to_include.difference_update(non_worker_kanban_tools)
+        tools_to_include.update(worker_tools)
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
@@ -1122,6 +1157,16 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    # A model may emit an undeclared tool name even when it is absent from the
+    # advertised catalog.  Internal-only registry entries are available to
+    # narrowly bound capabilities, not to this model-originated dispatcher.
+    entry = registry.get_entry(function_name)
+    if entry is not None and not entry.expose_to_model:
+        return json.dumps(
+            {"error": f"Tool '{function_name}' is not available for model dispatch"},
+            ensure_ascii=False,
+        )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -1321,25 +1366,30 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            trusted_raw_result = None
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    nonlocal trusted_raw_result
+                    trusted_raw_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
+                    return trusted_raw_result
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    nonlocal trusted_raw_result
+                    trusted_raw_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+                    return trusted_raw_result
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
@@ -1411,7 +1461,11 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
-        return result
+        return (
+            TrustedToolResult(result, trusted_raw_result)
+            if isinstance(result, str)
+            else result
+        )
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"

@@ -52,7 +52,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Disable when the platform should steer silently (the text still lands in
     # the active run; only the confirmation echo is suppressed).
     "busy_steer_ack_enabled": True,
-    # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
+    # When true, delete tool-progress / long-running semantic / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
     # live, just cleaned up after success so the chat doesn't fill up with
@@ -135,7 +135,13 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Discord has a native "subtext" primitive (-# small grey text) that reads
     # as metadata rather than content, so reasoning summaries default to it
     # here instead of the fenced code block used elsewhere.
-    "discord":     {**_TIER_HIGH, "reasoning_style": "subtext"},
+    "discord":     {
+        **_TIER_HIGH,
+        "reasoning_style": "subtext",
+        # Internal iteration/tool names are diagnostic data, not user-facing
+        # progress. Operators can still inspect them in logs.
+        "busy_ack_detail": False,
+    },
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;

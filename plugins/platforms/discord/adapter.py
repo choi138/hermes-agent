@@ -952,6 +952,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Parent message→channel lookup for durable mention-inbox anchored threads.
+        # The mapping is rebuilt from a successful send or marker reconciliation
+        # after each restart; Discord's message.thread remains the source of truth.
+        self._mention_inbox_parent_channels: Dict[str, str] = {}
+        self._mention_inbox_thread_locks: Dict[str, asyncio.Lock] = {}
+        self._mention_inbox_router: Any = None
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -2970,10 +2976,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs: Dict[str, Any] = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if metadata and metadata.get("mention_inbox_no_mentions"):
+                        send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -2992,10 +3001,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs: Dict[str, Any] = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if metadata and metadata.get("mention_inbox_no_mentions"):
+                            retry_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -5860,6 +5872,306 @@ class DiscordAdapter(BasePlatformAdapter):
     # Thread creation helpers
     # ------------------------------------------------------------------
 
+    def remember_mention_inbox_parent(
+        self, parent_message_id: str, parent_channel_id: str
+    ) -> None:
+        """Remember where a sent/reconciled inbox alert can be fetched."""
+        message_id = str(parent_message_id)
+        channel_id = str(parent_channel_id)
+        if not message_id.isdigit() or not channel_id.isdigit():
+            raise ValueError("Discord parent message and channel IDs must be numeric")
+        mapping = getattr(self, "_mention_inbox_parent_channels", None)
+        if mapping is None:
+            mapping = {}
+            self._mention_inbox_parent_channels = mapping
+        mapping[message_id] = channel_id
+        while len(mapping) > 2000:
+            mapping.pop(next(iter(mapping)))
+
+    async def _mention_inbox_parent_message(self, parent_message_id: str) -> Any:
+        message_id = str(parent_message_id)
+        if not message_id.isdigit():
+            raise ValueError("Discord parent message ID must be numeric")
+        mapping = getattr(self, "_mention_inbox_parent_channels", {})
+        channel_id = mapping.get(message_id)
+        if channel_id is None:
+            raise ValueError("Discord parent channel is unknown")
+        client = getattr(self, "_client", None)
+        if client is None:
+            raise RuntimeError("Discord adapter is not connected")
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(channel_id))
+        if channel is None or not hasattr(channel, "fetch_message"):
+            raise RuntimeError("Discord parent channel is unavailable")
+        return await channel.fetch_message(int(message_id))
+
+    async def find_anchored_thread(self, parent_message_id: str) -> str | None:
+        """Return the public thread already anchored to an inbox alert, if any."""
+        message = await self._mention_inbox_parent_message(parent_message_id)
+        thread = getattr(message, "thread", None)
+        if thread is not None and getattr(thread, "id", None) is not None:
+            return str(thread.id)
+        client = getattr(self, "_client", None)
+        cached = client.get_channel(int(parent_message_id)) if client is not None else None
+        if cached is not None and getattr(cached, "id", None) is not None:
+            return str(cached.id)
+        return None
+
+    async def create_anchored_thread(
+        self,
+        parent_message_id: str,
+        name: str,
+        auto_archive_duration: int = 1440,
+    ) -> str:
+        """Idempotently create a public thread from a bot-authored parent alert."""
+        message_id = str(parent_message_id)
+        thread_name = " ".join(str(name).split())
+        if not message_id.isdigit():
+            raise ValueError("Discord parent message ID must be numeric")
+        if not thread_name or len(thread_name) > 100:
+            raise ValueError("Discord thread name must contain 1..100 characters")
+        if auto_archive_duration not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
+            raise ValueError("unsupported Discord auto archive duration")
+        locks = getattr(self, "_mention_inbox_thread_locks", None)
+        if locks is None:
+            locks = {}
+            self._mention_inbox_thread_locks = locks
+        lock = locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            existing = await self.find_anchored_thread(message_id)
+            if existing is not None:
+                return existing
+            message = await self._mention_inbox_parent_message(message_id)
+            try:
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=auto_archive_duration,
+                )
+            except Exception:
+                # Discord can report an already-created race. Re-fetch the
+                # parent and accept only a real anchored thread before raising.
+                existing = await self.find_anchored_thread(message_id)
+                if existing is not None:
+                    return existing
+                raise
+            thread_id = getattr(thread, "id", None)
+            if thread_id is None:
+                raise RuntimeError("Discord thread creation returned no thread ID")
+            return str(thread_id)
+
+    def mark_mention_inbox_thread_participation(self, thread_id: str) -> None:
+        value = str(thread_id)
+        if not value.isdigit():
+            raise ValueError("Discord thread ID must be numeric")
+        tracker = getattr(self, "_threads", None)
+        if tracker is None:
+            raise RuntimeError("Discord thread participation tracker is unavailable")
+        tracker.mark(value)
+
+    async def handle_message(self, event: MessageEvent) -> bool:
+        """Replay queued Discord ingress through late-bound thread routers."""
+        source = getattr(event, "source", None)
+        is_startup_replay = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+        )
+        is_external_discord_thread = bool(
+            source is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and getattr(source, "chat_type", None) == "thread"
+            and not getattr(event, "internal", False)
+        )
+        if is_startup_replay and is_external_discord_thread:
+            thread_id = str(
+                getattr(source, "thread_id", None)
+                or getattr(source, "chat_id", "")
+                or ""
+            )
+            raw_message = getattr(event, "raw_message", None)
+            metadata = getattr(event, "metadata", {})
+            original_content = (
+                metadata.get("discord_original_content")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(original_content, str):
+                original_content = str(
+                    getattr(raw_message, "content", None)
+                    or getattr(event, "text", "")
+                    or ""
+                )
+            route_result = None
+            if thread_id and raw_message is not None:
+                route_result = await self._route_mention_inbox_message_result(
+                    raw_message,
+                    thread_id=thread_id,
+                    raw_content=original_content,
+                )
+            if route_result is not None and bool(route_result.handled):
+                return True
+            agent_text = (
+                None
+                if route_result is None
+                else getattr(route_result, "agent_text", None)
+            )
+            if isinstance(agent_text, str) and agent_text.strip():
+                event.text = agent_text
+
+        # Internal approved-execution events and ordinary Discord events stay
+        # on the shared adapter rail. Returning True records successful
+        # admission for enqueue_mention_inbox_execution().
+        await super().handle_message(event)
+        return True
+
+    def set_mention_inbox_router(self, router: Any | None) -> None:
+        """Install or clear the dedicated registered-work-thread router."""
+        self._mention_inbox_router = router
+
+    def set_mention_inbox_execution_observer(self, observer: Any | None) -> None:
+        """Install or clear the in-process approved-execution lifecycle observer."""
+        self._mention_inbox_execution_observer = observer
+
+    async def enqueue_mention_inbox_execution(
+        self, request: Any, prompt: str
+    ) -> str:
+        """Admit one approved envelope to the existing thread session rail."""
+        execution_id = str(getattr(request, "execution_id", ""))
+        proposal_hash = str(getattr(request, "proposal_hash", ""))
+        mode = str(getattr(request, "executor_hint", ""))
+        approval_message_id = str(getattr(request, "approval_message_id", ""))
+        approver_user_id = str(getattr(request, "approver_user_id", ""))
+        thread_id = str(getattr(request, "thread_id", ""))
+        if not execution_id or len(execution_id) > 80:
+            raise ValueError("execution_id is invalid")
+        if len(proposal_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in proposal_hash
+        ):
+            raise ValueError("proposal_hash is invalid")
+        if mode not in {"direct", "kanban"}:
+            raise ValueError("execution mode is invalid")
+        if not all(
+            value.isdigit()
+            for value in (approval_message_id, approver_user_id, thread_id)
+        ):
+            raise ValueError("Discord execution identities must be numeric")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20_000:
+            raise ValueError("approved execution prompt is invalid")
+        client = getattr(self, "_client", None)
+        if client is None:
+            raise RuntimeError("Discord adapter is not connected")
+        channel = client.get_channel(int(thread_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(thread_id))
+        if channel is None:
+            raise RuntimeError("approved execution thread is unavailable")
+        parent = getattr(channel, "parent", None)
+        parent_id = str(getattr(parent, "id", "") or "")
+        guild = getattr(channel, "guild", None)
+        guild_name = str(getattr(guild, "name", "") or "")
+        thread_name = str(getattr(channel, "name", "") or "work thread")
+        chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
+        chat_topic = getattr(parent, "topic", None)
+        source = self.build_source(
+            chat_id=thread_id,
+            chat_name=chat_name,
+            chat_type="thread",
+            user_id=approver_user_id,
+            user_name="approved mention-inbox user",
+            thread_id=thread_id,
+            chat_topic=chat_topic if isinstance(chat_topic, str) else None,
+            guild_id=(None if guild is None else str(getattr(guild, "id", "") or "")),
+            parent_chat_id=parent_id or None,
+            message_id=approval_message_id,
+            role_authorized=True,
+        )
+        has_config = getattr(self, "config", None) is not None
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=None,
+            auto_skill=(
+                self._resolve_channel_skills(thread_id, parent_id or None)
+                if has_config
+                else None
+            ),
+            channel_prompt=(
+                self._resolve_channel_prompt(thread_id, parent_id or None)
+                if has_config
+                else None
+            ),
+            internal=True,
+            metadata={
+                "mention_inbox_execution": {
+                    "execution_id": execution_id,
+                    "proposal_hash": proposal_hash,
+                    "mode": mode,
+                }
+            },
+        )
+        if not await self.handle_message(event):
+            raise RuntimeError("approved execution event was not admitted")
+        return f"{mode}:{execution_id}"
+
+    async def _route_mention_inbox_message_result(
+        self, message: Any, *, thread_id: str, raw_content: str
+    ) -> Any | None:
+        router = getattr(self, "_mention_inbox_router", None)
+        if router is None or not router.is_work_thread(thread_id):
+            return None
+        from plugins.mention_inbox.router import (
+            InboxDiscordMessage,
+            InboxRouteResult,
+        )
+
+        reference = getattr(message, "reference", None)
+        reply_to = getattr(reference, "message_id", None)
+        if reply_to is None:
+            reply_to = getattr(getattr(reference, "resolved", None), "id", None)
+        user_id = str(getattr(getattr(message, "author", None), "id", ""))
+        message_id = str(getattr(message, "id", ""))
+        content = raw_content
+        bot_id = getattr(getattr(self, "_client", None), "user", None)
+        bot_id = getattr(bot_id, "id", None)
+        if bot_id is not None:
+            content = content.replace(f"<@!{bot_id}>", f"<@{bot_id}>")
+        try:
+            return await router.handle_message(
+                InboxDiscordMessage(
+                    thread_id=thread_id,
+                    message_id=message_id,
+                    user_id=user_id,
+                    text=content,
+                    reply_to_message_id=(None if reply_to is None else str(reply_to)),
+                )
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Mention-inbox work-thread router failed closed",
+                self.name,
+                exc_info=True,
+            )
+            try:
+                await message.channel.send(
+                    "이 work thread의 상태를 확인하지 못해 요청을 실행하지 않았어요. 잠시 뒤 다시 시도해 주세요.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                pass
+            return InboxRouteResult(True, "router_failed_closed")
+
+    async def _route_mention_inbox_message(
+        self, message: Any, *, thread_id: str, raw_content: str
+    ) -> bool:
+        """Compatibility wrapper for deterministic handled/not-handled checks."""
+
+        result = await self._route_mention_inbox_message_result(
+            message,
+            thread_id=thread_id,
+            raw_content=raw_content,
+        )
+        return bool(result is not None and result.handled)
+
     async def _handle_thread_create_slash(
         self,
         interaction: discord.Interaction,
@@ -7401,6 +7713,7 @@ class DiscordAdapter(BasePlatformAdapter):
         recovered: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
+        gateway_ingress_monotonic = time.monotonic()
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
         # in a thread where the bot has already participated.
@@ -7493,6 +7806,21 @@ class DiscordAdapter(BasePlatformAdapter):
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
+        if is_thread and thread_id is not None:
+            route_result = await self._route_mention_inbox_message_result(
+                message,
+                thread_id=thread_id,
+                raw_content=raw_content,
+            )
+            if route_result is not None and bool(route_result.handled):
+                return True
+            agent_text = (
+                None
+                if route_result is None
+                else getattr(route_result, "agent_text", None)
+            )
+            if isinstance(agent_text, str) and agent_text.strip():
+                normalized_content = agent_text
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -7868,6 +8196,13 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata={
+                "gateway_ingress_monotonic": gateway_ingress_monotonic,
+                # Discord ingress strips the bot mention from message.content
+                # before normalization. Startup replay needs the untouched
+                # form so exact mention-inbox control syntax remains exact.
+                "discord_original_content": raw_content,
+            },
         )
 
         # Track thread participation so the bot won't require @mention for

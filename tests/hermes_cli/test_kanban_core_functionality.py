@@ -205,6 +205,396 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn2.close()
 
 
+def _append_role_delivery_event(conn, task_id, kind):
+    run_row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not run_row or run_row["current_run_id"] is None:
+        assert kb.claim_task(conn, task_id) is not None
+        run_row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, task_id, kind, None, run_id=int(run_row["current_run_id"]),
+        )
+    return conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()[0]
+
+
+def test_role_delivery_migration_is_additive_for_existing_db(kanban_home):
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        conn.execute("DROP TABLE kanban_role_deliveries")
+        conn.execute(
+            """
+            CREATE TABLE kanban_role_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                task_id TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                sender_profile TEXT NOT NULL,
+                notifier_profile TEXT,
+                message TEXT NOT NULL,
+                event_payload TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                text_delivered INTEGER NOT NULL DEFAULT 0,
+                next_artifact_index INTEGER NOT NULL DEFAULT 0,
+                available_at INTEGER NOT NULL DEFAULT 0,
+                claim_token TEXT,
+                claim_expires INTEGER,
+                last_error_kind TEXT,
+                created_at INTEGER NOT NULL,
+                delivered_at INTEGER,
+                UNIQUE(event_id, platform, chat_id, thread_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_role_deliveries (
+                event_id, task_id, event_kind, platform, chat_id,
+                sender_profile, message, created_at
+            ) VALUES (1, 'legacy-task', 'completed', 'discord', 'channel',
+                      'shinei', 'legacy row', 1)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Opening a representative pre-manifest schema must migrate in place and
+    # preserve queued rows; this is the path a restarted gateway actually uses.
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_role_deliveries)")
+        }
+        assert {
+            "sender_profile", "status", "claim_token", "claim_expires",
+            "text_delivered", "next_artifact_index", "artifact_manifest",
+        } <= columns
+        legacy = conn.execute(
+            "SELECT message, artifact_manifest FROM kanban_role_deliveries"
+        ).fetchone()
+        assert tuple(legacy) == ("legacy row", "[]")
+    finally:
+        conn.close()
+
+
+def test_role_delivery_claim_is_profile_scoped_and_single_owner(kanban_home):
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="role delivery", assignee="shinei")
+        event_id = _append_role_delivery_event(conn1, tid, "completed")
+        for _ in range(2):
+            assert kb.enqueue_role_delivery(
+                conn1, event_id=event_id, task_id=tid, event_kind="completed",
+                platform="discord", chat_id="channel", thread_id="thread",
+                sender_profile="shinei", notifier_profile="default",
+                message="done",
+            )
+        assert kb.claim_role_deliveries(
+            conn2, sender_profile="raiden", platform="discord",
+            claimant="raiden-process", now=100,
+        ) == []
+        first = kb.claim_role_deliveries(
+            conn1, sender_profile="shinei", platform="discord",
+            claimant="shinei-process-1", now=100,
+        )
+        assert len(first) == 1
+        assert kb.claim_role_deliveries(
+            conn2, sender_profile="shinei", platform="discord",
+            claimant="shinei-process-2", now=100,
+        ) == []
+        assert kb.complete_role_delivery(
+            conn1, delivery_id=first[0]["id"],
+            claim_token=first[0]["claim_token"], now=101,
+        )
+        assert kb.claim_role_deliveries(
+            conn2, sender_profile="shinei", platform="discord",
+            claimant="shinei-process-2", now=200,
+        ) == []
+    finally:
+        conn1.close()
+        conn2.close()
+
+
+def test_role_delivery_expired_claim_recovers_after_process_restart(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="restart lease", assignee="shinei")
+        event_id = _append_role_delivery_event(conn, tid, "spawned")
+        kb.enqueue_role_delivery(
+            conn, event_id=event_id, task_id=tid, event_kind="spawned",
+            platform="discord", chat_id="channel", thread_id=None,
+            sender_profile="shinei", notifier_profile="default",
+            message="running",
+        )
+        abandoned = kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="dead-process", lease_seconds=60, now=100,
+        )
+        assert len(abandoned) == 1
+        recovered = kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="restarted-process", now=161,
+        )
+        assert len(recovered) == 1
+        assert recovered[0]["id"] == abandoned[0]["id"]
+        assert recovered[0]["claim_token"] != abandoned[0]["claim_token"]
+        assert not kb.complete_role_delivery(
+            conn, delivery_id=abandoned[0]["id"],
+            claim_token=abandoned[0]["claim_token"], now=162,
+        )
+    finally:
+        conn.close()
+
+
+def test_role_delivery_identity_excludes_mutable_sender_profile(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="identity", assignee="shinei")
+        event_id = _append_role_delivery_event(conn, tid, "completed")
+        assert kb.enqueue_role_delivery(
+            conn, event_id=event_id, task_id=tid, event_kind="completed",
+            platform="discord", chat_id="channel", thread_id="thread",
+            sender_profile="shinei", notifier_profile="default", message="done",
+        )
+        assert kb.enqueue_role_delivery(
+            conn, event_id=event_id, task_id=tid, event_kind="completed",
+            platform="discord", chat_id="channel", thread_id="thread",
+            sender_profile="shinei", notifier_profile="anju", message="done",
+        )
+        with pytest.raises(ValueError, match="sender profile mismatch"):
+            kb.enqueue_role_delivery(
+                conn, event_id=event_id, task_id=tid, event_kind="completed",
+                platform="discord", chat_id="channel", thread_id="thread",
+                sender_profile="raiden", notifier_profile="default", message="done",
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_role_deliveries"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_role_delivery_identity_rejects_same_event_with_different_task(kanban_home):
+    conn = kb.connect()
+    try:
+        first_task = kb.create_task(conn, title="first", assignee="shinei")
+        other_task = kb.create_task(conn, title="other", assignee="shinei")
+        claimed = kb.claim_task(conn, first_task)
+        assert claimed is not None
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (first_task,),
+        ).fetchone()[0]
+        assert kb.enqueue_role_delivery(
+            conn, event_id=event_id, task_id=first_task, event_kind="claimed",
+            platform="discord", chat_id="channel", thread_id="thread",
+            sender_profile="shinei", notifier_profile="default", message="first",
+        )
+        with pytest.raises(ValueError, match="event/task linkage"):
+            kb.enqueue_role_delivery(
+                conn, event_id=event_id, task_id=other_task, event_kind="claimed",
+                platform="discord", chat_id="channel", thread_id="thread",
+                sender_profile="raiden", notifier_profile="default", message="other",
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_role_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_role_delivery_sender_profile_is_authoritative_from_event_run(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="authoritative profile", assignee="shinei")
+        assert kb.claim_task(conn, task_id) is not None
+        event = conn.execute(
+            "SELECT id, kind FROM task_events WHERE task_id = ? AND run_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+        with pytest.raises(ValueError, match="sender profile mismatch"):
+            kb.enqueue_role_delivery(
+                conn,
+                event_id=event["id"],
+                task_id=task_id,
+                event_kind=event["kind"],
+                platform="discord",
+                chat_id="channel",
+                thread_id=None,
+                sender_profile="raiden",
+                notifier_profile="default",
+                message="must not impersonate",
+            )
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_role_deliveries"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_role_delivery_lease_can_be_renewed_before_slow_send_expires(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="slow send", assignee="shinei")
+        claimed_task = kb.claim_task(conn, tid)
+        assert claimed_task is not None
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()[0]
+        kb.enqueue_role_delivery(
+            conn, event_id=event_id, task_id=tid, event_kind="claimed",
+            platform="discord", chat_id="channel", thread_id=None,
+            sender_profile="shinei", notifier_profile="default", message="slow",
+        )
+        delivery = kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="sender-one", lease_seconds=60, limit=1, now=100,
+        )[0]
+        assert kb.renew_role_delivery_lease(
+            conn, delivery_id=delivery["id"],
+            claim_token=delivery["claim_token"], lease_seconds=60, now=159,
+        )
+        assert kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="sender-two", lease_seconds=60, limit=1, now=161,
+        ) == []
+        assert kb.complete_role_delivery(
+            conn, delivery_id=delivery["id"],
+            claim_token=delivery["claim_token"], now=162,
+        )
+    finally:
+        conn.close()
+
+
+def test_role_delivery_fifo_blocks_later_same_destination_during_backoff(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="fifo", assignee="shinei")
+        event_ids = [
+            _append_role_delivery_event(conn, tid, "heartbeat")
+            for _ in range(2)
+        ]
+        for event_id in event_ids:
+            kb.enqueue_role_delivery(
+                conn, event_id=event_id, task_id=tid, event_kind="heartbeat",
+                platform="discord", chat_id="channel", thread_id="thread",
+                sender_profile="shinei", notifier_profile="default",
+                message=f"event-{event_id}",
+            )
+        first = kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="sender", now=100,
+        )
+        assert [row["event_id"] for row in first] == [event_ids[0]]
+        assert kb.retry_role_delivery(
+            conn, delivery_id=first[0]["id"],
+            claim_token=first[0]["claim_token"], error_kind="offline",
+            retry_after_seconds=60, now=100,
+        )
+        assert kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="sender", now=120,
+        ) == []
+        retried = kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="sender", now=160,
+        )
+        assert [row["event_id"] for row in retried] == [event_ids[0]]
+    finally:
+        conn.close()
+
+
+def test_role_delivery_progress_is_durable_and_fenced(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="progress", assignee="shinei")
+        event_id = _append_role_delivery_event(conn, tid, "completed")
+        kb.enqueue_role_delivery(
+            conn, event_id=event_id, task_id=tid, event_kind="completed",
+            platform="discord", chat_id="channel", thread_id=None,
+            sender_profile="shinei", notifier_profile="default", message="done",
+        )
+        claimed = kb.claim_role_deliveries(
+            conn, sender_profile="shinei", platform="discord",
+            claimant="sender", now=100,
+        )[0]
+        assert kb.advance_role_delivery_progress(
+            conn, delivery_id=claimed["id"], claim_token=claimed["claim_token"],
+            text_delivered=True, next_artifact_index=1,
+        )
+        assert not kb.advance_role_delivery_progress(
+            conn, delivery_id=claimed["id"], claim_token="stale-token",
+            next_artifact_index=2,
+        )
+        row = conn.execute(
+            "SELECT text_delivered, next_artifact_index FROM kanban_role_deliveries"
+        ).fetchone()
+        assert tuple(row) == (1, 1)
+    finally:
+        conn.close()
+
+
+def test_role_delivery_stage_and_cursor_advance_roll_back_together(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="atomic stage", assignee="shinei")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="discord", chat_id="channel",
+            notifier_profile="default",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.complete_task(conn, tid, summary="done")
+        initial_cursor = kb.list_notify_subs(conn, tid)[0]["last_event_id"]
+
+        def invalid_builder(events):
+            event = events[-1]
+            return [{
+                "event_id": event.id,
+                "task_id": tid,
+                "event_kind": event.kind,
+                "platform": "discord",
+                "chat_id": "channel",
+                "thread_id": "",
+                "sender_profile": "",
+                "notifier_profile": "default",
+                "message": "must fail closed",
+            }]
+
+        with pytest.raises(ValueError, match="blank"):
+            kb.claim_unseen_events_for_sub(
+                conn, task_id=tid, platform="discord", chat_id="channel",
+                kinds=("completed",), role_delivery_builder=invalid_builder,
+            )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == initial_cursor
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_role_deliveries"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # GC + retention
 # ---------------------------------------------------------------------------
@@ -258,60 +648,62 @@ def test_read_worker_log_tail(kanban_home):
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
 
-def test_max_runtime_terminates_overrun_worker(kanban_home):
+def test_max_runtime_terminates_overrun_worker(kanban_home, monkeypatch):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
+    state = {"alive": True}
+    identity = "test:max-runtime-worker"
+    worker_pid = 987654321
+
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
+        state["alive"] = False
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
     import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+    monkeypatch.setattr(_kb, "get_process_identity", lambda _pid: identity)
 
+    conn = kb.connect()
     try:
-        conn = kb.connect()
-        try:
-            tid = kb.create_task(
-                conn, title="long job", assignee="worker",
-                max_runtime_seconds=1,  # one second cap
+        tid = kb.create_task(
+            conn, title="long job", assignee="worker",
+            max_runtime_seconds=1,  # one second cap
+        )
+        # Spawn by hand: claim + set pid + set active run start to the past.
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, worker_pid)
+        # Backdate both the task-level first-start timestamp and the active
+        # run timestamp so elapsed > limit under the per-run runtime model.
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (old_started, tid),
             )
-            # Spawn by hand: claim + set pid + set active run start to the past.
-            kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
-            # Backdate both the task-level first-start timestamp and the active
-            # run timestamp so elapsed > limit under the per-run runtime model.
-            old_started = int(time.time()) - 30
-            with kb.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET started_at = ? WHERE id = ?",
-                    (old_started, tid),
-                )
-                conn.execute(
-                    "UPDATE task_runs SET started_at = ? "
-                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                    (old_started, tid),
-                )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
+            )
 
-            timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
-            assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+        timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
+        assert tid in timed_out
+        assert killed and killed[0][0] == worker_pid
 
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
-            assert task.worker_pid is None
-            assert task.last_heartbeat_at is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", f"timed-out task should reset to ready, got {task.status}"
+        assert task.worker_pid is None
+        assert task.last_heartbeat_at is None
 
-            events = kb.list_events(conn, tid)
-            assert any(e.kind == "timed_out" for e in events)
-            to_event = next(e for e in events if e.kind == "timed_out")
-            assert to_event.payload["limit_seconds"] == 1
-            assert to_event.payload["elapsed_seconds"] >= 30
-        finally:
-            conn.close()
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "timed_out" for e in events)
+        to_event = next(e for e in events if e.kind == "timed_out")
+        assert to_event.payload["limit_seconds"] == 1
+        assert to_event.payload["elapsed_seconds"] >= 30
     finally:
-        _kb._pid_alive = original_alive
+        _kb._discard_owned_worker(worker_pid)
+        conn.close()
 
 
 
@@ -671,7 +1063,7 @@ def test_pid_alive_detects_zombie(kanban_home):
         time.sleep(0.3)
         # Verify /proc reports zombie state so the test is actually
         # exercising the zombie path and not some other liveness failure
-        with open(f"/proc/{pid}/status") as f:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
             state_line = next(
                 (l for l in f if l.startswith("State:")), ""
             )
@@ -1036,6 +1428,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
+    runner._kanban_notifier_profile = "default"
     corrupt_db = tmp_path / "kanban.db"
     corrupt_db.write_text("not sqlite", encoding="utf-8")
 
@@ -1211,6 +1604,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         # Simulate a live claim (not expired).
         lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
         future = int(time.time()) + 3600
+        identity = "test:manual-reclaim-worker"
         killed: list[int] = []
         state = {"alive": True}
 
@@ -1220,6 +1614,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        monkeypatch.setattr(_kb, "get_process_identity", lambda _pid: identity)
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -1227,8 +1622,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
+            "worker_pid, worker_identity, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?, ?)",
+            (t, lock, future, 12345, identity, int(time.time())),
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
@@ -1406,5 +1802,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

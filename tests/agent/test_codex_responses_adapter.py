@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_responses_adapter import (
+    CodexStreamIncompleteError,
     _chat_messages_to_responses_input,
     _format_responses_error,
     _normalize_codex_response,
@@ -278,6 +279,50 @@ def test_normalize_codex_response_failed_includes_code_in_error():
 
 
 
+def test_normalize_stream_incomplete_is_typed_and_retryable_without_output():
+    response = SimpleNamespace(
+        status="failed",
+        output=[],
+        output_text="",
+        error={
+            "code": "stream_incomplete",
+            "message": "Upstream websocket closed before response.completed",
+        },
+        _hermes_streamed_chars=0,
+    )
+
+    with pytest.raises(CodexStreamIncompleteError) as raised:
+        _normalize_codex_response(response)
+
+    error = raised.value
+    assert error.code == "stream_incomplete"
+    assert error.streamed_chars == 0
+    assert error.output_item_count == 0
+    assert error.safe_to_retry is True
+
+
+def test_normalize_stream_incomplete_marks_partial_output_unsafe_to_retry():
+    response = SimpleNamespace(
+        status="failed",
+        output=[
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="incomplete",
+                content=[SimpleNamespace(type="output_text", text="partial answer")],
+            )
+        ],
+        output_text="partial answer",
+        error={"code": "stream_incomplete", "message": "websocket closed"},
+        _hermes_streamed_chars=len("partial answer"),
+    )
+
+    with pytest.raises(CodexStreamIncompleteError) as raised:
+        _normalize_codex_response(response)
+
+    error = raised.value
+    assert error.safe_to_retry is False
+    assert error.partial_text == "partial answer"
 # ---------------------------------------------------------------------------
 # Reasoning-channel answer salvage (xAI grok) — grok-4.x on the xAI
 # /v1/responses surface sometimes emits its final answer inside the
