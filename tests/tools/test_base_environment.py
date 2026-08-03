@@ -115,25 +115,24 @@ class TestAtomicSnapshotWrite:
         assert f"> '{snap}'" not in wrapped
         assert f"> {snap}\n" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_temp_path_uses_mktemp_not_process_ids(self):
+        """The temp name must be unique on bash 3.2 as well as newer bash.
+
+        ``$$`` is shared by concurrent subshells, and macOS' system bash 3.2
+        has no ``$BASHPID``. ``mktemp`` closes both collision paths.
+        """
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
-        # The bare $$ temp form must be gone.
+        assert "command mktemp" in wrapped
+        assert ".tmp.XXXXXX" in wrapped
+        assert "$BASHPID" not in wrapped
         assert ".tmp.$$" not in wrapped
 
 
-    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
+    def test_init_session_bootstrap_also_atomic_and_unique(self):
         """The init_session bootstrap (first snapshot write) is the same shared
-        file a concurrent command could source — it must be atomic and use
-        ``$BASHPID`` too."""
+        file a concurrent command could source — it must also use ``mktemp``."""
         env = _TestableEnv()
         captured = {}
 
@@ -148,7 +147,9 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
+        assert "command mktemp" in boot
+        assert ".tmp.XXXXXX" in boot
+        assert "$BASHPID" not in boot
         assert ".tmp.$$" not in boot
 
 
@@ -178,8 +179,8 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
-    unique), which is what closes the race; ``$$`` would still tear here.
+    that would corrupt PATH. The writer uses ``mktemp`` so this contract also
+    holds on macOS' system bash 3.2, which does not provide ``$BASHPID``.
     """
 
     def _run(self, script):
@@ -194,11 +195,13 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _snap_tmp_template = _q(snap + ".tmp.XXXXXX")
+        _snap_tmp = '"$__hermes_snapshot_tmp"'
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
+            f"__hermes_snapshot_tmp=$(command mktemp {_snap_tmp_template}) || exit 1; "
             f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
             f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
             "done"
@@ -235,7 +238,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
         # Redirect export into an unwritable dir so the export side fails; mv
         # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
+        bad_tmp = _q("/nonexistent-dir/snap.tmp")
         script = (
             f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
             f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
