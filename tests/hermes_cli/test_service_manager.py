@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from hermes_cli.service_manager import (
@@ -206,7 +208,8 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    assert stat.S_IMODE(event.stat().st_mode) == 0o3730, (
+    expected_event_modes = {0o3730} if sys.platform == "linux" else {0o1730, 0o3730}
+    assert stat.S_IMODE(event.stat().st_mode) in expected_event_modes, (
         f"event/ mode = {oct(event.stat().st_mode)}, want 03730"
     )
 
@@ -218,7 +221,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    assert stat.S_IMODE(supervise_event.stat().st_mode) == 0o3730
+    assert stat.S_IMODE(supervise_event.stat().st_mode) in expected_event_modes
 
     # supervise/control FIFO.
     control = supervise / "control"
@@ -487,5 +490,4 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
 
