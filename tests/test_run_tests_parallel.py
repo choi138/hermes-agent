@@ -233,6 +233,62 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_parallel_files_get_isolated_pytest_temp_roots(tmp_path: Path) -> None:
+    """Each pytest subprocess owns and then cleans up its numbered-dir root."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "temproot-probes"
+    probe_dir.mkdir()
+
+    handoffs = []
+    for name in ("alpha", "beta"):
+        handoff = tmp_path / f"{name}-temproot.txt"
+        handoffs.append(handoff)
+        probe = probe_dir / f"test_{name}.py"
+        probe.write_text(
+            textwrap.dedent(
+                f"""
+                import os
+                from pathlib import Path
+
+                def test_records_private_pytest_temproot():
+                    temp_root = os.environ.get("PYTEST_DEBUG_TEMPROOT")
+                    assert temp_root
+                    assert Path(temp_root).is_dir()
+                    Path({str(handoff)!r}).write_text(temp_root, encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-timeout",
+            "30",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    roots = [Path(path.read_text(encoding="utf-8")) for path in handoffs]
+    assert roots[0] != roots[1]
+    assert all(not root.exists() for root in roots)
+
+
 
 
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
