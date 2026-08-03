@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent.background_review_policy import is_primary_foreground_agent
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,

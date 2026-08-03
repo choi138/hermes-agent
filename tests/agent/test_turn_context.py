@@ -254,6 +254,35 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_memory_nudge_fires_at_interval():
+    agent = _FakeAgent()
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"memory"}
+    agent._memory_store = object()
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is True
+    # A trigger is only a due marker. The finalizer resets it after a healthy
+    # foreground turn successfully queues/deduplicates the review; a failed
+    # turn must leave the learning opportunity due.
+    assert agent._turns_since_memory == 1
+
+
+def test_subagent_does_not_tick_memory_review_cadence():
+    agent = _FakeAgent()
+    agent._delegate_depth = 1
+    agent.platform = "subagent"
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"memory"}
+    agent._memory_store = object()
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is False
+    assert agent._turns_since_memory == 0
+
+
 
 
 
@@ -331,7 +360,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 
