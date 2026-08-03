@@ -383,6 +383,8 @@ def _merge_slot_extra_body(
 def _maybe_apply_moa_cache_control(
     messages: list[dict[str, Any]],
     runtime: dict[str, Any],
+    *,
+    cache_disabled: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Decorate an advisor or aggregator request with cache_control when its
     route honors it.
@@ -396,17 +398,27 @@ def _maybe_apply_moa_cache_control(
 
     Returns the messages unchanged on any resolution error or when the
     policy says the route doesn't honor markers.
+
+    ``cache_disabled`` (or the live config when omitted) is stamped onto the
+    policy stub so ``prompt_caching.cache_ttl: off`` is not bypassed by the
+    blank-agent pattern (#76085).
     """
     try:
-        from types import SimpleNamespace
-
-        from agent.agent_runtime_helpers import anthropic_prompt_cache_policy
+        from agent.agent_runtime_helpers import (
+            anthropic_prompt_cache_policy,
+            blank_cache_policy_stub,
+        )
         from agent.prompt_caching import apply_anthropic_cache_control
 
+        # Prefer an explicit kwarg, then a snapshot on the runtime dict
+        # (threaded from the live agent), else config via the stub factory.
+        if cache_disabled is None and "_cache_disabled" in runtime:
+            cache_disabled = runtime.get("_cache_disabled")
+
         # The policy function reads agent.* only as fallbacks for kwargs we
-        # don't pass; provide a stub so the slot is judged purely on its own
-        # resolved runtime.
-        stub = SimpleNamespace(provider="", base_url="", api_mode="", model="")
+        # don't pass; blank_cache_policy_stub is the only sanctioned stub
+        # so _cache_disabled cannot be left off again (#76085).
+        stub = blank_cache_policy_stub(cache_disabled)
         should_cache, native_layout = anthropic_prompt_cache_policy(
             stub,
             provider=runtime.get("provider") or "",
@@ -432,6 +444,7 @@ def _run_reference(
     max_tokens: int | None = None,
     reference_timeout: float | None = None,
     context_length_cache: Any = None,
+    cache_disabled: bool | None = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model and return ``(label, text, accounting)``.
 
@@ -493,7 +506,12 @@ def _run_reference(
         # caching is opt-in per request. OpenAI-family advisors are untouched
         # (their caching is automatic; markers are ignored harmlessly, but we
         # only decorate when the policy says the route honors them).
-        messages = _maybe_apply_moa_cache_control(messages, runtime)
+        # Pin the live agent disable onto the runtime so advisor decoration
+        # tracks conversation state, not a fresh config re-read (#76085).
+        cache_runtime = runtime
+        if cache_disabled is not None:
+            cache_runtime = {**runtime, "_cache_disabled": cache_disabled}
+        messages = _maybe_apply_moa_cache_control(messages, cache_runtime)
         # Per-slot max_tokens takes precedence over the preset-level
         # reference_max_tokens passed in by the caller. This lets each
         # reference model have its own output cap independently.
@@ -797,6 +815,9 @@ def _run_references_parallel(
     # instead of re-probing metadata sources per reference (dict get/set is
     # GIL-atomic; a rare duplicate probe on a first-use race is harmless).
     _ctx_len_cache: dict[tuple[str, str], int | None] = {}
+    cache_disabled = (
+        getattr(agent, "_cache_disabled", None) if agent is not None else None
+    )
     try:
         for idx, slot in enumerate(reference_models):
             if slot.get("provider") == "moa":
@@ -815,6 +836,7 @@ def _run_references_parallel(
                     max_tokens=max_tokens,
                     reference_timeout=reference_timeout,
                     context_length_cache=_ctx_len_cache,
+                    cache_disabled=cache_disabled,
                 )
             ] = idx
 
@@ -1262,6 +1284,19 @@ def aggregate_moa_context(
 
     agg_label = _slot_label(aggregator)
     agg_runtime = _slot_runtime(aggregator)
+    # Pin the live agent disable onto synthesis decoration so mid-session
+    # config flips cannot re-enable markers on this path alone (#76085).
+    # Same not-None guard as _run_reference: stamping None would be a no-op
+    # (present-None falls through to the config fallback anyway).
+    agg_cache_runtime = agg_runtime
+    _agg_cache_disabled = (
+        getattr(agent, "_cache_disabled", None) if agent is not None else None
+    )
+    if _agg_cache_disabled is not None:
+        agg_cache_runtime = {
+            **agg_runtime,
+            "_cache_disabled": _agg_cache_disabled,
+        }
     try:
         # Same cache_control decoration as _run_reference's advisor calls
         # (see _maybe_apply_moa_cache_control) — this synthesis call is a
@@ -1274,7 +1309,7 @@ def aggregate_moa_context(
         # breakpoints, even when the resolved aggregator slot is a
         # cache-honoring route (e.g. Claude on OpenRouter/native Anthropic).
         agg_messages = _maybe_apply_moa_cache_control(
-            [{"role": "user", "content": synth_prompt}], agg_runtime
+            [{"role": "user", "content": synth_prompt}], agg_cache_runtime
         )
         response = call_llm(
             task="moa_aggregator",
@@ -1657,6 +1692,52 @@ class MoAChatCompletions:
         max_tokens: Any = agg_kwargs.get("max_tokens")
         tools: Any = agg_kwargs.get("tools")
         extra_body: Any = agg_kwargs.get("extra_body")
+        agg_runtime = _slot_runtime(aggregator)
+        try:
+            from agent.agent_runtime_helpers import (
+                plan_cache_sections_for_destination,
+            )
+
+            guidance = prepared.get("guidance")
+            planning_messages = agg_messages
+            if guidance:
+                planning_messages = peel_reference_guidance(
+                    agg_messages,
+                    str(guidance),
+                )
+            # plan_cache_sections_for_destination never mutates its inputs
+            # and always returns request-local copies, so the prepared
+            # state stays canonical.
+            # Tri-state: only pass a bool when a live agent snapshot exists.
+            # Prepared-aggregator facades built via __new__ have no _agent;
+            # getattr(self._agent, ...) raises and bool(None-agent) would
+            # force False and suppress the planner's config fallback (#76085).
+            _agent = getattr(self, "_agent", None)
+            _cache_disabled = (
+                getattr(_agent, "_cache_disabled", None)
+                if _agent is not None
+                else None
+            )
+            agg_messages, tools = plan_cache_sections_for_destination(
+                planning_messages,
+                tools,
+                provider=agg_runtime.get("provider") or "",
+                base_url=agg_runtime.get("base_url") or "",
+                api_mode=agg_runtime.get("api_mode") or "",
+                model=agg_runtime.get("model") or "",
+                cache_disabled=_cache_disabled,
+            )
+            if guidance:
+                _attach_reference_guidance(agg_messages, str(guidance))
+        except Exception as exc:  # pragma: no cover - cache planning must not block MoA
+            # Warning, not debug: since the call-block site skips MoA, this
+            # block is the aggregator's ONLY decoration path — a silent
+            # failure here ships an undecorated request and regresses the
+            # exact 0%-cache MoA failure the planning exists to prevent.
+            logger.warning(
+                "MoA aggregator cache plan failed — sending undecorated "
+                "request (cache misses expected): %s", exc,
+            )
         # Record the exact aggregator INPUT (incl. the injected reference
         # context) into the pending trace so a trace captures what the
         # aggregator actually saw, not a reconstruction. Traces are a
@@ -1697,7 +1778,6 @@ class MoAChatCompletions:
             # actually governs the aggregator stream, not just call_llm's default.
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
-        agg_runtime = _slot_runtime(aggregator)
         # _slot_runtime may carry the provider's request_overrides.extra_body;
         # pop it and merge with the caller's extra_body (caller wins) so the
         # explicit kwarg below never collides with **agg_runtime.

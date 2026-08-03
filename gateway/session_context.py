@@ -96,7 +96,6 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
-
 @dataclass(frozen=True)
 class TrustedGatewaySource:
     """Server-authenticated source metadata for privileged gateway tools.
@@ -132,6 +131,12 @@ _TRUSTED_GATEWAY_SOURCE: ContextVar[Optional[TrustedGatewaySource]] = ContextVar
     "HERMES_TRUSTED_GATEWAY_SOURCE",
     default=None,
 )
+
+# Per-session cron marker. Unlike the process-global legacy env var, this is
+# scoped to one cron job / inbound session. _UNSET preserves the legacy env
+# fallback for CLI/tests; "1" marks cron; "" explicitly marks non-cron and
+# masks any leaked process env value.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -173,6 +178,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -250,6 +256,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    cron_session: Any = _UNSET,
     scope_id: str = "",
     parent_chat_id: str = "",
     role_authorized: bool = False,
@@ -271,6 +278,10 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
+    ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
+    and ``""`` explicitly marks a non-cron session while masking leaked env.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -291,6 +302,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
         _TRUSTED_GATEWAY_SOURCE.set(
             TrustedGatewaySource(
@@ -346,6 +358,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CRON_SESSION,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

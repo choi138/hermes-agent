@@ -316,6 +316,14 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
+    # ACP (Agent Client Protocol) keys — profile-isolable so different
+    # profiles can use different ACP backends without cross-leak.
+    "HERMES_ACP_AUTH_METHOD",
+    "HERMES_ACP_AUTO_APPROVE",
+    "HERMES_COPILOT_ACP_COMMAND",
+    "HERMES_COPILOT_ACP_ARGS",
+    "COPILOT_CLI_PATH",
+    "COPILOT_ACP_BASE_URL",
 })
 import yaml
 
@@ -1678,7 +1686,9 @@ def get_custom_provider_extra_headers(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
-        return normalize_extra_headers(entry.get("extra_headers"))
+        headers = normalize_extra_headers(entry.get("extra_headers"))
+        if headers:
+            return headers
     return {}
 
 
@@ -3232,20 +3242,29 @@ def apply_terminal_config_to_env(
     gives those child-process launch paths the same config bridge as classic
     CLI without importing ``cli.py`` and paying for its startup side effects.
 
-    When the user config contains a ``terminal`` section, config.yaml is
-    authoritative and overrides existing env values.  Otherwise defaults only
-    backfill missing env vars so exported/.env values keep working.
+    Explicit keys in the user config's ``terminal`` section are authoritative
+    and override their matching env values.  Merged defaults only backfill
+    missing env vars; they never replace unrelated exported/.env values.
     """
     target = os.environ if env is None else env
 
     raw_config = read_raw_config()
-    file_has_terminal_config = isinstance(raw_config.get("terminal"), dict)
+    raw_terminal_cfg = raw_config.get("terminal")
+    file_has_terminal_config = isinstance(raw_terminal_cfg, dict)
+    if not file_has_terminal_config:
+        raw_terminal_cfg = {}
     should_override = file_has_terminal_config if override is None else override
 
     cfg = config if config is not None else load_config_readonly()
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
         return target
+
+    # A caller-supplied config is its own source of explicit keys.  For the
+    # normal merged-config path, only keys present in raw config.yaml may
+    # override existing env values; keys inherited from DEFAULT_CONFIG are
+    # backfill-only.
+    explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
@@ -3257,7 +3276,7 @@ def apply_terminal_config_to_env(
                 continue
             if isinstance(value, str):
                 value = os.path.expanduser(value)
-        if should_override or env_var not in target:
+        if (should_override and cfg_key in explicit_keys) or env_var not in target:
             target[env_var] = _terminal_env_value(value)
     return target
 
@@ -4089,10 +4108,36 @@ def reload_env() -> int:
 
 
 def get_env_value(key: str) -> Optional[str]:
-    """Get a value from ~/.hermes/.env or environment."""
-    # Check environment first
-    if key in os.environ:
-        return os.environ[key]
+    """Get a value from ``os.environ`` or ``~/.hermes/.env``, scope-aware.
+
+    The ``os.environ`` read routes through ``agent.secret_scope.get_secret``
+    so that, under an active profile scope (multiplexed gateway turn), this
+    is scope-checked rather than leaking another profile's raw ``os.environ``
+    value. ``get_secret`` encodes the whole policy: global vars pass through;
+    scope is authoritative under multiplexing (miss -> None, no environ
+    fallthrough); when multiplexing is off it behaves exactly like the
+    legacy ``os.environ`` read. Its siblings ``get_env_value_prefer_dotenv``
+    and ``gateway.config._getenv`` already work this way — this was the last
+    scope-blind reader of the trio (#67027).
+    """
+    try:
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            get_secret as _get_secret,
+        )
+    except Exception:
+        if key in os.environ:
+            return os.environ[key]
+        return load_env().get(key)
+
+    try:
+        val = _get_secret(key)
+    except UnscopedSecretError:
+        raise
+    except Exception:
+        val = os.environ.get(key)
+    if val is not None:
+        return val
 
     # Then check .env file
     env_vars = load_env()
@@ -4838,8 +4883,15 @@ def set_config_value(key: str, value: str, force: bool = False):
         try:
             with open(config_path, encoding="utf-8") as f:
                 user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+        except Exception as exc:
+            print(
+                f"✗ Cannot parse {config_path}: {exc}\n"
+                f"  The file contains a YAML syntax error. Fix the error\n"
+                f"  in your config file first, then retry.\n"
+                f"  (hermes config edit will open it in your editor.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -4861,6 +4913,16 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+    # Normalize a scalar ``model`` key before writing sub-keys so that
+    # ``hermes config set model.provider openai`` doesn't silently
+    # destroy the model id when ``model`` is a bare string shorthand
+    # (e.g. ``model: gpt-4o``).  Without this _set_nested replaces the
+    # scalar with an empty dict, dropping the model id permanently.
+    _model_key = key.strip().lower()
+    if _model_key.startswith("model."):
+        _model_val = user_config.get("model")
+        if isinstance(_model_val, str) and _model_val:
+            user_config["model"] = {"default": _model_val}
     # Guard against #74995: a single-segment key that names an existing
     # mapping would silently overwrite the entire section with a scalar
     # (e.g. ``hermes config set model gpt-5.6-sol`` when model already
@@ -5036,8 +5098,15 @@ def unset_config_value(key: str):
         try:
             with open(config_path, encoding="utf-8") as f:
                 user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+        except Exception as exc:
+            print(
+                f"✗ Cannot parse {config_path}: {exc}\n"
+                f"  The file contains a YAML syntax error. Fix the error\n"
+                f"  in your config file first, then retry.\n"
+                f"  (hermes config edit will open it in your editor.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     removed = _unset_nested(user_config, key)
 

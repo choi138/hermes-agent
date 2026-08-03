@@ -73,8 +73,9 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
-    apply_anthropic_cache_control,
+    build_prompt_cache_plan,
     strip_anthropic_cache_control,
+    strip_anthropic_tool_cache_control,
 )
 from agent.request_footprint import canonical_tool_schema_metrics, text_metrics
 from agent.retry_utils import (
@@ -743,6 +744,92 @@ _CONTENT_POLICY_RECOVERY_HINT = (
 )
 
 
+# Memo for the send-path tool-call argument canonicalization inside
+# run_conversation().  That pass re-canonicalizes the arguments string of
+# EVERY historical tool call on EVERY API-call iteration (quadratic in
+# session tool-call count), and the api_messages copies share the exact
+# argument string objects with the persisted history, so the same strings
+# come through unchanged iteration after iteration.
+#
+# Soundness: canonicalization is a pure, deterministic function of the
+# input string (fixed separators, sort_keys=True), so a value-keyed memo
+# is exact — equal inputs always produce the canonical form computed the
+# first time.  Malformed strings raise out of json.loads BEFORE anything
+# is stored, so the repair fallback below is never memoized and reruns on
+# every occurrence, exactly as before.  Bounded FIFO eviction mirrors the
+# _MSG_TOKENS_CACHE idiom in agent/model_metadata.py.
+_CANON_ARGS_CACHE: Dict[str, str] = {}
+_CANON_ARGS_CACHE_MAX = 4096
+# Count bound alone doesn't bound MEMORY: write_file/patch argument strings
+# run 100KB+, so 4096 entries could pin ~800MB in a long-lived gateway
+# process. The byte budget keeps the memo effective for the common case
+# (args ~0.5-2KB) while bounding the worst case.
+_CANON_ARGS_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_canon_args_cache_bytes = 0
+
+
+def _canonicalize_tool_call_arguments(arg_str: str) -> str:
+    """Return the canonical wire form of a tool-call arguments JSON string.
+
+    Raises whatever ``json.loads`` raises on malformed input; the caller
+    falls back to ``_repair_tool_call_arguments``, exactly as before.
+    """
+    global _canon_args_cache_bytes
+    cached = _CANON_ARGS_CACHE.get(arg_str)
+    if cached is not None:
+        return cached
+    canonical = json.dumps(
+        json.loads(arg_str), separators=(",", ":"), sort_keys=True,
+    )
+    _CANON_ARGS_CACHE[arg_str] = canonical
+    _canon_args_cache_bytes += len(arg_str) + len(canonical)
+    while len(_CANON_ARGS_CACHE) > _CANON_ARGS_CACHE_MAX or (
+        _canon_args_cache_bytes > _CANON_ARGS_CACHE_MAX_BYTES
+        and len(_CANON_ARGS_CACHE) > 1
+    ):
+        try:
+            evicted_key = next(iter(_CANON_ARGS_CACHE))
+            evicted_val = _CANON_ARGS_CACHE.pop(evicted_key)
+            _canon_args_cache_bytes -= len(evicted_key) + len(evicted_val)
+        except (StopIteration, KeyError, RuntimeError):
+            break
+    return canonical
+
+
+def _canonicalize_api_tool_calls(api_messages) -> None:
+    """Canonicalize tool-call argument JSON on the send-path message copy.
+
+    Rewrites each message's ``tool_calls`` in place (copy-on-write for the
+    tool-call dicts it canonicalizes; the persisted history is untouched).
+    The pass still traverses every message and tool call each iteration;
+    the memo above bounds the JSON parse/serialize work to one round-trip
+    per UNIQUE argument string instead of one per string per iteration —
+    the quadratic part of the cost. The remaining traversal is pointer
+    chasing and dict copies, cheap next to a json.loads + json.dumps.
+    """
+    for am in api_messages:
+        tcs = am.get("tool_calls")
+        if not tcs:
+            continue
+        new_tcs = []
+        for tc in tcs:
+            if isinstance(tc, dict) and "function" in tc:
+                try:
+                    tc = {**tc, "function": {
+                        **tc["function"],
+                        "arguments": _canonicalize_tool_call_arguments(
+                            tc["function"]["arguments"]
+                        ),
+                    }}
+                except Exception:
+                    tc["function"]["arguments"] = _repair_tool_call_arguments(
+                        tc["function"]["arguments"],
+                        tc["function"].get("name", "?"),
+                    )
+            new_tcs.append(tc)
+        am["tool_calls"] = new_tcs
+
+
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
@@ -947,7 +1034,8 @@ def _redecorate_prompt_cache_for_provider(
     *,
     system_message=None,
     moa_prepared: Optional[Dict[str, Any]] = None,
-) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    tools_for_api: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]] | tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Strip and re-apply cache_control for the *current* provider policy.
 
     Decoration runs once per call block before the retry loop for the primary
@@ -957,10 +1045,9 @@ def _redecorate_prompt_cache_for_provider(
     by reshaping at the top of each retry attempt.
 
     The source list is the mutated in-flight request (image shrink / ASCII /
-    reasoning_details recoveries already applied) — never a pristine
-    pre-decoration snapshot. MoA guidance is peeled, the base is redecorated,
-    then ``rebase_prepared_request`` re-attaches guidance outside the cached
-    span.
+    reasoning_details recoveries already applied), never a pristine
+    pre-decoration snapshot. MoA guidance is peeled and rebased without
+    decoration; the acting aggregator plans its resolved destination later.
     """
     messages: List[Dict[str, Any]] = [
         dict(m) if isinstance(m, dict) else m for m in (api_messages or [])
@@ -971,6 +1058,21 @@ def _redecorate_prompt_cache_for_provider(
         messages = _peel_moa_guidance(messages, guidance)
 
     strip_anthropic_cache_control(messages)
+    planned_tools = strip_anthropic_tool_cache_control(
+        tools_for_api if tools_for_api is not None else getattr(agent, "tools", [])
+    )
+
+    if prepared is not None and getattr(agent, "provider", None) == "moa":
+        # Prepared MoA state is canonical: the synchronous acting-aggregator
+        # sender owns its destination-local cache plan after it resolves the slot.
+        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+        rebase = getattr(completions, "rebase_prepared_request", None)
+        if callable(rebase):
+            prepared = rebase(prepared, messages)
+            messages = prepared["messages"]
+        if tools_for_api is None:
+            return messages, prepared
+        return messages, prepared, planned_tools
 
     # Direct attribute access matches the call-block decoration site — the
     # flags are unconditionally initialized on AIAgent, and a getattr
@@ -978,31 +1080,25 @@ def _redecorate_prompt_cache_for_provider(
     if agent._use_prompt_caching:
         _ensure_cached_system_prompt_static(agent, system_message=system_message)
         static = getattr(agent, "_cached_system_prompt_static", None)
-        messages = apply_anthropic_cache_control(
+        direct_tool_cache = getattr(
+            agent,
+            "_direct_native_anthropic_tool_cache_capability",
+            lambda: False,
+        )()
+        plan = build_prompt_cache_plan(
             messages,
+            planned_tools,
             cache_ttl=agent._cache_ttl,
             native_anthropic=agent._use_native_cache_layout,
             static_system_prefix=static if isinstance(static, str) else None,
+            direct_native_tool_cache=direct_tool_cache,
         )
+        messages = plan.messages
+        planned_tools = plan.tools
 
-    if (
-        prepared is not None
-        and getattr(agent, "provider", None) == "moa"
-    ):
-        # No `and guidance` here: guidance=None is a real prepared shape
-        # (all-references-failed / silent degraded policy builds the
-        # prepared request without attaching guidance), and the MoA facade
-        # sends prepared["messages"] — not api_kwargs["messages"] — so the
-        # rebase must refresh the prepared object even when there is no
-        # guidance to re-attach. rebase_prepared_request handles falsy
-        # guidance by copying the messages and skipping the attach.
-        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
-        rebase = getattr(completions, "rebase_prepared_request", None)
-        if callable(rebase):
-            prepared = rebase(prepared, messages)
-            messages = prepared["messages"]
-
-    return messages, prepared
+    if tools_for_api is None:
+        return messages, prepared
+    return messages, prepared, planned_tools
 
 
 def _apply_context_engine_selection(
@@ -1710,29 +1806,7 @@ def run_conversation(
         for am in api_messages:
             if isinstance(am.get("content"), str):
                 am["content"] = am["content"].strip()
-        for am in api_messages:
-            tcs = am.get("tool_calls")
-            if not tcs:
-                continue
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict) and "function" in tc:
-                    try:
-                        args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {**tc, "function": {
-                            **tc["function"],
-                            "arguments": json.dumps(
-                                args_obj, separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        }}
-                    except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
-                        )
-                new_tcs.append(tc)
-            am["tool_calls"] = new_tcs
+        _canonicalize_api_tool_calls(api_messages)
 
         # Proactively strip any surrogate characters before the API call.
         # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
@@ -1749,12 +1823,8 @@ def run_conversation(
         # regardless of ordering (a single-space pad here previously had to
         # be sequenced after normalization to survive, forking the concept).
 
-        # Apply Anthropic prompt caching for Claude models on native
-        # Anthropic, OpenRouter, and third-party Anthropic-compatible
-        # gateways. Auto-detected: if ``_use_prompt_caching`` is set, inject
-        # cache_control breakpoints for the static system prefix, full system
-        # prompt, and last two messages (or the legacy system-and-3 layout
-        # when no static prefix is available).
+        # Build the request-local cache sections only after every transcript
+        # mutation. The canonical tool registry stays undecorated.
         #
         # Runs LAST, after every message mutation above. Marking earlier
         # defeats the prefix stability the mutations exist to create:
@@ -1769,10 +1839,12 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        if agent._use_prompt_caching:
+        tools_for_api = agent.tools
+        if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
-            api_messages = apply_anthropic_cache_control(
+            _initial_cache_plan = build_prompt_cache_plan(
                 api_messages,
+                tools_for_api,
                 cache_ttl=agent._cache_ttl,
                 native_anthropic=agent._use_native_cache_layout,
                 static_system_prefix=(
@@ -1780,7 +1852,10 @@ def run_conversation(
                     if isinstance(_static_system_prefix, str)
                     else None
                 ),
+                direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
             )
+            api_messages = _initial_cache_plan.messages
+            tools_for_api = _initial_cache_plan.tools
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2140,15 +2215,22 @@ def run_conversation(
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
                 # re-render for the current provider before building kwargs.
-                api_messages, _moa_prepared_request = (
+                api_messages, _moa_prepared_request, tools_for_api = (
                     _redecorate_prompt_cache_for_provider(
                         agent,
                         api_messages,
                         system_message=system_message,
                         moa_prepared=_moa_prepared_request,
+                        tools_for_api=tools_for_api,
                     )
                 )
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                if tools_for_api == agent.tools:
+                    api_kwargs = agent._build_api_kwargs(api_messages)
+                else:
+                    api_kwargs = agent._build_api_kwargs(
+                        api_messages,
+                        tools_for_api=tools_for_api,
+                    )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2156,6 +2238,7 @@ def run_conversation(
                         api_kwargs,
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
+                        sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2315,6 +2398,7 @@ def run_conversation(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
+                            sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -2613,7 +2697,7 @@ def run_conversation(
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
-                        logger.error(f"{agent.log_prefix}Invalid API response after {max_retries} retries.")
+                        logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
@@ -2628,7 +2712,7 @@ def run_conversation(
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
-                    logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
+                    logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
                     
                     # Sleep in small increments to stay responsive to interrupts
                     sleep_end = time.time() + wait_time
@@ -4582,7 +4666,7 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
+                        logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -4651,7 +4735,7 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
+                        logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
                         return {
@@ -4724,7 +4808,7 @@ def run_conversation(
                             agent._flush_status_buffer()
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                            logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                            logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                             return {
@@ -4843,7 +4927,7 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                        logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -4901,7 +4985,7 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
+                        logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
                         return {
@@ -5167,7 +5251,7 @@ def run_conversation(
                             f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
                             force=True,
                         )
-                    logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
+                    logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the

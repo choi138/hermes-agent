@@ -474,6 +474,12 @@ def finalize_turn(
                 # otherwise ``/resume`` reloads ``content=""`` and the bug
                 # resurfaces cross-session.
                 _tail.pop("_db_persisted", None)
+                # The bounded flush-scan cursor (run_agent.py) skips the
+                # identity-matched prefix of its previous snapshot on the
+                # assumption that no live dict loses the marker in place —
+                # this pop is the one place that does. Invalidate it so the
+                # filled row is re-examined instead of skipped.
+                agent._db_flush_scan_prefix = None
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
@@ -513,6 +519,18 @@ def finalize_turn(
                 ):
                     _before = len(messages)
                     _compacted = _compressor._micro_compact(messages)
+                    # Micro-compaction defrag rewrites the newest MICRO
+                    # marker's content and pops _db_persisted from the live
+                    # dict in place — the sibling of the pop site above. The
+                    # compressor has no agent reference, so it raises a flag
+                    # for us to invalidate the bounded flush-scan cursor;
+                    # otherwise the rewritten marker row is identity-skipped
+                    # and the stale summary persists to state.db.
+                    if getattr(
+                        _compressor, "_flush_scan_cursor_invalidated", False
+                    ):
+                        _compressor._flush_scan_cursor_invalidated = False
+                        agent._db_flush_scan_prefix = None
                     if isinstance(_compacted, list) and _compacted:
                         messages[:] = _compacted
                     _after = len(messages)

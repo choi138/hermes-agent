@@ -1120,9 +1120,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list) -> dict:
+def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    tools_for_api = agent.tools
+    if tools_for_api is None:
+        tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -2382,7 +2383,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logger.warning(f"Failed to get summary response: {e}")
+        logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
         from agent import relay_llm
@@ -2423,7 +2424,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_vm(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
+            logger.warning("Failed to cleanup VM for task %s: %s", task_id, e)
     try:
         headed = False
         try:
@@ -2441,7 +2442,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_browser(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+            logger.warning("Failed to cleanup browser for task %s: %s", task_id, e)
 
 
 def _build_partial_stream_stub(
