@@ -145,8 +145,26 @@ class TestRefusalOutsideScope:
 
 
 class TestSkips:
+    def test_file_removed_during_access_check_is_not_reported_readonly(
+        self, hermes_home, tmp_path, monkeypatch
+    ):
+        """A concurrent quarantine may rename state.db after is_file()."""
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        db = outside / "state.db"
+        db.write_bytes(bytes(4096))
+        real_access = os.access
 
+        def remove_before_access(path, mode):
+            if Path(path) == db:
+                db.unlink(missing_ok=True)
+                return False
+            return real_access(path, mode)
 
+        monkeypatch.setattr(hermes_state.os, "access", remove_before_access)
+
+        preflight_db_writability(db, db_label="state.db")
+        assert not db.exists()
 
     def test_healthy_db_untouched(self, hermes_home):
         db = hermes_home / "state.db"

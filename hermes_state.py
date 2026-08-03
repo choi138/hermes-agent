@@ -1077,10 +1077,35 @@ def preflight_db_writability(
         except (OSError, ValueError):
             return False
 
-    def _ensure_writable(p: Path, *, is_dir: bool = False) -> None:
+    def _ensure_writable(
+        p: Path,
+        *,
+        is_dir: bool = False,
+        missing_ok: bool = False,
+    ) -> None:
         import stat as _stat
 
         if os.access(p, os.R_OK | os.W_OK):
+            return
+
+        # The main DB and its WAL/SHM sidecars are volatile between the
+        # caller's ``is_file()`` probe and this access check. A concurrent
+        # zeroed-DB quarantine can rename the main file, and SQLite can remove
+        # sidecars during checkpoint/close. A vanished optional file is not a
+        # read-only file, so let the subsequent connection re-evaluate the
+        # current path instead of reporting a false permission failure.
+        def _vanished() -> bool:
+            if not missing_ok:
+                return False
+            try:
+                p.stat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            return False
+
+        if _vanished():
             return
         if _in_repair_scope(p):
             try:
@@ -1096,6 +1121,8 @@ def preflight_db_writability(
                     "x" if is_dir else "",
                 )
                 return
+        if _vanished():
+            return
         kind = "directory" if is_dir else "file"
         wal_note = (
             " Do NOT delete the -wal file — it contains committed data that "
@@ -1119,7 +1146,7 @@ def preflight_db_writability(
     for suffix in ("", "-wal", "-shm"):
         p = db_path.with_name(db_path.name + suffix) if suffix else db_path
         if p.is_file():
-            _ensure_writable(p)
+            _ensure_writable(p, missing_ok=True)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
