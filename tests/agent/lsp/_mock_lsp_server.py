@@ -188,6 +188,9 @@ def main():
             continue
 
         if msg.get("method") == "exit":
+            exit_delay = float(os.environ.get("MOCK_LSP_EXIT_DELAY", "0"))
+            if exit_delay > 0:
+                time.sleep(exit_delay)
             return 0
 
         # Unknown request: respond with method-not-found.
