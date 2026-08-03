@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -33,7 +34,8 @@ from plugins.mention_inbox.proposals import (
     proposal_to_json,
 )
 from plugins.mention_inbox.router import InboxDiscordMessage
-from plugins.mention_inbox.store import MentionInboxStore
+from plugins.mention_inbox.store import MentionInboxStore, work_execution_id
+from plugins.mention_inbox.workspace import WorktreeRequest
 
 NOW = datetime(2026, 7, 29, 11, 0, tzinfo=timezone.utc)
 SUBJECT = "github:R_repo:PR_7"
@@ -50,7 +52,12 @@ WORKSPACE = "/Users/test/Documents/hermes-workspaces/silviahealth-content"
 COMMIT_SHA = "abc1234" + ("0" * 33)
 
 
-def _proposal(*, executor_hint: str = "direct", publish: bool = False):
+def _proposal(
+    *,
+    executor_hint: str = "direct",
+    publish: bool = False,
+    head_sha: str = "head-1",
+):
     allowed_actions = [
         "read_repository",
         "edit_scoped_files",
@@ -67,7 +74,7 @@ def _proposal(*, executor_hint: str = "direct", publish: bool = False):
         source_dedupe_key=DEDUPE,
         source_revision=SOURCE_REVISION,
         subject_key=SUBJECT,
-        head_sha="head-1",
+        head_sha=head_sha,
         goal="요청된 PR 변경을 확인하고 범위 안에서 수정한다.",
         steps=("diff를 읽는다.", "범위 내 수정을 한다.", "테스트한다."),
         allowed_actions=tuple(allowed_actions),
@@ -87,6 +94,8 @@ def _state(
         head_sha=head_sha,
         head_ref=HEAD_REF,
         head_repository=HEAD_REPOSITORY,
+        repository_node_id="R_repo",
+        base_repository="owner/repo",
     )
 
 
@@ -95,11 +104,16 @@ def _seed(
     *,
     executor_hint: str = "direct",
     publish: bool = False,
+    head_sha: str = "head-1",
 ):
     store = MentionInboxStore(path, clock=lambda: NOW)
     store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
     store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
-    proposal = _proposal(executor_hint=executor_hint, publish=publish)
+    proposal = _proposal(
+        executor_hint=executor_hint,
+        publish=publish,
+        head_sha=head_sha,
+    )
     store.create_proposal(proposal)
     store.record_proposal_message(
         proposal.proposal_id,
@@ -123,10 +137,25 @@ class _Resolver:
 class _Discord:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.edits: list[tuple[str, str, str]] = []
 
     async def send_to_thread(self, thread_id: str, content: str) -> str:
         self.sent.append((thread_id, content))
         return f"reply-{len(self.sent)}"
+
+    async def edit_thread_message(
+        self,
+        thread_id: str,
+        message_id: str,
+        content: str,
+    ) -> None:
+        self.edits.append((thread_id, message_id, content))
+
+    async def find_marker(
+        self, thread_id: str, marker: str, *, limit: int
+    ) -> str | None:
+        del thread_id, marker, limit
+        return None
 
 
 class _Dispatcher:
@@ -161,7 +190,22 @@ class _Dispatcher:
         )
 
 
-def _handler(store, resolver, dispatcher, discord):
+class _WorktreeManager:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.requests: list[WorktreeRequest] = []
+
+    def workspace_for(self, execution_id: str) -> Path:
+        return self.root / "executions" / execution_id
+
+    def prepare(self, request: WorktreeRequest) -> Path:
+        self.requests.append(request)
+        workspace = self.workspace_for(request.execution_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        return workspace
+
+
+def _handler(store, resolver, dispatcher, discord, *, workspace_manager=None):
     return ApprovalHandler(
         store=store,
         source_resolver=resolver,
@@ -170,6 +214,7 @@ def _handler(store, resolver, dispatcher, discord):
         bot_mention=BOT_MENTION,
         authorized_approver_ids=frozenset({APPROVER}),
         workspace=WORKSPACE,
+        workspace_manager=workspace_manager,
     )
 
 
@@ -220,6 +265,35 @@ async def test_authorized_exact_reply_commits_receipts_before_queued_dispatch(
     assert "아직 시작되지 않았고" in discord.sent[0][1]
     assert "✅" not in discord.sent[0][1]
     assert proposal.proposal_id not in discord.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_approval_prepares_execution_owned_worktree_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    head_sha = "a" * 40
+    store, proposal = _seed(tmp_path / "inbox.db", head_sha=head_sha)
+    dispatcher = _Dispatcher(store)
+    manager = _WorktreeManager(tmp_path / "workspaces")
+
+    result = await _handler(
+        store,
+        _Resolver(_state(head_sha)),
+        dispatcher,
+        _Discord(),
+        workspace_manager=manager,
+    ).approve(_approval_message(), proposal)
+
+    assert result.kind == "execution_queued"
+    assert len(manager.requests) == 1
+    request = dispatcher.requests[0]
+    assert manager.requests[0].execution_id == request.execution_id
+    assert request.workspace == str(
+        (tmp_path / "workspaces" / "executions" / request.execution_id).resolve()
+    )
+    execution = store.get_execution(request.execution_id)
+    assert execution is not None
+    assert execution.workspace == request.workspace
 
 
 @pytest.mark.asyncio
@@ -312,13 +386,18 @@ async def test_dispatch_failure_is_persisted_blocked_without_error_leak(
     assert execution.dispatch_id == f"direct:{execution.execution_id}"
     assert len(discord.sent) == 2
     assert "아직 시작되지 않았" in discord.sent[0][1]
-    assert "시작하지 못" in discord.sent[1][1]
+    assert "시작하지 않았" in discord.sent[1][1]
     assert "private-token-value" not in "\n".join(
         content for _, content in discord.sent
     )
 
 
-def _store_source_event(store: MentionInboxStore, *, api_url: str) -> None:
+def _store_source_event(
+    store: MentionInboxStore,
+    *,
+    api_url: str,
+    repository: str = "silviahealth/content",
+) -> None:
     event = ingest_event({
         "schema_version": "1",
         "source": {"platform": "github", "event_id": "IC_99"},
@@ -333,7 +412,8 @@ def _store_source_event(store: MentionInboxStore, *, api_url: str) -> None:
             "action_detail": "direct_review_requested",
             "source_url": "https://github.com/silviahealth/content/pull/7",
             "metadata": {
-                "repository": "silviahealth/content",
+                "repository": repository,
+                "repository_private": False,
                 "subject_type": "PullRequest",
                 "subject_number": 7,
                 "subject_key": SUBJECT,
@@ -348,18 +428,32 @@ def _store_source_event(store: MentionInboxStore, *, api_url: str) -> None:
 
 
 class _GitHubClient:
-    def __init__(self) -> None:
+    def __init__(self, payload=None) -> None:
         self.urls: list[str] = []
+        self.payload = payload
 
     def fetch_subject(self, url: str):
         self.urls.append(url)
+        if self.payload is not None:
+            return self.payload
         return {
             "number": 7,
             "updated_at": "2026-07-29T10:03:00Z",
+            "user": {"node_id": "U_recent"},
+            "base": {
+                "repo": {
+                    "node_id": "R_repo",
+                    "full_name": "silviahealth/content",
+                    "private": False,
+                }
+            },
             "head": {
                 "sha": "head-3",
                 "ref": HEAD_REF,
-                "repo": {"full_name": HEAD_REPOSITORY},
+                "repo": {
+                    "full_name": HEAD_REPOSITORY,
+                    "private": False,
+                },
             },
         }
 
@@ -382,8 +476,67 @@ async def test_github_resolver_reloads_subject_revision_and_head_from_stored_url
         head_sha="head-3",
         head_ref=HEAD_REF,
         head_repository=HEAD_REPOSITORY,
+        repository_node_id="R_repo",
+        base_repository="silviahealth/content",
     )
     assert client.urls == [api_url]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        ("base_private", True),
+        ("head_private", True),
+        ("base_node_id", "R_changed"),
+        ("base_name", "changed/project"),
+        ("author_node_id", "U_someone_else"),
+    ),
+)
+async def test_external_resolver_rejects_fresh_private_or_changed_scope(
+    tmp_path: Path, mutation: tuple[str, object]
+) -> None:
+    store, proposal = _seed(tmp_path / f"external-{mutation[0]}.db")
+    repository = "external/project"
+    api_url = f"https://api.github.com/repos/{repository}/pulls/7"
+    _store_source_event(store, api_url=api_url, repository=repository)
+    payload = {
+        "number": 7,
+        "updated_at": SOURCE_REVISION,
+        "user": {"node_id": "U_recent"},
+        "base": {
+            "repo": {
+                "node_id": "R_repo",
+                "full_name": repository,
+                "private": False,
+            }
+        },
+        "head": {
+            "sha": "head-1",
+            "ref": HEAD_REF,
+            "repo": {"full_name": "contributor/project", "private": False},
+        },
+    }
+    key, value = mutation
+    if key == "base_private":
+        payload["base"]["repo"]["private"] = value
+    elif key == "head_private":
+        payload["head"]["repo"]["private"] = value
+    elif key == "base_node_id":
+        payload["base"]["repo"]["node_id"] = value
+    elif key == "base_name":
+        payload["base"]["repo"]["full_name"] = value
+    else:
+        payload["user"]["node_id"] = value
+    resolver = GitHubSubjectStateResolver(
+        store=store,
+        client=_GitHubClient(payload),
+        include_public_actionable_activity=True,
+        external_repository_actions="own_pr_write",
+    )
+
+    with pytest.raises(ValueError):
+        await resolver.resolve(proposal)
 
 
 @pytest.mark.asyncio
@@ -480,12 +633,21 @@ def _seed_queued(
     executor_hint: str = "direct",
     publish: bool = False,
     workspace: str = WORKSPACE,
+    workspace_manager: _WorktreeManager | None = None,
+    head_sha: str = "head-1",
 ):
     store, proposal = _seed(
         path,
         executor_hint=executor_hint,
         publish=publish,
+        head_sha=head_sha,
     )
+    if workspace_manager is not None:
+        workspace = str(
+            workspace_manager.workspace_for(
+                work_execution_id(proposal.proposal_id, proposal.revision)
+            ).resolve()
+        )
     approved = store.approve_proposal_cas(
         proposal_id=proposal.proposal_id,
         revision=proposal.revision,
@@ -548,12 +710,95 @@ async def test_lifecycle_completes_only_with_successful_verification_receipt(
     assert latest is not None and latest.status is ProposalStatus.COMPLETED
     assert receipt is not None and receipt.status == "completed"
     assert "시작" in discord.sent[0][1]
-    assert "검증" in discord.sent[1][1]
-    assert discord.sent[2][1].startswith("완료")
-    rendered = "\n".join(content for _, content in discord.sent)
+    assert "검증" in discord.edits[0][2]
+    assert "마무리" in discord.edits[-1][2]
+    assert discord.sent[1][1].startswith("✅")
+    assert receipt.status_message_id == "reply-1"
+    assert receipt.terminal_receipt_message_id == "reply-2"
+    rendered = "\n".join(
+        [content for _, content in discord.sent]
+        + [content for _, _, content in discord.edits]
+    )
     assert execution.execution_id not in rendered
     assert proposal.proposal_id not in rendered
     assert "private-token-value" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_completed_execution_recovers_receipt_after_crash_before_send(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(tmp_path / "receipt-before-send.db")
+    discord = _Discord()
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=discord, workspace=WORKSPACE
+    )
+    store.mark_execution_running(execution.execution_id, tool_name="terminal")
+    store.record_execution_tool_completion(
+        execution.execution_id,
+        tool_name="terminal",
+        success=True,
+        exit_code=0,
+        action="verification",
+    )
+    store.mark_execution_verifying(execution.execution_id)
+    completed = store.complete_execution_with_terminal_receipt(
+        execution.execution_id,
+        content="✅ recovered completion",
+    )
+
+    assert completed.status == "completed"
+    assert completed.terminal_receipt_message_id is None
+    assert await observer.reconcile_terminal_receipts() == 1
+    assert len(discord.sent) == 1
+    assert "[hermes-execution-receipt:" in discord.sent[0][1]
+    assert store.get_execution(execution.execution_id).terminal_receipt_message_id == (
+        "reply-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_execution_reconciles_uncertain_send_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    store, _, execution = _seed_queued(tmp_path / "receipt-after-send.db")
+    store._clock = lambda: now[0]
+    store.mark_execution_running(execution.execution_id, tool_name="terminal")
+    store.record_execution_tool_completion(
+        execution.execution_id,
+        tool_name="terminal",
+        success=True,
+        exit_code=0,
+        action="verification",
+    )
+    store.mark_execution_verifying(execution.execution_id)
+    store.complete_execution_with_terminal_receipt(
+        execution.execution_id,
+        content="✅ uncertain completion",
+    )
+    claim = store.claim_terminal_receipt(lease_seconds=10)
+    assert claim is not None
+    now[0] += timedelta(seconds=11)
+
+    class DiscordWithHistory(_Discord):
+        async def find_marker(
+            self, thread_id: str, marker: str, *, limit: int
+        ) -> str | None:
+            del thread_id, limit
+            assert marker in claim.content
+            return "already-sent"
+
+    discord = DiscordWithHistory()
+    observer = ExecutionLifecycleObserver(
+        store=store, discord=discord, workspace=WORKSPACE
+    )
+
+    assert await observer.reconcile_terminal_receipts() == 1
+    assert discord.sent == []
+    assert store.get_execution(execution.execution_id).terminal_receipt_message_id == (
+        "already-sent"
+    )
 
 
 @pytest.mark.asyncio
@@ -572,7 +817,7 @@ async def test_lifecycle_blocks_agent_turn_without_tool_activity(
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.BLOCKED
     assert store.get_execution(execution.execution_id).status == "blocked"
     assert len(discord.sent) == 1
-    assert "시작하지 못" in discord.sent[0][1]
+    assert "시작하지 않았" in discord.sent[0][1]
     assert "no_tool_activity" in discord.sent[0][1]
 
 
@@ -623,7 +868,10 @@ async def test_kanban_lifecycle_records_durable_queue_without_claiming_completio
     assert outcome == "queued"
     assert store.get_execution(execution.execution_id).status == "completed"
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.QUEUED
-    rendered = "\n".join(content for _, content in discord.sent)
+    rendered = "\n".join(
+        [content for _, content in discord.sent]
+        + [content for _, _, content in discord.edits]
+    )
     assert "Kanban" in rendered
     assert "구현 완료가 아니라" in rendered
     assert "private-card-id" not in rendered
@@ -656,6 +904,28 @@ async def test_execution_context_must_match_reserved_proposal_and_mode(
             proposal_hash=proposal.content_hash,
             mode="kanban",
         )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_accepts_only_execution_worktree_under_workspace_root(
+    tmp_path: Path,
+) -> None:
+    worktree = f"{WORKSPACE}/executions/wx_1234567890abcdef12345678"
+    store, proposal, execution = _seed_queued(
+        tmp_path / "worktree-context.db",
+        workspace=worktree,
+    )
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=_Discord(),
+        workspace=WORKSPACE,
+    )
+
+    observer.validate_execution_context(
+        execution.execution_id,
+        proposal_hash=proposal.content_hash,
+        mode="direct",
+    )
 
 
 @pytest.mark.asyncio
@@ -951,7 +1221,7 @@ async def test_publish_completion_requires_post_commit_sha_receipt(
     assert outcome == "blocked"
     assert store.get_execution(execution.execution_id).status == "blocked"
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.BLOCKED
-    assert "verification_missing" in discord.sent[-1][1]
+    assert "verification_missing" in discord.edits[-1][2]
 
 
 class _RecoveryDispatcher:
@@ -985,6 +1255,106 @@ async def test_recovery_revalidates_and_readmits_queued_execution(
     assert store.get_execution(execution.execution_id).status == "queued"
     assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.QUEUED
     assert discord.sent == []
+
+
+@pytest.mark.asyncio
+async def test_overlapping_recovery_instances_atomically_claim_execution(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "recover-claim.db"
+    store, _, execution = _seed_queued(db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingResolver(_Resolver):
+        async def resolve(self, proposal):
+            self.calls += 1
+            entered.set()
+            await release.wait()
+            return self.state
+
+    first_dispatcher = _RecoveryDispatcher()
+    second_dispatcher = _RecoveryDispatcher()
+    first = _handler(
+        MentionInboxStore(db, clock=lambda: NOW),
+        BlockingResolver(_state()),
+        first_dispatcher,
+        _Discord(),
+    )
+    second = _handler(
+        MentionInboxStore(db, clock=lambda: NOW),
+        _Resolver(_state()),
+        second_dispatcher,
+        _Discord(),
+    )
+
+    first_task = asyncio.create_task(first.recover_queued())
+    await entered.wait()
+    assert await second.recover_queued() == 0
+    release.set()
+    assert await first_task == 1
+    assert [request.execution_id for request in first_dispatcher.requests] == [
+        execution.execution_id
+    ]
+    assert second_dispatcher.requests == []
+
+
+@pytest.mark.asyncio
+async def test_policy_rollback_durably_invalidates_queued_external_execution(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(tmp_path / "policy-rollback.db")
+    _store_source_event(
+        store,
+        api_url="https://api.github.com/repos/external/project/pulls/7",
+        repository="external/project",
+    )
+    discord = _Discord()
+    handler = _handler(
+        store,
+        _Resolver(_state()),
+        _RecoveryDispatcher(),
+        discord,
+    )
+
+    changed = await handler.reconcile_execution_policy(
+        trusted_repositories=frozenset({"silviahealth/content"}),
+        external_repository_actions="disabled",
+    )
+
+    assert changed == 1
+    assert store.get_execution(execution.execution_id).status == "blocked"
+    assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.NEEDS_REAPPROVAL
+    assert "이전 실행 요청은 사용하지 않고" in discord.sent[0][1]
+    assert await handler.recover_queued() == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_recreates_exact_execution_worktree_before_readmission(
+    tmp_path: Path,
+) -> None:
+    manager = _WorktreeManager(tmp_path / "workspaces")
+    head_sha = "a" * 40
+    store, _, execution = _seed_queued(
+        tmp_path / "recover-worktree.db",
+        workspace_manager=manager,
+        head_sha=head_sha,
+    )
+    dispatcher = _RecoveryDispatcher()
+    handler = _handler(
+        store,
+        _Resolver(_state(head_sha)),
+        dispatcher,
+        _Discord(),
+        workspace_manager=manager,
+    )
+
+    recovered = await handler.recover_queued()
+
+    assert recovered == 1
+    assert len(manager.requests) == 1
+    assert manager.requests[0].execution_id == execution.execution_id
+    assert dispatcher.requests[0].workspace == execution.workspace
 
 
 @pytest.mark.asyncio

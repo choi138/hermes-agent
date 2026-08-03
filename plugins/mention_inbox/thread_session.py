@@ -130,8 +130,32 @@ def _read_only_content(
     }
 
 
+def _external_write_allowed(
+    event: MentionEvent,
+    *,
+    trusted_repositories: frozenset[str],
+    external_repository_actions: str,
+) -> bool:
+    metadata = _metadata(event)
+    repository = metadata.get("repository")
+    if repository in trusted_repositories:
+        return True
+    actionable_kind = metadata.get("actionable_kind") or event.untrusted.action_detail
+    return bool(
+        external_repository_actions == "own_pr_write"
+        and metadata.get("repository_private") is False
+        and metadata.get("subject_owned_by_target") is True
+        and actionable_kind in _OWN_PR_ACTION_KINDS
+        and _head_sha(event) is not None
+    )
+
+
 def _proposal_content(
-    event: MentionEvent, *, source_revision: str | None = None
+    event: MentionEvent,
+    *,
+    source_revision: str | None = None,
+    host_write_allowed: bool = True,
+    repository_code_execution_allowed: bool = True,
 ) -> dict[str, object]:
     metadata = _metadata(event)
     repository = _bounded(metadata.get("repository") or "repository", 100)
@@ -163,6 +187,13 @@ def _proposal_content(
             explanation=f"{explanation} 확인한 내용: {brief.summary}",
         )
 
+    if not host_write_allowed:
+        return _read_only_content(
+            repository=repository,
+            title=title,
+            explanation=f"{explanation} 확인한 내용: {brief.summary}",
+        )
+
     steps: list[str] = []
     seen_urls: set[str] = set()
     for finding in brief.findings:
@@ -177,17 +208,20 @@ def _proposal_content(
             steps.append(f"원문: {_bounded(finding.source_url, 480)}")
     if not steps:
         steps.append(f"확인된 요청: {_bounded(brief.summary, 400)}")
-    steps.append("확인된 범위 안에서만 수정하고 대상 테스트로 검증한다.")
-    allowed_actions = [
-        "read_repository",
-        "edit_scoped_files",
-        "run_targeted_tests",
-    ]
-    verification = [
-        "대상 테스트 통과",
-        "변경 diff와 확인된 요청 대조",
-        "완료 전 실제 실행 근거 확인",
-    ]
+    steps.append(
+        "확인된 범위 안에서만 수정하고 대상 테스트로 검증한다."
+        if repository_code_execution_allowed
+        else "확인된 범위 안에서만 수정하고 repository code 실행 없이 검토한다."
+    )
+    allowed_actions = ["read_repository", "edit_scoped_files"]
+    if repository_code_execution_allowed:
+        allowed_actions.append("run_targeted_tests")
+        verification = ["대상 테스트 통과"]
+    else:
+        verification = ["repository code를 실행하지 않은 정적 diff 검토"]
+    verification.extend(
+        ("변경 diff와 확인된 요청 대조", "완료 전 실제 실행 근거 확인")
+    )
     actionable_kind = metadata.get("actionable_kind") or event.untrusted.action_detail
     if actionable_kind in _OWN_PR_ACTION_KINDS and _head_sha(event) is not None:
         allowed_actions.extend(
@@ -255,6 +289,8 @@ class MentionInboxThreadCoordinator:
         executor_hint: str = "direct",
         auto_archive_duration: int = 1440,
         approval_available: bool = False,
+        trusted_repositories: frozenset[str] = frozenset({"silviahealth/content"}),
+        external_repository_actions: str = "disabled",
     ) -> None:
         if executor_hint not in {"direct", "kanban"}:
             raise ValueError("executor_hint must be direct or kanban")
@@ -262,12 +298,20 @@ class MentionInboxThreadCoordinator:
             raise ValueError("invalid Discord auto archive duration")
         if not isinstance(approval_available, bool):
             raise ValueError("approval_available must be a boolean")
+        if external_repository_actions not in {
+            "disabled",
+            "inspect_only",
+            "own_pr_write",
+        }:
+            raise ValueError("external_repository_actions is invalid")
         self._store = store
         self._discord = discord
         self._bot_mention = bot_mention
         self._executor_hint = executor_hint
         self._auto_archive_duration = auto_archive_duration
         self._approval_available = approval_available
+        self._trusted_repositories = trusted_repositories
+        self._external_repository_actions = external_repository_actions
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _lock(self, subject_key: str) -> asyncio.Lock:
@@ -285,6 +329,12 @@ class MentionInboxThreadCoordinator:
         brief = _bound_brief(event, source_revision=source_revision)
         if brief is None or not brief.approvable:
             return False, "preflight_not_approvable"
+        if not _external_write_allowed(
+            event,
+            trusted_repositories=self._trusted_repositories,
+            external_repository_actions=self._external_repository_actions,
+        ):
+            return False, "approval_unavailable"
         return True, None
 
     def _proposal_for(
@@ -297,7 +347,20 @@ class MentionInboxThreadCoordinator:
         subject = _subject_key(event)
         head_sha = _head_sha(event)
         latest = self._store.get_latest_proposal(subject)
-        content = _proposal_content(event, source_revision=source_revision)
+        metadata = _metadata(event)
+        repository = metadata.get("repository")
+        trusted_repository = repository in self._trusted_repositories
+        host_write_allowed = _external_write_allowed(
+            event,
+            trusted_repositories=self._trusted_repositories,
+            external_repository_actions=self._external_repository_actions,
+        )
+        content = _proposal_content(
+            event,
+            source_revision=source_revision,
+            host_write_allowed=host_write_allowed,
+            repository_code_execution_allowed=trusted_repository,
+        )
         content["executor_hint"] = self._executor_hint
         if latest is None:
             proposal = build_work_proposal(
@@ -422,6 +485,7 @@ class MentionInboxThreadCoordinator:
                         self._bot_mention,
                         approval_offered=approval_offered,
                         approval_unavailable_reason=unavailable_reason,
+                        event=event,
                     )
                 )
                 content = "\n\n".join(parts)
@@ -448,7 +512,24 @@ class MentionInboxThreadCoordinator:
                         # older revision cannot also identify this proposal.
                         message_id = None
                 if message_id is None:
-                    message_id = await self._discord.send_to_thread(thread_id, content)
+                    proposal_sender = getattr(
+                        self._discord,
+                        "send_proposal_to_thread",
+                        None,
+                    )
+                    if callable(proposal_sender):
+                        message_id = await proposal_sender(
+                            thread_id,
+                            content,
+                            proposal_id=proposal.proposal_id,
+                            proposal_revision=proposal.revision,
+                            approval_offered=approval_offered,
+                        )
+                    else:
+                        message_id = await self._discord.send_to_thread(
+                            thread_id,
+                            content,
+                        )
                 self._store.record_proposal_message(
                     proposal.proposal_id,
                     proposal.revision,

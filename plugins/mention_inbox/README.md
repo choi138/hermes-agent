@@ -246,9 +246,12 @@ other external write.
 
 ### Selection and mapping
 
-The collector requires an explicit repository allowlist. An empty allowlist
-collects nothing. P3-M2 hydrates the current GitHub subject and emits only
-current, user-directed actions:
+The collector requires an explicit trusted-repository allowlist. By default,
+repositories outside that list are rejected. When
+`include_public_actionable_activity=true`, public pull requests from other
+repositories may enter hydration, but they are accepted only after the current
+subject proves exact user targeting or exact ownership. P3-M2 hydrates the
+current GitHub subject and emits only current, user-directed actions:
 
 - an explicit direct mention in the selected comment/review -> `reply`
 - a current direct review request whose notification reason is `review_requested`
@@ -291,7 +294,7 @@ $HERMES_HOME/mention_inbox/inbox.db
 
 The store enables WAL, a bounded busy timeout, and owner-only `0600` file mode
 where the platform supports POSIX permissions. The dedupe key is the event
-primary key. Store schema version 7 binds each Discord proposal message to an
+primary key. Store schema version 10 binds each Discord proposal message to an
 immutable `approval_offered` boolean and each approved execution to its verified
 PR head repository, head branch, and absolute workspace root. Migration of
 older proposal rows defaults `approval_offered` to false; an older execution
@@ -352,6 +355,8 @@ mention_inbox:
   enabled: false
   credential_env: GITHUB_PAT_TOKEN
   repositories: [silviahealth/content]
+  include_public_actionable_activity: false
+  external_repository_actions: disabled
   destination: discord:1531851208858275860
   team_mentions: false
   team_review_requests: false
@@ -364,6 +369,7 @@ mention_inbox:
     bot_mention: null
     execution_mode: direct
     workspace: Documents/hermes-workspaces/silviahealth-content
+    workspace_root: Documents/hermes-workspaces
   retention_days: 30
   lease_seconds: 60
 ```
@@ -372,11 +378,36 @@ Read replay is limited to at most seven days and ten pages even when configured
 explicitly. It is GET-only and never changes GitHub notification read state.
 
 When `execution_enabled=true`, both `terminal.cwd` and
-`action_sessions.workspace` are required. `workspace` must be a safe relative
-POSIX path. The runtime resolves it under `terminal.cwd` and durably binds the
-resulting absolute root to each approval. Use a dedicated, clean clone for this
-path; do not point it at the gateway checkout or a directory with unrelated
-changes.
+an action-session workspace scope are required. With
+`external_repository_actions=disabled`, `action_sessions.workspace` names the
+single trusted clone. With either external mode,
+`action_sessions.workspace_root` names the trusted root that contains
+repository caches and execution-owned worktrees. Both values must be safe
+relative POSIX paths and resolve under `terminal.cwd`; do not point either at
+the gateway checkout or a directory with unrelated changes.
+
+External repository authority is configured independently from collection:
+
+- `disabled` keeps every external proposal read-only.
+- `inspect_only` explicitly enables the staged read-only rollout and never
+  offers host execution.
+- `own_pr_write` may offer scoped edit/commit/non-force-push only when fresh
+  GitHub hydration proves a public PR authored by the target user. It never
+  runs repository code or tests on the host. Cache clone/fetch operations use
+  an isolated anonymous Git environment with credential helpers, askpass,
+  ambient GitHub tokens, and user/system Git configuration disabled.
+
+Trusted allowlisted repositories retain the existing targeted-test execution
+path. Before every external approval, the runtime re-fetches the PR and proves
+the base repository name/node ID, public base and head visibility, target
+ownership, current revision, head repository, branch, and SHA.
+
+Startup recovery leases each queued execution atomically so overlapping gateway
+instances cannot admit the same work twice. Disabling an external write policy
+durably blocks its queued executions and moves their proposals back to
+reapproval. Completion state and the bounded terminal Discord receipt are
+committed together; a deterministic receipt marker reconciles uncertain sends
+without duplicating the visible completion message.
 
 Only the launcher resolves `GITHUB_PAT_TOKEN`; status and logs expose category
 labels, never credential or source payload values. Missing credentials and an
@@ -466,12 +497,14 @@ rollout stages. Activation requires its own operational approval and canary; it
 must not make historical messages executable.
 
 After a valid approval, the runtime revalidates the current GitHub source
-revision, PR HEAD SHA, head repository, and head branch before queueing. Direct
-execution runs in an isolated gateway session with only scoped file and terminal
-tools. File paths must be absolute, remain under the approved workspace after
-symlink resolution, and use only the approved read/write actions. Terminal
-calls require an explicit workspace-contained `workdir`; background and
-interactive PTY calls, shell composition, and unapproved programs are blocked.
+revision, base repository identity and visibility, PR ownership when required,
+PR HEAD SHA, head repository visibility, and head branch before queueing.
+Direct execution runs in an isolated gateway session with only scoped file and
+terminal tools. File paths must be absolute, remain under the approved
+workspace after symlink resolution, and use only the approved read/write
+actions. Terminal calls require an explicit workspace-contained `workdir`;
+background and interactive PTY calls, shell composition, and unapproved
+programs are blocked.
 
 Only actionable notifications on the authenticated user's own PR add
 `switch_to_pr_branch`, `commit_changes`, and `push_current_branch`. The allowed

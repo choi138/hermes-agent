@@ -29,6 +29,7 @@ from plugins.mention_inbox.github_collector import GitHubNotificationCollector
 from plugins.mention_inbox.runtime import GitHubMentionPoller
 from plugins.mention_inbox.store import DEFAULT_DESTINATION, MentionInboxStore
 from plugins.mention_inbox.voice import RenderedDiscordEvent, render_action_alert
+from plugins.mention_inbox.workspace import RepositoryWorktreeManager
 
 _ALLOWED_REPOSITORY = "silviahealth/content"
 _ALLOWED_ENV = "GITHUB_PAT_TOKEN"
@@ -43,6 +44,8 @@ class MentionInboxConfig:
     enabled: bool = False
     credential_env: str = _ALLOWED_ENV
     repositories: tuple[str, ...] = (_ALLOWED_REPOSITORY,)
+    include_public_actionable_activity: bool = False
+    external_repository_actions: str = "disabled"
     destination: str = DEFAULT_DESTINATION
     retention_days: int = 30
     lease_seconds: int = 60
@@ -57,6 +60,7 @@ class MentionInboxConfig:
     execution_enabled: bool = False
     execution_mode: str = "direct"
     execution_workspace: str | None = None
+    execution_workspace_root: str | None = None
     terminal_cwd: str | None = None
 
 
@@ -92,6 +96,16 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         raise ValueError("mention_inbox.repositories must be a non-empty string list")
     if set(repositories) != {_ALLOWED_REPOSITORY}:
         raise ValueError("mention_inbox.repositories contains a repository outside the allowlist")
+    include_public_actionable_activity = raw.get(
+        "include_public_actionable_activity", False
+    )
+    if not isinstance(include_public_actionable_activity, bool):
+        raise ValueError(
+            "mention_inbox.include_public_actionable_activity must be a boolean"
+        )
+    external_repository_actions = raw.get("external_repository_actions", "disabled")
+    if external_repository_actions not in {"disabled", "inspect_only", "own_pr_write"}:
+        raise ValueError("mention_inbox.external_repository_actions is invalid")
     if not isinstance(destination, str) or re.fullmatch(r"discord:[1-9][0-9]{5,24}", destination) is None:
         raise ValueError("mention_inbox.destination must be a Discord channel destination")
     team_mentions = raw.get("team_mentions", False)
@@ -138,19 +152,32 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         if workspace_value is None
         else normalize_execution_workspace(workspace_value)
     )
+    workspace_root_value = action_sessions.get("workspace_root")
+    execution_workspace_root = (
+        None
+        if workspace_root_value is None
+        else normalize_execution_workspace(workspace_root_value)
+    )
     if action_sessions_enabled and (bot_mention is None or not approver_ids):
         raise ValueError("enabled action sessions require bot mention and approvers")
     if execution_enabled and not action_sessions_enabled:
         raise ValueError("execution cannot be enabled while action sessions are disabled")
     terminal_cwd: str | None = None
     if execution_enabled:
-        if execution_workspace is None:
-            raise ValueError("enabled execution requires an action-session workspace")
+        selected_workspace = (
+            execution_workspace
+            if external_repository_actions == "disabled"
+            else execution_workspace_root
+        )
+        if selected_workspace is None:
+            raise ValueError(
+                "enabled execution requires an action-session workspace scope"
+            )
         terminal = config.get("terminal", {})
         if not isinstance(terminal, Mapping):
             raise ValueError("terminal must be an object for mention-inbox execution")
         terminal_cwd_value = terminal.get("cwd")
-        resolve_execution_workspace(terminal_cwd_value, execution_workspace)
+        resolve_execution_workspace(terminal_cwd_value, selected_workspace)
         assert isinstance(terminal_cwd_value, str)
         terminal_cwd = terminal_cwd_value
     replay_lookback_minutes = _positive_int(
@@ -171,6 +198,8 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         enabled=enabled,
         credential_env=credential_env,
         repositories=tuple(repositories),
+        include_public_actionable_activity=include_public_actionable_activity,
+        external_repository_actions=external_repository_actions,
         destination=destination,
         retention_days=_positive_int(raw.get("retention_days"), "retention_days", 30),
         lease_seconds=_positive_int(raw.get("lease_seconds"), "lease_seconds", 60),
@@ -185,6 +214,7 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         execution_enabled=execution_enabled,
         execution_mode=execution_mode,
         execution_workspace=execution_workspace,
+        execution_workspace_root=execution_workspace_root,
         terminal_cwd=terminal_cwd,
     )
 
@@ -493,6 +523,48 @@ class GatewayDiscordTransport:
             raise RuntimeError("discord_thread_send_failed")
         return str(result.message_id)
 
+    async def edit_thread_message(
+        self,
+        thread_id: str,
+        message_id: str,
+        content: str,
+    ) -> None:
+        result = await self._adapter.edit_message(
+            thread_id,
+            message_id,
+            content,
+            finalize=True,
+            metadata={
+                "nonconversational": True,
+                "mention_inbox_no_mentions": True,
+            },
+        )
+        if not result.success:
+            raise RuntimeError("discord_thread_edit_failed")
+
+    async def send_proposal_to_thread(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        proposal_id: str,
+        proposal_revision: int,
+        approval_offered: bool,
+    ) -> str:
+        sender = getattr(self._adapter, "send_mention_inbox_proposal", None)
+        if not callable(sender):
+            return await self.send_to_thread(thread_id, content)
+        result = await sender(
+            thread_id,
+            content,
+            proposal_id=proposal_id,
+            proposal_revision=proposal_revision,
+            approval_offered=approval_offered,
+        )
+        if not result.success or not result.message_id:
+            raise RuntimeError("discord_proposal_send_failed")
+        return str(result.message_id)
+
 
 class _LazyGitHubNotificationCollector:
     """Hydrate candidates after resolving the authenticated stable identity."""
@@ -516,6 +588,7 @@ class _LazyGitHubNotificationCollector:
         *,
         team_mentions: bool = False,
         team_review_requests: bool = False,
+        include_public_actionable_activity: bool = False,
     ) -> None:
         if not isinstance(team_mentions, bool) or not isinstance(
             team_review_requests, bool
@@ -525,10 +598,12 @@ class _LazyGitHubNotificationCollector:
         self._repositories = repositories
         self._team_mentions = team_mentions
         self._team_review_requests = team_review_requests
+        self._include_public_actionable_activity = include_public_actionable_activity
         self._collector = GitHubNotificationCollector(
             target_id="github:authenticated-user",
             allowed_repositories=repositories,
             include_owned_pr_activity=True,
+            include_public_actionable_activity=include_public_actionable_activity,
         )
         self._target_login: str | None = None
         self._target_id: str | None = None
@@ -544,6 +619,7 @@ class _LazyGitHubNotificationCollector:
             target_login=user.login,
             allowed_repositories=self._repositories,
             include_owned_pr_activity=True,
+            include_public_actionable_activity=self._include_public_actionable_activity,
         )
 
     def accepts(self, notification: Mapping[str, Any]) -> bool:
@@ -755,6 +831,9 @@ class MentionInboxGatewayService:
                 self.config.repositories,
                 team_mentions=self.config.team_mentions,
                 team_review_requests=self.config.team_review_requests,
+                include_public_actionable_activity=(
+                    self.config.include_public_actionable_activity
+                ),
             )
             poller = GitHubMentionPoller(
                 client=client,
@@ -781,9 +860,19 @@ class MentionInboxGatewayService:
 
                 approval_handler = None
                 if self.config.execution_enabled:
+                    workspace_scope = (
+                        self.config.execution_workspace
+                        if self.config.external_repository_actions == "disabled"
+                        else self.config.execution_workspace_root
+                    )
                     workspace = resolve_execution_workspace(
                         self.config.terminal_cwd,
-                        self.config.execution_workspace,
+                        workspace_scope,
+                    )
+                    workspace_manager = (
+                        None
+                        if self.config.external_repository_actions == "disabled"
+                        else RepositoryWorktreeManager(workspace)
                     )
                     execution_observer = ExecutionLifecycleObserver(
                         store=store,
@@ -800,6 +889,12 @@ class MentionInboxGatewayService:
                             store=store,
                             client=client,
                             allowed_repositories=frozenset(self.config.repositories),
+                            include_public_actionable_activity=(
+                                self.config.external_repository_actions != "disabled"
+                            ),
+                            external_repository_actions=(
+                                self.config.external_repository_actions
+                            ),
                         ),
                         dispatcher=GatewayExecutionDispatcher(self._discord_adapter),
                         discord=discord_transport,
@@ -808,6 +903,7 @@ class MentionInboxGatewayService:
                             self.config.authorized_approver_ids
                         ),
                         workspace=workspace,
+                        workspace_manager=workspace_manager,
                     )
                 thread_coordinator = MentionInboxThreadCoordinator(
                     store=store,
@@ -816,6 +912,10 @@ class MentionInboxGatewayService:
                     executor_hint=self.config.execution_mode,
                     auto_archive_duration=self.config.thread_auto_archive_minutes,
                     approval_available=approval_handler is not None,
+                    trusted_repositories=frozenset(self.config.repositories),
+                    external_repository_actions=(
+                        self.config.external_repository_actions
+                    ),
                 )
                 router = InboxProposalRouter(
                     store=store,
@@ -830,8 +930,14 @@ class MentionInboxGatewayService:
                 self._discord_adapter.set_mention_inbox_router(router)
                 self._router_installed = True
                 if approval_handler is not None:
+                    await execution_observer.reconcile_terminal_receipts()
+                    await approval_handler.reconcile_execution_policy(
+                        trusted_repositories=frozenset(self.config.repositories),
+                        external_repository_actions=(
+                            self.config.external_repository_actions
+                        ),
+                    )
                     await thread_coordinator.reconcile_execution_activation()
-                if approval_handler is not None:
                     await approval_handler.recover_queued()
             delivery = DiscordMentionDelivery(
                 store=store,
