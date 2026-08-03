@@ -176,16 +176,21 @@ def test_proposal_and_status_messages_hide_internal_ids() -> None:
             proposal,
             bot_mention="<@1525050525641805886>",
             approval_offered=True,
+            event=_event(),
         ),
         render_queued(proposal),
     ))
     assert proposal.proposal_id not in combined
     assert proposal.content_hash not in combined
     assert proposal.subject_key not in combined
-    assert "요약" in combined
-    assert "해야 할 일" in combined
-    assert "완료 확인" in combined
-    assert "리뷰 반영해서 수정해줘" in combined
+    assert "현재 요청" in combined
+    assert "제 추천" in combined
+    assert "영향 범위" in combined
+    assert "원문" in combined
+    assert "`리뷰 반영해줘`" in combined
+    assert "요약\n" not in combined
+    assert "해야 할 일" not in combined
+    assert "완료 확인" not in combined
     assert "승인" not in combined
 
 
@@ -223,7 +228,7 @@ def test_proposal_message_is_bounded_without_dropping_natural_request_hint() -> 
     )
 
     assert len(rendered) <= 1900
-    assert "리뷰 반영해서 수정해줘" in rendered
+    assert "`리뷰 반영해줘`" in rendered
     assert "<@1525050525641805886>" not in rendered
     assert "승인" not in rendered
 
@@ -251,8 +256,12 @@ def test_completed_voice_requires_verified_evidence() -> None:
             verified=True,
         )
     )
-    assert "완료" in completed
+    assert "바꾼 내용" in completed
+    assert "확인한 내용" in completed
+    assert "기술 정보" in completed
     assert "4 passed" in completed
+    assert completed.index("바꾼 내용") < completed.index("확인한 내용")
+    assert completed.index("확인한 내용") < completed.index("기술 정보")
 
 
 def test_alert_names_review_summary_action() -> None:

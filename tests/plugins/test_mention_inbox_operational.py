@@ -66,6 +66,8 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     assert disabled.team_review_requests is False
     assert disabled.read_replay_lookback_minutes == 1440
     assert disabled.read_replay_max_pages == 2
+    assert disabled.include_public_actionable_activity is False
+    assert disabled.external_repository_actions == "disabled"
     config = parse_mention_inbox_config({"mention_inbox": {
         "enabled": True,
         "credential_env": "GITHUB_PAT_TOKEN",
@@ -74,6 +76,12 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
         "retention_days": 30,
     }})
     assert config == _enabled_config()
+    public_config = parse_mention_inbox_config({"mention_inbox": {
+        "include_public_actionable_activity": True,
+        "external_repository_actions": "inspect_only",
+    }})
+    assert public_config.include_public_actionable_activity is True
+    assert public_config.external_repository_actions == "inspect_only"
     for invalid in (
         {"enabled": "true"},
         {"enabled": True, "credential_env": "TOKEN"},
@@ -82,6 +90,8 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
         {"enabled": True, "retention_days": 0},
         {"enabled": True, "read_replay_lookback_minutes": 10081},
         {"enabled": True, "read_replay_max_pages": 11},
+        {"include_public_actionable_activity": "true"},
+        {"external_repository_actions": "write"},
     ):
         with pytest.raises(ValueError):
             parse_mention_inbox_config({"mention_inbox": invalid})
@@ -125,6 +135,27 @@ def test_execution_config_requires_scoped_workspace_and_terminal_cwd() -> None:
     without_cwd = {**raw, "terminal": {}}
     with pytest.raises(ValueError):
         parse_mention_inbox_config(without_cwd)
+
+
+def test_external_execution_uses_repository_workspace_root() -> None:
+    parsed = parse_mention_inbox_config({
+        "terminal": {"cwd": "/Users/test"},
+        "mention_inbox": {
+            "include_public_actionable_activity": True,
+            "external_repository_actions": "own_pr_write",
+            "action_sessions": {
+                "enabled": True,
+                "bot_mention": "<@1525050677381279865>",
+                "authorized_approver_ids": ["396159160201658368"],
+                "execution_enabled": True,
+                "workspace_root": "Documents/hermes-workspaces",
+            },
+        },
+    })
+
+    assert parsed.execution_workspace is None
+    assert parsed.execution_workspace_root == "Documents/hermes-workspaces"
+    assert parsed.external_repository_actions == "own_pr_write"
 
 
 def test_renderer_bounds_untrusted_text_escapes_mentions_and_has_marker() -> None:
@@ -786,6 +817,61 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
     assert coordinator._approval_available is expected_handler
 
 
+@pytest.mark.asyncio
+async def test_external_execution_wires_repository_worktree_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plugins.mention_inbox.operational as operational
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            assert token == "opaque-token"
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.router = None
+            self.execution_observer = None
+
+        def set_mention_inbox_router(self, router) -> None:
+            self.router = router
+
+        def set_mention_inbox_execution_observer(self, observer) -> None:
+            self.execution_observer = observer
+
+    monkeypatch.setattr(operational, "GitHubNotificationsClient", Client)
+    monkeypatch.setattr(operational.MentionInboxRuntime, "start", lambda self: None)
+    adapter = Adapter()
+    config = MentionInboxConfig(
+        enabled=True,
+        include_public_actionable_activity=True,
+        external_repository_actions="inspect_only",
+        destination=DESTINATION,
+        action_sessions_enabled=True,
+        proposal_bot_mention="<@1525050677381279865>",
+        authorized_approver_ids=("396159160201658368",),
+        execution_enabled=True,
+        execution_workspace_root="Documents/hermes-workspaces",
+        terminal_cwd="/Users/test",
+    )
+    service = MentionInboxGatewayService(
+        config,
+        adapter,
+        environ={"GITHUB_PAT_TOKEN": "opaque-token"},
+        db_path=tmp_path / "external-worktrees.db",
+    )
+
+    await service.start()
+
+    handler = adapter.router._approval_handler
+    assert handler is not None
+    assert handler._workspace_manager is not None
+    assert handler._workspace == "/Users/test/Documents/hermes-workspaces"
+    assert adapter.execution_observer._workspace == (
+        "/Users/test/Documents/hermes-workspaces"
+    )
+
+
 def test_collector_bounds_external_title_body_before_persistence() -> None:
     collector = GitHubNotificationCollector(
         target_id="github:me", allowed_repositories={"silviahealth/content"}
@@ -793,14 +879,18 @@ def test_collector_bounds_external_title_body_before_persistence() -> None:
     notification = {
         "id": "n1", "reason": "mention", "unread": True,
         "updated_at": "2026-07-29T08:00:00Z",
-        "subject": {"title": "t" * 5000, "type": "Issue", "url": None},
+        "subject": {
+            "title": "t" * 5000,
+            "type": "PullRequest",
+            "url": "https://api.github.com/repos/silviahealth/content/pulls/1",
+        },
         "repository": {
             "node_id": "repo-node", "full_name": "silviahealth/content"
         },
     }
     detail = {
         "node_id": "issue-node", "body": "b" * 50000,
-        "html_url": "https://github.com/silviahealth/content/issues/1",
+        "html_url": "https://github.com/silviahealth/content/pull/1",
         "user": {"node_id": "actor", "type": "User"},
     }
     collected = collector.normalize(notification, detail)

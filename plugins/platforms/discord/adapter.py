@@ -885,6 +885,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._mention_inbox_parent_channels: Dict[str, str] = {}
         self._mention_inbox_thread_locks: Dict[str, asyncio.Lock] = {}
         self._mention_inbox_router: Any = None
+        self._mention_inbox_persistent_view_client: Any = None
+        self._mention_inbox_persistent_views: Dict[str, Any] = {}
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1156,6 +1158,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_mentions=_build_allowed_mentions(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._register_mention_inbox_persistent_views()
             adapter_self = self  # capture for closure
 
             # Register event handlers
@@ -5688,7 +5691,50 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def set_mention_inbox_router(self, router: Any | None) -> None:
         """Install or clear the dedicated registered-work-thread router."""
+        if router is None:
+            client = getattr(self, "_mention_inbox_persistent_view_client", None)
+            remove_view = getattr(client, "remove_view", None)
+            if callable(remove_view):
+                for view in self._mention_inbox_persistent_views.values():
+                    remove_view(view)
+            self._mention_inbox_persistent_views.clear()
         self._mention_inbox_router = router
+        if router is not None:
+            self._register_mention_inbox_persistent_views()
+
+    def _register_mention_inbox_persistent_views(self) -> None:
+        """Restore exact pending proposal controls on the current Discord client."""
+        client = getattr(self, "_client", None)
+        router = getattr(self, "_mention_inbox_router", None)
+        bindings = getattr(router, "persistent_control_bindings", None)
+        add_view = getattr(client, "add_view", None)
+        if client is None or not callable(bindings) or not callable(add_view):
+            return
+        if (
+            getattr(self, "_mention_inbox_persistent_view_client", None)
+            is not client
+        ):
+            self._mention_inbox_persistent_view_client = client
+            self._mention_inbox_persistent_views = {}
+        for binding in bindings():
+            message_id = str(getattr(binding, "proposal_message_id", ""))
+            thread_id = str(getattr(binding, "thread_id", ""))
+            if not message_id.isdigit() or not thread_id.isdigit():
+                logger.warning(
+                    "[%s] Skipping invalid persistent mention-inbox control binding",
+                    self.name,
+                )
+                continue
+            if message_id in self._mention_inbox_persistent_views:
+                continue
+            view = self._build_mention_inbox_proposal_view(
+                thread_id=thread_id,
+                proposal_id=str(binding.proposal_id),
+                proposal_revision=int(binding.proposal_revision),
+                approval_offered=bool(binding.approval_offered),
+            )
+            add_view(view, message_id=int(message_id))
+            self._mention_inbox_persistent_views[message_id] = view
 
     def set_mention_inbox_execution_observer(self, observer: Any | None) -> None:
         """Install or clear the in-process approved-execution lifecycle observer."""
@@ -7031,6 +7077,129 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    def _build_mention_inbox_proposal_view(
+        self,
+        *,
+        thread_id: str,
+        proposal_id: str,
+        proposal_revision: int,
+        approval_offered: bool,
+    ) -> Any:
+        """Build a persistent view bound to one proposal revision and thread."""
+        adapter = self
+
+        class MentionInboxProposalView(discord.ui.View):
+            def __init__(self) -> None:
+                super().__init__(timeout=None)
+                controls = [
+                    ("inspect", "저장된 근거 보기", discord.ButtonStyle.secondary),
+                    ("later", "나중에", discord.ButtonStyle.secondary),
+                ]
+                if approval_offered:
+                    controls.insert(
+                        0,
+                        ("start", "수정 시작", discord.ButtonStyle.success),
+                    )
+                for action, label, style in controls:
+                    button = discord.ui.Button(
+                        label=label,
+                        style=style,
+                        custom_id=(
+                            f"mention-inbox:{action}:{proposal_id}:"
+                            f"{proposal_revision}"
+                        ),
+                    )
+                    button.callback = self._callback(action)
+                    self.add_item(button)
+
+            def _callback(self, action: str):
+                async def handle(interaction: Any) -> None:
+                    # Discord interactions expire quickly. Acknowledge before any
+                    # persistence lookup, responder call, or execution routing.
+                    await interaction.response.defer(ephemeral=True, thinking=True)
+                    message = getattr(interaction, "message", None)
+                    message_id = str(getattr(message, "id", ""))
+                    router = getattr(adapter, "_mention_inbox_router", None)
+                    if router is None:
+                        result_kind = "proposal_action_stale"
+                    else:
+                        result = await router.handle_action(
+                            thread_id=str(thread_id),
+                            proposal_id=proposal_id,
+                            proposal_revision=proposal_revision,
+                            proposal_message_id=message_id,
+                            user_id=str(getattr(interaction.user, "id", "")),
+                            interaction_id=str(getattr(interaction, "id", "")),
+                            action=action,
+                        )
+                        result_kind = result.kind
+                    response = {
+                        "approval_queued": "수정을 준비하고 있어요.",
+                        "execution_queued": "수정을 준비하고 있어요.",
+                        "conversation_response": "저장된 근거를 thread에 요약했어요.",
+                        "conversation_fallback": "저장된 근거를 thread에 요약했어요.",
+                        "proposal_deferred": "이 요청은 그대로 두고 나중에 진행할게요.",
+                        "proposal_action_unauthorized": "이 작업을 실행할 권한이 없어요.",
+                        "proposal_action_stale": "더 최신 요청이 있어 이 버튼은 사용하지 않았어요.",
+                    }.get(result_kind, "요청 상태를 thread에서 확인해 주세요.")
+                    if result_kind not in {
+                        "proposal_action_unauthorized",
+                        "proposal_action_stale",
+                    }:
+                        for child in self.children:
+                            child.disabled = True
+                        if message is not None:
+                            await message.edit(view=self)
+                    await interaction.followup.send(
+                        response,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+
+                return handle
+
+        return MentionInboxProposalView()
+
+    async def send_mention_inbox_proposal(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        proposal_id: str,
+        proposal_revision: int,
+        approval_offered: bool,
+    ) -> SendResult:
+        """Send revision-bound persistent controls beside a proposal."""
+
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        if getattr(self, "_mention_inbox_router", None) is None:
+            return SendResult(success=False, error="Mention-inbox router unavailable")
+
+        try:
+            channel = self._client.get_channel(int(thread_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(thread_id))
+            view = self._build_mention_inbox_proposal_view(
+                thread_id=thread_id,
+                proposal_id=proposal_id,
+                proposal_revision=proposal_revision,
+                approval_offered=approval_offered,
+            )
+            message = await channel.send(
+                content=self.format_message(content),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return SendResult(success=True, message_id=str(message.id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_mention_inbox_proposal failed: %s",
+                self.name,
+                exc,
+            )
+            return SendResult(success=False, error=str(exc))
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",

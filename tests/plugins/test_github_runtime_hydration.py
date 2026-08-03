@@ -136,6 +136,7 @@ def _poll(
     *,
     team_mentions: bool = False,
     team_review_requests: bool = False,
+    include_public_actionable_activity: bool = False,
 ):
     store = MentionInboxStore(
         tmp_path / "inbox.db",
@@ -146,6 +147,7 @@ def _poll(
         ("silviahealth/content",),
         team_mentions=team_mentions,
         team_review_requests=team_review_requests,
+        include_public_actionable_activity=include_public_actionable_activity,
     )
     result = GitHubMentionPoller(
         client=client,
@@ -315,6 +317,52 @@ class _AIReviewClient(_Client):
     def fetch_pull_review_comments(self, url: str, *, repository: str, limit: int = 50):
         self.calls.append("review_comments")
         return (self._ai_event(),) if self.event_type == "review_comment" else ()
+
+
+class _ExternalOwnedPRClient(_AIReviewClient):
+    def __init__(self) -> None:
+        super().__init__("review")
+
+    def list_notifications(self, **kwargs: Any) -> GitHubNotificationPage:
+        page = super().list_notifications(**kwargs)
+        notification = page.items[0]
+        notification["repository"].update(
+            {
+                "node_id": "R_external",
+                "full_name": "external/project",
+                "private": False,
+            }
+        )
+        notification["subject"].update(
+            {
+                "url": "https://api.github.com/repos/external/project/pulls/7",
+                "latest_comment_url": (
+                    "https://api.github.com/repos/external/project/issues/comments/99"
+                ),
+            }
+        )
+        return page
+
+
+def test_runtime_persists_freshly_hydrated_ownership_for_external_public_pr(
+    tmp_path: Path,
+) -> None:
+    result, store = _poll(
+        tmp_path,
+        _ExternalOwnedPRClient(),
+        include_public_actionable_activity=True,
+    )
+
+    assert result.created == 1
+    connection = sqlite3.connect(store.path)
+    event_json = connection.execute("SELECT event_json FROM mention_events").fetchone()[
+        0
+    ]
+    connection.close()
+    metadata = json.loads(event_json)["untrusted"]["metadata"]
+    assert metadata["repository"] == "external/project"
+    assert metadata["repository_private"] is False
+    assert metadata["subject_owned_by_target"] is True
 
 
 @pytest.mark.parametrize(

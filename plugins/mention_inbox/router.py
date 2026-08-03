@@ -143,6 +143,15 @@ class InboxRouteResult:
     agent_text: str | None = None
 
 
+@dataclass(frozen=True)
+class PersistentProposalControlBinding:
+    thread_id: str
+    proposal_id: str
+    proposal_revision: int
+    proposal_message_id: str
+    approval_offered: bool
+
+
 class ProposalReplyTransport(Protocol):
     async def find_message_content(
         self, thread_id: str, content: str, *, limit: int
@@ -269,6 +278,94 @@ class InboxProposalRouter:
 
     def is_work_thread(self, thread_id: str) -> bool:
         return self._store.get_work_item_session_by_thread(str(thread_id)) is not None
+
+    def persistent_control_bindings(
+        self, *, limit: int = 1000
+    ) -> tuple[PersistentProposalControlBinding, ...]:
+        """Return pending controls that discord.py must restore after restart."""
+        controls: list[PersistentProposalControlBinding] = []
+        for session in self._store.list_active_work_item_sessions(limit=limit):
+            if session.discord_thread_id is None:
+                continue
+            proposal = self._store.get_latest_proposal(session.subject_key)
+            if proposal is None or proposal.status is not ProposalStatus.PENDING:
+                continue
+            binding = self._store.get_proposal_message_binding(
+                proposal.proposal_id,
+                proposal.revision,
+            )
+            if binding is None:
+                continue
+            controls.append(
+                PersistentProposalControlBinding(
+                    thread_id=session.discord_thread_id,
+                    proposal_id=proposal.proposal_id,
+                    proposal_revision=proposal.revision,
+                    proposal_message_id=binding.message_id,
+                    approval_offered=binding.approval_offered,
+                )
+            )
+        return tuple(controls)
+
+    async def handle_action(
+        self,
+        *,
+        thread_id: str,
+        proposal_id: str,
+        proposal_revision: int,
+        proposal_message_id: str,
+        user_id: str,
+        interaction_id: str,
+        action: str,
+    ) -> InboxRouteResult:
+        if action not in {"start", "inspect", "later"}:
+            raise ValueError("proposal action is invalid")
+        if user_id not in self._authorized_approver_ids:
+            return InboxRouteResult(True, "proposal_action_unauthorized")
+        session = self._store.get_work_item_session_by_thread(thread_id)
+        proposal = self._store.get_proposal(proposal_id, proposal_revision)
+        if session is None or proposal is None:
+            return InboxRouteResult(True, "proposal_action_stale")
+        binding = self._store.get_proposal_message_binding(
+            proposal_id,
+            proposal_revision,
+        )
+        if (
+            binding is None
+            or session.subject_key != proposal.subject_key
+            or binding.message_id != proposal_message_id
+        ):
+            return InboxRouteResult(True, "proposal_action_stale")
+        latest = self._store.get_latest_proposal(session.subject_key)
+        if (
+            latest is None
+            or latest.proposal_id != proposal.proposal_id
+            or latest.revision != proposal.revision
+            or latest.content_hash != proposal.content_hash
+        ):
+            return InboxRouteResult(True, "proposal_action_stale", proposal)
+        if action == "later":
+            return InboxRouteResult(True, "proposal_deferred", proposal)
+
+        message = InboxDiscordMessage(
+            thread_id=thread_id,
+            message_id=interaction_id,
+            user_id=user_id,
+            text=(
+                f"{self._bot_mention} 승인"
+                if action == "start"
+                else f"{self._bot_mention} 저장된 근거 보기"
+            ),
+            reply_to_message_id=proposal_message_id,
+        )
+        if action == "start":
+            return await self._route_approval(message, proposal, binding)
+        return await self._route_conversation(
+            message,
+            proposal,
+            binding,
+            "저장된 preflight 근거를 요약해 주세요",
+        )
 
     async def _route_approval(
         self,

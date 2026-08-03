@@ -22,6 +22,7 @@ class GitHubActionKind(str, Enum):
 
 
 class SuppressionReason(str, Enum):
+    NOT_PULL_REQUEST = "not_pull_request"
     STALE_NOTIFICATION_REASON = "stale_notification_reason"
     SELF_AUTHORED = "self_authored"
     BOT_GENERATED_MENTION = "bot_generated_mention"
@@ -349,6 +350,8 @@ def classify_actionable(
 
     if not isinstance(notification, Mapping):
         return _suppressed(SuppressionReason.NON_ACTIONABLE)
+    if _mapping(notification.get("subject")).get("type") != "PullRequest":
+        return _suppressed(SuppressionReason.NOT_PULL_REQUEST)
     reason = notification.get("reason")
     if reason not in _CANDIDATE_REASONS:
         return _suppressed(SuppressionReason.NON_ACTIONABLE)

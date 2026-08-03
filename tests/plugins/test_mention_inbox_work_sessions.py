@@ -82,6 +82,58 @@ def test_interrupted_thread_creation_retry_survives_restart(tmp_path: Path) -> N
     )
 
 
+def test_github_pr_identity_and_parent_message_are_unique(tmp_path: Path) -> None:
+    store = _store(tmp_path / "mention-inbox.db")
+    first = store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+
+    assert first.repository_node_id == "R_repo"
+    assert first.pr_node_id == "PR_7"
+
+    store.prepare_work_item_parent(SUBJECT, "parent-1")
+    store.reserve_work_item_session(
+        "github:R_other:PR_8",
+        "github:IC_100:U_recent",
+        SOURCE_REVISION,
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        store.prepare_work_item_parent("github:R_other:PR_8", "parent-1")
+
+
+def test_v7_session_rows_backfill_immutable_github_identity(tmp_path: Path) -> None:
+    path = tmp_path / "mention-inbox.db"
+    connection = sqlite3.connect(path)
+    connection.execute("""
+        CREATE TABLE work_item_sessions (
+            subject_key TEXT PRIMARY KEY,
+            source_dedupe_key TEXT NOT NULL,
+            parent_message_id TEXT,
+            discord_thread_id TEXT,
+            state TEXT NOT NULL,
+            last_event_revision TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    connection.execute(
+        """
+        INSERT INTO work_item_sessions (
+            subject_key, source_dedupe_key, state, last_event_revision,
+            created_at, updated_at
+        ) VALUES (?, ?, 'reserved', ?, ?, ?)
+        """,
+        (SUBJECT, DEDUPE, SOURCE_REVISION, SOURCE_REVISION, SOURCE_REVISION),
+    )
+    connection.execute("PRAGMA user_version = 7")
+    connection.commit()
+    connection.close()
+
+    session = _store(path).get_work_item_session(SUBJECT)
+
+    assert session is not None
+    assert session.repository_node_id == "R_repo"
+    assert session.pr_node_id == "PR_7"
+
+
 def test_restart_restores_pending_proposal_and_message_mapping(tmp_path: Path) -> None:
     path = tmp_path / "inbox.db"
     store = _store(path)

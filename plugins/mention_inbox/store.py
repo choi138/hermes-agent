@@ -31,7 +31,7 @@ from plugins.mention_inbox.proposals import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1531851208858275860"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -79,6 +79,8 @@ class DeliveryClaim:
 class WorkItemSession:
     subject_key: str
     source_dedupe_key: str
+    repository_node_id: str | None
+    pr_node_id: str | None
     parent_message_id: str | None
     discord_thread_id: str | None
     state: str
@@ -113,6 +115,8 @@ class WorkExecution:
     head_ref: str | None
     head_repository: str | None
     workspace: str | None
+    status_message_id: str | None
+    terminal_receipt_message_id: str | None
     status: str
     dispatch_id: str | None
     evidence_json: str | None
@@ -124,6 +128,15 @@ class WorkExecution:
 class RecoverableExecution:
     execution: WorkExecution
     approver_user_id: str
+
+
+@dataclass(frozen=True)
+class TerminalReceiptClaim:
+    execution_id: str
+    thread_id: str
+    marker: str
+    content: str
+    requires_reconciliation: bool
 
 
 _CLOSED_SESSION_STATES = frozenset({"completed", "rejected", "expired"})
@@ -183,6 +196,21 @@ def _require_git_ref(value: str | None) -> str | None:
     ):
         raise ValueError("head_ref must be a safe Git branch ref")
     return ref
+
+
+def _github_subject_identity(subject_key: str) -> tuple[str, str] | None:
+    parts = subject_key.split(":")
+    if len(parts) != 3 or parts[0] != "github" or not parts[1] or not parts[2]:
+        return None
+    return parts[1], parts[2]
+
+
+def work_execution_id(proposal_id: str, revision: int) -> str:
+    proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        raise ValueError("revision must be a positive integer")
+    identity = f"{proposal_key}\0{revision}"
+    return "wx_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def _require_repository(value: str | None) -> str | None:
@@ -267,6 +295,12 @@ def _work_item_session(row: sqlite3.Row) -> WorkItemSession:
     return WorkItemSession(
         subject_key=str(row["subject_key"]),
         source_dedupe_key=str(row["source_dedupe_key"]),
+        repository_node_id=(
+            None
+            if row["repository_node_id"] is None
+            else str(row["repository_node_id"])
+        ),
+        pr_node_id=None if row["pr_node_id"] is None else str(row["pr_node_id"]),
         parent_message_id=(
             None if row["parent_message_id"] is None else str(row["parent_message_id"])
         ),
@@ -317,6 +351,16 @@ def _work_execution(row: sqlite3.Row) -> WorkExecution:
             None if row["head_repository"] is None else str(row["head_repository"])
         ),
         workspace=(None if row["workspace"] is None else str(row["workspace"])),
+        status_message_id=(
+            None
+            if row["status_message_id"] is None
+            else str(row["status_message_id"])
+        ),
+        terminal_receipt_message_id=(
+            None
+            if row["terminal_receipt_message_id"] is None
+            else str(row["terminal_receipt_message_id"])
+        ),
         status=str(row["status"]),
         dispatch_id=(None if row["dispatch_id"] is None else str(row["dispatch_id"])),
         evidence_json=(
@@ -512,6 +556,8 @@ class MentionInboxStore:
                 CREATE TABLE IF NOT EXISTS work_item_sessions (
                     subject_key TEXT PRIMARY KEY,
                     source_dedupe_key TEXT NOT NULL,
+                    repository_node_id TEXT,
+                    pr_node_id TEXT,
                     parent_message_id TEXT,
                     discord_thread_id TEXT,
                     state TEXT NOT NULL,
@@ -520,16 +566,54 @@ class MentionInboxStore:
                     updated_at TEXT NOT NULL
                 )
             """)
+            session_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(work_item_sessions)")
+            }
+            for column in ("repository_node_id", "pr_node_id"):
+                if column not in session_columns:
+                    connection.execute(
+                        f"ALTER TABLE work_item_sessions ADD COLUMN {column} TEXT"
+                    )
+            for row in connection.execute(
+                """
+                SELECT subject_key FROM work_item_sessions
+                WHERE repository_node_id IS NULL OR pr_node_id IS NULL
+                """
+            ).fetchall():
+                identity = _github_subject_identity(str(row["subject_key"]))
+                if identity is None:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE work_item_sessions
+                    SET repository_node_id = ?, pr_node_id = ?
+                    WHERE subject_key = ?
+                    """,
+                    (*identity, str(row["subject_key"])),
+                )
             connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_work_item_thread
                 ON work_item_sessions(discord_thread_id)
                 WHERE discord_thread_id IS NOT NULL
             """)
             connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_work_item_parent
+                ON work_item_sessions(parent_message_id)
+                WHERE parent_message_id IS NOT NULL
+            """)
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_work_item_github_pr
+                ON work_item_sessions(repository_node_id, pr_node_id)
+                WHERE repository_node_id IS NOT NULL AND pr_node_id IS NOT NULL
+            """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS work_proposals (
                     proposal_id TEXT NOT NULL,
                     proposal_revision INTEGER NOT NULL,
                     subject_key TEXT NOT NULL,
+                    repository_node_id TEXT,
+                    pr_node_id TEXT,
                     source_dedupe_key TEXT NOT NULL,
                     source_revision TEXT NOT NULL,
                     head_sha TEXT,
@@ -555,6 +639,33 @@ class MentionInboxStore:
                     ADD COLUMN approval_offered INTEGER NOT NULL DEFAULT 0
                         CHECK (approval_offered IN (0, 1))
                     """
+                )
+            for column in ("repository_node_id", "pr_node_id"):
+                if column not in proposal_columns:
+                    connection.execute(
+                        f"ALTER TABLE work_proposals ADD COLUMN {column} TEXT"
+                    )
+            for row in connection.execute(
+                """
+                SELECT proposal_id, proposal_revision, subject_key
+                FROM work_proposals
+                WHERE repository_node_id IS NULL OR pr_node_id IS NULL
+                """
+            ).fetchall():
+                identity = _github_subject_identity(str(row["subject_key"]))
+                if identity is None:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE work_proposals
+                    SET repository_node_id = ?, pr_node_id = ?
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (
+                        *identity,
+                        str(row["proposal_id"]),
+                        int(row["proposal_revision"]),
+                    ),
                 )
             connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_work_proposal_message
@@ -589,6 +700,13 @@ class MentionInboxStore:
                     head_ref TEXT,
                     head_repository TEXT,
                     workspace TEXT,
+                    status_message_id TEXT,
+                    terminal_receipt_message_id TEXT,
+                    recovery_lease_until TEXT,
+                    terminal_receipt_marker TEXT,
+                    terminal_receipt_content TEXT,
+                    terminal_receipt_status TEXT,
+                    terminal_receipt_lease_until TEXT,
                     status TEXT NOT NULL,
                     dispatch_id TEXT,
                     evidence_json TEXT,
@@ -601,7 +719,18 @@ class MentionInboxStore:
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(work_executions)")
             }
-            for column in ("head_ref", "head_repository", "workspace"):
+            for column in (
+                "head_ref",
+                "head_repository",
+                "workspace",
+                "status_message_id",
+                "terminal_receipt_message_id",
+                "recovery_lease_until",
+                "terminal_receipt_marker",
+                "terminal_receipt_content",
+                "terminal_receipt_status",
+                "terminal_receipt_lease_until",
+            ):
                 if column not in execution_columns:
                     connection.execute(
                         f"ALTER TABLE work_executions ADD COLUMN {column} TEXT"
@@ -845,14 +974,24 @@ class MentionInboxStore:
                     (subject,),
                 ).fetchone()
                 if row is None:
+                    identity = _github_subject_identity(subject)
                     connection.execute(
                         """
                         INSERT INTO work_item_sessions (
-                            subject_key, source_dedupe_key, state,
+                            subject_key, source_dedupe_key,
+                            repository_node_id, pr_node_id, state,
                             last_event_revision, created_at, updated_at
-                        ) VALUES (?, ?, 'reserved', ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)
                         """,
-                        (subject, dedupe, source_revision, now, now),
+                        (
+                            subject,
+                            dedupe,
+                            None if identity is None else identity[0],
+                            None if identity is None else identity[1],
+                            source_revision,
+                            now,
+                            now,
+                        ),
                     )
                 else:
                     state = str(row["state"])
@@ -1090,15 +1229,17 @@ class MentionInboxStore:
                     """
                     INSERT INTO work_proposals (
                         proposal_id, proposal_revision, subject_key,
+                        repository_node_id, pr_node_id,
                         source_dedupe_key, source_revision, head_sha,
                         proposal_json, proposal_hash, status,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         proposal.proposal_id,
                         proposal.revision,
                         proposal.subject_key,
+                        *(_github_subject_identity(proposal.subject_key) or (None, None)),
                         proposal.source_dedupe_key,
                         proposal.source_revision,
                         proposal.head_sha,
@@ -1475,8 +1616,7 @@ class MentionInboxStore:
             raise ValueError("mode must be a lowercase identifier")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
             raise ValueError("revision must be a positive integer")
-        identity = f"{proposal_key}\0{revision}"
-        execution_id = "wx_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        execution_id = work_execution_id(proposal_key, revision)
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
@@ -1639,6 +1779,101 @@ class MentionInboxStore:
         finally:
             connection.close()
 
+    def claim_recoverable_executions(
+        self,
+        *,
+        limit: int = 100,
+        lease_seconds: int = 60,
+    ) -> tuple[RecoverableExecution, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        now = self._clock()
+        now_text = _iso_datetime(now)
+        lease_until = _iso_datetime(now + timedelta(seconds=lease_seconds))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT e.*, a.approver_user_id AS recovery_approver_user_id
+                FROM work_executions AS e
+                JOIN work_approvals AS a
+                  ON a.proposal_id = e.proposal_id
+                 AND a.proposal_revision = e.proposal_revision
+                 AND a.approval_message_id = e.approval_message_id
+                WHERE e.status IN ('reserved', 'queued')
+                  AND (
+                    e.recovery_lease_until IS NULL
+                    OR e.recovery_lease_until <= ?
+                  )
+                ORDER BY e.created_at, e.execution_id
+                LIMIT ?
+                """,
+                (now_text, limit),
+            ).fetchall()
+            claimed: list[RecoverableExecution] = []
+            for row in rows:
+                updated = connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET recovery_lease_until = ?, updated_at = ?
+                    WHERE execution_id = ?
+                      AND status IN ('reserved', 'queued')
+                      AND (
+                        recovery_lease_until IS NULL
+                        OR recovery_lease_until <= ?
+                      )
+                    """,
+                    (lease_until, now_text, str(row["execution_id"]), now_text),
+                )
+                if updated.rowcount != 1:
+                    continue
+                claimed.append(
+                    RecoverableExecution(
+                        execution=_work_execution(row),
+                        approver_user_id=_require_stable_text(
+                            str(row["recovery_approver_user_id"]),
+                            "approver_user_id",
+                            limit=80,
+                        ),
+                    )
+                )
+            connection.commit()
+            return tuple(claimed)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release_execution_recovery(self, execution_id: str) -> None:
+        execution_key = _require_stable_text(
+            execution_id,
+            "execution_id",
+            limit=80,
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET recovery_lease_until = NULL, updated_at = ?
+                    WHERE execution_id = ?
+                      AND status IN ('reserved', 'queued')
+                    """,
+                    (now, execution_key),
+                )
+        finally:
+            connection.close()
+
     def invalidate_execution_for_reapproval(
         self, execution_id: str, *, evidence_category: str
     ) -> WorkExecution:
@@ -1693,6 +1928,111 @@ class MentionInboxStore:
                     (execution_key,),
                 ).fetchone()
                 return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def invalidate_queued_external_executions(
+        self,
+        *,
+        trusted_repositories: frozenset[str],
+        evidence_category: str,
+    ) -> tuple[WorkExecution, ...]:
+        trusted = frozenset(
+            _require_stable_text(repository, "repository", limit=200)
+            for repository in trusted_repositories
+        )
+        category = _require_error_category(evidence_category)
+        evidence_json = json.dumps(
+            {"category": category},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                rows = connection.execute(
+                    """
+                    SELECT e.execution_id, m.event_json
+                    FROM work_executions AS e
+                    JOIN work_proposals AS p
+                      ON p.proposal_id = e.proposal_id
+                     AND p.proposal_revision = e.proposal_revision
+                    JOIN work_item_sessions AS s
+                      ON s.subject_key = p.subject_key
+                    LEFT JOIN mention_events AS m
+                      ON m.dedupe_key = s.source_dedupe_key
+                    WHERE e.status IN ('reserved', 'queued')
+                    ORDER BY e.created_at, e.execution_id
+                    """
+                ).fetchall()
+                changed: list[WorkExecution] = []
+                for candidate in rows:
+                    repository: str | None = None
+                    raw_event = candidate["event_json"]
+                    if raw_event is not None:
+                        try:
+                            event = restore_event(json.loads(str(raw_event)))
+                            raw_repository = event.untrusted.metadata.get("repository")
+                            if isinstance(raw_repository, str):
+                                repository = raw_repository
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                            repository = None
+                    if repository in trusted:
+                        continue
+                    execution_id = str(candidate["execution_id"])
+                    execution_row = connection.execute(
+                        "SELECT * FROM work_executions WHERE execution_id = ?",
+                        (execution_id,),
+                    ).fetchone()
+                    if execution_row is None:
+                        continue
+                    current = _work_execution(execution_row)
+                    proposal_row = connection.execute(
+                        """
+                        SELECT * FROM work_proposals
+                        WHERE proposal_id = ? AND proposal_revision = ?
+                        """,
+                        (current.proposal_id, current.proposal_revision),
+                    ).fetchone()
+                    if proposal_row is None:
+                        continue
+                    proposal = _stored_proposal(proposal_row)
+                    if ProposalStatus.NEEDS_REAPPROVAL not in _PROPOSAL_TRANSITIONS.get(
+                        proposal.status,
+                        frozenset(),
+                    ):
+                        continue
+                    self._write_proposal_status(
+                        connection,
+                        proposal,
+                        ProposalStatus.NEEDS_REAPPROVAL,
+                        now,
+                    )
+                    connection.execute(
+                        """
+                        UPDATE work_executions
+                        SET status = 'blocked', evidence_json = ?,
+                            recovery_lease_until = NULL, updated_at = ?
+                        WHERE execution_id = ?
+                          AND status IN ('reserved', 'queued')
+                        """,
+                        (evidence_json, now, execution_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE work_item_sessions
+                        SET state = 'needs_reapproval', updated_at = ?
+                        WHERE subject_key = ?
+                        """,
+                        (now, proposal.subject_key),
+                    )
+                    updated = connection.execute(
+                        "SELECT * FROM work_executions WHERE execution_id = ?",
+                        (execution_id,),
+                    ).fetchone()
+                    changed.append(_work_execution(updated))
+                return tuple(changed)
         finally:
             connection.close()
 
@@ -1971,6 +2311,229 @@ class MentionInboxStore:
             target_proposal=ProposalStatus.VERIFYING,
         )
 
+    def complete_execution_with_terminal_receipt(
+        self,
+        execution_id: str,
+        *,
+        content: str,
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(
+            execution_id,
+            "execution_id",
+            limit=80,
+        )
+        receipt_body = _require_stable_text(content, "content", limit=1900)
+        marker = (
+            "[hermes-execution-receipt:"
+            + hashlib.sha256(execution_key.encode("utf-8")).hexdigest()[:24]
+            + "]"
+        )
+        receipt_content = f"{receipt_body}\n\n{marker}"
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                current = _work_execution(row)
+                if current.status == "completed":
+                    if (
+                        row["terminal_receipt_marker"] == marker
+                        and row["terminal_receipt_content"] == receipt_content
+                        and row["terminal_receipt_status"] in {
+                            "pending",
+                            "sending",
+                            "sent",
+                        }
+                    ):
+                        return current
+                    raise ValueError("completed execution receipt is missing")
+                if current.status != "verifying":
+                    raise ValueError("execution status transition mismatch")
+                evidence = self._decode_execution_evidence(current.evidence_json)
+                completions = evidence["tool_completions"]
+                if not any(
+                    isinstance(item, dict) and item.get("success") is True
+                    for item in completions
+                ):
+                    raise ValueError("successful tool evidence is required")
+                proposal_row = connection.execute(
+                    """
+                    SELECT * FROM work_proposals
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (current.proposal_id, current.proposal_revision),
+                ).fetchone()
+                if proposal_row is None:
+                    raise KeyError("execution proposal not found")
+                proposal = _stored_proposal(proposal_row)
+                if proposal.status is not ProposalStatus.VERIFYING:
+                    raise ValueError("execution proposal status transition mismatch")
+                self._write_proposal_status(
+                    connection,
+                    proposal,
+                    ProposalStatus.COMPLETED,
+                    now,
+                )
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET status = 'completed',
+                        terminal_receipt_marker = ?,
+                        terminal_receipt_content = ?,
+                        terminal_receipt_status = 'pending',
+                        terminal_receipt_lease_until = NULL,
+                        recovery_lease_until = NULL,
+                        updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (marker, receipt_content, now, execution_key),
+                )
+                connection.execute(
+                    """
+                    UPDATE work_item_sessions
+                    SET state = 'completed', updated_at = ?
+                    WHERE subject_key = ?
+                    """,
+                    (now, proposal.subject_key),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(updated)
+        finally:
+            connection.close()
+
+    def claim_terminal_receipt(
+        self,
+        *,
+        lease_seconds: int = 60,
+    ) -> TerminalReceiptClaim | None:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        now = self._clock()
+        now_text = _iso_datetime(now)
+        lease_until = _iso_datetime(now + timedelta(seconds=lease_seconds))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM work_executions
+                WHERE terminal_receipt_message_id IS NULL
+                  AND terminal_receipt_marker IS NOT NULL
+                  AND terminal_receipt_content IS NOT NULL
+                  AND (
+                    terminal_receipt_status = 'pending'
+                    OR (
+                        terminal_receipt_status = 'sending'
+                        AND terminal_receipt_lease_until <= ?
+                    )
+                  )
+                ORDER BY updated_at, execution_id
+                LIMIT 1
+                """,
+                (now_text,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            requires_reconciliation = str(row["terminal_receipt_status"]) == "sending"
+            updated = connection.execute(
+                """
+                UPDATE work_executions
+                SET terminal_receipt_status = 'sending',
+                    terminal_receipt_lease_until = ?, updated_at = ?
+                WHERE execution_id = ?
+                  AND terminal_receipt_message_id IS NULL
+                  AND (
+                    terminal_receipt_status = 'pending'
+                    OR (
+                        terminal_receipt_status = 'sending'
+                        AND terminal_receipt_lease_until <= ?
+                    )
+                  )
+                """,
+                (
+                    lease_until,
+                    now_text,
+                    str(row["execution_id"]),
+                    now_text,
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                return None
+            claim = TerminalReceiptClaim(
+                execution_id=str(row["execution_id"]),
+                thread_id=str(row["thread_id"]),
+                marker=str(row["terminal_receipt_marker"]),
+                content=str(row["terminal_receipt_content"]),
+                requires_reconciliation=requires_reconciliation,
+            )
+            connection.commit()
+            return claim
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_terminal_receipt_sent(
+        self,
+        execution_id: str,
+        *,
+        message_id: str,
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(
+            execution_id,
+            "execution_id",
+            limit=80,
+        )
+        message = _require_stable_text(message_id, "message_id", limit=80)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                existing = row["terminal_receipt_message_id"]
+                if existing is not None and str(existing) != message:
+                    raise ValueError("execution message binding is immutable")
+                if row["terminal_receipt_status"] not in {"sending", "sent"}:
+                    raise ValueError("terminal receipt is not claimed")
+                connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET terminal_receipt_message_id = ?,
+                        terminal_receipt_status = 'sent',
+                        terminal_receipt_lease_until = NULL,
+                        updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (message, now, execution_key),
+                )
+                stored = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(stored)
+        finally:
+            connection.close()
+
     def mark_execution_completed(self, execution_id: str) -> WorkExecution:
         return self._advance_execution_and_proposal(
             execution_id,
@@ -2051,6 +2614,53 @@ class MentionInboxStore:
                 (execution_key,),
             ).fetchone()
             return None if row is None else _work_execution(row)
+        finally:
+            connection.close()
+
+    def record_execution_message(
+        self,
+        execution_id: str,
+        message_id: str,
+        *,
+        terminal: bool = False,
+    ) -> WorkExecution:
+        execution_key = _require_stable_text(
+            execution_id,
+            "execution_id",
+            limit=80,
+        )
+        message = _require_stable_text(message_id, "message_id", limit=80)
+        column = (
+            "terminal_receipt_message_id"
+            if terminal
+            else "status_message_id"
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                row = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("execution receipt not found")
+                existing = row[column]
+                if existing is not None and str(existing) != message:
+                    raise ValueError("execution message binding is immutable")
+                connection.execute(
+                    f"""
+                    UPDATE work_executions
+                    SET {column} = ?, updated_at = ?
+                    WHERE execution_id = ?
+                    """,
+                    (message, now, execution_key),
+                )
+                stored = connection.execute(
+                    "SELECT * FROM work_executions WHERE execution_id = ?",
+                    (execution_key,),
+                ).fetchone()
+                return _work_execution(stored)
         finally:
             connection.close()
 

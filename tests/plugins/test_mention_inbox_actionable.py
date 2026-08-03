@@ -113,6 +113,23 @@ def test_human_latest_comment_direct_mention_is_actionable() -> None:
     assert decision.event.source_url.endswith("#issuecomment-991")
 
 
+def test_issue_direct_mention_is_suppressed() -> None:
+    notification = _notification()
+    notification["subject"] = {
+        "title": "Issue mention",
+        "type": "Issue",
+        "url": "https://api.github.com/repos/silviahealth/content/issues/7",
+    }
+
+    decision = classify_actionable(
+        notification,
+        _context(latest_event=_human_event(body="@recent-won 확인 부탁해요")),
+    )
+
+    assert decision.event is None
+    assert decision.suppression_reason is SuppressionReason.NOT_PULL_REQUEST
+
+
 def test_source_revision_is_current_subject_revision_not_comment_revision() -> None:
     latest = _human_event(body="@recent-won 확인 부탁해요")
     latest["updated_at"] = "2026-07-29T10:02:00Z"
