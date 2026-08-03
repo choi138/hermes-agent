@@ -363,7 +363,7 @@ class TestRunCommandTts:
             "\n".join([
                 "import sys, time",
                 "print('starting tier 1', file=sys.stderr, flush=True)",
-                "time.sleep(1.0)",
+                "time.sleep(30)",
             ]),
             encoding="utf-8",
         )
@@ -371,7 +371,7 @@ class TestRunCommandTts:
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_tts(
                 _shell_command(sys.executable, "-u", str(script)),
-                timeout=0.2,
+                timeout=2.0,
             )
 
         assert "starting tier 1" in (excinfo.value.stderr or "")
