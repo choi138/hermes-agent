@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -11,6 +12,10 @@ import pytest
 from tools.approval import detect_dangerous_command, detect_hardline_command
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="real-binary grammar assertions require GNU/Linux tool implementations",
+)
 @pytest.mark.parametrize(
     ("argv", "stdin", "expected_returncode", "expected_output"),
     [
@@ -32,6 +37,10 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     assert completed.stdout == expected_output
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="real-binary execution assertions require GNU/Linux sort/man/script",
+)
 @pytest.mark.parametrize(
     ("tool", "args", "stdin", "needs_tty"),
     [

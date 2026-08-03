@@ -397,6 +397,7 @@ class TestTranscribeLocalExtended:
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._should_force_faster_whisper_cpu", return_value=False), \
              patch("tools.transcription_tools._load_stt_config", return_value=fake_config):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio), "base")

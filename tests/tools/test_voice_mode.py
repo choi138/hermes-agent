@@ -121,10 +121,18 @@ def fake_clock(monkeypatch):
 # ============================================================================
 
 class TestPulseSocketReachable:
-    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
+    @pytest.fixture
+    def pulse_runtime_dir(self, tmp_path_factory):
+        # AF_UNIX paths cap out at 104 bytes on macOS. The factory's short
+        # basename keeps the socket valid even under an isolated pytest root.
+        return tmp_path_factory.mktemp("p")
+
+    def test_stale_socket_file_not_reachable(
+        self, monkeypatch, pulse_runtime_dir
+    ):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = pulse_runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -132,14 +140,16 @@ class TestPulseSocketReachable:
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(pulse_runtime_dir))
         from tools.voice_mode import _pulse_socket_reachable
         assert _pulse_socket_reachable() is False
 
-    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
+    def test_listening_socket_reachable_via_xdg_runtime(
+        self, monkeypatch, pulse_runtime_dir
+    ):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = pulse_runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(str(sock_path))
@@ -147,7 +157,7 @@ class TestPulseSocketReachable:
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
             monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(pulse_runtime_dir))
             from tools.voice_mode import _pulse_socket_reachable
             assert _pulse_socket_reachable() is True
         finally:
@@ -689,11 +699,12 @@ class TestCleanupTempRecordings:
 # ============================================================================
 
 class TestPlayBeep:
-    def test_beep_calls_sounddevice_play(self, mock_sd):
+    def test_beep_calls_sounddevice_play(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
 
         from tools.voice_mode import play_beep
 
+        monkeypatch.setattr("tools.voice_mode._sounddevice_output_allowed", lambda: True)
         # play_beep uses polling (get_stream) + sd.stop() instead of sd.wait()
         mock_stream = MagicMock()
         mock_stream.active = False
@@ -1407,7 +1418,8 @@ class TestWSL2PowerShellFallback:
             m.wait = MagicMock(return_value=m.returncode)
             return m
 
-        with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("tools.voice_mode._is_wsl2_env", return_value=True), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1459,7 +1471,8 @@ class TestWSL2PowerShellFallback:
                 return io.StringIO("Linux Microsoft WSL2")
             return open(path, *args, **kwargs)
 
-        with patch("builtins.open", side_effect=_fake_open), \
+        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("builtins.open", side_effect=_fake_open), \
              patch("shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("subprocess.check_output", side_effect=_capture_check_output), \
              patch("subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \
@@ -1536,7 +1549,8 @@ class TestWSLAudioEnvironmentGate:
             monkeypatch.delenv(_ssh_var, raising=False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
-        with patch("builtins.open", side_effect=self._fake_open_wsl), \
+        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("builtins.open", side_effect=self._fake_open_wsl), \
              patch("tools.voice_mode._wsl_powershell_tts_available", return_value=True), \
              patch("tools.voice_mode._pulse_socket_reachable", return_value=False), \
              patch("hermes_constants.is_container", return_value=False):
@@ -1563,7 +1577,8 @@ class TestWSLAudioEnvironmentGate:
             monkeypatch.delenv(_ssh_var, raising=False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
-        with patch("builtins.open", side_effect=self._fake_open_wsl), \
+        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("builtins.open", side_effect=self._fake_open_wsl), \
              patch("tools.voice_mode._wsl_powershell_tts_available", return_value=False), \
              patch("tools.voice_mode._pulse_socket_reachable", return_value=False), \
              patch("hermes_constants.is_container", return_value=False):
