@@ -144,6 +144,50 @@ def test_normalizer_rejects_unselected_notifications(
     assert collector.normalize(notification, {}) is None
 
 
+def test_external_public_pr_requires_explicit_public_opt_in() -> None:
+    notification = _notification(repository="other/project")
+    notification["repository"]["private"] = False
+
+    disabled = GitHubNotificationCollector(
+        target_id="U_kgDORecentWon",
+        allowed_repositories={"silviahealth/content"},
+    )
+    enabled = GitHubNotificationCollector(
+        target_id="U_kgDORecentWon",
+        allowed_repositories={"silviahealth/content"},
+        include_public_actionable_activity=True,
+    )
+
+    assert disabled.accepts(notification) is False
+    assert enabled.accepts(notification) is True
+
+    notification["repository"]["private"] = True
+    assert enabled.accepts(notification) is False
+
+    del notification["repository"]["private"]
+    assert enabled.accepts(notification) is False
+
+
+def test_issue_notification_is_rejected_before_hydration() -> None:
+    collector = GitHubNotificationCollector(
+        target_id="U_kgDORecentWon",
+        allowed_repositories={"silviahealth/content"},
+    )
+    notification = _notification(reason="mention")
+    notification["subject"] = {
+        "title": "Issue mention",
+        "url": "https://api.github.com/repos/silviahealth/content/issues/7",
+        "latest_comment_url": (
+            "https://api.github.com/repos/silviahealth/content/issues/comments/11"
+        ),
+        "type": "Issue",
+    }
+
+    assert collector.accepts(notification) is False
+    assert collector.normalize(notification, _pull_request_detail()) is None
+    assert collector.normalize_many(notification, _pull_request_detail()) == ()
+
+
 @pytest.mark.parametrize(
     "notification",
     [
@@ -192,23 +236,16 @@ def test_selected_reason_maps_to_requested_action(
     assert collected.event.requested_action is expected_action
 
 
-def test_missing_subject_detail_keeps_notification_with_safe_fallbacks() -> None:
+def test_missing_subject_detail_fails_closed() -> None:
     collector = GitHubNotificationCollector(
         target_id="U_kgDORecentWon",
         allowed_repositories={"silviahealth/content"},
     )
 
-    collected = collector.normalize(_notification(reason="mention"), None)
+    notification = _notification(reason="mention")
 
-    assert collected is not None
-    event = collected.event
-    assert event.actor.actor_id == "github:unknown"
-    assert event.actor.kind is ActorKind.UNKNOWN
-    assert event.thread.thread_id == "github-notification:987654321"
-    assert event.thread.container_id == "R_kgDORepository"
-    assert event.untrusted.title == "Review requested for inbox contract"
-    assert event.untrusted.body == ""
-    assert event.untrusted.source_url is None
+    assert collector.normalize(notification, None) is None
+    assert collector.normalize_many(notification, None) == ()
 
 
 @pytest.mark.parametrize(
@@ -1034,7 +1071,8 @@ def test_poller_does_not_enrich_subject_from_different_repository(
 
     assert result.status == "ok"
     assert result.selected == 1
-    assert result.created == 1
+    assert result.created == 0
+    assert result.skipped == 1
     assert len(requests) == 1
     assert urlparse(requests[0].full_url).path == "/notifications"
 

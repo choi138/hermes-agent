@@ -13,6 +13,7 @@ from plugins.mention_inbox.preflight import (
     PreApprovalDisposition,
     brief_from_metadata,
 )
+from plugins.mention_inbox.presentation import normalize_review_text
 from plugins.mention_inbox.proposals import WorkProposal
 
 _ALLOWED_MENTIONS: dict[str, Any] = {
@@ -23,11 +24,11 @@ _ALLOWED_MENTIONS: dict[str, Any] = {
 }
 _BOT_MENTION_RE = re.compile(r"<@[0-9]{1,30}>")
 _STATUS_LABELS = {
-    PreApprovalDisposition.ACTION_REQUIRED: "🔴 Needs action",
-    PreApprovalDisposition.REVIEW_NEEDED: "🟠 Review needed",
-    PreApprovalDisposition.POSSIBLY_STALE: "🟡 Check current HEAD",
-    PreApprovalDisposition.INFORMATIONAL: "🟢 No action",
-    PreApprovalDisposition.INSUFFICIENT_EVIDENCE: "🟡 Needs inspection",
+    PreApprovalDisposition.ACTION_REQUIRED: "🔴 수정 요청",
+    PreApprovalDisposition.REVIEW_NEEDED: "🟠 리뷰 요청",
+    PreApprovalDisposition.POSSIBLY_STALE: "🟡 최신 상태 확인",
+    PreApprovalDisposition.INFORMATIONAL: "🟢 확인 완료",
+    PreApprovalDisposition.INSUFFICIENT_EVIDENCE: "🟡 추가 확인",
 }
 
 
@@ -58,17 +59,7 @@ class CompletionReceipt:
 
 
 def _compact_untrusted(value: object, limit: int) -> str:
-    text = " ".join(str(value or "").split())
-    text = (
-        text
-        .replace("@", "@\u200b")
-        .replace("<", "‹")
-        .replace(">", "›")
-        .replace("`", "ˋ")
-        .replace("*", "∗")
-        .replace("_", "‗")
-    )
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+    return normalize_review_text(value, limit=limit)
 
 
 def _trusted_github_url(value: object) -> str:
@@ -375,6 +366,7 @@ def render_proposal(
     *,
     approval_offered: bool = False,
     approval_unavailable_reason: str | None = None,
+    event: MentionEvent | None = None,
 ) -> str:
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")
@@ -390,17 +382,43 @@ def render_proposal(
     }:
         raise ValueError("invalid approval unavailable reason")
 
+    source_url = (
+        ""
+        if event is None
+        else _trusted_github_url(event.untrusted.source_url)
+    )
+    brief = (
+        None
+        if event is None
+        else brief_from_metadata(_metadata(event).get("preapproval_brief"))
+    )
+    scopes: list[str] = []
+    if brief is not None:
+        for finding in brief.findings[:4]:
+            location = _compact_untrusted(finding.path, 140)
+            if finding.line is not None:
+                location = f"{location}:{finding.line}"
+            if location:
+                scopes.append(location)
+    if not scopes:
+        scopes.append("PR diff와 관련 테스트")
+
     lines = [
-        "요약",
-        f"- {_compact_untrusted(proposal.goal, 500)}",
-        "해야 할 일",
+        "현재 요청",
+        _compact_untrusted(proposal.goal, 500),
+        "",
+        "제 추천",
         *_proposal_lines(proposal.steps),
-        "완료 확인",
-        *_proposal_lines(proposal.verification, item_limit=180),
+        "",
+        "영향 범위",
+        *[f"- {scope}" for scope in scopes],
     ]
+    if source_url:
+        lines.extend(("", "원문", source_url))
     if approval_offered:
         footer = (
-            "이 thread에서 `리뷰 반영해서 수정해줘`처럼 자연어로 요청할 수 있어요.",
+            "제가 수정하고 테스트한 뒤 이 PR 브랜치에 반영할 수 있어요.",
+            "이대로 진행하려면 `리뷰 반영해줘`라고 말해 주세요.",
         )
     elif approval_unavailable_reason == "execution_unavailable":
         footer = (
@@ -457,12 +475,14 @@ _BLOCKED_REASONS = {
 def render_blocked(
     proposal: WorkProposal, *, category: str | None = None
 ) -> str:
-    message = (
-        "실행 요청 기록은 보존했지만 작업을 시작하지 못했어요. "
-        "범위를 넓히거나 자동으로 다시 시도하지 않고, 이 thread에서 상태를 확인하겠습니다."
-    )
+    message = "⛔ 지금은 작업을 시작하지 않았어요."
     if category is None:
-        return message
+        return (
+            f"{message}\n\n"
+            "안전하게 진행할 근거가 부족해 자동으로 다시 시도하지 않았어요.\n\n"
+            "필요한 결정\n이 thread에서 상태를 확인한 뒤 다시 요청해 주세요.\n\n"
+            "보호 조치\n기존 파일과 Git 상태는 변경하지 않았어요."
+        )
     reason = _BLOCKED_REASONS.get(
         category,
         "안전하게 완료를 입증할 실행 근거가 부족했습니다.",
@@ -472,7 +492,13 @@ def render_blocked(
         if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", category)
         else "execution_blocked"
     )
-    return f"{message}\n원인: {reason}\n원인 코드: `{safe_category}`"
+    return (
+        f"{message}\n\n"
+        f"이유\n{reason}\n\n"
+        "필요한 결정\n문제가 해결된 뒤 이 thread에서 다시 요청해 주세요.\n\n"
+        "보호 조치\n기존 파일과 Git 상태는 변경하지 않았어요.\n\n"
+        f"||기술 정보: `{safe_category}`||"
+    )
 
 
 def render_execution_enabled_reproposal(proposal: WorkProposal) -> str:
@@ -497,8 +523,21 @@ def render_completed(receipt: CompletionReceipt) -> str:
     evidence = tuple(_compact_untrusted(item, 400) for item in receipt.evidence[:8])
     if not summary or any(not item for item in evidence):
         raise ValueError("completed voice requires non-empty evidence")
-    return "\n".join((
-        f"완료했습니다. {summary}",
-        "확인 근거:",
-        *[f"- {item}" for item in evidence],
-    ))
+    technical = tuple(
+        item
+        for item in evidence
+        if re.search(r"\b(?:commit|sha|branch|execution)\b", item, re.IGNORECASE)
+    )
+    verification = tuple(item for item in evidence if item not in technical)
+    lines = [
+        "✅ 반영했어요",
+        "",
+        "바꾼 내용",
+        summary,
+        "",
+        "확인한 내용",
+        *[f"- {item}" for item in verification or ("검증 근거를 확인했어요.",)],
+    ]
+    if technical:
+        lines.extend(("", "기술 정보", *[f"- {item}" for item in technical]))
+    return "\n".join(lines)

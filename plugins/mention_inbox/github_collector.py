@@ -176,6 +176,7 @@ class GitHubNotificationCollector:
         allowed_repositories: Iterable[str],
         target_login: str | None = None,
         include_owned_pr_activity: bool = False,
+        include_public_actionable_activity: bool = False,
     ) -> None:
         self._target_id = target_id
         self._target_login = target_login
@@ -185,16 +186,32 @@ class GitHubNotificationCollector:
             else frozenset({"assign", "mention", "review_requested", "team_mention"})
         )
         self._allowed_repositories = frozenset(allowed_repositories)
+        self._include_public_actionable_activity = include_public_actionable_activity
 
     def _is_selected(self, notification: Mapping[str, Any]) -> bool:
         if not isinstance(notification, Mapping):
             return False
         reason = notification.get("reason")
         repository = notification.get("repository")
-        if reason not in self._candidate_reasons or not isinstance(repository, Mapping):
+        subject = notification.get("subject")
+        if (
+            reason not in self._candidate_reasons
+            or not isinstance(repository, Mapping)
+            or (
+                isinstance(subject, Mapping)
+                and subject.get("type") not in {None, "PullRequest"}
+            )
+        ):
             return False
         full_name = repository.get("full_name")
-        return isinstance(full_name, str) and full_name in self._allowed_repositories
+        if not isinstance(full_name, str):
+            return False
+        if full_name in self._allowed_repositories:
+            return True
+        return (
+            self._include_public_actionable_activity
+            and repository.get("private") is False
+        )
 
     def _validate_notification(self, notification: Mapping[str, Any]) -> None:
         notification_id = notification.get("id")
@@ -241,6 +258,8 @@ class GitHubNotificationCollector:
         if not self._is_selected(notification):
             return None
         self._validate_notification(notification)
+        if subject_detail is None:
+            return None
         if isinstance(subject_detail, GitHubHydrationContext):
             return self._normalize_actionable(notification, subject_detail)
         return self._normalize_legacy(notification, subject_detail)
@@ -316,10 +335,24 @@ class GitHubNotificationCollector:
             actor_kind = "unknown"
 
         repository = notification["repository"]
+        subject_author = context.subject.get("user")
+        subject_owned_by_target = bool(
+            isinstance(subject_author, Mapping)
+            and (
+                (
+                    isinstance(subject_author.get("login"), str)
+                    and subject_author["login"].casefold()
+                    == context.target_login.casefold()
+                )
+                or subject_author.get("node_id") == context.target_node_id
+            )
+        )
         metadata: dict[str, Any] = {
             "actionable_kind": actionable.kind.value,
             "candidate_reason": notification["reason"],
             "repository": actionable.repository,
+            "repository_private": repository.get("private"),
+            "subject_owned_by_target": subject_owned_by_target,
             "subject_type": actionable.subject_type,
             "subject_number": actionable.number,
             "subject_key": actionable.subject_key,

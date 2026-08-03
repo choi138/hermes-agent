@@ -21,7 +21,11 @@ from plugins.mention_inbox.proposals import (
     proposal_to_json,
 )
 from plugins.mention_inbox.router import InboxDiscordMessage, InboxRouteResult
-from plugins.mention_inbox.store import MentionInboxStore, WorkExecution
+from plugins.mention_inbox.store import (
+    MentionInboxStore,
+    WorkExecution,
+    work_execution_id,
+)
 from plugins.mention_inbox.voice import (
     CompletionReceipt,
     render_blocked,
@@ -33,6 +37,11 @@ from plugins.mention_inbox.voice import (
     render_running,
     render_verifying,
 )
+from plugins.mention_inbox.workspace import (
+    RepositoryWorktreeManager,
+    WorkspacePreparationError,
+    WorktreeRequest,
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,8 @@ class ResolvedSourceState:
     head_sha: str | None
     head_ref: str | None = None
     head_repository: str | None = None
+    repository_node_id: str | None = None
+    base_repository: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -77,6 +88,16 @@ class ResolvedSourceState:
             self.head_ref is None or self.head_repository is None
         ):
             raise ValueError("PR source requires a verified head branch")
+        if (self.repository_node_id is None) != (self.base_repository is None):
+            raise ValueError("repository identity must be complete")
+        if self.repository_node_id is not None and (
+            re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.repository_node_id) is None
+            or re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.base_repository or ""
+            )
+            is None
+        ):
+            raise ValueError("repository identity is invalid")
 
 
 @dataclass(frozen=True)
@@ -270,7 +291,21 @@ class GatewayExecutionDispatcher:
 
 
 class ApprovalDiscordTransport(Protocol):
+    async def find_marker(
+        self,
+        thread_id: str,
+        marker: str,
+        *,
+        limit: int,
+    ) -> str | None: ...
+
     async def send_to_thread(self, thread_id: str, content: str) -> str: ...
+    async def edit_thread_message(
+        self,
+        thread_id: str,
+        message_id: str,
+        content: str,
+    ) -> None: ...
 
 
 class GitHubSubjectClient(Protocol):
@@ -286,14 +321,26 @@ class GitHubSubjectStateResolver:
         store: MentionInboxStore,
         client: GitHubSubjectClient,
         allowed_repositories: frozenset[str] = frozenset({"silviahealth/content"}),
+        include_public_actionable_activity: bool = False,
+        external_repository_actions: str = "disabled",
     ) -> None:
         if not allowed_repositories:
             raise ValueError("allowed_repositories must not be empty")
         self._store = store
         self._client = client
         self._allowed_repositories = allowed_repositories
+        self._include_public_actionable_activity = include_public_actionable_activity
+        if external_repository_actions not in {
+            "disabled",
+            "inspect_only",
+            "own_pr_write",
+        }:
+            raise ValueError("external_repository_actions is invalid")
+        self._external_repository_actions = external_repository_actions
 
-    def _coordinates(self, proposal: WorkProposal) -> tuple[str, str, int, str]:
+    def _coordinates(
+        self, proposal: WorkProposal
+    ) -> tuple[str, str, int, str, str, bool]:
         stored = self._store.get(proposal.source_dedupe_key)
         if stored is None:
             raise ValueError("proposal source event is unavailable")
@@ -305,9 +352,13 @@ class GitHubSubjectStateResolver:
         number = metadata.get("subject_number")
         subject_key = metadata.get("subject_key")
         subject_url = metadata.get("subject_api_url")
-        if repository not in self._allowed_repositories:
+        repository_private = metadata.get("repository_private")
+        external_repository = repository not in self._allowed_repositories
+        if external_repository and not (
+            self._include_public_actionable_activity and repository_private is False
+        ):
             raise ValueError("proposal repository is outside the allowlist")
-        if subject_type not in {"PullRequest", "Issue"}:
+        if subject_type != "PullRequest":
             raise ValueError("proposal subject type is invalid")
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             raise ValueError("proposal subject number is invalid")
@@ -333,50 +384,94 @@ class GitHubSubjectStateResolver:
             )
         if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
             raise ValueError("proposal repository is invalid")
-        return repository, subject_type, number, subject_url
+        subject_parts = proposal.subject_key.split(":")
+        if (
+            len(subject_parts) != 3
+            or subject_parts[0] != "github"
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", subject_parts[1]) is None
+        ):
+            raise ValueError("proposal repository identity is invalid")
+        return (
+            repository,
+            subject_parts[1],
+            number,
+            subject_url,
+            stored.event.target.target_id,
+            external_repository,
+        )
 
     async def resolve(self, proposal: WorkProposal) -> ResolvedSourceState:
-        repository, subject_type, number, subject_url = self._coordinates(proposal)
+        (
+            repository,
+            repository_node_id,
+            number,
+            subject_url,
+            target_id,
+            external_repository,
+        ) = self._coordinates(proposal)
         payload = await asyncio.to_thread(self._client.fetch_subject, subject_url)
         if not isinstance(payload, Mapping):
             raise ValueError("GitHub subject is unavailable")
         current_number = payload.get("number")
         if current_number != number:
             raise ValueError("GitHub subject number changed")
+        base = payload.get("base")
+        base_repo = base.get("repo") if isinstance(base, Mapping) else None
+        current_base_name = (
+            base_repo.get("full_name") if isinstance(base_repo, Mapping) else None
+        )
+        current_base_id = (
+            base_repo.get("node_id") if isinstance(base_repo, Mapping) else None
+        )
+        if current_base_name != repository or current_base_id != repository_node_id:
+            raise ValueError("GitHub base repository identity changed")
+        if external_repository:
+            if (
+                self._external_repository_actions != "own_pr_write"
+                or base_repo.get("private") is not False
+            ):
+                raise ValueError("external repository execution is not allowed")
+            author = payload.get("user")
+            author_id = author.get("node_id") if isinstance(author, Mapping) else None
+            if author_id != target_id:
+                raise ValueError("GitHub pull request ownership changed")
         source_revision = payload.get("updated_at")
         if not isinstance(source_revision, str) or not source_revision:
             raise ValueError("GitHub subject revision is unavailable")
         head_sha: str | None = None
         head_ref: str | None = None
         head_repository: str | None = None
-        if subject_type == "PullRequest":
-            head = payload.get("head")
-            head_sha_value = head.get("sha") if isinstance(head, Mapping) else None
-            if not isinstance(head_sha_value, str) or not head_sha_value:
-                raise ValueError("GitHub pull request HEAD is unavailable")
-            head_sha = head_sha_value
-            head_ref_value = head.get("ref") if isinstance(head, Mapping) else None
-            if not _is_safe_git_ref(head_ref_value):
-                raise ValueError("GitHub pull request head ref is invalid")
-            head_ref = head_ref_value
-            head_repo = head.get("repo") if isinstance(head, Mapping) else None
-            head_repo_name = (
-                head_repo.get("full_name") if isinstance(head_repo, Mapping) else None
+        head = payload.get("head")
+        head_sha_value = head.get("sha") if isinstance(head, Mapping) else None
+        if not isinstance(head_sha_value, str) or not head_sha_value:
+            raise ValueError("GitHub pull request HEAD is unavailable")
+        head_sha = head_sha_value
+        head_ref_value = head.get("ref") if isinstance(head, Mapping) else None
+        if not _is_safe_git_ref(head_ref_value):
+            raise ValueError("GitHub pull request head ref is invalid")
+        head_ref = head_ref_value
+        head_repo = head.get("repo") if isinstance(head, Mapping) else None
+        head_repo_name = (
+            head_repo.get("full_name") if isinstance(head_repo, Mapping) else None
+        )
+        if (
+            not isinstance(head_repo_name, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", head_repo_name
             )
-            if (
-                not isinstance(head_repo_name, str)
-                or re.fullmatch(
-                    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", head_repo_name
-                )
-                is None
-            ):
-                raise ValueError("GitHub pull request head repository is invalid")
-            head_repository = head_repo_name
+            is None
+        ):
+            raise ValueError("GitHub pull request head repository is invalid")
+        if external_repository and head_repo.get("private") is not False:
+            raise ValueError("GitHub pull request head repository is private")
+        head_repository = head_repo_name
         return ResolvedSourceState(
             source_revision=source_revision,
             head_sha=head_sha,
             head_ref=head_ref,
             head_repository=head_repository,
+            repository_node_id=repository_node_id,
+            base_repository=repository,
         )
 
 
@@ -398,9 +493,27 @@ class ExecutionLifecycleObserver:
         self._pending_lock = threading.Lock()
         self._pending: list[object] = []
 
-    def _schedule(self, thread_id: str, content: str) -> None:
+    async def _update_status(self, execution_id: str, content: str) -> None:
+        execution = self._store.get_execution(execution_id)
+        if execution is None:
+            raise KeyError("execution receipt not found")
+        if execution.status_message_id is None:
+            message_id = await self._discord.send_to_thread(
+                execution.thread_id,
+                content,
+            )
+            self._store.record_execution_message(execution_id, message_id)
+            return
+        await self._discord.edit_thread_message(
+            execution.thread_id,
+            execution.status_message_id,
+            content,
+        )
+
+    def _schedule(self, execution_id: str, content: str) -> None:
         future = asyncio.run_coroutine_threadsafe(
-            self._discord.send_to_thread(thread_id, content), self._loop
+            self._update_status(execution_id, content),
+            self._loop,
         )
         with self._pending_lock:
             self._pending.append(future)
@@ -465,8 +578,13 @@ class ExecutionLifecycleObserver:
             raise ValueError("approved execution proposal hash mismatch")
         if execution.mode != mode:
             raise ValueError("approved execution mode mismatch")
-        if execution.workspace != self._workspace:
+        if execution.workspace is None:
             raise ValueError("approved execution workspace mismatch")
+        self._validate_workspace_path(
+            execution.workspace,
+            "approved execution workspace",
+            root=self._workspace,
+        )
         if execution.status != "queued":
             raise ValueError("approved execution is not queued")
         proposal = self._store.get_proposal(
@@ -489,26 +607,32 @@ class ExecutionLifecycleObserver:
             return ("file", "terminal")
         raise ValueError("unsupported execution mode")
 
-    def _validate_workspace_path(self, value: object, name: str) -> str:
+    def _validate_workspace_path(
+        self,
+        value: object,
+        name: str,
+        *,
+        root: str,
+    ) -> str:
         if not isinstance(value, str) or not value or value != value.strip():
             raise ValueError(f"{name} requires an explicit workspace path")
         if "\\" in value or any(ord(char) < 32 for char in value):
             raise ValueError(f"{name} is outside the approved workspace")
         parsed = PurePosixPath(value)
-        root = PurePosixPath(self._workspace)
+        parsed_root = PurePosixPath(root)
         if (
             not parsed.is_absolute()
             or parsed.as_posix() != value
-            or (parsed != root and root not in parsed.parents)
+            or (parsed != parsed_root and parsed_root not in parsed.parents)
             or any(part in {"", ".", ".."} for part in parsed.parts[1:])
         ):
             raise ValueError(f"{name} is outside the approved workspace")
-        relative_parts = parsed.relative_to(root).parts
+        relative_parts = parsed.relative_to(parsed_root).parts
         if any(part.casefold() == ".git" for part in relative_parts):
             raise ValueError(f"{name} cannot access Git metadata")
         try:
             resolved = Path(value).resolve(strict=False)
-            resolved_root = Path(self._workspace).resolve(strict=False)
+            resolved_root = Path(root).resolve(strict=False)
         except (OSError, RuntimeError) as exc:
             raise ValueError(f"{name} is outside the approved workspace") from exc
         if resolved != resolved_root and resolved_root not in resolved.parents:
@@ -788,7 +912,9 @@ class ExecutionLifecycleObserver:
         if not argv:
             raise ValueError("terminal command must be stable text")
         validated_workdir = self._validate_workspace_path(
-            workdir, "terminal workdir"
+            workdir,
+            "terminal workdir",
+            root=execution.workspace or "",
         )
         self._validate_command_paths(argv, workdir=validated_workdir)
         program = argv[0]
@@ -849,8 +975,13 @@ class ExecutionLifecycleObserver:
         execution = self._store.get_execution(execution_id)
         if execution is None:
             raise KeyError("execution receipt not found")
-        if execution.workspace != self._workspace:
+        if execution.workspace is None:
             raise ValueError("approved execution workspace mismatch")
+        self._validate_workspace_path(
+            execution.workspace,
+            "approved execution workspace",
+            root=self._workspace,
+        )
         proposal = self._store.get_proposal(
             execution.proposal_id, execution.proposal_revision
         )
@@ -880,7 +1011,11 @@ class ExecutionLifecycleObserver:
                         raise ValueError("file read is outside approved actions")
                 elif "edit_scoped_files" not in proposal.allowed_actions:
                     raise ValueError("file write is outside approved actions")
-                self._validate_workspace_path(args.get("path"), "file tool path")
+                self._validate_workspace_path(
+                    args.get("path"),
+                    "file tool path",
+                    root=execution.workspace,
+                )
             if tool_name == "terminal":
                 if args.get("background") is True:
                     raise ValueError(
@@ -923,7 +1058,7 @@ class ExecutionLifecycleObserver:
             if execution.mode == "kanban"
             else render_running(proposal)
         )
-        self._schedule(execution.thread_id, content)
+        self._schedule(execution.execution_id, content)
 
     def _tool_action(
         self,
@@ -996,7 +1131,7 @@ class ExecutionLifecycleObserver:
                 and output.strip() == execution.head_ref
             )
         if action == "git_verify_workspace":
-            return output is not None and output.strip() == self._workspace
+            return output is not None and output.strip() == execution.workspace
         if action == "git_verify_origin":
             return (
                 output is not None
@@ -1121,8 +1256,9 @@ class ExecutionLifecycleObserver:
         )
         if proposal is None:
             raise RuntimeError("blocked execution proposal disappeared")
-        await self._discord.send_to_thread(
-            execution.thread_id, render_blocked(proposal, category=category)
+        await self._update_status(
+            execution.execution_id,
+            render_blocked(proposal, category=category),
         )
 
     @staticmethod
@@ -1210,6 +1346,33 @@ class ExecutionLifecycleObserver:
         )
         return tuple(evidence[:8])
 
+    async def reconcile_terminal_receipts(self, *, limit: int = 100) -> int:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        reconciled = 0
+        for _ in range(limit):
+            claim = self._store.claim_terminal_receipt()
+            if claim is None:
+                break
+            message_id: str | None = None
+            if claim.requires_reconciliation:
+                message_id = await self._discord.find_marker(
+                    claim.thread_id,
+                    claim.marker,
+                    limit=100,
+                )
+            if message_id is None:
+                message_id = await self._discord.send_to_thread(
+                    claim.thread_id,
+                    claim.content,
+                )
+            self._store.mark_terminal_receipt_sent(
+                claim.execution_id,
+                message_id=message_id,
+            )
+            reconciled += 1
+        return reconciled
+
     async def run_completed(
         self, execution_id: str, agent_result: Mapping[str, Any]
     ) -> str:
@@ -1242,8 +1405,9 @@ class ExecutionLifecycleObserver:
             )
             if queued is None or queued.status is not ProposalStatus.QUEUED:
                 raise RuntimeError("Kanban proposal did not remain queued")
-            await self._discord.send_to_thread(
-                execution.thread_id, render_kanban_queued(queued)
+            await self._update_status(
+                execution.execution_id,
+                render_kanban_queued(queued),
             )
             return "queued"
         if agent_result.get("completed") is not True:
@@ -1258,25 +1422,31 @@ class ExecutionLifecycleObserver:
         )
         if verifying is None:
             raise RuntimeError("verifying execution proposal disappeared")
-        await self._discord.send_to_thread(
-            execution.thread_id, render_verifying(verifying)
+        await self._update_status(
+            execution.execution_id,
+            render_verifying(verifying),
         )
-        execution = self._store.mark_execution_completed(execution_id)
+        receipt_content = render_completed(
+            CompletionReceipt(
+                summary=self._safe_agent_summary(agent_result),
+                evidence=self._completion_evidence(execution.evidence_json),
+                verified=True,
+            )
+        )
+        execution = self._store.complete_execution_with_terminal_receipt(
+            execution_id,
+            content=receipt_content,
+        )
         completed = self._store.get_proposal(
             execution.proposal_id, execution.proposal_revision
         )
         if completed is None:
             raise RuntimeError("completed execution proposal disappeared")
-        await self._discord.send_to_thread(
-            execution.thread_id,
-            render_completed(
-                CompletionReceipt(
-                    summary=self._safe_agent_summary(agent_result),
-                    evidence=self._completion_evidence(execution.evidence_json),
-                    verified=True,
-                )
-            ),
+        await self._update_status(
+            execution.execution_id,
+            "✅ 작업을 마무리했어요. 아래에서 변경 내용과 검증 근거를 확인해 주세요.",
         )
+        await self.reconcile_terminal_receipts()
         return "completed"
 
     async def run_failed(self, execution_id: str) -> None:
@@ -1298,6 +1468,7 @@ class ApprovalHandler:
         bot_mention: str,
         authorized_approver_ids: frozenset[str],
         workspace: str,
+        workspace_manager: RepositoryWorktreeManager | None = None,
     ) -> None:
         self._store = store
         self._source_resolver = source_resolver
@@ -1306,6 +1477,7 @@ class ApprovalHandler:
         self._bot_mention = bot_mention
         self._authorized_approver_ids = authorized_approver_ids
         self._workspace = normalize_execution_workspace_root(workspace)
+        self._workspace_manager = workspace_manager
 
     def _exact_command(self, message: InboxDiscordMessage) -> bool:
         return " ".join(message.text.split()) == f"{self._bot_mention} 승인"
@@ -1317,6 +1489,7 @@ class ApprovalHandler:
         proposal: WorkProposal,
         message: InboxDiscordMessage,
         current: ResolvedSourceState,
+        workspace: str,
     ) -> ApprovedExecutionRequest:
         return ApprovedExecutionRequest(
             execution_id=execution_id,
@@ -1330,7 +1503,7 @@ class ApprovalHandler:
             head_sha=proposal.head_sha,
             head_ref=current.head_ref,
             head_repository=current.head_repository,
-            workspace=self._workspace,
+            workspace=workspace,
             goal=proposal.goal,
             steps=proposal.steps,
             allowed_actions=proposal.allowed_actions,
@@ -1342,9 +1515,67 @@ class ApprovalHandler:
             thread_id=message.thread_id,
         )
 
+    def _worktree_request(
+        self,
+        proposal: WorkProposal,
+        current: ResolvedSourceState,
+    ) -> tuple[str, str, WorktreeRequest | None]:
+        execution_id = work_execution_id(proposal.proposal_id, proposal.revision)
+        if self._workspace_manager is None:
+            return execution_id, self._workspace, None
+        if (
+            current.repository_node_id is None
+            or current.base_repository is None
+            or current.head_repository is None
+            or current.head_ref is None
+            or current.head_sha is None
+        ):
+            raise ValueError("verified PR workspace coordinates are unavailable")
+        request = WorktreeRequest(
+            execution_id=execution_id,
+            repository_node_id=current.repository_node_id,
+            base_repository=current.base_repository,
+            head_repository=current.head_repository,
+            head_ref=current.head_ref,
+            head_sha=current.head_sha,
+        )
+        workspace = str(self._workspace_manager.workspace_for(execution_id).resolve())
+        return execution_id, workspace, request
+
+    async def reconcile_execution_policy(
+        self,
+        *,
+        trusted_repositories: frozenset[str],
+        external_repository_actions: str,
+    ) -> int:
+        if external_repository_actions not in {
+            "disabled",
+            "inspect_only",
+            "own_pr_write",
+        }:
+            raise ValueError("external_repository_actions is invalid")
+        if external_repository_actions == "own_pr_write":
+            return 0
+        changed = self._store.invalidate_queued_external_executions(
+            trusted_repositories=trusted_repositories,
+            evidence_category="external_policy_disabled",
+        )
+        for execution in changed:
+            proposal = self._store.get_proposal(
+                execution.proposal_id,
+                execution.proposal_revision,
+            )
+            if proposal is None:
+                continue
+            await self._discord.send_to_thread(
+                execution.thread_id,
+                render_needs_reapproval(proposal),
+            )
+        return len(changed)
+
     async def recover_queued(self, *, limit: int = 100) -> int:
         recovered_count = 0
-        for recoverable in self._store.list_recoverable_executions(limit=limit):
+        for recoverable in self._store.claim_recoverable_executions(limit=limit):
             execution = recoverable.execution
             proposal = self._store.get_proposal(
                 execution.proposal_id, execution.proposal_revision
@@ -1365,8 +1596,10 @@ class ApprovalHandler:
             try:
                 current = await self._source_resolver.resolve(proposal)
             except Exception:
+                self._store.release_execution_recovery(execution.execution_id)
                 continue
             if not isinstance(current, ResolvedSourceState):
+                self._store.release_execution_recovery(execution.execution_id)
                 continue
             if (
                 current.source_revision != proposal.source_revision
@@ -1384,7 +1617,10 @@ class ApprovalHandler:
                     )
                 continue
             if (
-                execution.workspace != self._workspace
+                (
+                    self._workspace_manager is None
+                    and execution.workspace != self._workspace
+                )
                 or execution.head_ref != current.head_ref
                 or execution.head_repository != current.head_repository
             ):
@@ -1400,6 +1636,46 @@ class ApprovalHandler:
                         execution.thread_id, render_needs_reapproval(stale)
                     )
                 continue
+            workspace = execution.workspace or self._workspace
+            if self._workspace_manager is not None:
+                try:
+                    expected_execution_id, expected_workspace, worktree_request = (
+                        self._worktree_request(proposal, current)
+                    )
+                    if (
+                        expected_execution_id != execution.execution_id
+                        or expected_workspace != workspace
+                        or worktree_request is None
+                    ):
+                        raise WorkspacePreparationError(
+                            "recovered workspace scope changed"
+                        )
+                    prepared = await asyncio.to_thread(
+                        self._workspace_manager.prepare,
+                        worktree_request,
+                    )
+                    if str(prepared.resolve()) != workspace:
+                        raise WorkspacePreparationError(
+                            "recovered workspace path changed"
+                        )
+                except (OSError, ValueError, WorkspacePreparationError):
+                    self._store.mark_execution_blocked(
+                        execution.execution_id,
+                        evidence_category="workspace_unavailable",
+                    )
+                    blocked = self._store.get_proposal(
+                        execution.proposal_id,
+                        execution.proposal_revision,
+                    )
+                    if blocked is not None:
+                        await self._discord.send_to_thread(
+                            execution.thread_id,
+                            render_blocked(
+                                blocked,
+                                category="workspace_unavailable",
+                            ),
+                        )
+                    continue
             expected_dispatch_id = f"{execution.mode}:{execution.execution_id}"
             if execution.status == "reserved":
                 self._store.mark_execution_dispatched(
@@ -1411,8 +1687,12 @@ class ApprovalHandler:
                     ProposalStatus.QUEUED,
                     expected_statuses=(ProposalStatus.APPROVED,),
                 )
-                await self._discord.send_to_thread(
+                status_message_id = await self._discord.send_to_thread(
                     execution.thread_id, render_queued(proposal)
+                )
+                self._store.record_execution_message(
+                    execution.execution_id,
+                    status_message_id,
                 )
             message = InboxDiscordMessage(
                 thread_id=execution.thread_id,
@@ -1431,6 +1711,7 @@ class ApprovalHandler:
                 proposal=proposal,
                 message=message,
                 current=current,
+                workspace=workspace,
             )
             try:
                 receipt = await self._dispatcher.dispatch(request)
@@ -1530,6 +1811,12 @@ class ApprovalHandler:
                 )
             return InboxRouteResult(True, approved.reason, approved.proposal)
 
+        try:
+            expected_execution_id, workspace, worktree_request = (
+                self._worktree_request(approved.proposal, current)
+            )
+        except ValueError:
+            return InboxRouteResult(True, "workspace_scope_invalid", approved.proposal)
         execution = self._store.reserve_work_execution(
             proposal_id=approved.proposal.proposal_id,
             revision=approved.proposal.revision,
@@ -1539,13 +1826,46 @@ class ApprovalHandler:
             mode=approved.proposal.executor_hint,
             head_ref=current.head_ref,
             head_repository=current.head_repository,
-            workspace=self._workspace,
+            workspace=workspace,
         )
+        if execution.execution_id != expected_execution_id:
+            raise RuntimeError("reserved execution identity changed")
+        if worktree_request is not None:
+            try:
+                prepared = await asyncio.to_thread(
+                    self._workspace_manager.prepare,
+                    worktree_request,
+                )
+                if str(prepared.resolve()) != workspace:
+                    raise WorkspacePreparationError(
+                        "prepared workspace does not match execution scope"
+                    )
+            except (OSError, ValueError, WorkspacePreparationError):
+                self._store.mark_execution_blocked(
+                    execution.execution_id,
+                    evidence_category="workspace_unavailable",
+                )
+                blocked = self._store.get_latest_proposal(
+                    approved.proposal.subject_key
+                )
+                if blocked is None:
+                    raise RuntimeError("blocked proposal state was not persisted")
+                blocked_message_id = await self._discord.send_to_thread(
+                    message.thread_id,
+                    render_blocked(blocked, category="workspace_unavailable"),
+                )
+                return InboxRouteResult(
+                    True,
+                    "execution_blocked",
+                    blocked,
+                    blocked_message_id,
+                )
         request = self._request(
             execution_id=execution.execution_id,
             proposal=approved.proposal,
             message=message,
             current=current,
+            workspace=workspace,
         )
         expected_dispatch_id = (
             f"{approved.proposal.executor_hint}:{execution.execution_id}"
@@ -1561,6 +1881,10 @@ class ApprovalHandler:
         )
         response_message_id = await self._discord.send_to_thread(
             message.thread_id, render_queued(queued)
+        )
+        self._store.record_execution_message(
+            execution.execution_id,
+            response_message_id,
         )
         try:
             receipt = await self._dispatcher.dispatch(request)

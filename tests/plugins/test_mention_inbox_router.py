@@ -15,6 +15,7 @@ from plugins.mention_inbox.router import (
     InboxDiscordMessage,
     InboxProposalRouter,
     InboxRouteResult,
+    PersistentProposalControlBinding,
 )
 from plugins.mention_inbox.store import MentionInboxStore
 
@@ -244,7 +245,7 @@ async def test_only_explicit_revision_command_creates_new_proposal(
     assert "API 회귀" in latest.goal
     binding = store.get_proposal_message_binding(latest.proposal_id, latest.revision)
     assert binding is not None and binding.approval_offered is True
-    assert "리뷰 반영해서 수정해줘" in discord.messages[-1][1]
+    assert "`리뷰 반영해줘`" in discord.messages[-1][1]
     assert f"{BOT_MENTION} 승인" not in discord.messages[-1][1]
     assert handler.calls == []
     assert responder.calls == []
@@ -567,7 +568,7 @@ async def test_conversation_failure_uses_stored_preflight_evidence(
     assert result.kind == "conversation_fallback"
     assert "질문에 실제 리뷰 근거로 답해야 해요" in content
     assert "실제 코멘트는 fallback이 질문에 답하지 못한다는 점입니다" in content
-    assert "plugins/mention‗inbox/router.py:334" in content
+    assert "plugins/mention_inbox/router.py:334" in content
     assert "현재 제안: revision 1 · status pending" in content
     assert "제안 수정:" not in content
     assert _mutation_counts(store) == before == (0, 0)
@@ -858,3 +859,103 @@ async def test_empty_reply_is_handled_without_revision(tmp_path: Path) -> None:
     assert result.kind == "empty_message"
     assert store.get_latest_proposal(SUBJECT).revision == 1
     assert discord.messages == []
+
+
+@pytest.mark.asyncio
+async def test_revision_bound_start_action_uses_exact_proposal_binding(
+    tmp_path: Path,
+) -> None:
+    store, proposal = _seed(tmp_path / "button-start.db")
+    discord = _Discord()
+    handler = _Handler()
+    router = _router(store, discord, handler=handler)
+
+    result = await router.handle_action(
+        thread_id="thread-1",
+        proposal_id=proposal.proposal_id,
+        proposal_revision=proposal.revision,
+        proposal_message_id="proposal-message-1",
+        user_id=USER,
+        interaction_id="interaction-1",
+        action="start",
+    )
+
+    assert result.kind == "approval_queued"
+    assert len(handler.calls) == 1
+    message, bound = handler.calls[0]
+    assert message.reply_to_message_id == "proposal-message-1"
+    assert message.text == f"{BOT_MENTION} 승인"
+    assert bound == proposal
+
+
+@pytest.mark.asyncio
+async def test_revision_bound_action_rejects_stale_or_unknown_revision(
+    tmp_path: Path,
+) -> None:
+    store, proposal = _seed(tmp_path / "button-stale.db")
+    handler = _Handler()
+    router = _router(store, _Discord(), handler=handler)
+
+    result = await router.handle_action(
+        thread_id="thread-1",
+        proposal_id=proposal.proposal_id,
+        proposal_revision=proposal.revision + 1,
+        proposal_message_id="proposal-message-1",
+        user_id=USER,
+        interaction_id="interaction-2",
+        action="start",
+    )
+
+    assert result.kind == "proposal_action_stale"
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_revision_bound_secondary_actions_do_not_mutate_proposal(
+    tmp_path: Path,
+) -> None:
+    store, proposal = _seed(tmp_path / "button-secondary.db")
+    responder = _Responder()
+    router = _router(store, _Discord(), responder=responder)
+
+    evidence = await router.handle_action(
+        thread_id="thread-1",
+        proposal_id=proposal.proposal_id,
+        proposal_revision=proposal.revision,
+        proposal_message_id="proposal-message-1",
+        user_id=USER,
+        interaction_id="interaction-3",
+        action="inspect",
+    )
+    defer = await router.handle_action(
+        thread_id="thread-1",
+        proposal_id=proposal.proposal_id,
+        proposal_revision=proposal.revision,
+        proposal_message_id="proposal-message-1",
+        user_id=USER,
+        interaction_id="interaction-4",
+        action="later",
+    )
+
+    assert evidence.kind == "conversation_response"
+    assert defer.kind == "proposal_deferred"
+    assert store.get_latest_proposal(SUBJECT) == proposal
+    assert len(responder.calls) == 1
+    assert responder.calls[0]["message"] == "저장된 preflight 근거를 요약해 주세요"
+
+
+def test_persistent_control_bindings_restore_exact_pending_message(
+    tmp_path: Path,
+) -> None:
+    store, proposal = _seed(tmp_path / "persistent-controls.db")
+    router = _router(store, _Discord(), handler=_Handler())
+
+    assert router.persistent_control_bindings() == (
+        PersistentProposalControlBinding(
+            thread_id="thread-1",
+            proposal_id=proposal.proposal_id,
+            proposal_revision=proposal.revision,
+            proposal_message_id="proposal-message-1",
+            approval_offered=True,
+        ),
+    )

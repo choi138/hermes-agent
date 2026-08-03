@@ -25,10 +25,14 @@ def _event(
     actionable_kind: str = "own_pr_review_comment",
     disposition: str = "review_needed",
     include_brief: bool = True,
+    repository: str = "silviahealth/content",
+    subject_owned_by_target: bool = False,
 ):
     metadata: dict[str, object] = {
         "actionable_kind": actionable_kind,
-        "repository": "silviahealth/content",
+        "repository": repository,
+        "repository_private": False,
+        "subject_owned_by_target": subject_owned_by_target,
         "subject_type": "PullRequest",
         "subject_number": 7,
         "subject_key": subject_key,
@@ -83,6 +87,7 @@ class _Discord:
         self.created: list[tuple[str, str, int]] = []
         self.marked: list[str] = []
         self.messages: dict[str, list[tuple[str, str]]] = {}
+        self.proposal_controls: list[dict[str, object]] = []
         self.next_message = 1
 
     async def find_anchored_thread(self, parent_message_id: str) -> str | None:
@@ -116,22 +121,45 @@ class _Discord:
         self.messages.setdefault(thread_id, []).append((message_id, content))
         return message_id
 
+    async def send_proposal_to_thread(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        proposal_id: str,
+        proposal_revision: int,
+        approval_offered: bool,
+    ) -> str:
+        self.proposal_controls.append({
+            "proposal_id": proposal_id,
+            "proposal_revision": proposal_revision,
+            "approval_offered": approval_offered,
+        })
+        return await self.send_to_thread(thread_id, content)
+
 
 def _coordinator(
-    path: Path, discord: _Discord, *, approval_available: bool = True
+    path: Path,
+    discord: _Discord,
+    *,
+    approval_available: bool = True,
+    external_repository_actions: str = "disabled",
 ) -> MentionInboxThreadCoordinator:
     return MentionInboxThreadCoordinator(
         store=MentionInboxStore(path, clock=lambda: NOW),
         discord=discord,
         bot_mention=BOT_MENTION,
         approval_available=approval_available,
+        trusted_repositories=frozenset({"silviahealth/content"}),
+        external_repository_actions=external_repository_actions,
     )
 
 
 @pytest.mark.asyncio
 async def test_same_subject_creates_one_thread_and_one_proposal(tmp_path: Path) -> None:
     discord = _Discord()
-    coordinator = _coordinator(tmp_path / "inbox.db", discord)
+    path = tmp_path / "inbox.db"
+    coordinator = _coordinator(path, discord)
     event = _event()
 
     first = await coordinator.ensure_thread(
@@ -148,6 +176,13 @@ async def test_same_subject_creates_one_thread_and_one_proposal(tmp_path: Path) 
     assert first.discord_thread_id == second.discord_thread_id == "thread-1"
     assert len(discord.created) == 1
     assert len(discord.messages["thread-1"]) == 1
+    proposal = MentionInboxStore(path).get_latest_proposal("github:R_repo:PR_7")
+    assert proposal is not None
+    assert discord.proposal_controls == [{
+        "proposal_id": proposal.proposal_id,
+        "proposal_revision": 1,
+        "approval_offered": True,
+    }]
     assert discord.marked == ["thread-1", "thread-1"]
 
 
@@ -170,8 +205,70 @@ async def test_approval_offer_is_bound_only_when_execution_and_preflight_allow_i
         proposal.proposal_id, proposal.revision
     )
     assert f"{BOT_MENTION} 승인" not in content
-    assert "리뷰 반영해서 수정해줘" in content
+    assert "`리뷰 반영해줘`" in content
     assert binding is not None and binding.approval_offered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["disabled", "inspect_only"])
+async def test_external_inspection_modes_never_offer_host_execution(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    path = tmp_path / f"{mode}.db"
+    discord = _Discord()
+
+    await _coordinator(
+        path,
+        discord,
+        approval_available=True,
+        external_repository_actions=mode,
+    ).ensure_thread(
+        _event(repository="external/project", subject_owned_by_target=True),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    proposal = MentionInboxStore(path).get_latest_proposal("github:R_repo:PR_7")
+    assert proposal is not None
+    binding = MentionInboxStore(path).get_proposal_message_binding(
+        proposal.proposal_id,
+        proposal.revision,
+    )
+    assert binding is not None and binding.approval_offered is False
+    assert proposal.allowed_actions == ("read_repository",)
+    assert "수정 시작" not in discord.messages["thread-1"][0][1]
+
+
+@pytest.mark.asyncio
+async def test_external_own_pr_write_excludes_repository_code_execution(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "own-write.db"
+    discord = _Discord()
+
+    await _coordinator(
+        path,
+        discord,
+        approval_available=True,
+        external_repository_actions="own_pr_write",
+    ).ensure_thread(
+        _event(repository="external/project", subject_owned_by_target=True),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    proposal = MentionInboxStore(path).get_latest_proposal("github:R_repo:PR_7")
+    assert proposal is not None
+    binding = MentionInboxStore(path).get_proposal_message_binding(
+        proposal.proposal_id,
+        proposal.revision,
+    )
+    assert binding is not None and binding.approval_offered is True
+    assert "edit_scoped_files" in proposal.allowed_actions
+    assert "push_current_branch" in proposal.allowed_actions
+    assert "run_targeted_tests" not in proposal.allowed_actions
+    assert "run_tests" not in proposal.allowed_actions
 
 
 @pytest.mark.asyncio
@@ -272,7 +369,7 @@ async def test_review_summary_proposal_uses_concrete_review_evidence(
     content = discord.messages["thread-1"][0][1]
     assert "확인한 내용" in content
     assert "이 줄을 확인해 주세요" in content
-    assert "plugins/mention‗inbox/voice.py:181" in content
+    assert "plugins/mention_inbox/voice.py:181" in content
     assert "현재 HEAD에서 확인이 필요한 리뷰 요청" in content
     assert "원본 event와 최신 repository 상태" not in content
 
@@ -465,8 +562,8 @@ async def test_pending_proposal_is_local_no_tools_and_omits_full_body(
     )
     content = discord.messages["thread-1"][0][1]
     assert "FULL_BODY_SENTINEL" not in content
-    assert "해야 할 일" in content
-    assert "리뷰 반영해서 수정해줘" in content
+    assert "제 추천" in content
+    assert "`리뷰 반영해줘`" in content
     assert BOT_MENTION not in content
     assert not hasattr(discord, "run_agent")
     assert not hasattr(discord, "execute_tool")
@@ -553,4 +650,4 @@ async def test_legacy_pending_is_reconciled_once_from_new_hydration(
     )
     assert expected_notice in rendered
     assert f"{BOT_MENTION} 승인" not in rendered
-    assert ("리뷰 반영해서 수정해줘" in rendered) is expected_new_offer
+    assert ("`리뷰 반영해줘`" in rendered) is expected_new_offer

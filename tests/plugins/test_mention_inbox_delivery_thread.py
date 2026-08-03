@@ -448,7 +448,7 @@ async def test_informational_event_is_threaded_without_replacing_actionable_prop
     assert latest == original
     assert len(parent_discord.sends) == 1
     assert len(thread_discord.messages) == 2
-    assert "🟢 No action" in thread_discord.messages[-1][1]
+    assert "🟢 확인 완료" in thread_discord.messages[-1][1]
     assert "Looks good" in thread_discord.messages[-1][1]
 
 
