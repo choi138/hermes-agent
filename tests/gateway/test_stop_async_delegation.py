@@ -139,6 +139,22 @@ def _admission_adapter(runner):
     return adapter, handler
 
 
+def _install_admission_barrier(
+    adapter: _AdmissionAdapter,
+    entered: threading.Event,
+    release: threading.Event,
+) -> None:
+    """Pause a synthetic event after delivery handoff but before admission."""
+    original_handle_message = adapter.handle_message
+
+    async def blocked_handle_message(event):
+        entered.set()
+        await asyncio.to_thread(release.wait, 5)
+        await original_handle_message(event)
+
+    adapter.handle_message = blocked_handle_message
+
+
 def _tokenized_completion(runner, source):
     session_key = build_session_key(source)
     return MessageEvent(
@@ -514,7 +530,7 @@ async def test_gateway_revalidates_claim_when_stop_wins_delivery_race(
 async def test_stop_after_claim_revalidation_blocks_adapter_admission(
     tmp_path, monkeypatch
 ):
-    """A stop during topic recovery wins after the final durable-claim read."""
+    """A stop during adapter handoff wins after the final durable-claim read."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     source = _source("thread-a")
     session_key = build_session_key(source)
@@ -544,21 +560,15 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
         clear_resume_pending=AsyncMock(return_value=False),
     )
 
-    recovery_entered = threading.Event()
-    release_recovery = threading.Event()
-
-    def blocking_topic_recovery(_source):
-        recovery_entered.set()
-        release_recovery.wait(timeout=5)
-        return None
-
-    adapter.set_topic_recovery_fn(blocking_topic_recovery)
+    admission_entered = threading.Event()
+    release_admission = threading.Event()
+    _install_admission_barrier(adapter, admission_entered, release_admission)
     delivery_task = asyncio.create_task(
         runner._deliver_completion_notification("synthetic", evt)
     )
 
     entered = await asyncio.wait_for(
-        asyncio.to_thread(recovery_entered.wait, 3),
+        asyncio.to_thread(admission_entered.wait, 3),
         timeout=4,
     )
     cancelled = -1
@@ -570,9 +580,9 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
                 reason="stop_command",
             )
         finally:
-            release_recovery.set()
+            release_admission.set()
     else:
-        release_recovery.set()
+        release_admission.set()
 
     result = await asyncio.wait_for(delivery_task, timeout=5)
     await adapter.cancel_background_tasks()
@@ -591,7 +601,7 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
 async def test_terminal_completion_stop_race_blocks_adapter_admission(
     tmp_path, monkeypatch
 ):
-    """A terminal completion already inside topic recovery loses to /stop."""
+    """A terminal completion already handed to the adapter loses to /stop."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     source = _source("thread-a")
     session_key = build_session_key(source)
@@ -633,21 +643,15 @@ async def test_terminal_completion_stop_race_blocks_adapter_admission(
         clear_resume_pending=AsyncMock(return_value=False),
     )
 
-    recovery_entered = threading.Event()
-    release_recovery = threading.Event()
-
-    def blocking_topic_recovery(_source):
-        recovery_entered.set()
-        release_recovery.wait(timeout=5)
-        return None
-
-    adapter.set_topic_recovery_fn(blocking_topic_recovery)
+    admission_entered = threading.Event()
+    release_admission = threading.Event()
+    _install_admission_barrier(adapter, admission_entered, release_admission)
     delivery_task = asyncio.create_task(
         runner._deliver_completion_notification("synthetic", evt)
     )
 
     entered = await asyncio.wait_for(
-        asyncio.to_thread(recovery_entered.wait, 3),
+        asyncio.to_thread(admission_entered.wait, 3),
         timeout=4,
     )
     if entered:
@@ -658,9 +662,9 @@ async def test_terminal_completion_stop_race_blocks_adapter_admission(
                 reason="stop_command",
             )
         finally:
-            release_recovery.set()
+            release_admission.set()
     else:
-        release_recovery.set()
+        release_admission.set()
 
     result = await asyncio.wait_for(delivery_task, timeout=5)
     await adapter.cancel_background_tasks()
