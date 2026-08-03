@@ -160,6 +160,14 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "discord", "long_running_notifications") is True
         assert resolve_display_setting({}, "discord", "busy_ack_detail") is False
 
+    def test_discord_semantic_progress_defaults_on_but_allows_opt_out(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "discord", "semantic_progress") is True
+        config = {"display": {"semantic_progress": False}}
+        assert resolve_display_setting(config, "discord", "semantic_progress") is False
+        assert resolve_display_setting({}, "telegram", "semantic_progress") is False
+
     def test_slack_workspace_chatter_defaults(self):
         """Slack should not leave permanent heartbeat/debug breadcrumbs in channels."""
         from gateway.display_config import resolve_display_setting
@@ -300,5 +308,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 

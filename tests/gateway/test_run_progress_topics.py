@@ -531,7 +531,13 @@ def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
 
 
 def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
-    """The real gateway path must retain the URL beyond its visible cap."""
+    """The raw Discord gateway path must retain the URL beyond its visible cap.
+
+    This integration intentionally reserves ``all``/``new`` on Discord for the
+    secret-safe semantic snapshot, which never exposes raw tool previews. Opt
+    out explicitly here to exercise upstream's raw-preview link path without
+    weakening that local default.
+    """
     import yaml
 
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
@@ -545,7 +551,9 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_preview_length": 0}}),
+        yaml.dump(
+            {"display": {"semantic_progress": False, "tool_preview_length": 0}}
+        ),
         encoding="utf-8",
     )
 

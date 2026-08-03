@@ -33,6 +33,9 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # Discord opts into secret-safe semantic snapshots below. Other platforms
+    # keep their existing raw/friendly progress rendering unless configured.
+    "semantic_progress": False,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -138,6 +141,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "discord":     {
         **_TIER_HIGH,
         "reasoning_style": "subtext",
+        "semantic_progress": True,
         # Internal iteration/tool names are diagnostic data, not user-facing
         # progress. Operators can still inspect them in logs.
         "busy_ack_detail": False,
@@ -279,6 +283,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "long_running_notifications",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
+        "semantic_progress",
         "thinking_progress",
     }:
         if isinstance(value, str):

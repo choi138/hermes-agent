@@ -775,6 +775,22 @@ def _resolve_gateway_tool_progress_mode(user_config: dict, platform_key: str) ->
     return str(mode).strip().lower()
 
 
+def _resolve_gateway_semantic_progress(
+    user_config: dict, platform_key: str
+) -> bool:
+    """Return whether the platform should replace raw tool previews with snapshots."""
+    from gateway.display_config import resolve_display_setting
+
+    return bool(
+        resolve_display_setting(
+            user_config,
+            platform_key,
+            "semantic_progress",
+            False,
+        )
+    )
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -16795,7 +16811,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config = _load_gateway_config()
             platform_key = _platform_config_key(source.platform)
             mode = _resolve_gateway_tool_progress_mode(user_config, platform_key)
-            if mode not in {"all", "new"}:
+            if (
+                mode not in {"all", "new"}
+                or not _resolve_gateway_semantic_progress(user_config, platform_key)
+            ):
                 return None, None
 
             adapter = self._adapter_for_source(source)
@@ -25355,6 +25374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_enabled = (
             source.platform == Platform.DISCORD
             and progress_mode in {"all", "new"}
+            and _resolve_gateway_semantic_progress(user_config, platform_key)
         )
         semantic_progress_tracker = None
         progress_language = None
