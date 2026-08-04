@@ -2738,11 +2738,21 @@ DEFAULT_CONFIG = {
         "profile_build": "ask",
     },
 
-    # Privacy-safe aggregate metrics written only to this profile's local
-    # telemetry directory. Collection is opt-in and no remote sink exists.
+    # Privacy-safe metrics written only to this profile's local telemetry
+    # directory. Collection is opt-in and no remote sink exists.
+    #
+    # Two storage shapes live behind ``enabled``:
+    #   * day-rolled bucketed counters, which are the only rows ever packaged
+    #     into <HERMES_HOME>/telemetry/shared_metrics/outbox/;
+    #   * ``local_observations`` — RAW per-event latency/token samples in the
+    #     ``observation_samples`` table of the same SQLite file. These are
+    #     numeric values with closed-allowlist dimensions, are NEVER packaged
+    #     or exported, and are bounded by a 30-day window plus a 250,000-row
+    #     cap. Set it to False to keep the counters without the raw samples.
     "telemetry": {
         "shared_metrics": {
             "enabled": False,
+            "local_observations": True,
         },
     },
 

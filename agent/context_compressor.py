@@ -1385,15 +1385,27 @@ class ContextCompressor(ContextEngine):
     ) -> Dict[str, Any]:
         """Initialize content-free per-attempt compression telemetry."""
         seed = getattr(self, "_compression_telemetry_seed", None)
+        seed_work_lane = ""
+        seed_platform = ""
         if isinstance(seed, dict):
             attempt_id = attempt_id or seed.get("attempt_id")
             session_id = session_id or seed.get("session_id")
             trigger_source = trigger_source or seed.get("trigger_source")
+            seed_work_lane = str(seed.get("work_lane") or "")
+            seed_platform = str(seed.get("platform") or "")
         telemetry: Dict[str, Any] = {
             "event": "compression_attempt",
             "attempt_id": attempt_id or uuid.uuid4().hex,
             "session_id": session_id or "",
             "trigger_source": trigger_source or "unknown",
+            # Immutable per-attempt lane/surface for the local observation rows.
+            "work_lane": seed_work_lane,
+            "platform": seed_platform,
+            # Populated by compress() once the real estimates exist; present as
+            # None on every early-return/abort path so the payload shape is
+            # stable for all 11 emit sites.
+            "tokens_before": None,
+            "tokens_after": None,
             "main_provider": self.provider or "",
             "main_model": self.model or "",
             "main_context_limit": _safe_int(self.context_length),
@@ -5593,7 +5605,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Micro-summarize one exchange
         exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
         _exchange_tokens = estimate_tokens_rough(exchange_text)
+        # The auxiliary summariser round trip sits INSIDE the window measured by
+        # _elapsed_ms and dominates it, so measure it separately — otherwise
+        # "compression got slower" cannot be told apart from "the summariser
+        # provider got slower".
+        _aux_started_at = time.monotonic()
         updated_summary = self._micro_summarize_one(exchange_text)
+        _aux_duration_ms = int((time.monotonic() - _aux_started_at) * 1000)
         if updated_summary is None:
             # Track consecutive failures on the same cursor position so we
             # don't busy-loop on an unsummarizable exchange every turn.
@@ -5627,6 +5645,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tokens_after=_tokens_before,
                 exchange_tokens=_exchange_tokens,
                 duration_ms=_elapsed_ms(),
+                aux_duration_ms=_aux_duration_ms,
             )
             return messages
 
@@ -5648,6 +5667,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             tokens_after=estimate_messages_tokens_rough(result),
             exchange_tokens=_exchange_tokens,
             duration_ms=_elapsed_ms(),
+            aux_duration_ms=_aux_duration_ms,
         )
         return result
 
@@ -5707,6 +5727,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         tokens_after: int | None,
         exchange_tokens: int | None = None,
         duration_ms: int | None = None,
+        aux_duration_ms: int | None = None,
     ) -> None:
         """Emit one content-free JSON log line describing a micro-compaction pass.
 
@@ -5749,6 +5770,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "passes_total": self._micro_compact_passes,
                 "tokens_saved_total": self._micro_compact_tokens_saved_total,
                 "duration_ms": _safe_int(duration_ms),
+                "aux_duration_ms": _safe_int(aux_duration_ms),
                 # Headroom, not efficiency: how full the window is being kept.
                 # This is the number that says whether the session can keep
                 # going without a hard batch compaction.
@@ -5762,8 +5784,44 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "micro compaction telemetry: %s",
                 json.dumps(payload, sort_keys=True, separators=(",", ":")),
             )
+            self._record_micro_compaction_observations(payload)
         except Exception as exc:
             logger.debug("failed to emit micro-compaction telemetry: %s", exc)
+
+    def _record_micro_compaction_observations(self, payload: Dict[str, Any]) -> None:
+        """Persist the local compression observation rows for one micro pass.
+
+        Reads ONLY the payload built above, whose window fields already come
+        from the cached ``_threshold_tokens`` / ``_resolved_context_length``
+        rather than the lazy properties that can fire a synchronous /models
+        probe.
+
+        ContextCompressor holds no agent reference, so the lane comes from the
+        work-lane ContextVar snapshot — valid because micro-compaction runs
+        synchronously on the turn thread after the user has seen the response.
+        """
+        try:
+            from hermes_cli.observability import local_observations, work_lane
+
+            outcome = str(payload.get("outcome") or "")
+            local_observations.record_compression_attempt(
+                kind="defrag" if outcome.startswith("defrag") else "micro",
+                outcome=(
+                    "committed"
+                    if outcome in {"absorbed", "defrag"}
+                    else "skipped"
+                    if outcome == "exchange_skipped"
+                    else "failed"
+                ),
+                trigger="micro_turn_end",
+                lane=work_lane.current_work_lane(),
+                duration_ms=payload.get("duration_ms"),
+                aux_duration_ms=payload.get("aux_duration_ms"),
+                tokens_before=payload.get("tokens_before"),
+                tokens_after=payload.get("tokens_after"),
+            )
+        except Exception as exc:
+            logger.debug("failed to record micro-compaction observations: %s", exc)
 
     def _sync_micro_compact_to_db(
         self,
@@ -6716,6 +6774,20 @@ This compaction should PRIORITISE preserving all information related to the focu
         saved_estimate = pre_estimate - new_estimate
         savings_pct = (saved_estimate / pre_estimate * 100) if pre_estimate > 0 else 0
         self._last_compression_savings_pct = savings_pct
+
+        # Reuse the estimates the anti-thrash verdict already computed — zero
+        # extra token estimation, zero extra traversal — so the compression
+        # observation rows can report before/after per invocation. The dict is
+        # the same object _begin_compression_telemetry created and is already
+        # covered by the attempt-state snapshot/restore across the pooled
+        # executor's worker boundary.
+        try:
+            active_telemetry = getattr(self, "_active_compression_telemetry", None)
+            if isinstance(active_telemetry, dict):
+                active_telemetry["tokens_before"] = _safe_int(pre_estimate)
+                active_telemetry["tokens_after"] = _safe_int(new_estimate)
+        except Exception:
+            pass
 
         # Message-only savings are diagnostic. The anti-thrashing verdict is
         # owned by the next provider-reported prompt count, which answers the

@@ -633,27 +633,13 @@ class _Runtime:
 def enabled() -> bool:
     """Return the shared-metrics policy for the active Hermes profile."""
     profile_key = relay_runtime.current_profile_key()
-    try:
-        from hermes_cli.config import read_raw_config_readonly
+    # Collection consent is profile-owned. Managed config overlays may control
+    # runtime policy, but cannot opt a profile into or out of shared metrics.
+    # The pure config read lives in metrics_policy so the Relay-independent
+    # recorder can share it WITHOUT this function's deactivation side effect.
+    from .metrics_policy import shared_metrics_consent
 
-        # Collection consent is profile-owned. Managed config overlays may
-        # control runtime policy, but cannot opt a profile into or out of
-        # shared metrics. Read-only fast path: this gate runs 2-3x per agent
-        # turn, and the mutable read_raw_config() paid a full config deepcopy
-        # on every call.
-        config = read_raw_config_readonly() or {}
-    except Exception:
-        logger.debug("Unable to read Hermes shared-metrics policy", exc_info=True)
-        value = False
-    else:
-        telemetry = config.get("telemetry") if isinstance(config, dict) else None
-        shared_metrics = (
-            telemetry.get("shared_metrics") if isinstance(telemetry, dict) else None
-        )
-        value = (
-            isinstance(shared_metrics, dict)
-            and shared_metrics.get("enabled") is True
-        )
+    value = shared_metrics_consent()
     if value:
         return True
     with _RUNTIME_LOCK:

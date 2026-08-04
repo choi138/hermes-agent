@@ -7383,6 +7383,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         smart_routing = None
         gjc_prepared = None
+        # Unconditional reset — see the identical comment on the CLI mirror in
+        # hermes_cli/cli_agent_setup_mixin.py. Both sites must stay in sync or
+        # CLI turns would report a real lane while gateway turns reported
+        # "direct", making the lanes incomparable.
+        try:
+            from hermes_cli.observability import work_lane as _work_lane
+
+            _work_lane.set_routing_lane("")
+        except Exception:
+            pass
         try:
             from hermes_cli.smart_model_routing import (
                 apply_decision_to_runtime,
@@ -7447,6 +7457,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         if smart_routing is not None:
             route["smart_routing"] = smart_routing
+            try:
+                from hermes_cli.observability import work_lane as _work_lane
+
+                _work_lane.set_routing_lane(
+                    str(smart_routing.get("selected_lane") or "")
+                )
+            except Exception:
+                pass
             if smart_routing.get("blocked"):
                 route["blocked"] = smart_routing
             elif isinstance(gjc_prepared, dict) and gjc_prepared.get("enabled"):

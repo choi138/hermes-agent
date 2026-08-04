@@ -1181,8 +1181,57 @@ def _emit_compression_attempt_telemetry(
             "context compression attempt telemetry: %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
+        _record_compression_observations(agent, payload)
     except Exception as exc:
         logger.debug("failed to emit compression attempt telemetry: %s", exc)
+
+
+def _record_compression_observations(agent: Any, payload: dict) -> None:
+    """Persist the local compression observation rows for one batch attempt.
+
+    Called from the SINGLE funnel every batch emit site converges on, whose body
+    is already wrapped in try/except so a durable write cannot break
+    compression.
+
+    Two guards matter:
+      * the pool-saturation site passes ``started_at=time.monotonic()`` inline
+        and therefore always yields ~0ms — it is mapped to
+        compression_outcome="skipped" and writes NO duration row;
+      * tokens_before/tokens_after are written ONLY when the payload's
+        attempt_id still matches ``agent._compression_attempt_id``. The abort
+        sites emit WITHOUT calling ``_begin_compression_telemetry``, so
+        ``payload = dict(telemetry)`` would otherwise carry the PREVIOUS
+        successful compaction's token counts stamped with this attempt's
+        outcome. ``payload.setdefault("attempt_id", ...)`` preserves the stale
+        id, which is exactly what makes the equality check a correct freshness
+        test.
+    """
+    try:
+        from hermes_cli.observability import local_observations
+
+        outcome = str(payload.get("commit_status") or "")
+        is_skipped = str(payload.get("failure_class") or "") == "pool_saturated"
+        fresh = bool(
+            payload.get("attempt_id")
+            and payload.get("attempt_id")
+            == getattr(agent, "_compression_attempt_id", None)
+        )
+        local_observations.record_compression_attempt(
+            kind="batch",
+            outcome="skipped" if is_skipped else outcome,
+            trigger=payload.get("trigger_source"),
+            # Seeded when the attempt began, never read live: compression runs
+            # on a shared worker pool whose jobs can outlive the turn that
+            # started them, so a live read could label a lane-A row with lane B.
+            lane=payload.get("work_lane") or "",
+            platform=payload.get("platform") or "",
+            duration_ms=None if is_skipped else payload.get("total_duration_ms"),
+            aux_duration_ms=payload.get("aux_call_duration_ms"),
+            tokens_before=payload.get("tokens_before") if fresh else None,
+            tokens_after=payload.get("tokens_after") if fresh else None,
+        )
+    except Exception as exc:
+        logger.debug("failed to record compression observations: %s", exc)
 
 
 def compression_skipped_due_to_lock(agent: Any) -> bool:
@@ -2201,6 +2250,11 @@ def compress_context(
             "attempt_id": _attempt_id,
             "session_id": agent.session_id or "",
             "trigger_source": _trigger_source,
+            # Snapshot the lane and surface HERE, on the turn thread, so a
+            # pooled compression worker that outlives its turn cannot have its
+            # row relabelled by a concurrent turn's lane.
+            "work_lane": str(getattr(agent, "_work_lane", "") or ""),
+            "platform": str(getattr(agent, "platform", "") or ""),
         })
     except Exception:
         pass

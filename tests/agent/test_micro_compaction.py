@@ -813,3 +813,137 @@ class TestDefragFlushCursorInvalidation:
             "finalize_turn must invalidate the bounded flush-scan cursor "
             "when the defrag pop stripped a live marker's stamp"
         )
+
+
+class TestMicroCompactionObservations:
+    """Local observation samples for the micro-compaction path (R3)."""
+
+    @pytest.fixture(autouse=True)
+    def observations(self, tmp_path, monkeypatch):
+        from hermes_cli.observability import local_observations, work_lane
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config_readonly",
+            lambda: {"telemetry": {"shared_metrics": {"enabled": True}}},
+        )
+        local_observations._reset_for_tests()
+        work_lane.set_routing_lane("")
+        yield
+        local_observations._reset_for_tests()
+        work_lane.set_routing_lane("")
+
+    @staticmethod
+    def _rows(metric_name=None):
+        from hermes_cli.observability.shared_metrics import SharedMetricsStore
+
+        return SharedMetricsStore().observation_samples(metric_name=metric_name)
+
+    def test_micro_pass_records_duration_and_token_rows(self):
+        from hermes_cli.observability.shared_metrics_contract import (
+            COMPRESSION_DURATION_METRIC,
+            COMPRESSION_TOKENS_AFTER_METRIC,
+            COMPRESSION_TOKENS_BEFORE_METRIC,
+            WORK_LANES,
+        )
+
+        cc = _compressor()
+        cc._micro_compact(_conversation(exchanges=8))
+
+        [duration] = self._rows(COMPRESSION_DURATION_METRIC)
+        [before] = self._rows(COMPRESSION_TOKENS_BEFORE_METRIC)
+        [after] = self._rows(COMPRESSION_TOKENS_AFTER_METRIC)
+        assert duration["dimensions"]["compression_kind"] == "micro"
+        assert duration["dimensions"]["compression_outcome"] == "committed"
+        assert duration["dimensions"]["compression_trigger"] == "micro_turn_end"
+        assert duration["dimensions"]["work_lane"] in WORK_LANES
+        assert before["value"] > 0
+        assert after["value"] > 0
+        assert before["unit"] == "tokens"
+
+    def test_aux_duration_is_recorded_and_bounded_by_the_pass_duration(self):
+        import time
+
+        from hermes_cli.observability.shared_metrics_contract import (
+            COMPRESSION_AUX_DURATION_METRIC,
+            COMPRESSION_DURATION_METRIC,
+        )
+
+        cc = _compressor()
+
+        def slow_summary(_text):
+            time.sleep(0.05)
+            return "ROLLING SUMMARY slow"
+
+        cc._micro_summarize_one = slow_summary
+        cc._micro_compact(_conversation(exchanges=8))
+
+        [aux] = self._rows(COMPRESSION_AUX_DURATION_METRIC)
+        [duration] = self._rows(COMPRESSION_DURATION_METRIC)
+        # The aux call dominates the measured window but cannot exceed it.
+        assert aux["value"] >= 40.0
+        assert aux["value"] <= duration["value"]
+
+    def test_defrag_outcome_uses_the_defrag_kind(self):
+        from hermes_cli.observability.shared_metrics_contract import (
+            COMPRESSION_DURATION_METRIC,
+        )
+
+        cc = _compressor()
+        cc._emit_micro_compaction_telemetry(
+            outcome="defrag",
+            messages_before=10,
+            messages_after=10,
+            tokens_before=5_000,
+            tokens_after=3_000,
+            duration_ms=42,
+        )
+
+        [duration] = self._rows(COMPRESSION_DURATION_METRIC)
+        assert duration["dimensions"]["compression_kind"] == "defrag"
+        assert duration["dimensions"]["compression_outcome"] == "committed"
+
+    def test_summarize_failure_is_recorded_as_failed(self):
+        from hermes_cli.observability.shared_metrics_contract import (
+            COMPRESSION_DURATION_METRIC,
+        )
+
+        cc = _compressor()
+        cc._micro_summarize_one = lambda _text: None
+        cc._micro_compact(_conversation(exchanges=8))
+
+        [duration] = self._rows(COMPRESSION_DURATION_METRIC)
+        assert duration["dimensions"]["compression_outcome"] == "failed"
+
+    def test_recording_never_forces_window_resolution(self):
+        """Same safety property as the log emitter: cached reads only.
+
+        The lazy ``threshold_tokens`` / ``context_length`` properties can fire a
+        synchronous /models probe (#32221), so the durable write must never
+        touch them either.
+        """
+        from hermes_cli.observability.shared_metrics_contract import (
+            COMPRESSION_DURATION_METRIC,
+        )
+
+        cc = _compressor()
+        cc._threshold_tokens = None
+        cc._resolved_context_length = None
+
+        def explode(self):  # pragma: no cover - must never be called
+            raise AssertionError("lazy window resolution was triggered")
+
+        with patch.object(
+            type(cc), "threshold_tokens", property(explode)
+        ), patch.object(type(cc), "context_length", property(explode)):
+            cc._emit_micro_compaction_telemetry(
+                outcome="absorbed",
+                messages_before=10,
+                messages_after=9,
+                tokens_before=5_000,
+                tokens_after=3_000,
+                duration_ms=17,
+                aux_duration_ms=11,
+            )
+
+        assert len(self._rows(COMPRESSION_DURATION_METRIC)) == 1

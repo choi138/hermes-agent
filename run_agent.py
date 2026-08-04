@@ -7658,6 +7658,21 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
+        # Resolve the observability work lane ONCE per turn, on the turn thread
+        # where the routing ContextVar is valid. Used only as the SEED for
+        # per-attempt state (compression telemetry, wire-attempt records) — never
+        # read live at emit time, which is what keeps a concurrent turn or a
+        # pooled compression worker from relabelling another lane's row.
+        try:
+            from hermes_cli.observability import work_lane as _work_lane_module
+
+            self._work_lane = _work_lane_module.current_work_lane(
+                platform=str(task_context["platform"] or ""),
+                is_subagent=bool(getattr(self, "is_subagent", False)),
+                parent_session_id=str(getattr(self, "_parent_session_id", "") or ""),
+            )
+        except Exception:
+            self._work_lane = "unknown"
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )

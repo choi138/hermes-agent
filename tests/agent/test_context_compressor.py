@@ -2908,3 +2908,60 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestCompressionTokenTelemetryFields:
+    """compress() must publish the before/after estimates it already computes."""
+
+    def test_compress_publishes_token_estimates(self, compressor):
+        from agent.context_compressor import estimate_messages_tokens_rough
+
+        compressor._begin_compression_telemetry(
+            attempt_id="attempt-1", current_tokens=90_000
+        )
+        msgs = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"message {i} " + "y" * 400,
+            }
+            for i in range(20)
+        ]
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("no provider"),
+        ):
+            result = compressor.compress(msgs)
+
+        telemetry = compressor._active_compression_telemetry
+        assert telemetry["tokens_before"] == estimate_messages_tokens_rough(msgs)
+        assert telemetry["tokens_after"] == estimate_messages_tokens_rough(result)
+        # Both are real estimates of the actual inputs/outputs, not placeholders.
+        assert telemetry["tokens_before"] > 0
+        assert telemetry["tokens_after"] > 0
+
+    def test_telemetry_shape_is_stable_on_every_abort_path(self, compressor):
+        """All 11 batch emit sites read the same payload keys."""
+        telemetry = compressor._begin_compression_telemetry(
+            attempt_id="attempt-1", current_tokens=1_000
+        )
+
+        for field in ("tokens_before", "tokens_after"):
+            assert field in telemetry
+            assert telemetry[field] is None
+        assert telemetry["work_lane"] == ""
+        assert telemetry["platform"] == ""
+
+    def test_seeded_lane_and_platform_reach_the_telemetry_dict(self, compressor):
+        compressor._compression_telemetry_seed = {
+            "attempt_id": "attempt-2",
+            "session_id": "session-x",
+            "trigger_source": "auto",
+            "work_lane": "research",
+            "platform": "gateway",
+        }
+        telemetry = compressor._begin_compression_telemetry(current_tokens=1_000)
+
+        assert telemetry["attempt_id"] == "attempt-2"
+        assert telemetry["work_lane"] == "research"
+        assert telemetry["platform"] == "gateway"

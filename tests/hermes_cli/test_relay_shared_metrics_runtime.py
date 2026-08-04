@@ -975,3 +975,139 @@ def test_failed_flush_keeps_daily_export_open_for_later_task(
 
 
 
+
+
+# ── R3-b: recording without any Relay host ──────────────────────────────
+
+
+@pytest.fixture
+def no_relay_host(tmp_path, monkeypatch):
+    """A profile whose Relay wheel is unimportable — the R3-b target host."""
+    from agent import model_call_timing
+    from hermes_cli.observability import local_observations
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(
+        "hermes_cli.config.read_raw_config_readonly",
+        lambda: {"telemetry": {"shared_metrics": {"enabled": True}}},
+    )
+
+    def missing_relay(name: str):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(relay_runtime.importlib, "import_module", missing_relay)
+    relay_shared_metrics._reset_for_tests()
+    relay_runtime._reset_for_tests()
+    local_observations._reset_for_tests()
+    model_call_timing.reset_for_tests()
+    monkeypatch.setattr(plugins, "_plugin_manager", PluginManager())
+    yield tmp_path / "hermes-home"
+    relay_shared_metrics._reset_for_tests()
+    relay_runtime._reset_for_tests()
+    local_observations._reset_for_tests()
+    model_call_timing.reset_for_tests()
+
+
+def _drive_one_turn(**overrides: Any) -> None:
+    from agent import model_call_timing
+
+    base = {
+        "session_id": "session-no-relay",
+        "task_id": "task-1",
+        "turn_id": "turn-1",
+        "api_request_id": "turn-1:api:1",
+        "platform": "cli",
+        "provider": "anthropic",
+        "model": "claude-sonnet",
+        "api_mode": "anthropic_messages",
+    }
+    base.update(overrides)
+
+    lifecycle.invoke_hook("on_session_start", **base)
+    lifecycle.invoke_hook("pre_llm_call", **base)
+    lifecycle.invoke_hook("pre_api_request", **base)
+    token = model_call_timing.begin_wire_attempt(
+        base["api_request_id"],
+        api_mode_family="anthropic_messages",
+        stream_mode="streaming",
+        call_role="primary",
+        work_lane="direct",
+        provider=base["provider"],
+        model=base["model"],
+    )
+    model_call_timing.stamp_first_frame(token)
+    model_call_timing.finish_wire_attempt(token, "")
+    lifecycle.invoke_hook("post_api_request", **base, assistant_content_chars=42)
+    lifecycle.invoke_hook("on_session_end", **base)
+
+
+def test_observations_are_recorded_without_a_relay_host(no_relay_host):
+    from hermes_cli.observability.shared_metrics import SharedMetricsStore
+    from hermes_cli.observability.shared_metrics_contract import (
+        FIRST_USEFUL_RESULT_METRIC,
+        MODEL_CALL_DURATION_METRIC,
+        TTFT_METRIC,
+    )
+
+    assert relay_runtime.get_runtime() is None
+    _drive_one_turn()
+    assert relay_shared_metrics._get_runtime() is None
+
+    store = SharedMetricsStore()
+    assert len(store.observation_samples(metric_name=TTFT_METRIC)) == 1
+    assert len(store.observation_samples(metric_name=MODEL_CALL_DURATION_METRIC)) == 1
+    [first_useful] = store.observation_samples(
+        metric_name=FIRST_USEFUL_RESULT_METRIC
+    )
+    assert first_useful["dimensions"]["first_result_kind"] == "assistant_text"
+    assert first_useful["dimensions"]["work_lane"] == "direct"
+
+
+def test_observation_recording_does_not_create_a_relay_host(no_relay_host):
+    _drive_one_turn()
+
+    assert relay_runtime.get_runtime() is None
+    assert relay_shared_metrics._get_runtime() is None
+
+
+def test_observation_retention_runs_without_a_relay_host(no_relay_host, monkeypatch):
+    """Regression guard: retention used to be reachable only via _Runtime._export."""
+    from hermes_cli.observability import shared_metrics as shared_metrics_module
+    from hermes_cli.observability.shared_metrics import SharedMetricsStore
+
+    monkeypatch.setattr(shared_metrics_module, "_MAX_OBSERVATION_ROWS", 4)
+    store = SharedMetricsStore()
+    dimensions = {
+        "api_mode_family": "chat_completions",
+        "attempt_outcome": "success",
+        "call_role": "primary",
+        "execution_surface": "cli",
+        "model_family": "gpt",
+        "provider_family": "direct",
+        "stream_mode": "streaming",
+        "work_lane": "direct",
+    }
+    store.record_observations(
+        [
+            {
+                "metric_name": "hermes.model_call.ttft_ms",
+                "dimensions": dict(dimensions),
+                "value": float(index),
+                "hermes_version": "v",
+            }
+            for index in range(10)
+        ]
+    )
+    connection = sqlite3.connect(store.database_path)
+    with connection:
+        connection.execute(
+            "UPDATE observation_samples SET period_start = '2000-01-01' WHERE value < 2"
+        )
+    connection.close()
+
+    # Drive the TRIGGER, not the method — that is what proves reachability.
+    _drive_one_turn()
+
+    remaining = SharedMetricsStore().observation_samples()
+    assert len(remaining) <= 4
+    assert all(row["period_start"] != "2000-01-01" for row in remaining)

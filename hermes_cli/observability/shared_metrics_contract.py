@@ -514,3 +514,332 @@ def model_call_outcome(kwargs: dict[str, Any]) -> str:
     """Fail closed when a terminal model-call outcome is not recognized."""
     value = str(kwargs.get("outcome") or "").lower()
     return value if value in MODEL_OUTCOMES else "failed"
+
+
+# ── Local observation contract (R3) ─────────────────────────────────────
+#
+# Observations are RAW per-event samples kept in the same local SQLite store
+# as the counters, in a separate ``observation_samples`` table. They are never
+# packaged and never leave the machine. R3's exit condition is that latency
+# claims be supported by comparable raw runs, and a counter cannot express a
+# millisecond or a token count (``record_counter`` has no amount parameter),
+# so raw samples are a separate write path with the same closed-allowlist
+# discipline the counters use.
+
+TTFT_METRIC = "hermes.model_call.ttft_ms"
+MODEL_CALL_DURATION_METRIC = "hermes.model_call.duration_ms"
+FIRST_USEFUL_RESULT_METRIC = "hermes.turn.first_useful_result_ms"
+COMPRESSION_DURATION_METRIC = "hermes.compression.duration_ms"
+COMPRESSION_AUX_DURATION_METRIC = "hermes.compression.aux_duration_ms"
+COMPRESSION_TOKENS_BEFORE_METRIC = "hermes.compression.tokens_before"
+COMPRESSION_TOKENS_AFTER_METRIC = "hermes.compression.tokens_after"
+RETRY_ATTEMPT_METRIC = "hermes.model_call.retry_attempt"
+FALLBACK_ACTIVATION_METRIC = "hermes.model_call.fallback_activation"
+
+# The R3 lane axis: work TYPE plus dispatch owner. The dispatch SURFACE
+# (scheduled_task, batch, cli, gateway, ...) is carried separately by
+# ``execution_surface``, which is present on every observation row — so
+# "scheduled" and "batch" are deliberately NOT lanes. Keeping them here would
+# have made a scheduled research run report work_lane="scheduled" and destroyed
+# the research/direct distinction R3 explicitly asks for.
+WORK_LANES: frozenset[str] = frozenset({
+    "delegated",
+    "direct",
+    "gjc",
+    "kanban",
+    "research",
+    "unknown",
+})
+
+# A SEPARATE vocabulary from the counter contract's ``call_role``, which stays
+# frozenset({"primary"}) so no already-exported series changes meaning.
+OBSERVATION_CALL_ROLES: frozenset[str] = frozenset({
+    "auxiliary",
+    "delegated",
+    "fallback",
+    "primary",
+    "unknown",
+})
+
+STREAM_MODES: frozenset[str] = frozenset({
+    "non_streaming",
+    "streaming",
+    "unknown",
+})
+
+# TTFT semantics differ per provider path, so raw runs are only comparable
+# within one value. In particular ``bedrock_converse`` TTFT is
+# botocore-retry-INCLUSIVE: agent/bedrock_adapter.py builds
+# boto3.client("bedrock-runtime") without Config(retries=...), unlike the
+# OpenAI-wire and Anthropic clients which pin max_retries=0.
+API_MODE_FAMILIES: frozenset[str] = frozenset({
+    "anthropic_messages",
+    "bedrock_converse",
+    "chat_completions",
+    "codex_responses",
+    "other",
+    "unknown",
+})
+
+# Mirrors agent.error_classifier.FailoverReason plus the loop's own
+# "invalid_response" reason. Kept literal rather than imported so the contract
+# has no import-time dependency on the agent error taxonomy; parity with
+# FailoverReason is asserted by a test.
+RETRY_REASONS: frozenset[str] = frozenset({
+    "auth",
+    "auth_permanent",
+    "billing",
+    "content_policy_blocked",
+    "context_overflow",
+    "format_error",
+    "image_too_large",
+    "invalid_encrypted_content",
+    "invalid_response",
+    "llama_cpp_grammar_pattern",
+    "long_context_tier",
+    "model_not_found",
+    "multimodal_tool_content_unsupported",
+    "oauth_long_context_beta_forbidden",
+    "overloaded",
+    "payload_too_large",
+    "provider_policy_blocked",
+    "rate_limit",
+    "server_error",
+    "ssl_cert_verification",
+    "thinking_signature",
+    "timeout",
+    "unknown",
+    "upstream_rate_limit",
+})
+FALLBACK_REASONS: frozenset[str] = RETRY_REASONS | frozenset({"none"})
+
+COMPRESSION_KINDS: frozenset[str] = frozenset({"batch", "defrag", "micro"})
+COMPRESSION_OUTCOMES: frozenset[str] = frozenset({
+    "aborted",
+    "committed",
+    "failed",
+    "rolled_back",
+    "skipped",
+    "unknown",
+})
+COMPRESSION_TRIGGERS: frozenset[str] = frozenset({
+    "gateway_hygiene",
+    "idle",
+    "manual",
+    "micro_turn_end",
+    "overflow_recovery",
+    "post_response",
+    "pre_api",
+    "preflight",
+    "unknown",
+})
+FIRST_RESULT_KINDS: frozenset[str] = frozenset({
+    "assistant_text",
+    "tool_result",
+    "unknown",
+})
+
+_MODEL_CALL_ATTEMPT_DIMENSIONS: dict[str, frozenset[str]] = {
+    "api_mode_family": API_MODE_FAMILIES,
+    "attempt_outcome": MODEL_OUTCOMES,
+    "call_role": OBSERVATION_CALL_ROLES,
+    "execution_surface": EXECUTION_SURFACES,
+    "model_family": MODEL_FAMILIES,
+    "provider_family": PROVIDER_FAMILIES,
+    "stream_mode": STREAM_MODES,
+    "work_lane": WORK_LANES,
+}
+_COMPRESSION_DIMENSIONS: dict[str, frozenset[str]] = {
+    "compression_kind": COMPRESSION_KINDS,
+    "compression_outcome": COMPRESSION_OUTCOMES,
+    "compression_trigger": COMPRESSION_TRIGGERS,
+    "execution_surface": EXECUTION_SURFACES,
+    "work_lane": WORK_LANES,
+}
+
+# metric name -> (unit, closed dimension allowlist)
+_OBSERVATION_SPECS: dict[str, tuple[str, dict[str, frozenset[str]]]] = {
+    TTFT_METRIC: ("ms", dict(_MODEL_CALL_ATTEMPT_DIMENSIONS)),
+    MODEL_CALL_DURATION_METRIC: ("ms", dict(_MODEL_CALL_ATTEMPT_DIMENSIONS)),
+    FIRST_USEFUL_RESULT_METRIC: (
+        "ms",
+        {
+            "execution_surface": EXECUTION_SURFACES,
+            "first_result_kind": FIRST_RESULT_KINDS,
+            "model_family": MODEL_FAMILIES,
+            "provider_family": PROVIDER_FAMILIES,
+            "work_lane": WORK_LANES,
+        },
+    ),
+    COMPRESSION_DURATION_METRIC: ("ms", dict(_COMPRESSION_DIMENSIONS)),
+    COMPRESSION_AUX_DURATION_METRIC: ("ms", dict(_COMPRESSION_DIMENSIONS)),
+    COMPRESSION_TOKENS_BEFORE_METRIC: ("tokens", dict(_COMPRESSION_DIMENSIONS)),
+    COMPRESSION_TOKENS_AFTER_METRIC: ("tokens", dict(_COMPRESSION_DIMENSIONS)),
+    RETRY_ATTEMPT_METRIC: (
+        "count",
+        {
+            "api_mode_family": API_MODE_FAMILIES,
+            "call_role": OBSERVATION_CALL_ROLES,
+            "execution_surface": EXECUTION_SURFACES,
+            "model_family": MODEL_FAMILIES,
+            "provider_family": PROVIDER_FAMILIES,
+            "retry_reason": RETRY_REASONS,
+            "work_lane": WORK_LANES,
+        },
+    ),
+    FALLBACK_ACTIVATION_METRIC: (
+        # NOT "count": the stored value is the 1-based fallback chain ordinal, so
+        # SUM(value) is not an activation count the way retry_attempt's is (one
+        # activation of the second chain entry gives sum=2.0, count=1). Use the
+        # row COUNT for activations and the value for chain depth.
+        "ordinal",
+        {
+            "api_mode_family": API_MODE_FAMILIES,
+            "call_role": OBSERVATION_CALL_ROLES,
+            "execution_surface": EXECUTION_SURFACES,
+            "fallback_reason": FALLBACK_REASONS,
+            "model_family": MODEL_FAMILIES,
+            "provider_family": PROVIDER_FAMILIES,
+            "work_lane": WORK_LANES,
+        },
+    ),
+}
+OBSERVATION_METRICS: frozenset[str] = frozenset(_OBSERVATION_SPECS)
+
+
+def observation_unit(metric_name: str) -> str:
+    """Return the stored unit for one registered observation metric."""
+    spec = _OBSERVATION_SPECS.get(metric_name)
+    if spec is None:
+        raise ValueError(f"Unsupported observation metric: {metric_name}")
+    return spec[0]
+
+
+def observation_dimensions_are_valid(
+    metric_name: str,
+    dimensions: dict[str, Any],
+) -> bool:
+    """Return whether dimensions match one closed observation contract."""
+    spec = _OBSERVATION_SPECS.get(metric_name)
+    if spec is None:
+        return False
+    contract = spec[1]
+    if set(dimensions) != set(contract):
+        return False
+    return all(
+        isinstance(dimensions[field], str)
+        and dimensions[field] in allowed_values
+        for field, allowed_values in contract.items()
+    )
+
+
+def observation_dimension_values(metric_name: str) -> dict[str, frozenset[str]]:
+    """Return the closed allowlist for one observation metric (read-only)."""
+    spec = _OBSERVATION_SPECS.get(metric_name)
+    if spec is None:
+        raise ValueError(f"Unsupported observation metric: {metric_name}")
+    return dict(spec[1])
+
+
+def _bounded(value: Any, allowed: frozenset[str], fallback: str = "unknown") -> str:
+    """Coerce arbitrary input to a member of one closed allowlist."""
+    try:
+        candidate = str(value or "").strip().lower()
+    except Exception:
+        return fallback
+    return candidate if candidate in allowed else fallback
+
+
+def work_lane(value: Any) -> str:
+    """Coerce arbitrary input to a WORK_LANES member."""
+    return _bounded(value, WORK_LANES)
+
+
+def observation_call_role(value: Any) -> str:
+    """Coerce arbitrary input to an OBSERVATION_CALL_ROLES member."""
+    return _bounded(value, OBSERVATION_CALL_ROLES)
+
+
+def stream_mode(value: Any) -> str:
+    """Coerce arbitrary input to a STREAM_MODES member."""
+    return _bounded(value, STREAM_MODES)
+
+
+def api_mode_family(value: Any) -> str:
+    """Map a Hermes ``api_mode`` to a bounded TTFT-comparable family."""
+    candidate = _bounded(value, API_MODE_FAMILIES, fallback="")
+    if candidate:
+        return candidate
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "unknown"
+    if raw in {"anthropic", "messages"}:
+        return "anthropic_messages"
+    if raw.startswith("bedrock"):
+        return "bedrock_converse"
+    if raw in {"chat", "completions", "openai", "chat_completion"}:
+        return "chat_completions"
+    if raw in {"responses", "codex"}:
+        return "codex_responses"
+    return "other"
+
+
+def retry_reason(value: Any) -> str:
+    """Coerce arbitrary input to a RETRY_REASONS member."""
+    raw = value
+    enum_value = getattr(raw, "value", None)
+    if isinstance(enum_value, str):
+        raw = enum_value
+    return _bounded(raw, RETRY_REASONS)
+
+
+def fallback_reason(value: Any) -> str:
+    """Coerce arbitrary input to a FALLBACK_REASONS member ('none' if unset)."""
+    if value is None:
+        return "none"
+    raw = value
+    enum_value = getattr(raw, "value", None)
+    if isinstance(enum_value, str):
+        raw = enum_value
+    return _bounded(raw, FALLBACK_REASONS)
+
+
+def compression_kind(value: Any) -> str:
+    """Coerce arbitrary input to a COMPRESSION_KINDS member."""
+    return _bounded(value, COMPRESSION_KINDS, fallback="batch")
+
+
+def compression_trigger(value: Any) -> str:
+    """Map a compression trigger source to a bounded label.
+
+    Today every automatic batch site collapses into ``_trigger_source``
+    "auto"; that maps to "unknown" so behaviour is preserved for callers that
+    do not opt in to the richer label.
+    """
+    return _bounded(value, COMPRESSION_TRIGGERS)
+
+
+def compression_outcome(
+    commit_status: Any = None,
+    failure_class: Any = None,
+) -> str:
+    """Map the existing commit_status / failure_class pair to a bounded label."""
+    status = str(commit_status or "").strip().lower()
+    if status in COMPRESSION_OUTCOMES:
+        return status
+    if status in {"committed_in_place", "commit", "commit_ok", "ok", "success"}:
+        return "committed"
+    if status in {"rollback", "rolled_back", "reverted"}:
+        return "rolled_back"
+    if status in {"skip", "skipped", "noop", "no_op", "pool_saturated"}:
+        return "skipped"
+    if status in {"cancelled", "abort", "aborted", "commit_fence_cancelled"}:
+        return "aborted"
+    if status in {"error", "failed", "failure"} or failure_class:
+        return "failed"
+    return "unknown"
+
+
+def first_result_kind(value: Any) -> str:
+    """Coerce arbitrary input to a FIRST_RESULT_KINDS member."""
+    return _bounded(value, FIRST_RESULT_KINDS)

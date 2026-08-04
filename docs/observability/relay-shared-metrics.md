@@ -97,6 +97,53 @@ are written with atomic replacement. Fully packaged aggregate rows and
 successfully exported package rows and files are retained locally for 30 days.
 Pending package rows and counters with unexported deltas are never pruned.
 
+### Local observation samples
+
+The same database file additionally holds an `observation_samples` table of RAW
+per-event numeric samples used for local latency analysis:
+
+| Metric | Unit | Meaning |
+| --- | --- | --- |
+| `hermes.model_call.ttft_ms` | ms | True model time-to-first-token: one row per physical wire attempt that produced a first frame, measured from the instant that same attempt's request went out on the wire. |
+| `hermes.model_call.duration_ms` | ms | One row per physical wire attempt, success **and** failure, from wire-request-issued to that attempt's terminal. |
+| `hermes.turn.first_useful_result_ms` | ms | Earliest of the turn's first successful tool result or first model call that produced assistant text, measured from the turn's earliest observed lifecycle hook. |
+| `hermes.compression.duration_ms` | ms | Wall time of one compression attempt, including the auxiliary summariser round trip. |
+| `hermes.compression.aux_duration_ms` | ms | Auxiliary-model time inside that window, so compression CPU is separable from summariser latency. |
+| `hermes.compression.tokens_before` / `.tokens_after` | tokens | Estimated message-only token counts entering and leaving one compression pass, written in one transaction so they are joinable per invocation. |
+| `hermes.model_call.retry_attempt` | count | One row per increment of the conversation loop's `retry_count`, with a bounded `retry_reason`. |
+| `hermes.model_call.fallback_activation` | count | One row per successful fallback chain advance; the value is the 1-based fallback ordinal. |
+
+Every row carries `work_lane` (`direct`, `research`, `gjc`, `kanban`,
+`delegated`, `unknown`) and `execution_surface`, so the direct, Kanban and
+research lanes stay separately labelled. All values are numeric and every
+dimension is validated against a closed allowlist on write, exactly like the
+counters.
+
+These rows are **never packaged and never exported** — the packaging path reads
+only `counter_aggregates`. They are bounded by the same 30-day retention window
+plus a hard 250,000-row cap, trimmed by a Relay-independent pass that runs at
+most once per UTC day (the Relay export path is not reachable on hosts without
+an importable Relay wheel). Recording is gated by
+`telemetry.shared_metrics.enabled` **and** the additive
+`telemetry.shared_metrics.local_observations` key (default `true`), so raw-sample
+retention can be turned off without turning the counters off. Raw samples do
+raise the entropy of what is stored locally compared with the bucketed
+counters; their exclusion from exports is asserted by a test rather than left
+implicit.
+
+Two documented asymmetries apply when comparing raw runs:
+
+* `hermes.model_call.*` rows carry a truthful `call_role`
+  (`primary` / `fallback` / `delegated` / `auxiliary`), whereas the exported
+  `hermes.model_call.count` counter still hardcodes `call_role="primary"` for
+  every call. That exported series is deliberately unchanged, because fixing it
+  would shift the denominator of an already-published metric.
+* `bedrock_converse` TTFT is botocore-retry-**inclusive** (the Bedrock runtime
+  client uses botocore's default retry policy, unlike the OpenAI-wire and
+  Anthropic clients which pin `max_retries=0`). Within that
+  `api_mode_family` a throttled run and a genuinely slow model are not
+  separable, so bedrock p95 TTFT must not be compared across load conditions.
+
 Each package contains an `install_id` generated as a random UUID. Despite the
 schema field name, its current scope is one `HERMES_HOME`, so it is more
 precisely a persistent pseudonymous profile identifier. It is not derived from

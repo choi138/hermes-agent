@@ -64,6 +64,64 @@ def _context_thread_target(callback):
     return lambda: context.run(callback)
 
 
+def begin_wire_attempt(agent, api_mode_family: str, stream_mode: str = "streaming"):
+    """Stamp the instant ONE physical provider request goes out on the wire.
+
+    Called from inside each provider's stream factory, never at the
+    ``relay_llm.stream()`` call site: under Relay-managed execution the factory
+    runs lazily on the first pull while Relay-disabled it runs eagerly at
+    construction, and — the point of the whole design — being inside the factory
+    makes it re-run per INNER stream retry so each physical socket gets its own
+    TTFT denominator.
+
+    Swallows everything and returns None on any failure. That is mandatory, not
+    advisory: every caller is a bare-bodied factory whose raise would land in the
+    managed stream's ``result["error"]`` and push the turn onto the
+    classified-API-error path (and the bedrock caller's handler can additionally
+    set ``agent._disable_streaming`` and print an IAM warning).
+    """
+    try:
+        from agent import model_call_timing
+
+        return model_call_timing.begin_wire_attempt(
+            getattr(agent, "_current_api_request_id", "") or "",
+            api_mode_family=api_mode_family,
+            stream_mode=stream_mode,
+            call_role=(
+                "delegated"
+                if getattr(agent, "is_subagent", False)
+                else "fallback"
+                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                else "primary"
+            ),
+            work_lane=str(getattr(agent, "_work_lane", "") or "unknown"),
+            provider=str(getattr(agent, "provider", "") or ""),
+            model=str(getattr(agent, "model", "") or ""),
+        )
+    except Exception:
+        return None
+
+
+def _stamp_first_frame(token) -> None:
+    """Record the first wire frame of one physical attempt. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.stamp_first_frame(token)
+    except Exception:
+        pass
+
+
+def _finish_wire_attempt(token, outcome: str) -> None:
+    """Record one physical attempt's terminal instant. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.finish_wire_attempt(token, outcome)
+    except Exception:
+        pass
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -2059,12 +2117,45 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
-        return True
+        activated = True
     except Exception as e:
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback(reason)  # try next in chain
+
+    # Local observation: one real fallback chain advance. Emitted AFTER the
+    # try/except above and behind its own swallow-all guard, NOT at the former
+    # ``return True`` inside the try: that handler blacklists the nous
+    # credential, logs "Failed to activate fallback", and RECURSES to the next
+    # chain entry — so a transient sqlite error from a metrics write would have
+    # burned a healthy fallback, i.e. a metrics write changing user-facing
+    # failover.
+    #
+    # Exactly-once per real activation: the recursive skip paths and the
+    # exception retry above all re-enter through the _fallback_index increment,
+    # so stamping there would over-count, and the exhausted-chain early return
+    # correctly records nothing.
+    try:
+        from hermes_cli.observability import local_observations
+
+        local_observations.record_fallback_activation(
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            fallback_ordinal=int(getattr(agent, "_fallback_index", 0) or 0),
+            reason=reason,
+            platform=str(getattr(agent, "platform", "") or ""),
+            provider=fb_provider,
+            model=fb_model,
+            api_mode=str(getattr(agent, "api_mode", "") or ""),
+            call_role="fallback",
+            lane=str(getattr(agent, "_work_lane", "") or ""),
+        )
+    except Exception as _fallback_metric_error:
+        logger.debug(
+            "local observation fallback_activation emit failed: %s",
+            _fallback_metric_error,
+        )
+    return activated
 
 
 
@@ -2563,6 +2654,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 intercepted_events = []
                 writer_token = {"value": None}
+                # NOTE bedrock TTFT is botocore-retry-INCLUSIVE: the runtime
+                # client is built without Config(retries=...), unlike the
+                # OpenAI-wire and Anthropic clients which pin max_retries=0. See
+                # agent/model_call_timing.py.
+                _wire = {"token": None}
+
+                def _bedrock_on_event() -> None:
+                    # Fires at the very top of ``for event in event_stream``
+                    # before any branching, i.e. on the FIRST wire frame —
+                    # matching the semantics ``_diag['first_chunk_at']`` has on
+                    # the other two paths (both count message_start / empty
+                    # frames). Deliberately not ``_fire_first()``, which is the
+                    # on_first_delta UI gate and fires only on
+                    # text/tool/reasoning, so it would not be comparable.
+                    _bedrock_last_event["t"] = time.time()
+                    # One-shot per ATTEMPT. on_event fires for every yielded
+                    # Bedrock event, and stamp_first_frame takes a process-wide
+                    # lock, so an unguarded call would acquire it once per token
+                    # frame. The other two streaming paths guard the identical
+                    # call with their ``_diag['first_chunk_at'] is None`` check;
+                    # here the already-stamped token is the equivalent latch
+                    # (``_wire['token']`` is replaced on every new attempt).
+                    if _wire.get("stamped_token") is not _wire["token"]:
+                        _wire["stamped_token"] = _wire["token"]
+                        _stamp_first_frame(_wire["token"])
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
                     final_kwargs = dict(next_api_kwargs)
@@ -2570,6 +2686,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
+                        _wire["token"] = begin_wire_attempt(
+                            agent, "bedrock_converse"
+                        )
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -2656,12 +2775,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_tool_start=_on_tool,
                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
-                    on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
+                    on_event=_bedrock_on_event,
                 )
                 result["response"] = stream.final_response or streamed_response
             except Exception as e:
                 result["error"] = e
             finally:
+                _finish_wire_attempt(_wire["token"], "")
                 if stream is not None:
                     stream.close()
 
@@ -2880,6 +3000,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         "discarded_bytes": 0,
     }
     managed_stream_holder = {"stream": None}
+    # Per-PHYSICAL-attempt TTFT slot for the chat_completions path, held at this
+    # scope (like ``managed_stream_holder``) so the stream factory that runs on
+    # the worker thread can publish the token and the outer terminal ``finally``
+    # can stamp the attempt's end. Re-stamped by the factory on every inner
+    # stream retry; ``begin_wire_attempt`` closes out the superseded record.
+    _wire = {"token": None}
 
     def _set_managed_stream(stream: Any) -> Any:
         managed_stream_holder["stream"] = stream
@@ -3052,6 +3178,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
+            _wire["token"] = begin_wire_attempt(agent, "chat_completions")
             agent._touch_activity("waiting for provider response (streaming)")
             return request_client.chat.completions.create(**stream_kwargs)
 
@@ -3154,6 +3281,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
+                    # True model TTFT numerator: a monotonic_ns() read plus one
+                    # dict write behind this same one-shot guard. No SQLite and
+                    # no buffering — the first delta still reaches
+                    # agent._fire_stream_delta on this very iteration.
+                    _stamp_first_frame(_wire["token"])
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -3524,6 +3656,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         _stream_context = {"manager": None, "stream": None}
+        # Anthropic has no pre-wire stamp inside its factory today —
+        # ``last_chunk_time["t"]`` above is set OUTSIDE it, so on a retried
+        # attempt it is stale. Re-stamped per physical attempt below.
+        _wire = {"token": None}
         base_final_message = None
 
         from agent import relay_llm
@@ -3537,6 +3673,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            _wire["token"] = begin_wire_attempt(agent, "anthropic_messages")
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()
@@ -3601,6 +3738,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
                         _diag["first_chunk_at"] = last_chunk_time["t"]
+                        _stamp_first_frame(_wire["token"])
                     _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(event)
                 except Exception:
                     pass
@@ -3644,6 +3782,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ) from None
                         raise
         finally:
+            _finish_wire_attempt(_wire["token"], "")
             try:
                 _close_managed_stream()
             finally:
@@ -3997,6 +4136,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             result["error"] = e
             return
         finally:
+            # Stamp this physical attempt's terminal instant. The OUTCOME is
+            # left blank on purpose: the recorder fills it from the terminal
+            # hook (success at post_api_request, failed/cancelled at
+            # api_request_error), so a failed attempt still produces a row.
+            _finish_wire_attempt(_wire["token"], "")
             _close_managed_stream()
             # Reuse reason only on a clean stream; any other outcome (error,
             # cancel-swallow) really closes so the next attempt builds a

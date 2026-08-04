@@ -19,7 +19,10 @@ from utils import atomic_json_write
 from .shared_metrics_contract import (
     COUNTER_METRICS,
     MODEL_CALL_METRIC,
+    OBSERVATION_METRICS,
     counter_dimensions_are_valid,
+    observation_dimensions_are_valid,
+    observation_unit,
 )
 
 
@@ -28,6 +31,16 @@ _STORE_SCHEMA_VERSION = "1"
 _BUSY_TIMEOUT_MS = 250
 _SCHEMA_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_HISTORY_RETENTION_DAYS = 30
+# Raw observation samples are per-event, so they grow linearly with traffic
+# unlike the day-rolled counters. Bound them by BOTH the shared 30-day cutoff
+# and a hard row cap (~40 MB ceiling).
+_MAX_OBSERVATION_ROWS = 250_000
+# The metrics store is deliberately NOT WAL (that would create -wal/-shm
+# siblings at default permissions and weaken the 0600 guarantee), so a
+# per-event writer needs more headroom than the 250ms counter default when it
+# contends with the packaging path and the compression worker pool.
+_OBSERVATION_BUSY_TIMEOUT_MS = 2_000
+_OBSERVATION_PRUNE_STATE_KEY = "observations_pruned_on"
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +51,20 @@ def _utc_now() -> datetime:
 
 def _isoformat(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _percentile(ordered_values: list[float], percentile: int) -> float:
+    """Nearest-rank percentile over an already-sorted, non-empty list."""
+    if not ordered_values:
+        return 0.0
+    index = max(
+        0,
+        min(
+            len(ordered_values) - 1,
+            int(round((percentile / 100.0) * (len(ordered_values) - 1))),
+        ),
+    )
+    return float(ordered_values[index])
 
 
 class SharedMetricsStore:
@@ -108,6 +135,99 @@ class SharedMetricsStore:
                 ),
             )
 
+    def record_observation(
+        self,
+        metric_name: str,
+        dimensions: dict[str, str],
+        value: float,
+        hermes_version: str,
+        *,
+        unit: str | None = None,
+    ) -> None:
+        """Append one raw local observation sample (never exported)."""
+        self.record_observations(
+            [
+                {
+                    "metric_name": metric_name,
+                    "dimensions": dimensions,
+                    "value": value,
+                    "hermes_version": hermes_version,
+                    "unit": unit,
+                }
+            ]
+        )
+
+    def record_observations(self, rows: list[dict[str, Any]]) -> int:
+        """Append a batch of raw observation samples in ONE transaction.
+
+        Every row is validated against the closed observation contract BEFORE a
+        connection is opened, so one bad row cannot leave a half-written batch.
+        Rows whose value is negative or non-finite are silently dropped (the
+        structural backstop for the TTFT sign hazard). Returns the number of
+        rows written.
+        """
+        prepared: list[tuple[Any, ...]] = []
+        recorded_at = _isoformat(_utc_now())
+        period_start = _utc_now().date().isoformat()
+        for row in rows or []:
+            metric_name = str(row.get("metric_name") or "")
+            if metric_name not in OBSERVATION_METRICS:
+                raise ValueError(f"Unsupported observation metric: {metric_name}")
+            dimensions = row.get("dimensions")
+            if not isinstance(dimensions, dict) or not observation_dimensions_are_valid(
+                metric_name, dimensions
+            ):
+                raise ValueError(
+                    f"Unsupported dimensions for observation metric: {metric_name}"
+                )
+            try:
+                value = float(row.get("value"))
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Dropping observation sample with a non-numeric value: %s",
+                    metric_name,
+                )
+                continue
+            if value != value or value in {float("inf"), float("-inf")} or value < 0:
+                logger.debug(
+                    "Dropping out-of-range observation sample: %s=%r",
+                    metric_name,
+                    value,
+                )
+                continue
+            prepared.append(
+                (
+                    recorded_at,
+                    period_start,
+                    metric_name,
+                    str(row.get("unit") or observation_unit(metric_name)),
+                    str(row.get("hermes_version") or "") or "unknown",
+                    json.dumps(dimensions, sort_keys=True, separators=(",", ":")),
+                    value,
+                )
+            )
+        if not prepared:
+            return 0
+        with self._connection(
+            busy_timeout_ms=_OBSERVATION_BUSY_TIMEOUT_MS
+        ) as connection:
+            with write_txn(connection):
+                connection.executemany(
+                    """
+                    INSERT INTO observation_samples(
+                        recorded_at,
+                        period_start,
+                        metric_name,
+                        unit,
+                        hermes_version,
+                        dimensions_json,
+                        value
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    prepared,
+                )
+        return len(prepared)
+
     def create_and_export_package(self) -> list[Path]:
         """Commit one pending delta package, then atomically export the outbox."""
         pending_periods = self._pending_period_count()
@@ -159,6 +279,88 @@ class SharedMetricsStore:
             }
             for row in rows
         ]
+
+    def observation_samples(
+        self,
+        *,
+        metric_name: str | None = None,
+        since: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return raw observation rows for local inspection and tests."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if metric_name:
+            clauses.append("metric_name = ?")
+            params.append(metric_name)
+        if since:
+            clauses.append("recorded_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    sample_id,
+                    recorded_at,
+                    period_start,
+                    metric_name,
+                    unit,
+                    hermes_version,
+                    dimensions_json,
+                    value
+                FROM observation_samples
+                {where}
+                ORDER BY sample_id
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "sample_id": row["sample_id"],
+                "recorded_at": row["recorded_at"],
+                "period_start": row["period_start"],
+                "metric_name": row["metric_name"],
+                "unit": row["unit"],
+                "hermes_version": row["hermes_version"],
+                "dimensions": json.loads(row["dimensions_json"]),
+                "value": row["value"],
+            }
+            for row in rows
+        ]
+
+    def observation_summary(self) -> list[dict[str, Any]]:
+        """Return count/sum/min/max/p50/p95 per metric + dimension combination."""
+        grouped: dict[tuple[str, str], list[float]] = {}
+        units: dict[tuple[str, str], str] = {}
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT metric_name, dimensions_json, unit, value
+                FROM observation_samples
+                ORDER BY metric_name, dimensions_json, value
+                """
+            ).fetchall()
+        for row in rows:
+            key = (str(row["metric_name"]), str(row["dimensions_json"]))
+            grouped.setdefault(key, []).append(float(row["value"]))
+            units.setdefault(key, str(row["unit"]))
+        summary: list[dict[str, Any]] = []
+        for (metric, dimensions_json), values in sorted(grouped.items()):
+            ordered = sorted(values)
+            summary.append(
+                {
+                    "metric_name": metric,
+                    "unit": units.get((metric, dimensions_json), ""),
+                    "dimensions": json.loads(dimensions_json),
+                    "count": len(ordered),
+                    "sum": sum(ordered),
+                    "min": ordered[0],
+                    "max": ordered[-1],
+                    "p50": _percentile(ordered, 50),
+                    "p95": _percentile(ordered, 95),
+                }
+            )
+        return summary
 
     @contextmanager
     def _connection(
@@ -246,6 +448,38 @@ class SharedMetricsStore:
                 created_at TEXT NOT NULL,
                 exported_at TEXT
             )
+            """
+        )
+        # Raw per-event samples for local latency analysis. Additive: nothing in
+        # the packaging path reads this table, so exports stay byte-identical
+        # and _STORE_SCHEMA_VERSION deliberately stays "1" (the version check
+        # above has no upgrade branch — bumping it would raise out of every
+        # existing store and silently stop ALL metrics). ``unit`` is stored per
+        # row so the table is self-describing for offline analysis.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS observation_samples (
+                sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                hermes_version TEXT NOT NULL,
+                dimensions_json TEXT NOT NULL,
+                value REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS observation_samples_metric_period_idx
+            ON observation_samples(metric_name, period_start)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS observation_samples_period_idx
+            ON observation_samples(period_start, sample_id)
             """
         )
         connection.execute(
@@ -497,6 +731,11 @@ class SharedMetricsStore:
                         """,
                         (package_id, cutoff_timestamp),
                     )
+                # Belt and braces: the Relay-backed export path trims raw
+                # samples too. The authoritative, Relay-independent trigger is
+                # prune_observation_samples() below, because this method's only
+                # production caller chain runs inside _Runtime._export().
+                self._prune_observations_in_transaction(connection, cutoff_period)
                 connection.execute(
                     """
                     DELETE FROM counter_aggregates
@@ -512,3 +751,67 @@ class SharedMetricsStore:
                     """,
                     (cutoff_period,),
                 )
+
+    @staticmethod
+    def _prune_observations_in_transaction(
+        connection: sqlite3.Connection,
+        cutoff_period: str,
+    ) -> None:
+        """Trim raw samples by retention window, then by a hard row cap.
+
+        The cap uses ``MAX(sample_id) - cap`` — an index endpoint lookup — and
+        NOT a descending ``LIMIT`` subquery, which would walk up to
+        _MAX_OBSERVATION_ROWS rowids while holding BEGIN IMMEDIATE and starve
+        every concurrent emitter. ``sample_id`` is AUTOINCREMENT and monotonic,
+        so the arithmetic bound stays correct after gaps.
+        """
+        connection.execute(
+            "DELETE FROM observation_samples WHERE period_start < ?",
+            (cutoff_period,),
+        )
+        connection.execute(
+            """
+            DELETE FROM observation_samples
+            WHERE sample_id <= (
+                SELECT MAX(sample_id) FROM observation_samples
+            ) - ?
+            """,
+            (_MAX_OBSERVATION_ROWS,),
+        )
+
+    def prune_observation_samples(self, *, now: datetime | None = None) -> bool:
+        """Trim raw observation samples independently of the Relay export path.
+
+        Runs at most once per UTC day per store (guarded through
+        ``telemetry_state``), never nested inside a packaging transaction, and
+        never gated on ``packaged_value`` — observations are never packaged.
+        Returns whether this call performed the day's prune.
+        """
+        moment = now or _utc_now()
+        today = moment.date().isoformat()
+        cutoff_period = (
+            moment - timedelta(days=_LOCAL_HISTORY_RETENTION_DAYS)
+        ).date().isoformat()
+        # The day claim and the deletion share ONE transaction so they are
+        # atomic. Claiming in a separate committed transaction would mean a
+        # failure in the deletion (SQLITE_BUSY past the timeout, disk full)
+        # leaves the day marked as pruned, suppressing retention for up to 24h
+        # on every process. write_txn issues BEGIN IMMEDIATE, so a concurrent
+        # process still cannot double-scan: it blocks, then reads the claim and
+        # returns False.
+        with self._connection(
+            busy_timeout_ms=_OBSERVATION_BUSY_TIMEOUT_MS
+        ) as connection:
+            with write_txn(connection):
+                row = connection.execute(
+                    "SELECT value FROM telemetry_state WHERE key = ?",
+                    (_OBSERVATION_PRUNE_STATE_KEY,),
+                ).fetchone()
+                if row is not None and str(row["value"]) == today:
+                    return False
+                self._prune_observations_in_transaction(connection, cutoff_period)
+                connection.execute(
+                    "INSERT OR REPLACE INTO telemetry_state(key, value) VALUES (?, ?)",
+                    (_OBSERVATION_PRUNE_STATE_KEY, today),
+                )
+        return True

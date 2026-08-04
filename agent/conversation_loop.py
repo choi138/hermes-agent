@@ -2401,9 +2401,59 @@ def run_conversation(
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
+                        # Streaming: the provider factories own the timing token,
+                        # because one _perform_api_call can contain several
+                        # physical sockets (inner stream retries).
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
+                    from agent import model_call_timing
+
+                    # Non-streaming: one dispatch equals one wire attempt here
+                    # (SDK retries are pinned to 0 on the OpenAI-wire and
+                    # Anthropic clients), and TTFT is structurally unavailable —
+                    # stream_mode="non_streaming" makes that an explicit
+                    # property of the row rather than a silent data gap.
+                    _nonstream_token = None
+                    try:
+                        from agent.chat_completion_helpers import (
+                            begin_wire_attempt as _begin_wire_attempt,
+                        )
+
+                        _nonstream_token = _begin_wire_attempt(
+                            agent,
+                            str(getattr(agent, "api_mode", "") or ""),
+                            stream_mode="non_streaming",
+                        )
+                    except Exception:
+                        _nonstream_token = None
+                    try:
+                        _nonstream_result = _perform_non_streaming_api_call(
+                            next_api_kwargs
+                        )
+                    except BaseException as _nonstream_error:
+                        try:
+                            model_call_timing.finish_wire_attempt(
+                                _nonstream_token,
+                                "cancelled"
+                                if isinstance(
+                                    _nonstream_error,
+                                    (KeyboardInterrupt, InterruptedError),
+                                )
+                                else "failed",
+                            )
+                        except Exception:
+                            pass
+                        raise
+                    try:
+                        model_call_timing.finish_wire_attempt(
+                            _nonstream_token, "success"
+                        )
+                    except Exception:
+                        pass
+                    return _nonstream_result
+
+                def _perform_non_streaming_api_call(next_api_kwargs):
                     from agent import relay_llm
 
                     return relay_llm.execute(
@@ -2608,7 +2658,20 @@ def run_conversation(
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
-                    
+
+                    # NOTE: hermes.model_call.retry_attempt is NOT emitted here.
+                    # The ``_invoke_api_request_error_hook`` call above already
+                    # reached this block with retryable=True and reason=
+                    # "invalid_response", and local_observations records the
+                    # retry row from that hook. Emitting again here would double
+                    # every invalid-response retry in the raw table.
+                    #
+                    # The hook route counts LOOP-level retries only: the one-shot
+                    # TurnRetryState guards each ``continue`` without incrementing
+                    # retry_count, and codex stream recovery even refunds
+                    # api_call_count. PHYSICAL attempts are counted by the row
+                    # count of hermes.model_call.duration_ms instead.
+
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
                     # rather than retrying with extended backoff.

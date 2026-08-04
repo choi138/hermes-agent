@@ -5883,3 +5883,93 @@ class TestMemoryContextSanitization:
         assert "stale observation" not in result
         assert "how is the honcho working" in result
 
+
+
+class TestWorkLaneAndHookPayloadStability:
+    """R3 additive-instrumentation guards on the turn boundary."""
+
+    def test_work_lane_is_resolved_before_start_task_run(self, agent):
+        from hermes_cli.observability.shared_metrics_contract import WORK_LANES
+
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+
+        observed = {}
+
+        def capture_start(**kwargs):
+            observed["lane_at_start"] = getattr(agent, "_work_lane", None)
+
+        with (
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+                side_effect=capture_start,
+            ),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch("agent.conversation_loop.run_conversation", return_value="done"),
+        ):
+            agent.run_conversation("hello", task_id="task-lane")
+
+        assert observed["lane_at_start"] in WORK_LANES
+
+    def test_kanban_env_makes_the_turn_lane_kanban(self, agent, monkeypatch):
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.platform = "cli"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-7")
+        monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+
+        with (
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch("agent.conversation_loop.run_conversation", return_value="done"),
+        ):
+            agent.run_conversation("hello", task_id="task-kanban")
+
+        assert agent._work_lane == "kanban"
+
+    def test_post_api_request_payload_keys_are_unchanged(self):
+        """No new kwarg may be added to this hook.
+
+        agent/outbound_webhooks.py forwards every kwarg outside
+        _TOP_LEVEL_PAYLOAD_KEYS into an HTTP POST body, so a new latency kwarg
+        would ship the R3 metrics off the machine with no new network code. The
+        recorder reads its timing from api_request_id instead.
+        """
+        import inspect
+        import re
+
+        from agent import conversation_loop
+
+        source = inspect.getsource(conversation_loop)
+        block = source.split('_invoke_hook(\n                        "post_api_request",', 1)
+        assert len(block) == 2, "post_api_request invoke site not found"
+        body = block[1].split("\n            except Exception:", 1)[0]
+        keys = set(re.findall(r"^\s{24}(\w+)=", body, re.M))
+
+        assert keys == {
+            "api_call_count",
+            "api_duration",
+            "api_mode",
+            "api_request_id",
+            "assistant_content_chars",
+            "assistant_message",
+            "assistant_tool_call_count",
+            "base_url",
+            "ended_at",
+            "finish_reason",
+            "message_count",
+            "model",
+            "platform",
+            "provider",
+            "response",
+            "response_model",
+            "session_id",
+            "started_at",
+            "task_id",
+            "turn_id",
+            "usage",
+        }

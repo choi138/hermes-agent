@@ -312,6 +312,18 @@ class CLIAgentSetupMixin:
         }
         smart_routing = None
         gjc_prepared = None
+        # Clear the observability routing lane UNCONDITIONALLY before routing.
+        # The real set below is conditional on smart routing producing a
+        # decision, and the enclosing except only assigns routed_model, so
+        # without this reset a turn whose routing raised, was disabled, or
+        # short-circuited on an explicit model would inherit the previous turn's
+        # lane and mislabel an unbounded run of later turns.
+        try:
+            from hermes_cli.observability import work_lane as _work_lane
+
+            _work_lane.set_routing_lane("")
+        except Exception:
+            pass
         try:
             from hermes_cli.smart_model_routing import (
                 apply_decision_to_runtime,
@@ -381,6 +393,14 @@ class CLIAgentSetupMixin:
         }
         if smart_routing is not None:
             route["smart_routing"] = smart_routing
+            try:
+                from hermes_cli.observability import work_lane as _work_lane
+
+                _work_lane.set_routing_lane(
+                    str(smart_routing.get("selected_lane") or "")
+                )
+            except Exception:
+                pass
             if smart_routing.get("blocked"):
                 route["blocked"] = smart_routing
             elif isinstance(gjc_prepared, dict) and gjc_prepared.get("enabled"):

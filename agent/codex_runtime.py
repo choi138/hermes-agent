@@ -28,6 +28,36 @@ from agent.background_review_policy import is_successful_review_outcome
 logger = logging.getLogger(__name__)
 
 
+def _begin_codex_wire_attempt(agent):
+    """Stamp one physical codex_responses request. Never raises (bare factory)."""
+    try:
+        from agent.chat_completion_helpers import begin_wire_attempt
+
+        return begin_wire_attempt(agent, "codex_responses")
+    except Exception:
+        return None
+
+
+def _stamp_codex_first_frame(token) -> None:
+    """Record the first wire frame of one codex attempt. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.stamp_first_frame(token)
+    except Exception:
+        pass
+
+
+def _finish_codex_wire_attempt(token) -> None:
+    """Record one codex attempt's terminal instant. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.finish_wire_attempt(token, "")
+    except Exception:
+        pass
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -1277,9 +1307,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_commentary_message(text: str) -> None:
         agent._fire_streamed_codex_commentary(text)
 
+    # Per-PHYSICAL-attempt TTFT slot. ``_on_event`` is defined OUTSIDE the
+    # attempt loop below, so it must read the CURRENT attempt's token from this
+    # mutable dict rather than closing over a value.
+    _wire = {"token": None}
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
+        # First wire frame of this attempt: _consume_codex_event_stream invokes
+        # on_event at the very top of its event loop before any event_type
+        # branching. Deliberately not the on_first_delta site, which codex does
+        # not fire on reasoning deltas while chat_completions does — those two
+        # are not comparable.
+        _stamp_codex_first_frame(_wire["token"])
         agent._touch_activity("receiving stream response")
 
     for attempt in range(max_stream_retries + 1):
@@ -1292,6 +1333,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
+            # Inside the factory AND inside the attempt loop, so each internal
+            # reconnect gets its own TTFT denominator. Bare body — the helper
+            # swallows everything and returns None.
+            _wire["token"] = _begin_codex_wire_attempt(agent)
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
@@ -1431,6 +1476,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             return final
         finally:
+            # Terminal instant for THIS physical attempt; the outcome is filled
+            # in by the recorder from the terminal lifecycle hook.
+            _finish_codex_wire_attempt(_wire["token"])
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:
