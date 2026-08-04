@@ -7247,15 +7247,18 @@ class DiscordAdapter(BasePlatformAdapter):
         class MentionInboxProposalView(discord.ui.View):
             def __init__(self) -> None:
                 super().__init__(timeout=None)
+                # No one-click execution control. An approved proposal can
+                # commit and push to the trusted repository, so approval stays
+                # deliberate and text-only: an exact "<bot> 승인" reply, or a
+                # natural-language execution request in the thread. Both still
+                # require ``approval_offered`` at the router boundary, so
+                # dropping the button narrows the surface without widening any
+                # authorization. ``approval_offered`` is kept in the signature
+                # for the caller contract and the stored view binding.
                 controls = [
                     ("inspect", "저장된 근거 보기", discord.ButtonStyle.secondary),
                     ("later", "나중에", discord.ButtonStyle.secondary),
                 ]
-                if approval_offered:
-                    controls.insert(
-                        0,
-                        ("start", "수정 시작", discord.ButtonStyle.success),
-                    )
                 for action, label, style in controls:
                     button = discord.ui.Button(
                         label=label,
