@@ -534,6 +534,13 @@ COMPRESSION_AUX_DURATION_METRIC = "hermes.compression.aux_duration_ms"
 COMPRESSION_TOKENS_BEFORE_METRIC = "hermes.compression.tokens_before"
 COMPRESSION_TOKENS_AFTER_METRIC = "hermes.compression.tokens_after"
 RETRY_ATTEMPT_METRIC = "hermes.model_call.retry_attempt"
+# R4 round-trip metrics. All three are derived inside the recorder from the
+# EXISTING post_api_request payload (which already carries
+# assistant_tool_call_count), so no published hook payload is widened and the
+# values cannot leave the machine through a subscribed outbound webhook.
+TOOL_BATCH_SIZE_METRIC = "hermes.turn.tool_batch_size"
+SINGLE_TOOL_STREAK_METRIC = "hermes.turn.single_tool_round_streak"
+MODEL_ROUNDS_METRIC = "hermes.turn.model_rounds"
 FALLBACK_ACTIVATION_METRIC = "hermes.model_call.fallback_activation"
 
 # The R3 lane axis: work TYPE plus dispatch owner. The dispatch SURFACE
@@ -673,6 +680,12 @@ _MODEL_CALL_ATTEMPT_DIMENSIONS: dict[str, frozenset[str]] = {
     "stream_mode": STREAM_MODES,
     "work_lane": WORK_LANES,
 }
+_ROUND_DIMENSIONS: dict[str, frozenset[str]] = {
+    "execution_surface": EXECUTION_SURFACES,
+    "model_family": MODEL_FAMILIES,
+    "provider_family": PROVIDER_FAMILIES,
+    "work_lane": WORK_LANES,
+}
 _COMPRESSION_DIMENSIONS: dict[str, frozenset[str]] = {
     "compression_failure": COMPRESSION_FAILURES,
     "compression_kind": COMPRESSION_KINDS,
@@ -686,6 +699,9 @@ _COMPRESSION_DIMENSIONS: dict[str, frozenset[str]] = {
 _OBSERVATION_SPECS: dict[str, tuple[str, dict[str, frozenset[str]]]] = {
     TTFT_METRIC: ("ms", dict(_MODEL_CALL_ATTEMPT_DIMENSIONS)),
     MODEL_CALL_DURATION_METRIC: ("ms", dict(_MODEL_CALL_ATTEMPT_DIMENSIONS)),
+    TOOL_BATCH_SIZE_METRIC: ("count", dict(_ROUND_DIMENSIONS)),
+    SINGLE_TOOL_STREAK_METRIC: ("count", dict(_ROUND_DIMENSIONS)),
+    MODEL_ROUNDS_METRIC: ("count", dict(_ROUND_DIMENSIONS)),
     FIRST_USEFUL_RESULT_METRIC: (
         "ms",
         {

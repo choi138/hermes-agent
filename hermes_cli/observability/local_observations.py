@@ -41,7 +41,10 @@ from .shared_metrics_contract import (
     FALLBACK_ACTIVATION_METRIC,
     FIRST_USEFUL_RESULT_METRIC,
     MODEL_CALL_DURATION_METRIC,
+    MODEL_ROUNDS_METRIC,
     RETRY_ATTEMPT_METRIC,
+    SINGLE_TOOL_STREAK_METRIC,
+    TOOL_BATCH_SIZE_METRIC,
     TTFT_METRIC,
     api_mode_family,
     execution_surface,
@@ -93,6 +96,12 @@ class _TurnSlot:
     # published hook payload (which would let the values leave the machine).
     call_role: str = "unknown"
     first_result_recorded: bool = False
+    # R4 round-trip counters. model_rounds counts assistant rounds in this turn;
+    # single_tool_streak is the CURRENT run of rounds that dispatched exactly one
+    # tool call, flushed as a sample when the run ends so the distribution of
+    # serial stretches is recoverable rather than just their average.
+    model_rounds: int = 0
+    single_tool_streak: int = 0
     rows: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -259,6 +268,10 @@ def flush(session_id: Any = None) -> None:
                 if session and key[0] != session:
                     continue
                 slot = _TURNS.pop(key)
+                # Emit the turn's trailing single-tool streak and its total round
+                # count before the slot is discarded, otherwise a turn that ends
+                # on a serial stretch loses exactly the stretch R4 cares about.
+                _close_round_accounting(slot)
                 pending.extend(slot.rows)
             if session:
                 pending.extend(_LOOSE.pop(session, []))
@@ -338,6 +351,73 @@ def _record_first_useful_result(slot: _TurnSlot, kind: str) -> None:
             "value": elapsed_ms,
         }
     )
+
+
+def _round_dimensions(slot: _TurnSlot) -> dict[str, str]:
+    return {
+        "execution_surface": execution_surface({"platform": slot.surface}),
+        "model_family": model_family({"model": slot.model}),
+        "provider_family": provider_family({"provider": slot.provider}),
+        "work_lane": work_lane(slot.lane),
+    }
+
+
+def _record_round(slot: _TurnSlot, tool_call_count: int) -> None:
+    """Account one assistant round for the R4 round-trip metrics.
+
+    ``tool_batch_size`` is emitted only for rounds that actually dispatched
+    tools: a round with zero tool calls is the final answer, and folding those
+    zeros in would drag the mean batch size down and make a genuine batching
+    improvement invisible.
+
+    ``single_tool_round_streak`` is emitted when a run of exactly-one-tool rounds
+    ENDS, so what lands is the length of each serial stretch. That is the
+    quantity R4 wants to shrink; a per-round boolean could not distinguish one
+    stretch of six from six isolated singles.
+    """
+    slot.model_rounds += 1
+    if tool_call_count > 0:
+        slot.rows.append(
+            {
+                "metric_name": TOOL_BATCH_SIZE_METRIC,
+                "dimensions": _round_dimensions(slot),
+                "value": float(tool_call_count),
+            }
+        )
+    if tool_call_count == 1:
+        slot.single_tool_streak += 1
+        return
+    if slot.single_tool_streak > 0:
+        slot.rows.append(
+            {
+                "metric_name": SINGLE_TOOL_STREAK_METRIC,
+                "dimensions": _round_dimensions(slot),
+                "value": float(slot.single_tool_streak),
+            }
+        )
+        slot.single_tool_streak = 0
+
+
+def _close_round_accounting(slot: _TurnSlot) -> None:
+    """Flush the turn's trailing streak and its total round count."""
+    if slot.single_tool_streak > 0:
+        slot.rows.append(
+            {
+                "metric_name": SINGLE_TOOL_STREAK_METRIC,
+                "dimensions": _round_dimensions(slot),
+                "value": float(slot.single_tool_streak),
+            }
+        )
+        slot.single_tool_streak = 0
+    if slot.model_rounds > 0:
+        slot.rows.append(
+            {
+                "metric_name": MODEL_ROUNDS_METRIC,
+                "dimensions": _round_dimensions(slot),
+                "value": float(slot.model_rounds),
+            }
+        )
+        slot.model_rounds = 0
 
 
 # ── model-call attempt flush ────────────────────────────────────────────
@@ -624,6 +704,14 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
                     content_chars = 0
                 if content_chars > 0:
                     _record_first_useful_result(slot, "assistant_text")
+                # R4: assistant_tool_call_count is ALREADY on this published
+                # payload (agent/conversation_loop.py:5821), so the round-trip
+                # metrics need no new hook kwarg.
+                try:
+                    tool_calls = int(kwargs.get("assistant_tool_call_count") or 0)
+                except (TypeError, ValueError):
+                    tool_calls = 0
+                _record_round(slot, tool_calls)
         # Outside the lock on purpose: see _flush_wire_attempts.
         _write(pending)
         return

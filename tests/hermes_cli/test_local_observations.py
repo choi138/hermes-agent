@@ -667,3 +667,101 @@ def test_committed_compression_has_no_failure(recorder):
     )
     for row in _rows():
         assert row["dimensions"]["compression_failure"] == "none"
+
+
+# ── R4 round-trip metrics ───────────────────────────────────────────────
+
+
+def _round(tool_calls: int, content_chars: int = 0) -> None:
+    local_observations.observe_lifecycle(
+        "post_api_request",
+        **_base(),
+        assistant_content_chars=content_chars,
+        assistant_tool_call_count=tool_calls,
+    )
+
+
+def test_tool_batch_size_skips_the_zero_tool_final_round(recorder):
+    from hermes_cli.observability.shared_metrics_contract import (
+        MODEL_ROUNDS_METRIC,
+        TOOL_BATCH_SIZE_METRIC,
+    )
+
+    local_observations.observe_lifecycle("pre_api_request", **_base())
+    _round(3)
+    _round(2)
+    _round(0, content_chars=42)  # final answer, no tools
+    local_observations.observe_lifecycle("on_session_end", session_id="session-1")
+
+    batches = sorted(row["value"] for row in _rows(TOOL_BATCH_SIZE_METRIC))
+    assert batches == [2.0, 3.0], "a zero-tool final round must not be counted"
+    [rounds] = _rows(MODEL_ROUNDS_METRIC)
+    assert rounds["value"] == 3.0, "all three rounds still count as model rounds"
+
+
+def test_single_tool_streak_records_stretch_length_not_a_boolean(recorder):
+    """One stretch of four must be distinguishable from four isolated singles."""
+    from hermes_cli.observability.shared_metrics_contract import (
+        SINGLE_TOOL_STREAK_METRIC,
+    )
+
+    local_observations.observe_lifecycle("pre_api_request", **_base())
+    for _ in range(4):
+        _round(1)
+    _round(3)  # breaks the stretch
+    _round(1)
+    _round(1)
+    local_observations.observe_lifecycle("on_session_end", session_id="session-1")
+
+    streaks = sorted(row["value"] for row in _rows(SINGLE_TOOL_STREAK_METRIC))
+    assert streaks == [2.0, 4.0], streaks
+
+
+def test_a_turn_ending_on_a_streak_still_records_it(recorder):
+    from hermes_cli.observability.shared_metrics_contract import (
+        SINGLE_TOOL_STREAK_METRIC,
+    )
+
+    local_observations.observe_lifecycle("pre_api_request", **_base())
+    _round(1)
+    _round(1)
+    _round(1)
+    local_observations.observe_lifecycle("on_session_end", session_id="session-1")
+
+    [streak] = _rows(SINGLE_TOOL_STREAK_METRIC)
+    assert streak["value"] == 3.0
+
+
+def test_round_metric_dimensions_are_valid_and_lane_aware(recorder):
+    from hermes_cli.observability.shared_metrics_contract import (
+        MODEL_ROUNDS_METRIC,
+        TOOL_BATCH_SIZE_METRIC,
+    )
+
+    work_lane.set_routing_lane("research_readonly")
+    local_observations.observe_lifecycle("pre_api_request", **_base())
+    _round(2)
+    local_observations.observe_lifecycle("on_session_end", session_id="session-1")
+
+    for metric in (TOOL_BATCH_SIZE_METRIC, MODEL_ROUNDS_METRIC):
+        [row] = _rows(metric)
+        assert observation_dimensions_are_valid(metric, row["dimensions"])
+        assert row["dimensions"]["work_lane"] == "research"
+        assert row["dimensions"]["execution_surface"] == "cli"
+
+
+def test_no_round_rows_when_recording_is_disabled(tmp_path, monkeypatch):
+    from hermes_cli.observability.shared_metrics_contract import TOOL_BATCH_SIZE_METRIC
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "off-home"))
+    monkeypatch.setattr(
+        "hermes_cli.config.read_raw_config_readonly",
+        lambda: {"telemetry": {"shared_metrics": {"enabled": False}}},
+    )
+    local_observations._reset_for_tests()
+    local_observations.observe_lifecycle("pre_api_request", **_base())
+    _round(4)
+    local_observations.observe_lifecycle("on_session_end", session_id="session-1")
+
+    assert not (tmp_path / "off-home" / "telemetry").exists()
+    del TOOL_BATCH_SIZE_METRIC
