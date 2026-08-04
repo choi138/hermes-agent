@@ -270,14 +270,16 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
             "1-based starting line (default 1)."
         ),
         ("parameters", "properties", "limit"): (
-            "Line limit (default 500, max 2000)."
+            "Line limit (default 500, max 2000); pass 2000 to read a whole file in one call."
         ),
     },
     "write_file": {
         (): (
             "Write a complete file, creating parent directories. OVERWRITES the entire "
             "file; use patch for targeted edits or append. Suspicious large shrinks are "
-            "blocked unless confirmed with the returned SHA-256. Runs syntax checks."
+            "blocked unless confirmed with the returned SHA-256. Runs syntax checks. "
+            "On success the result's bytes_written is the resulting file size — report "
+            "it instead of a follow-up wc/ls/stat call."
         ),
         ("parameters", "properties", "path"): (
             "File path to create or overwrite."

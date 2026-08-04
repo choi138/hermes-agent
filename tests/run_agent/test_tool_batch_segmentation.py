@@ -387,6 +387,34 @@ def agent():
         return a
 
 
+@pytest.fixture()
+def file_agent():
+    """Agent whose tool surface includes the path-scoped file tools.
+
+    Needed by the mutation-then-observation ordering tests, which batch
+    write_file with search_files / terminal.
+    """
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs(
+                "web_search", "terminal", "write_file", "search_files", "read_file"
+            ),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        a.client = MagicMock()
+        return a
+
+
 class TestSegmentedDispatchIntegration:
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
@@ -541,6 +569,163 @@ class TestSegmentedDispatchIntegration:
         seq.assert_not_called()
 
 
+
+    def test_writes_batched_with_search_are_ordered_so_search_sees_them(
+        self, file_agent, tmp_path
+    ):
+        """R4 step 2: pins the guarantee PARALLEL_TOOL_CALL_GUIDANCE advertises.
+
+        Three write_file calls to distinct files plus a trailing
+        search_files over their shared directory, emitted in ONE assistant
+        response.  The writes may run concurrently (disjoint targets), but
+        the search overlaps all three as a reader-vs-writer conflict, so it
+        MUST be fenced into a later segment and therefore observe the
+        completed writes.
+
+        Absolute paths are used deliberately: an absolute path never
+        consults any cwd, so the ordering holds regardless of the known
+        divergence between the planner's execution_cwd
+        (get_active_env().cwd) and the file tools' resolution base.
+        """
+        targets = [tmp_path / name for name in ("a.txt", "b.txt", "c.txt")]
+        calls = [
+            _tc(
+                "write_file",
+                json.dumps({"path": str(target), "content": "content-%d" % index}),
+                call_id="w%d" % index,
+            )
+            for index, target in enumerate(targets)
+        ]
+        calls.append(
+            _tc(
+                "search_files",
+                json.dumps({"pattern": "content", "path": str(tmp_path)}),
+                call_id="g1",
+            )
+        )
+        write_ids = ["w0", "w1", "w2"]
+
+        # (1) Planner: the observation shares no segment with any mutation,
+        #     and lands strictly later.
+        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segment_of = {
+            tool_call.id: index
+            for index, (_kind, segment_calls) in enumerate(segments)
+            for tool_call in segment_calls
+        }
+        assert all(
+            segment_of["g1"] > segment_of[write_id] for write_id in write_ids
+        ), (
+            "search_files must be fenced into a segment after every write_file; "
+            f"kinds={_kinds(segments)} placement={segment_of}"
+        )
+
+        # (2) Runtime: the search starts only after every write finished, and
+        #     the writes genuinely overlap each other.
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        rendezvous = threading.Barrier(3, timeout=10)
+        events = []
+        events_lock = threading.Lock()
+
+        def fake_handle(name, args, task_id, **kwargs):
+            with events_lock:
+                events.append(("start", name, kwargs["tool_call_id"]))
+            if name == "write_file":
+                # All three writes must be in flight simultaneously — proves
+                # the disjoint-target writes were admitted to one parallel run
+                # rather than silently serialized.
+                rendezvous.wait()
+            with events_lock:
+                events.append(("end", name, kwargs["tool_call_id"]))
+            return json.dumps({"ok": name})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            file_agent._execute_tool_calls(msg, messages, "task-batch-obs")
+
+        search_start = events.index(("start", "search_files", "g1"))
+        write_ends = [
+            index
+            for index, event in enumerate(events)
+            if event[0] == "end" and event[1] == "write_file"
+        ]
+        write_starts = [
+            index
+            for index, event in enumerate(events)
+            if event[0] == "start" and event[1] == "write_file"
+        ]
+        assert len(write_ends) == 3 and len(write_starts) == 3
+        assert all(index < search_start for index in write_ends), (
+            "search_files observed the directory before a batched write "
+            f"completed; events={events}"
+        )
+        # Concurrency: every write had started before any write ended.
+        assert max(write_starts) < min(write_ends), (
+            f"batched writes to disjoint paths did not overlap; events={events}"
+        )
+
+        # (3) Exactly one result per call, in emission order.
+        assert [m["tool_call_id"] for m in messages] == write_ids + ["g1"]
+
+    def test_write_batched_with_terminal_probe_is_ordered_unconditionally(
+        self, file_agent, tmp_path
+    ):
+        """The resolver-independent half of the mutation-then-observation
+        guarantee.
+
+        ``terminal`` is absent from _PARALLEL_SAFE_TOOLS, so it is an
+        unconditional barrier: _add_sequential() closes the live parallel run
+        before appending it.  A shell verification emitted after writes is
+        therefore ordered behind them REGARDLESS of path canonicalisation —
+        here execution_cwd deliberately points at an unrelated directory.
+        The absolute-path requirement in the prompt applies only to the
+        file-tool half of the guarantee, not this one.
+
+        Two writes (not one) because a lone parallel segment is demoted to
+        sequential and then merged with the following sequential segment —
+        ordering would still hold, but the *segment* boundary would not be
+        observable.
+        """
+        unrelated = tmp_path / "elsewhere"
+        unrelated.mkdir()
+        targets = [tmp_path / "one.txt", tmp_path / "two.txt"]
+        calls = [
+            _tc(
+                "write_file",
+                json.dumps({"path": str(target), "content": "payload"}),
+                call_id="w%d" % index,
+            )
+            for index, target in enumerate(targets)
+        ]
+        calls.append(
+            _tc("terminal", json.dumps({"command": "ls -l"}), call_id="t1")
+        )
+
+        segments = _plan_tool_batch_segments(calls, execution_cwd=unrelated)
+        segment_of = {
+            tool_call.id: index
+            for index, (_kind, segment_calls) in enumerate(segments)
+            for tool_call in segment_calls
+        }
+        assert segment_of["t1"] > segment_of["w0"]
+        assert segment_of["t1"] > segment_of["w1"]
+
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+        lock = threading.Lock()
+
+        def fake_handle(name, args, task_id, **kwargs):
+            with lock:
+                executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            file_agent._execute_tool_calls(msg, messages, "task-terminal-obs")
+
+        assert executed.index("t1") == 2
+        assert set(executed[:2]) == {"w0", "w1"}
+        assert [m["tool_call_id"] for m in messages] == ["w0", "w1", "t1"]
 
     def test_interrupt_during_barrier_drains_later_segments(self, agent):
         """Interrupt raised while the barrier tool runs: the trailing parallel

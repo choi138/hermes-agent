@@ -98,8 +98,8 @@ DEFAULT_CONFIG = {
         # instead of one call per turn.  The runtime already runs independent
         # calls concurrently, so this just steers the model to produce the
         # batch — cutting round-trips and the resent-context cost that
-        # compounds over a long conversation.  Costs ~70 tokens in the cached
-        # system prompt.  Set False to disable globally.
+        # compounds over a long conversation.  Costs ~360 tokens in the
+        # cached system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected

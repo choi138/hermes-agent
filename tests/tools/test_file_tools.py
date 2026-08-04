@@ -1070,3 +1070,79 @@ class TestNotFoundCache:
         assert _check_not_found_cache("read", "/tmp/never-exists-notify", tid) is None, (
             "notify_other_tool_call must clear cached misses"
         )
+
+
+class TestReadFileSchemaHonesty:
+    """R4 step 2: READ_FILE_SCHEMA's declared ``limit`` default must match
+    what the registered handler actually forwards.
+
+    The schema used to advertise ``default: 2000`` while ``_handle_read_file``
+    forwarded 500.  A model that wanted a whole file therefore omitted
+    ``limit``, got 500 lines plus a ``next_offset``, and paid a continuation
+    round the schema had promised it would not need.  Nothing in the tree
+    pinned the two together (``_handle_read_file`` is referenced only at its
+    definition and its registry registration), so they were free to drift.
+
+    Both values are DERIVED here rather than hardcoded on both sides, so the
+    test fails on divergence in either direction instead of freezing one
+    number.
+    """
+
+    def test_read_file_schema_default_matches_handler_fallback(self):
+        from tools.file_tools import READ_FILE_SCHEMA
+
+        assert READ_FILE_SCHEMA["parameters"]["properties"]["limit"]["default"] == 500
+
+    def test_handler_forwards_the_schema_default_when_limit_is_omitted(
+        self, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        recorded = {}
+
+        def _recorder(path, offset=1, limit=None, task_id=None, **kwargs):
+            recorded.update(path=path, offset=offset, limit=limit, task_id=task_id)
+            return json.dumps({"content": ""})
+
+        monkeypatch.setattr(ft, "read_file_tool", _recorder)
+        ft._handle_read_file({"path": "/tmp/schema-honesty-probe.txt"})
+
+        schema_default = ft.READ_FILE_SCHEMA["parameters"]["properties"]["limit"][
+            "default"
+        ]
+        assert recorded["limit"] == schema_default, (
+            "the registered read_file handler must forward the limit the schema "
+            f"advertises; schema says {schema_default}, handler sent "
+            f"{recorded['limit']}"
+        )
+
+    def test_schema_tells_the_model_how_to_get_a_whole_file_in_one_call(self):
+        """The honesty fix alone saves zero rounds — the model cannot predict
+        a file's length.  The explicit ``limit=2000`` hint is what converts an
+        accurate schema into a round saver, and the max must stay 2000 so no
+        capability is removed."""
+        from tools.file_tools import READ_FILE_SCHEMA
+
+        limit_prop = READ_FILE_SCHEMA["parameters"]["properties"]["limit"]
+        assert limit_prop["maximum"] == 2000
+        assert "limit=2000" in limit_prop["description"]
+
+    def test_gateway_compact_description_carries_the_same_hint(self):
+        """Gateway/Discord sessions are shown a compacted schema from a
+        separate table; fixing only one of the two descriptions the model can
+        see would leave the round-saving hint off for those surfaces."""
+        from gateway.tool_policy import _DISCORD_CORE_COMPACT_DESCRIPTIONS
+
+        compact = _DISCORD_CORE_COMPACT_DESCRIPTIONS["read_file"][
+            ("parameters", "properties", "limit")
+        ]
+        assert "default 500" in compact
+        assert "2000" in compact
+        # The two assertions above also hold for the pre-change string
+        # "Line limit (default 500, max 2000)." — pin the ACTIONABLE hint, which
+        # is the part that actually removes a pagination round.
+        assert "whole file in one call" in compact
+
+        write = _DISCORD_CORE_COMPACT_DESCRIPTIONS["write_file"][()]
+        assert "bytes_written" in write
+        assert "wc/ls/stat" in write
