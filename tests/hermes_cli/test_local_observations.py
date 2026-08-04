@@ -596,3 +596,74 @@ def test_retry_row_carries_the_turn_lane_and_learned_call_role(recorder):
     [retry] = _rows(RETRY_ATTEMPT_METRIC)
     assert retry["dimensions"]["work_lane"] == "research"
     assert retry["dimensions"]["call_role"] == "fallback"
+
+
+# ── compression_failure dimension (added after the R3-d baseline, 2026-08-04) ──
+
+
+def test_compression_failure_buckets_every_runtime_value(recorder):
+    """The runtime's failure_class values must all land in the closed vocabulary.
+
+    The first R3-d baseline capture recorded six compression rows that all read
+    ``outcome=aborted`` with no reason attached, which made "why did compression
+    abort?" unanswerable from the raw table. The real cause turned out to be
+    ``no_progress``.
+    """
+    from hermes_cli.observability.shared_metrics_contract import (
+        COMPRESSION_FAILURES,
+        compression_failure,
+    )
+
+    for raw in (
+        "commit_fence_cancelled",
+        "explicit_interrupt",
+        "lock_contended",
+        "no_progress",
+        "pool_saturated",
+        "exception:TimeoutError",
+        "rollback:KeyError",
+    ):
+        bucket = compression_failure(raw)
+        assert bucket in COMPRESSION_FAILURES, (raw, bucket)
+        assert bucket != "other", (
+            f"{raw!r} fell through to 'other'; add its head to "
+            "COMPRESSION_FAILURES so the abort reason stays queryable"
+        )
+    assert compression_failure(None) == "none"
+    assert compression_failure("") == "none"
+    assert compression_failure("something_brand_new") == "other"
+
+
+def test_compression_rows_carry_the_failure_reason(recorder):
+    local_observations.record_compression_attempt(
+        kind="batch",
+        outcome="aborted",
+        failure="no_progress",
+        trigger="auto",
+        lane="direct",
+        platform="cli",
+        duration_ms=35.5,
+    )
+    rows = _rows("hermes.compression.duration_ms")
+    assert len(rows) == 1
+    assert rows[0]["dimensions"]["compression_failure"] == "no_progress"
+    assert rows[0]["dimensions"]["compression_outcome"] == "aborted"
+    assert observation_dimensions_are_valid(
+        "hermes.compression.duration_ms", rows[0]["dimensions"]
+    )
+
+
+def test_committed_compression_has_no_failure(recorder):
+    local_observations.record_compression_attempt(
+        kind="micro",
+        outcome="committed",
+        failure=None,
+        trigger="micro_turn_end",
+        lane="direct",
+        platform="cli",
+        duration_ms=12.0,
+        tokens_before=900.0,
+        tokens_after=400.0,
+    )
+    for row in _rows():
+        assert row["dimensions"]["compression_failure"] == "none"

@@ -614,6 +614,30 @@ RETRY_REASONS: frozenset[str] = frozenset({
 FALLBACK_REASONS: frozenset[str] = RETRY_REASONS | frozenset({"none"})
 
 COMPRESSION_KINDS: frozenset[str] = frozenset({"batch", "defrag", "micro"})
+# Why a separate dimension instead of more COMPRESSION_OUTCOMES members: the
+# runtime's failure_class is open-ended ("exception:<TypeName>",
+# "rollback:<TypeName>", ...), so folding it into the outcome would either
+# explode cardinality or, as originally shipped, discard it entirely — which
+# made every abort indistinguishable and left "why did compression abort?"
+# unanswerable from the raw table. These buckets keep the vocabulary closed.
+#
+# The members below are the complete set the runtime actually emits, taken from
+# every ``failure_class=`` site in agent/conversation_compression.py and
+# agent/context_compressor.py. Keep them in sync with those call sites.
+COMPRESSION_FAILURES: frozenset[str] = frozenset({
+    "commit_fence_cancelled",
+    "exception",
+    "explicit_interrupt",
+    "guard",
+    "lock_contended",
+    "no_progress",
+    "none",
+    "other",
+    "pool_saturated",
+    "rollback",
+    "unknown",
+})
+
 COMPRESSION_OUTCOMES: frozenset[str] = frozenset({
     "aborted",
     "committed",
@@ -650,6 +674,7 @@ _MODEL_CALL_ATTEMPT_DIMENSIONS: dict[str, frozenset[str]] = {
     "work_lane": WORK_LANES,
 }
 _COMPRESSION_DIMENSIONS: dict[str, frozenset[str]] = {
+    "compression_failure": COMPRESSION_FAILURES,
     "compression_kind": COMPRESSION_KINDS,
     "compression_outcome": COMPRESSION_OUTCOMES,
     "compression_trigger": COMPRESSION_TRIGGERS,
@@ -817,6 +842,25 @@ def compression_trigger(value: Any) -> str:
     do not opt in to the richer label.
     """
     return _bounded(value, COMPRESSION_TRIGGERS)
+
+
+def compression_failure(failure_class: Any = None) -> str:
+    """Bucket the runtime's open-ended failure_class into a closed label.
+
+    The runtime emits values like "pool_saturated", "explicit_interrupt",
+    "exception:TimeoutError" and "rollback:KeyError". Prefix-bucketing keeps the
+    dimension cardinality bounded while still separating the abort REASONS,
+    which a bare commit_status cannot do.
+    """
+    raw = str(failure_class or "").strip().lower()
+    if not raw:
+        return "none"
+    head = raw.split(":", 1)[0]
+    if head in COMPRESSION_FAILURES:
+        return head
+    if head in {"guard", "refused", "precondition"}:
+        return "guard"
+    return "other"
 
 
 def compression_outcome(

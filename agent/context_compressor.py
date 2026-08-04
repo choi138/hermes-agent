@@ -5814,6 +5814,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                     else "failed"
                 ),
                 trigger="micro_turn_end",
+                # The micro path has no failure_class; the outcome string itself
+                # names the reason, so map the two failing shapes explicitly.
+                failure=(
+                    "guard"
+                    if outcome == "exchange_skipped"
+                    else "other"
+                    if outcome in {"defrag_failed", "summarize_failed"}
+                    else None
+                ),
                 lane=work_lane.current_work_lane(),
                 duration_ms=payload.get("duration_ms"),
                 aux_duration_ms=payload.get("aux_duration_ms"),

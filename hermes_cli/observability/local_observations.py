@@ -529,6 +529,7 @@ def record_compression_attempt(
     kind: Any,
     outcome: Any,
     trigger: Any,
+    failure: Any = None,
     lane: Any = "",
     platform: Any = "",
     duration_ms: Any = None,
@@ -547,9 +548,10 @@ def record_compression_attempt(
         return
     try:
         from .shared_metrics_contract import compression_kind, compression_outcome
-        from .shared_metrics_contract import compression_trigger
+        from .shared_metrics_contract import compression_failure, compression_trigger
 
         dimensions = {
+            "compression_failure": compression_failure(failure),
             "compression_kind": compression_kind(kind),
             "compression_outcome": compression_outcome(outcome),
             "compression_trigger": compression_trigger(trigger),

@@ -1219,6 +1219,9 @@ def _record_compression_observations(agent: Any, payload: dict) -> None:
         local_observations.record_compression_attempt(
             kind="batch",
             outcome="skipped" if is_skipped else outcome,
+            # Without this, every abort reason collapses into outcome="aborted"
+            # and "why did compression abort?" is unanswerable from the table.
+            failure=payload.get("failure_class"),
             trigger=payload.get("trigger_source"),
             # Seeded when the attempt began, never read live: compression runs
             # on a shared worker pool whose jobs can outlive the turn that
