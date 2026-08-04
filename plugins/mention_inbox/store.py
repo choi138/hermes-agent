@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -31,7 +32,8 @@ from plugins.mention_inbox.proposals import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1531851208858275860"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
+_DISCORD_MAX_SNOWFLAKE = (1 << 64) - 1
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,10 @@ class DeliveryClaim:
     attempts: int
     requires_reconciliation: bool
 
+    @property
+    def token(self) -> int:
+        return self.attempts
+
 
 @dataclass(frozen=True)
 class WorkItemSession:
@@ -82,6 +88,7 @@ class WorkItemSession:
     repository_node_id: str | None
     pr_node_id: str | None
     parent_message_id: str | None
+    parent_channel_id: str | None
     discord_thread_id: str | None
     state: str
     last_event_revision: str
@@ -119,6 +126,8 @@ class WorkExecution:
     terminal_receipt_message_id: str | None
     status: str
     dispatch_id: str | None
+    recovery_token: str | None
+    owner_id: str | None
     evidence_json: str | None
     created_at: datetime
     updated_at: datetime
@@ -128,6 +137,7 @@ class WorkExecution:
 class RecoverableExecution:
     execution: WorkExecution
     approver_user_id: str
+    recovery_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,7 +146,12 @@ class TerminalReceiptClaim:
     thread_id: str
     marker: str
     content: str
+    claim_token: str
     requires_reconciliation: bool
+
+
+class TerminalReceiptClaimLostError(ValueError):
+    """The terminal receipt lease is expired, replaced, or foreign."""
 
 
 _CLOSED_SESSION_STATES = frozenset({"completed", "rejected", "expired"})
@@ -179,6 +194,16 @@ def _require_stable_text(value: str, name: str, *, limit: int = 500) -> str:
         or len(value) > limit
     ):
         raise ValueError(f"{name} must be a bounded non-empty trimmed string")
+    return value
+
+
+def _require_discord_snowflake(value: str, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{5,19}", value) is None
+        or int(value) > _DISCORD_MAX_SNOWFLAKE
+    ):
+        raise ValueError(f"{name} must be a valid Discord snowflake")
     return value
 
 
@@ -304,6 +329,9 @@ def _work_item_session(row: sqlite3.Row) -> WorkItemSession:
         parent_message_id=(
             None if row["parent_message_id"] is None else str(row["parent_message_id"])
         ),
+        parent_channel_id=(
+            None if row["parent_channel_id"] is None else str(row["parent_channel_id"])
+        ),
         discord_thread_id=(
             None if row["discord_thread_id"] is None else str(row["discord_thread_id"])
         ),
@@ -363,6 +391,10 @@ def _work_execution(row: sqlite3.Row) -> WorkExecution:
         ),
         status=str(row["status"]),
         dispatch_id=(None if row["dispatch_id"] is None else str(row["dispatch_id"])),
+        recovery_token=(
+            None if row["recovery_token"] is None else str(row["recovery_token"])
+        ),
+        owner_id=(None if row["owner_id"] is None else str(row["owner_id"])),
         evidence_json=(
             None if row["evidence_json"] is None else str(row["evidence_json"])
         ),
@@ -559,6 +591,7 @@ class MentionInboxStore:
                     repository_node_id TEXT,
                     pr_node_id TEXT,
                     parent_message_id TEXT,
+                    parent_channel_id TEXT,
                     discord_thread_id TEXT,
                     state TEXT NOT NULL,
                     last_event_revision TEXT NOT NULL,
@@ -570,7 +603,7 @@ class MentionInboxStore:
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(work_item_sessions)")
             }
-            for column in ("repository_node_id", "pr_node_id"):
+            for column in ("repository_node_id", "pr_node_id", "parent_channel_id"):
                 if column not in session_columns:
                     connection.execute(
                         f"ALTER TABLE work_item_sessions ADD COLUMN {column} TEXT"
@@ -703,10 +736,13 @@ class MentionInboxStore:
                     status_message_id TEXT,
                     terminal_receipt_message_id TEXT,
                     recovery_lease_until TEXT,
+                    recovery_token TEXT,
+                    owner_id TEXT,
                     terminal_receipt_marker TEXT,
                     terminal_receipt_content TEXT,
                     terminal_receipt_status TEXT,
                     terminal_receipt_lease_until TEXT,
+                    terminal_receipt_claim_token TEXT,
                     status TEXT NOT NULL,
                     dispatch_id TEXT,
                     evidence_json TEXT,
@@ -726,10 +762,13 @@ class MentionInboxStore:
                 "status_message_id",
                 "terminal_receipt_message_id",
                 "recovery_lease_until",
+                "recovery_token",
+                "owner_id",
                 "terminal_receipt_marker",
                 "terminal_receipt_content",
                 "terminal_receipt_status",
                 "terminal_receipt_lease_until",
+                "terminal_receipt_claim_token",
             ):
                 if column not in execution_columns:
                     connection.execute(
@@ -1043,10 +1082,15 @@ class MentionInboxStore:
             connection.close()
 
     def list_active_work_item_sessions(
-        self, *, limit: int = 100
+        self,
+        *,
+        limit: int = 100,
+        include_overflow: bool = False,
     ) -> tuple[WorkItemSession, ...]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
+        if not isinstance(include_overflow, bool):
+            raise ValueError("include_overflow must be a bool")
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -1056,17 +1100,37 @@ class MentionInboxStore:
                 ORDER BY updated_at, subject_key
                 LIMIT ?
                 """,
-                (limit,),
+                (limit + int(include_overflow),),
             ).fetchall()
             return tuple(_work_item_session(row) for row in rows)
         finally:
             connection.close()
 
+    def active_work_item_session_count(self) -> int:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM work_item_sessions
+                WHERE state NOT IN ('completed', 'rejected', 'expired')
+                """
+            ).fetchone()
+            return 0 if row is None else int(row["count"])
+        finally:
+            connection.close()
+
     def prepare_work_item_parent(
-        self, subject_key: str, parent_message_id: str
+        self,
+        subject_key: str,
+        parent_message_id: str,
+        parent_channel_id: str,
     ) -> WorkItemSession:
         subject = _require_stable_text(subject_key, "subject_key")
         parent = _require_stable_text(parent_message_id, "parent_message_id", limit=80)
+        parent_channel = _require_discord_snowflake(
+            parent_channel_id, "parent_channel_id"
+        )
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
@@ -1078,16 +1142,80 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("work item session not found")
                 existing = row["parent_message_id"]
+                existing_channel = row["parent_channel_id"]
                 if existing is not None and str(existing) != parent:
                     raise ValueError("work item session already maps to a different parent")
+                if (
+                    existing_channel is not None
+                    and str(existing_channel) != parent_channel
+                ):
+                    raise ValueError(
+                        "work item session belongs to a different Discord destination"
+                    )
                 connection.execute(
                     """
                     UPDATE work_item_sessions
-                    SET parent_message_id = ?, updated_at = ?
+                    SET parent_message_id = ?, parent_channel_id = ?, updated_at = ?
                     WHERE subject_key = ?
                     """,
-                    (parent, now, subject),
+                    (parent, parent_channel, now, subject),
                 )
+                stored = connection.execute(
+                    "SELECT * FROM work_item_sessions WHERE subject_key = ?",
+                    (subject,),
+                ).fetchone()
+                return _work_item_session(stored)
+        finally:
+            connection.close()
+
+    def replace_unthreaded_work_item_parent(
+        self,
+        subject_key: str,
+        *,
+        expected_parent_message_id: str,
+        parent_message_id: str,
+        parent_channel_id: str,
+    ) -> WorkItemSession:
+        subject = _require_stable_text(subject_key, "subject_key")
+        expected_parent = _require_stable_text(
+            expected_parent_message_id,
+            "expected_parent_message_id",
+            limit=80,
+        )
+        parent = _require_stable_text(
+            parent_message_id,
+            "parent_message_id",
+            limit=80,
+        )
+        parent_channel = _require_discord_snowflake(
+            parent_channel_id, "parent_channel_id"
+        )
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                updated = connection.execute(
+                    """
+                    UPDATE work_item_sessions
+                    SET parent_message_id = ?, parent_channel_id = ?, updated_at = ?
+                    WHERE subject_key = ?
+                      AND parent_message_id = ?
+                      AND (parent_channel_id IS NULL OR parent_channel_id = ?)
+                      AND discord_thread_id IS NULL
+                    """,
+                    (
+                        parent,
+                        parent_channel,
+                        now,
+                        subject,
+                        expected_parent,
+                        parent_channel,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(
+                        "unthreaded work item parent changed concurrently"
+                    )
                 stored = connection.execute(
                     "SELECT * FROM work_item_sessions WHERE subject_key = ?",
                     (subject,),
@@ -1109,10 +1237,17 @@ class MentionInboxStore:
             connection.close()
 
     def record_work_item_thread(
-        self, subject_key: str, parent_message_id: str, thread_id: str
+        self,
+        subject_key: str,
+        parent_message_id: str,
+        parent_channel_id: str,
+        thread_id: str,
     ) -> WorkItemSession:
         subject = _require_stable_text(subject_key, "subject_key")
         parent = _require_stable_text(parent_message_id, "parent_message_id", limit=80)
+        parent_channel = _require_discord_snowflake(
+            parent_channel_id, "parent_channel_id"
+        )
         thread = _require_stable_text(thread_id, "thread_id", limit=80)
         now = _iso_datetime(self._clock())
         connection = self._connect()
@@ -1125,9 +1260,14 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("work item session not found")
                 existing_parent = row["parent_message_id"]
+                existing_parent_channel = row["parent_channel_id"]
                 existing_thread = row["discord_thread_id"]
                 if (
                     (existing_parent is not None and str(existing_parent) != parent)
+                    or (
+                        existing_parent_channel is not None
+                        and str(existing_parent_channel) != parent_channel
+                    )
                     or (existing_thread is not None and str(existing_thread) != thread)
                 ):
                     raise ValueError("work item session already maps to a different thread")
@@ -1135,11 +1275,11 @@ class MentionInboxStore:
                 connection.execute(
                     """
                     UPDATE work_item_sessions
-                    SET parent_message_id = ?, discord_thread_id = ?,
-                        state = ?, updated_at = ?
+                    SET parent_message_id = ?, parent_channel_id = ?,
+                        discord_thread_id = ?, state = ?, updated_at = ?
                     WHERE subject_key = ?
                     """,
-                    (parent, thread, state, now, subject),
+                    (parent, parent_channel, thread, state, now, subject),
                 )
                 stored = connection.execute(
                     "SELECT * FROM work_item_sessions WHERE subject_key = ?",
@@ -1707,40 +1847,69 @@ class MentionInboxStore:
             connection.close()
 
     def mark_execution_dispatched(
-        self, execution_id: str, dispatch_id: str
+        self,
+        execution_id: str,
+        dispatch_id: str,
+        *,
+        lease_seconds: int = 60,
+        recovery_token: str | None = None,
     ) -> WorkExecution:
+        """Promote a reservation and establish its durable dispatch generation."""
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
         dispatch = _require_stable_text(dispatch_id, "dispatch_id", limit=200)
-        now = _iso_datetime(self._clock())
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        token = (
+            secrets.token_hex(16)
+            if recovery_token is None
+            else _require_stable_text(recovery_token, "recovery_token", limit=80)
+        )
+        now_dt = self._clock()
+        now = _iso_datetime(now_dt)
+        lease_until = _iso_datetime(now_dt + timedelta(seconds=lease_seconds))
         connection = self._connect()
         try:
-            with connection:
-                row = connection.execute(
-                    "SELECT * FROM work_executions WHERE execution_id = ?",
-                    (execution_key,),
-                ).fetchone()
-                if row is None:
-                    raise KeyError("execution receipt not found")
-                current = _work_execution(row)
-                if current.status == "queued":
-                    if current.dispatch_id != dispatch:
-                        raise ValueError("execution already maps to a different dispatch")
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM work_executions WHERE execution_id = ?",
+                (execution_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("execution receipt not found")
+            current = _work_execution(row)
+            if current.status == "queued":
+                if current.dispatch_id != dispatch:
+                    raise ValueError("execution already maps to a different dispatch")
+                if current.recovery_token is not None:
+                    connection.commit()
                     return current
-                if current.status != "reserved":
-                    raise ValueError("only a reserved execution may be dispatched")
-                connection.execute(
-                    """
-                    UPDATE work_executions
-                    SET status = 'queued', dispatch_id = ?, updated_at = ?
-                    WHERE execution_id = ? AND status = 'reserved'
-                    """,
-                    (dispatch, now, execution_key),
-                )
-                updated = connection.execute(
-                    "SELECT * FROM work_executions WHERE execution_id = ?",
-                    (execution_key,),
-                ).fetchone()
-                return _work_execution(updated)
+            elif current.status != "reserved":
+                raise ValueError("only a reserved execution may be dispatched")
+            updated = connection.execute(
+                """
+                UPDATE work_executions
+                SET status = 'queued', dispatch_id = ?, recovery_token = ?,
+                    owner_id = NULL, recovery_lease_until = ?, updated_at = ?
+                WHERE execution_id = ? AND status IN ('reserved', 'queued')
+                  AND (recovery_token IS NULL OR recovery_token = ?)
+                """,
+                (dispatch, token, lease_until, now, execution_key, token),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("execution dispatch ownership changed concurrently")
+            stored = connection.execute(
+                "SELECT * FROM work_executions WHERE execution_id = ?",
+                (execution_key,),
+            ).fetchone()
+            connection.commit()
+            return _work_execution(stored)
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -1810,7 +1979,7 @@ class MentionInboxStore:
                 WHERE e.status IN ('reserved', 'queued')
                   AND (
                     e.recovery_lease_until IS NULL
-                    OR e.recovery_lease_until <= ?
+                    OR julianday(e.recovery_lease_until) <= julianday(?)
                   )
                 ORDER BY e.created_at, e.execution_id
                 LIMIT ?
@@ -1819,18 +1988,26 @@ class MentionInboxStore:
             ).fetchall()
             claimed: list[RecoverableExecution] = []
             for row in rows:
+                token = secrets.token_hex(16)
                 updated = connection.execute(
                     """
                     UPDATE work_executions
-                    SET recovery_lease_until = ?, updated_at = ?
+                    SET recovery_token = ?, owner_id = NULL,
+                        recovery_lease_until = ?, updated_at = ?
                     WHERE execution_id = ?
                       AND status IN ('reserved', 'queued')
                       AND (
                         recovery_lease_until IS NULL
-                        OR recovery_lease_until <= ?
+                        OR julianday(recovery_lease_until) <= julianday(?)
                       )
                     """,
-                    (lease_until, now_text, str(row["execution_id"]), now_text),
+                    (
+                        token,
+                        lease_until,
+                        now_text,
+                        str(row["execution_id"]),
+                        now_text,
+                    ),
                 )
                 if updated.rowcount != 1:
                     continue
@@ -1842,6 +2019,7 @@ class MentionInboxStore:
                             "approver_user_id",
                             limit=80,
                         ),
+                        recovery_token=token,
                     )
                 )
             connection.commit()
@@ -1852,33 +2030,127 @@ class MentionInboxStore:
         finally:
             connection.close()
 
-    def release_execution_recovery(self, execution_id: str) -> None:
+    def renew_execution_recovery_lease(
+        self,
+        execution_id: str,
+        *,
+        recovery_token: str,
+        lease_seconds: int = 60,
+    ) -> str | None:
         execution_key = _require_stable_text(
             execution_id,
             "execution_id",
+            limit=80,
+        )
+        token = _require_stable_text(
+            recovery_token,
+            "recovery_token",
+            limit=80,
+        )
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        now_dt = self._clock()
+        now = _iso_datetime(now_dt)
+        lease_until = _iso_datetime(
+            now_dt + timedelta(seconds=lease_seconds)
+        )
+        connection = self._connect()
+        try:
+            with connection:
+                updated = connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET recovery_lease_until = ?, updated_at = ?
+                    WHERE execution_id = ?
+                      AND status IN ('reserved', 'queued')
+                      AND recovery_token = ?
+                      AND julianday(recovery_lease_until) > julianday(?)
+                    """,
+                    (lease_until, now, execution_key, token, now),
+                )
+                return token if updated.rowcount == 1 else None
+        finally:
+            connection.close()
+
+    def release_execution_recovery(
+        self,
+        execution_id: str,
+        *,
+        recovery_token: str,
+    ) -> bool:
+        execution_key = _require_stable_text(
+            execution_id,
+            "execution_id",
+            limit=80,
+        )
+        token = _require_stable_text(
+            recovery_token,
+            "recovery_token",
             limit=80,
         )
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
             with connection:
-                connection.execute(
+                updated = connection.execute(
                     """
                     UPDATE work_executions
-                    SET recovery_lease_until = NULL, updated_at = ?
+                    SET recovery_token = NULL, owner_id = NULL,
+                        recovery_lease_until = NULL, updated_at = ?
                     WHERE execution_id = ?
                       AND status IN ('reserved', 'queued')
+                      AND recovery_token = ?
                     """,
-                    (now, execution_key),
+                    (now, execution_key, token),
                 )
+                return updated.rowcount == 1
+        finally:
+            connection.close()
+
+    def admit_execution_owner(
+        self,
+        execution_id: str,
+        *,
+        recovery_token: str,
+        owner_id: str,
+    ) -> bool:
+        """Bind one gateway run instance to the current queued generation."""
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
+        owner = _require_stable_text(owner_id, "owner_id", limit=80)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                updated = connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET owner_id = ?, updated_at = ?
+                    WHERE execution_id = ? AND status = 'queued'
+                      AND recovery_token = ?
+                      AND julianday(recovery_lease_until) > julianday(?)
+                      AND (owner_id IS NULL OR owner_id = ?)
+                    """,
+                    (owner, now, execution_key, token, now, owner),
+                )
+                return updated.rowcount == 1
         finally:
             connection.close()
 
     def invalidate_execution_for_reapproval(
-        self, execution_id: str, *, evidence_category: str
+        self,
+        execution_id: str,
+        *,
+        evidence_category: str,
+        recovery_token: str,
     ) -> WorkExecution:
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
         category = _require_error_category(evidence_category)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
         evidence_json = json.dumps(
             {"category": category}, separators=(",", ":"), sort_keys=True
         )
@@ -1893,6 +2165,8 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token != token or current.owner_id is not None:
+                    raise ValueError("execution recovery lease is stale")
                 if current.status == "blocked":
                     return current
                 if current.status not in {"reserved", "queued"}:
@@ -1911,14 +2185,17 @@ class MentionInboxStore:
                 self._write_proposal_status(
                     connection, proposal, ProposalStatus.NEEDS_REAPPROVAL, now
                 )
-                connection.execute(
+                updated_execution = connection.execute(
                     """
                     UPDATE work_executions
                     SET status = 'blocked', evidence_json = ?, updated_at = ?
-                    WHERE execution_id = ?
+                    WHERE execution_id = ? AND recovery_token = ?
+                      AND owner_id IS NULL
                     """,
-                    (evidence_json, now, execution_key),
+                    (evidence_json, now, execution_key, token),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution recovery lease is stale")
                 connection.execute(
                     "UPDATE work_item_sessions SET state = 'needs_reapproval', updated_at = ? WHERE subject_key = ?",
                     (now, proposal.subject_key),
@@ -2037,10 +2314,27 @@ class MentionInboxStore:
             connection.close()
 
     def mark_execution_blocked(
-        self, execution_id: str, *, evidence_category: str
+        self,
+        execution_id: str,
+        *,
+        evidence_category: str,
+        recovery_token: str | None,
+        owner_id: str | None,
     ) -> WorkExecution:
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
         category = _require_error_category(evidence_category)
+        if recovery_token is None and owner_id is not None:
+            raise ValueError("execution owner identity is invalid")
+        token = (
+            None
+            if recovery_token is None
+            else _require_stable_text(recovery_token, "recovery_token", limit=80)
+        )
+        owner = (
+            None
+            if owner_id is None
+            else _require_stable_text(owner_id, "owner_id", limit=80)
+        )
         evidence_json = json.dumps(
             {"category": category}, separators=(",", ":"), sort_keys=True
         )
@@ -2055,6 +2349,17 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token is None:
+                    authorized = token is None and owner is None
+                elif current.owner_id is None:
+                    authorized = current.recovery_token == token and owner is None
+                else:
+                    authorized = (
+                        current.recovery_token == token
+                        and current.owner_id == owner
+                    )
+                if not authorized:
+                    raise ValueError("execution owner is stale or foreign")
                 if current.status == "blocked":
                     return current
                 if current.status not in {"reserved", "queued", "running", "verifying"}:
@@ -2073,14 +2378,17 @@ class MentionInboxStore:
                 self._write_proposal_status(
                     connection, proposal, ProposalStatus.BLOCKED, now
                 )
-                connection.execute(
+                updated_execution = connection.execute(
                     """
                     UPDATE work_executions
                     SET status = 'blocked', evidence_json = ?, updated_at = ?
                     WHERE execution_id = ?
+                      AND recovery_token IS ? AND owner_id IS ?
                     """,
-                    (evidence_json, now, execution_key),
+                    (evidence_json, now, execution_key, token, owner),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution owner is stale or foreign")
                 connection.execute(
                     "UPDATE work_item_sessions SET state = 'blocked', updated_at = ? WHERE subject_key = ?",
                     (now, proposal.subject_key),
@@ -2114,12 +2422,16 @@ class MentionInboxStore:
         execution_id: str,
         *,
         tool_name: str,
+        recovery_token: str,
+        owner_id: str,
         transition_proposal: bool = True,
     ) -> tuple[WorkExecution, bool]:
         if not isinstance(transition_proposal, bool):
             raise ValueError("transition_proposal must be boolean")
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
         tool = _require_stable_text(tool_name, "tool_name", limit=100)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
+        owner = _require_stable_text(owner_id, "owner_id", limit=80)
         if not all(char.isalnum() or char in "_.:-" for char in tool):
             raise ValueError("tool_name contains unsupported characters")
         now = _iso_datetime(self._clock())
@@ -2133,8 +2445,15 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token != token or current.owner_id != owner:
+                    raise ValueError("execution owner is stale or foreign")
                 if current.status not in {"queued", "running"}:
                     raise ValueError("execution cannot record tool start")
+                if current.status == "queued" and (
+                    row["recovery_lease_until"] is None
+                    or _parse_datetime(str(row["recovery_lease_until"])) <= self._clock()
+                ):
+                    raise ValueError("execution owner lease expired")
                 evidence = self._decode_execution_evidence(current.evidence_json)
                 starts = evidence["tool_starts"]
                 assert isinstance(starts, dict)
@@ -2159,14 +2478,18 @@ class MentionInboxStore:
                         "UPDATE work_item_sessions SET state = 'running', updated_at = ? WHERE subject_key = ?",
                         (now, proposal.subject_key),
                     )
-                connection.execute(
+                updated_execution = connection.execute(
                     """
                     UPDATE work_executions
-                    SET status = 'running', evidence_json = ?, updated_at = ?
+                    SET status = 'running', evidence_json = ?,
+                        recovery_lease_until = NULL, updated_at = ?
                     WHERE execution_id = ?
+                      AND recovery_token = ? AND owner_id = ?
                     """,
-                    (evidence_json, now, execution_key),
+                    (evidence_json, now, execution_key, token, owner),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution owner is stale or foreign")
                 updated = connection.execute(
                     "SELECT * FROM work_executions WHERE execution_id = ?",
                     (execution_key,),
@@ -2182,11 +2505,15 @@ class MentionInboxStore:
         tool_name: str,
         success: bool,
         exit_code: int | None,
+        recovery_token: str,
+        owner_id: str,
         action: str | None = None,
         detail: str | None = None,
     ) -> WorkExecution:
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
         tool = _require_stable_text(tool_name, "tool_name", limit=100)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
+        owner = _require_stable_text(owner_id, "owner_id", limit=80)
         if not all(char.isalnum() or char in "_.:-" for char in tool):
             raise ValueError("tool_name contains unsupported characters")
         if not isinstance(success, bool):
@@ -2220,6 +2547,8 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token != token or current.owner_id != owner:
+                    raise ValueError("execution owner is stale or foreign")
                 if current.status != "running":
                     raise ValueError("tool completion requires a running execution")
                 evidence = self._decode_execution_evidence(current.evidence_json)
@@ -2239,10 +2568,16 @@ class MentionInboxStore:
                 evidence_json = json.dumps(
                     evidence, separators=(",", ":"), sort_keys=True
                 )
-                connection.execute(
-                    "UPDATE work_executions SET evidence_json = ?, updated_at = ? WHERE execution_id = ?",
-                    (evidence_json, now, execution_key),
+                updated_execution = connection.execute(
+                    """
+                    UPDATE work_executions SET evidence_json = ?, updated_at = ?
+                    WHERE execution_id = ?
+                      AND recovery_token = ? AND owner_id = ?
+                    """,
+                    (evidence_json, now, execution_key, token, owner),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution owner is stale or foreign")
                 updated = connection.execute(
                     "SELECT * FROM work_executions WHERE execution_id = ?",
                     (execution_key,),
@@ -2251,8 +2586,16 @@ class MentionInboxStore:
         finally:
             connection.close()
 
-    def mark_kanban_execution_admitted(self, execution_id: str) -> WorkExecution:
+    def mark_kanban_execution_admitted(
+        self,
+        execution_id: str,
+        *,
+        recovery_token: str,
+        owner_id: str,
+    ) -> WorkExecution:
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
+        owner = _require_stable_text(owner_id, "owner_id", limit=80)
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
@@ -2264,6 +2607,8 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token != token or current.owner_id != owner:
+                    raise ValueError("execution owner is stale or foreign")
                 if current.status == "completed":
                     return current
                 if current.status != "running" or current.mode != "kanban":
@@ -2286,10 +2631,16 @@ class MentionInboxStore:
                 proposal = _stored_proposal(proposal_row)
                 if proposal.status is not ProposalStatus.QUEUED:
                     raise ValueError("Kanban-admitted proposal must remain queued")
-                connection.execute(
-                    "UPDATE work_executions SET status = 'completed', updated_at = ? WHERE execution_id = ?",
-                    (now, execution_key),
+                updated_execution = connection.execute(
+                    """
+                    UPDATE work_executions SET status = 'completed', updated_at = ?
+                    WHERE execution_id = ?
+                      AND recovery_token = ? AND owner_id = ?
+                    """,
+                    (now, execution_key, token, owner),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution owner is stale or foreign")
                 connection.execute(
                     "UPDATE work_item_sessions SET state = 'queued', updated_at = ? WHERE subject_key = ?",
                     (now, proposal.subject_key),
@@ -2302,9 +2653,17 @@ class MentionInboxStore:
         finally:
             connection.close()
 
-    def mark_execution_verifying(self, execution_id: str) -> WorkExecution:
+    def mark_execution_verifying(
+        self,
+        execution_id: str,
+        *,
+        recovery_token: str,
+        owner_id: str,
+    ) -> WorkExecution:
         return self._advance_execution_and_proposal(
             execution_id,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
             expected_execution="running",
             target_execution="verifying",
             expected_proposal=ProposalStatus.RUNNING,
@@ -2316,6 +2675,8 @@ class MentionInboxStore:
         execution_id: str,
         *,
         content: str,
+        recovery_token: str,
+        owner_id: str,
     ) -> WorkExecution:
         execution_key = _require_stable_text(
             execution_id,
@@ -2323,6 +2684,8 @@ class MentionInboxStore:
             limit=80,
         )
         receipt_body = _require_stable_text(content, "content", limit=1900)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
+        owner = _require_stable_text(owner_id, "owner_id", limit=80)
         marker = (
             "[hermes-execution-receipt:"
             + hashlib.sha256(execution_key.encode("utf-8")).hexdigest()[:24]
@@ -2340,6 +2703,8 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token != token or current.owner_id != owner:
+                    raise ValueError("execution owner is stale or foreign")
                 if current.status == "completed":
                     if (
                         row["terminal_receipt_marker"] == marker
@@ -2379,7 +2744,7 @@ class MentionInboxStore:
                     ProposalStatus.COMPLETED,
                     now,
                 )
-                connection.execute(
+                updated_execution = connection.execute(
                     """
                     UPDATE work_executions
                     SET status = 'completed',
@@ -2387,12 +2752,16 @@ class MentionInboxStore:
                         terminal_receipt_content = ?,
                         terminal_receipt_status = 'pending',
                         terminal_receipt_lease_until = NULL,
+                        terminal_receipt_claim_token = NULL,
                         recovery_lease_until = NULL,
                         updated_at = ?
                     WHERE execution_id = ?
+                      AND recovery_token = ? AND owner_id = ?
                     """,
-                    (marker, receipt_content, now, execution_key),
+                    (marker, receipt_content, now, execution_key, token, owner),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution owner is stale or foreign")
                 connection.execute(
                     """
                     UPDATE work_item_sessions
@@ -2423,6 +2792,7 @@ class MentionInboxStore:
         now = self._clock()
         now_text = _iso_datetime(now)
         lease_until = _iso_datetime(now + timedelta(seconds=lease_seconds))
+        claim_token = secrets.token_urlsafe(32)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2436,7 +2806,7 @@ class MentionInboxStore:
                     terminal_receipt_status = 'pending'
                     OR (
                         terminal_receipt_status = 'sending'
-                        AND terminal_receipt_lease_until <= ?
+                        AND julianday(terminal_receipt_lease_until) <= julianday(?)
                     )
                   )
                 ORDER BY updated_at, execution_id
@@ -2452,19 +2822,21 @@ class MentionInboxStore:
                 """
                 UPDATE work_executions
                 SET terminal_receipt_status = 'sending',
-                    terminal_receipt_lease_until = ?, updated_at = ?
+                    terminal_receipt_lease_until = ?,
+                    terminal_receipt_claim_token = ?, updated_at = ?
                 WHERE execution_id = ?
                   AND terminal_receipt_message_id IS NULL
                   AND (
                     terminal_receipt_status = 'pending'
                     OR (
                         terminal_receipt_status = 'sending'
-                        AND terminal_receipt_lease_until <= ?
+                        AND julianday(terminal_receipt_lease_until) <= julianday(?)
                     )
                   )
                 """,
                 (
                     lease_until,
+                    claim_token,
                     now_text,
                     str(row["execution_id"]),
                     now_text,
@@ -2478,6 +2850,7 @@ class MentionInboxStore:
                 thread_id=str(row["thread_id"]),
                 marker=str(row["terminal_receipt_marker"]),
                 content=str(row["terminal_receipt_content"]),
+                claim_token=claim_token,
                 requires_reconciliation=requires_reconciliation,
             )
             connection.commit()
@@ -2488,55 +2861,117 @@ class MentionInboxStore:
         finally:
             connection.close()
 
+    def renew_terminal_receipt_lease(
+        self,
+        execution_id: str,
+        *,
+        claim_token: str,
+        lease_seconds: int,
+    ) -> bool:
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        token = _require_stable_text(claim_token, "claim_token", limit=100)
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        now_dt = self._clock()
+        now = _iso_datetime(now_dt)
+        lease_until = _iso_datetime(now_dt + timedelta(seconds=lease_seconds))
+        connection = self._connect()
+        try:
+            with connection:
+                result = connection.execute(
+                    """
+                    UPDATE work_executions
+                    SET terminal_receipt_lease_until = ?, updated_at = ?
+                    WHERE execution_id = ?
+                      AND terminal_receipt_status = 'sending'
+                      AND terminal_receipt_message_id IS NULL
+                      AND terminal_receipt_claim_token = ?
+                      AND julianday(terminal_receipt_lease_until) > julianday(?)
+                    """,
+                    (lease_until, now, execution_key, token, now),
+                )
+                return result.rowcount == 1
+        finally:
+            connection.close()
+
     def mark_terminal_receipt_sent(
         self,
         execution_id: str,
         *,
+        claim_token: str,
         message_id: str,
     ) -> WorkExecution:
-        execution_key = _require_stable_text(
-            execution_id,
-            "execution_id",
-            limit=80,
-        )
+        execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        token = _require_stable_text(claim_token, "claim_token", limit=100)
         message = _require_stable_text(message_id, "message_id", limit=80)
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
-            with connection:
-                row = connection.execute(
-                    "SELECT * FROM work_executions WHERE execution_id = ?",
-                    (execution_key,),
-                ).fetchone()
-                if row is None:
-                    raise KeyError("execution receipt not found")
-                existing = row["terminal_receipt_message_id"]
-                if existing is not None and str(existing) != message:
-                    raise ValueError("execution message binding is immutable")
-                if row["terminal_receipt_status"] not in {"sending", "sent"}:
-                    raise ValueError("terminal receipt is not claimed")
-                connection.execute(
-                    """
-                    UPDATE work_executions
-                    SET terminal_receipt_message_id = ?,
-                        terminal_receipt_status = 'sent',
-                        terminal_receipt_lease_until = NULL,
-                        updated_at = ?
-                    WHERE execution_id = ?
-                    """,
-                    (message, now, execution_key),
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM work_executions WHERE execution_id = ?",
+                (execution_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("execution receipt not found")
+            if row["terminal_receipt_claim_token"] != token:
+                raise TerminalReceiptClaimLostError(
+                    "terminal receipt claim is stale or foreign"
                 )
-                stored = connection.execute(
-                    "SELECT * FROM work_executions WHERE execution_id = ?",
-                    (execution_key,),
-                ).fetchone()
-                return _work_execution(stored)
+            existing = row["terminal_receipt_message_id"]
+            if existing is not None:
+                if str(existing) != message:
+                    raise ValueError("execution message binding is immutable")
+                if row["terminal_receipt_status"] != "sent":
+                    raise ValueError("terminal receipt state is invalid")
+                connection.commit()
+                return _work_execution(row)
+            result = connection.execute(
+                """
+                UPDATE work_executions
+                SET terminal_receipt_message_id = ?,
+                    terminal_receipt_status = 'sent',
+                    terminal_receipt_lease_until = NULL,
+                    updated_at = ?
+                WHERE execution_id = ?
+                  AND terminal_receipt_status = 'sending'
+                  AND terminal_receipt_message_id IS NULL
+                  AND terminal_receipt_claim_token = ?
+                  AND julianday(terminal_receipt_lease_until) > julianday(?)
+                """,
+                (message, now, execution_key, token, now),
+            )
+            if result.rowcount != 1:
+                raise TerminalReceiptClaimLostError(
+                    "terminal receipt claim is expired"
+                )
+            stored = connection.execute(
+                "SELECT * FROM work_executions WHERE execution_id = ?",
+                (execution_key,),
+            ).fetchone()
+            connection.commit()
+            return _work_execution(stored)
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
-    def mark_execution_completed(self, execution_id: str) -> WorkExecution:
+    def mark_execution_completed(
+        self,
+        execution_id: str,
+        *,
+        recovery_token: str,
+        owner_id: str,
+    ) -> WorkExecution:
         return self._advance_execution_and_proposal(
             execution_id,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
             expected_execution="verifying",
             target_execution="completed",
             expected_proposal=ProposalStatus.VERIFYING,
@@ -2547,12 +2982,16 @@ class MentionInboxStore:
         self,
         execution_id: str,
         *,
+        recovery_token: str,
+        owner_id: str,
         expected_execution: str,
         target_execution: str,
         expected_proposal: ProposalStatus,
         target_proposal: ProposalStatus,
     ) -> WorkExecution:
         execution_key = _require_stable_text(execution_id, "execution_id", limit=80)
+        token = _require_stable_text(recovery_token, "recovery_token", limit=80)
+        owner = _require_stable_text(owner_id, "owner_id", limit=80)
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
@@ -2564,6 +3003,8 @@ class MentionInboxStore:
                 if row is None:
                     raise KeyError("execution receipt not found")
                 current = _work_execution(row)
+                if current.recovery_token != token or current.owner_id != owner:
+                    raise ValueError("execution owner is stale or foreign")
                 if current.status == target_execution:
                     return current
                 if current.status != expected_execution:
@@ -2585,14 +3026,17 @@ class MentionInboxStore:
                 self._write_proposal_status(
                     connection, proposal, target_proposal, now
                 )
-                connection.execute(
+                updated_execution = connection.execute(
                     """
                     UPDATE work_executions
                     SET status = ?, updated_at = ?
                     WHERE execution_id = ?
+                      AND recovery_token = ? AND owner_id = ?
                     """,
-                    (target_execution, now, execution_key),
+                    (target_execution, now, execution_key, token, owner),
                 )
+                if updated_execution.rowcount != 1:
+                    raise ValueError("execution owner is stale or foreign")
                 connection.execute(
                     "UPDATE work_item_sessions SET state = ?, updated_at = ? WHERE subject_key = ?",
                     (target_execution, now, proposal.subject_key),
@@ -2887,11 +3331,21 @@ class MentionInboxStore:
                 FROM delivery_outbox o
                 WHERE o.destination = ? AND (
                     o.status = 'pending' OR
-                    (o.status = 'sending' AND o.lease_until <= ?)
+                    (
+                        o.status = 'sending'
+                        AND julianday(o.lease_until) <= julianday(?)
+                    )
                 ) AND o.event_json IS NOT NULL AND o.source_revision IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM delivery_outbox active
+                      WHERE active.destination = o.destination
+                        AND active.status = 'sending'
+                        AND julianday(active.lease_until) > julianday(?)
+                  )
                 ORDER BY o.delivery_id LIMIT 1
                 """,
-                (destination, now),
+                (destination, now, now),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -2925,27 +3379,103 @@ class MentionInboxStore:
         finally:
             connection.close()
 
-    def release_delivery(self, delivery_id: int, *, error_category: str) -> None:
+    def renew_delivery_lease(
+        self,
+        delivery_id: int,
+        *,
+        expected_attempt: int,
+        lease_seconds: int,
+    ) -> bool:
+        if (
+            isinstance(expected_attempt, bool)
+            or not isinstance(expected_attempt, int)
+            or expected_attempt <= 0
+        ):
+            raise ValueError("expected_attempt must be a positive integer")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds <= 0
+        ):
+            raise ValueError("lease_seconds must be a positive integer")
+        now_dt = self._clock().astimezone(timezone.utc)
+        lease_until = _iso_datetime(now_dt + timedelta(seconds=lease_seconds))
+        now = _iso_datetime(now_dt)
+        connection = self._connect()
+        try:
+            with connection:
+                result = connection.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET lease_until = ?, updated_at = ?
+                    WHERE delivery_id = ? AND status = 'sending'
+                      AND attempts = ?
+                      AND julianday(lease_until) > julianday(?)
+                    """,
+                    (lease_until, now, delivery_id, expected_attempt, now),
+                )
+                return result.rowcount == 1
+        finally:
+            connection.close()
+
+    def release_delivery(
+        self,
+        delivery_id: int,
+        *,
+        claim_token: int,
+        error_category: str,
+    ) -> bool:
         category = _require_error_category(error_category)
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
             with connection:
-                connection.execute(
+                result = connection.execute(
                     """
                     UPDATE delivery_outbox
                     SET status = 'pending', lease_until = NULL,
                         error_category = ?, updated_at = ?
                     WHERE delivery_id = ? AND status = 'sending'
+                      AND attempts = ?
                     """,
-                    (category, now, delivery_id),
+                    (category, now, delivery_id, claim_token),
                 )
+                return result.rowcount == 1
+        finally:
+            connection.close()
+
+    def note_delivery_error(
+        self,
+        delivery_id: int,
+        *,
+        error_category: str,
+        claim_token: int,
+    ) -> bool:
+        category = _require_error_category(error_category)
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                result = connection.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET error_category = ?, updated_at = ?
+                    WHERE delivery_id = ? AND status = 'sending'
+                      AND attempts = ?
+                    """,
+                    (category, now, delivery_id, claim_token),
+                )
+                return result.rowcount == 1
         finally:
             connection.close()
 
     def mark_delivery_parent_confirmed(
-        self, delivery_id: int, *, message_id: str
-    ) -> None:
+        self,
+        delivery_id: int,
+        *,
+        claim_token: int,
+        message_id: str,
+    ) -> bool:
         if not isinstance(message_id, str) or not message_id:
             raise ValueError("message_id must be a non-empty string")
         now = _iso_datetime(self._clock())
@@ -2953,7 +3483,11 @@ class MentionInboxStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT status, message_id FROM delivery_outbox WHERE delivery_id = ?",
+                """
+                SELECT status, message_id, attempts
+                FROM delivery_outbox
+                WHERE delivery_id = ?
+                """,
                 (delivery_id,),
             ).fetchone()
             if row is None:
@@ -2961,54 +3495,99 @@ class MentionInboxStore:
             existing = row["message_id"]
             if existing is not None and str(existing) != message_id:
                 raise ValueError("delivery already maps to a different message")
+            if int(row["attempts"]) != claim_token:
+                connection.rollback()
+                return False
             if str(row["status"]) == "sent":
                 connection.commit()
-                return
+                return True
             if str(row["status"]) != "sending":
                 raise ValueError("only a sending delivery may confirm its parent")
-            connection.execute(
+            result = connection.execute(
                 """
                 UPDATE delivery_outbox
                 SET message_id = ?, updated_at = ?
                 WHERE delivery_id = ? AND status = 'sending'
+                  AND attempts = ?
                 """,
-                (message_id, now, delivery_id),
+                (message_id, now, delivery_id, claim_token),
             )
             connection.commit()
+            return result.rowcount == 1
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
 
-    def mark_delivery_sent(self, delivery_id: int, *, message_id: str) -> None:
+    def mark_delivery_sent(
+        self,
+        delivery_id: int,
+        *,
+        claim_token: int,
+        message_id: str,
+    ) -> bool:
         if not isinstance(message_id, str) or not message_id:
             raise ValueError("message_id must be a non-empty string")
         now = _iso_datetime(self._clock())
         connection = self._connect()
         try:
             with connection:
-                connection.execute(
+                result = connection.execute(
                     """
                     UPDATE delivery_outbox
                     SET status = 'sent', message_id = ?, lease_until = NULL,
                         error_category = NULL, updated_at = ?
-                    WHERE delivery_id = ?
+                    WHERE delivery_id = ? AND status = 'sending'
+                      AND attempts = ?
                     """,
-                    (message_id, now, delivery_id),
+                    (message_id, now, delivery_id, claim_token),
                 )
+                return result.rowcount == 1
+        finally:
+            connection.close()
+
+    def pending_delivery_error_category(self) -> str | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT error_category
+                FROM delivery_outbox
+                WHERE status IN ('pending', 'sending')
+                  AND error_category IS NOT NULL
+                ORDER BY delivery_id
+                LIMIT 1
+                """
+            ).fetchone()
+            return None if row is None else str(row["error_category"])
         finally:
             connection.close()
 
     def health(self, collector_key: str) -> dict[str, object]:
-        status = self.get_collector_status(collector_key)
+        collector = self.get_collector_status(collector_key)
+        delivery_error = self.pending_delivery_error_category()
+        if collector is None:
+            status = "degraded"
+            error_category = "not_started"
+        elif collector.status != "ok":
+            status = collector.status
+            error_category = collector.error_category
+        elif delivery_error is not None:
+            status = "degraded"
+            error_category = delivery_error
+        else:
+            status = collector.status
+            error_category = collector.error_category
         return {
-            "status": "degraded" if status is None else status.status,
-            "error_category": "not_started" if status is None else status.error_category,
-            "last_attempt_at": None if status is None else status.last_attempt_at,
-            "last_success_at": None if status is None else status.last_success_at,
-            "next_poll_at": None if status is None else status.next_poll_at,
-            "consecutive_failures": 0 if status is None else status.consecutive_failures,
+            "status": status,
+            "error_category": error_category,
+            "last_attempt_at": None if collector is None else collector.last_attempt_at,
+            "last_success_at": None if collector is None else collector.last_success_at,
+            "next_poll_at": None if collector is None else collector.next_poll_at,
+            "consecutive_failures": (
+                0 if collector is None else collector.consecutive_failures
+            ),
             "pending_delivery_count": self.pending_delivery_count(),
         }
 

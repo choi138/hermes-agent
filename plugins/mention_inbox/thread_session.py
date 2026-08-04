@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Protocol
 
 from plugins.mention_inbox.contract import MentionEvent
 from plugins.mention_inbox.preflight import (
@@ -29,11 +30,31 @@ from plugins.mention_inbox.voice import (
 
 
 class ThreadSessionTransport(Protocol):
+    def remember_parent_message(
+        self, parent_message_id: str, parent_channel_id: str
+    ) -> None: ...
+
     async def find_anchored_thread(self, parent_message_id: str) -> str | None: ...
 
     async def create_anchored_thread(
         self, parent_message_id: str, name: str, auto_archive_duration: int
     ) -> str: ...
+
+    async def ensure_thread_participants(
+        self,
+        thread_id: str,
+        user_ids: frozenset[str],
+    ) -> None: ...
+
+    async def is_thread_active(self, thread_id: str) -> bool: ...
+
+    async def thread_has_parent(
+        self,
+        thread_id: str,
+        parent_channel_id: str,
+    ) -> bool: ...
+
+    async def activate_thread(self, thread_id: str) -> None: ...
 
     def mark_thread_participation(self, thread_id: str) -> None: ...
 
@@ -42,6 +63,36 @@ class ThreadSessionTransport(Protocol):
     ) -> str | None: ...
 
     async def send_to_thread(self, thread_id: str, content: str) -> str: ...
+
+
+class ThreadParticipantSyncError(RuntimeError):
+    """Discord rejected synchronization of configured work-thread participants."""
+
+
+class ThreadDestinationMismatchError(RuntimeError):
+    """A durable work thread belongs to a different Discord destination."""
+
+
+class ThreadParticipantReconciliationIncompleteError(RuntimeError):
+    """Startup membership reconciliation exceeded its bounded session window."""
+
+
+_NO_PARTICIPANT_USER_IDS: frozenset[str] = frozenset()
+DeliveryCheckpoint = Callable[[], Awaitable[None]]
+
+
+async def _checkpoint_delivery(checkpoint: DeliveryCheckpoint | None) -> None:
+    if checkpoint is not None:
+        await checkpoint()
+
+
+@dataclass(frozen=True)
+class ThreadParticipantReconciliation:
+    examined: int
+    repaired: int
+    skipped: int
+    failed: int
+    overflow: int = 0
 
 
 def _metadata(event: MentionEvent) -> Mapping[str, object]:
@@ -291,6 +342,8 @@ class MentionInboxThreadCoordinator:
         approval_available: bool = False,
         trusted_repositories: frozenset[str] = frozenset({"silviahealth/content"}),
         external_repository_actions: str = "disabled",
+        participant_user_ids: frozenset[str] = _NO_PARTICIPANT_USER_IDS,
+        participant_parent_channel_id: str | None = None,
     ) -> None:
         if executor_hint not in {"direct", "kanban"}:
             raise ValueError("executor_hint must be direct or kanban")
@@ -312,6 +365,8 @@ class MentionInboxThreadCoordinator:
         self._approval_available = approval_available
         self._trusted_repositories = trusted_repositories
         self._external_repository_actions = external_repository_actions
+        self._participant_user_ids: frozenset[str] = participant_user_ids
+        self._participant_parent_channel_id = participant_parent_channel_id
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _lock(self, subject_key: str) -> asyncio.Lock:
@@ -425,34 +480,98 @@ class MentionInboxThreadCoordinator:
         event: MentionEvent,
         *,
         parent_message_id: str,
+        parent_channel_id: str | None = None,
         source_revision: str,
+        delivery_checkpoint: DeliveryCheckpoint | None = None,
     ) -> WorkItemSession:
         if not isinstance(event, MentionEvent):
             raise ValueError("event must be a MentionEvent")
         subject = _subject_key(event)
         async with self._lock(subject):
+            configured_channel = self._participant_parent_channel_id
+            incoming_channel = parent_channel_id or configured_channel
+            if incoming_channel is None:
+                raise ValueError("Discord parent channel is required")
+            if (
+                configured_channel is not None
+                and configured_channel != incoming_channel
+            ):
+                raise ThreadDestinationMismatchError(
+                    "Discord work thread does not belong to the configured "
+                    "Discord destination"
+                )
             existing = self._store.get_active_work_item_session(subject)
+            if (
+                existing is not None
+                and existing.parent_channel_id is not None
+                and existing.parent_channel_id != incoming_channel
+            ):
+                raise ThreadDestinationMismatchError(
+                    "Discord work thread does not belong to the configured "
+                    "Discord destination"
+                )
             session = self._store.reserve_work_item_session(
                 subject, event.dedupe_key, source_revision
             )
-            if existing is None or existing.parent_message_id is None:
+            if (
+                existing is None
+                or existing.parent_message_id is None
+                or existing.parent_channel_id is None
+            ):
                 session = self._store.prepare_work_item_parent(
-                    subject, parent_message_id
+                    subject, parent_message_id, incoming_channel
                 )
             parent = session.parent_message_id or parent_message_id
+            durable_channel = session.parent_channel_id or incoming_channel
+            self._discord.remember_parent_message(parent, durable_channel)
 
             thread_id = session.discord_thread_id
             if thread_id is None:
                 thread_id = await self._discord.find_anchored_thread(parent)
+                if thread_id is None and parent != parent_message_id:
+                    session = (
+                        self._store.replace_unthreaded_work_item_parent(
+                            subject,
+                            expected_parent_message_id=parent,
+                            parent_message_id=parent_message_id,
+                            parent_channel_id=durable_channel,
+                        )
+                    )
+                    parent = session.parent_message_id or parent_message_id
+                    self._discord.remember_parent_message(parent, durable_channel)
+                    thread_id = await self._discord.find_anchored_thread(parent)
                 if thread_id is None:
+                    await _checkpoint_delivery(delivery_checkpoint)
                     thread_id = await self._discord.create_anchored_thread(
                         parent,
                         _thread_name(event),
                         self._auto_archive_duration,
                     )
+            if not await self._discord.thread_has_parent(
+                thread_id,
+                durable_channel,
+            ):
+                raise ThreadDestinationMismatchError(
+                    "Discord work thread does not belong to the configured "
+                    "Discord destination"
+                )
             session = self._store.record_work_item_thread(
-                subject, parent, thread_id
+                subject, parent, durable_channel, thread_id
             )
+            if self._participant_user_ids:
+                try:
+                    await _checkpoint_delivery(delivery_checkpoint)
+                    await self._discord.activate_thread(thread_id)
+                    await _checkpoint_delivery(delivery_checkpoint)
+                    await self._discord.ensure_thread_participants(
+                        thread_id,
+                        self._participant_user_ids,
+                    )
+                except Exception as exc:
+                    raise ThreadParticipantSyncError(
+                        "Discord thread participant synchronization failed"
+                    ) from exc
+            await _checkpoint_delivery(delivery_checkpoint)
             self._discord.mark_thread_participation(thread_id)
 
             approval_offered, unavailable_reason = self._approval_offer(
@@ -512,6 +631,7 @@ class MentionInboxThreadCoordinator:
                         # older revision cannot also identify this proposal.
                         message_id = None
                 if message_id is None:
+                    await _checkpoint_delivery(delivery_checkpoint)
                     proposal_sender = getattr(
                         self._discord,
                         "send_proposal_to_thread",
@@ -530,6 +650,7 @@ class MentionInboxThreadCoordinator:
                             thread_id,
                             content,
                         )
+                    await _checkpoint_delivery(delivery_checkpoint)
                 self._store.record_proposal_message(
                     proposal.proposal_id,
                     proposal.revision,
@@ -547,6 +668,7 @@ class MentionInboxThreadCoordinator:
         event: MentionEvent,
         *,
         source_revision: str,
+        delivery_checkpoint: DeliveryCheckpoint | None = None,
     ) -> str | None:
         """Route a later event through the subject's one durable PR thread."""
 
@@ -564,7 +686,9 @@ class MentionInboxThreadCoordinator:
         await self.ensure_thread(
             event,
             parent_message_id=session.parent_message_id,
+            parent_channel_id=session.parent_channel_id,
             source_revision=source_revision,
+            delivery_checkpoint=delivery_checkpoint,
         )
         latest = self._store.get_latest_proposal(subject)
         if latest is None:
@@ -582,9 +706,11 @@ class MentionInboxThreadCoordinator:
                 session.discord_thread_id, content, limit=100
             )
             if message_id is None:
+                await _checkpoint_delivery(delivery_checkpoint)
                 message_id = await self._discord.send_to_thread(
                     session.discord_thread_id, content
                 )
+                await _checkpoint_delivery(delivery_checkpoint)
             return message_id
         binding = self._store.get_proposal_message_binding(
             latest.proposal_id, latest.revision
@@ -602,6 +728,21 @@ class MentionInboxThreadCoordinator:
                 session.parent_message_id is None
                 or session.discord_thread_id is None
             ):
+                continue
+            try:
+                if (
+                    self._participant_parent_channel_id is not None
+                    and not await self._discord.thread_has_parent(
+                        session.discord_thread_id,
+                        self._participant_parent_channel_id,
+                    )
+                ):
+                    continue
+                if not await self._discord.is_thread_active(
+                    session.discord_thread_id
+                ):
+                    continue
+            except Exception:
                 continue
             stored = self._store.get(session.source_dedupe_key)
             if stored is None or _subject_key(stored.event) != session.subject_key:
@@ -630,3 +771,56 @@ class MentionInboxThreadCoordinator:
                 if binding is not None and binding.approval_offered:
                     reconciled += 1
         return reconciled
+
+    async def reconcile_thread_participants(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> ThreadParticipantReconciliation:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if not self._participant_user_ids:
+            return ThreadParticipantReconciliation(0, 0, 0, 0)
+        examined = 0
+        repaired = 0
+        skipped = 0
+        failed = 0
+        sessions = self._store.list_active_work_item_sessions(
+            limit=limit,
+            include_overflow=True,
+        )
+        overflow = max(len(sessions) - limit, 0)
+        for session in sessions[:limit]:
+            examined += 1
+            thread_id = session.discord_thread_id
+            if thread_id is None:
+                skipped += 1
+                continue
+            try:
+                if (
+                    self._participant_parent_channel_id is not None
+                    and not await self._discord.thread_has_parent(
+                        thread_id,
+                        self._participant_parent_channel_id,
+                    )
+                ):
+                    skipped += 1
+                    continue
+                if not await self._discord.is_thread_active(thread_id):
+                    skipped += 1
+                    continue
+                await self._discord.ensure_thread_participants(
+                    thread_id,
+                    self._participant_user_ids,
+                )
+            except Exception:
+                failed += 1
+            else:
+                repaired += 1
+        return ThreadParticipantReconciliation(
+            examined=examined,
+            repaired=repaired,
+            skipped=skipped,
+            failed=failed,
+            overflow=overflow,
+        )

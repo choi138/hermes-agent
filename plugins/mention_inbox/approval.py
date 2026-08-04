@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import urlsplit
 
 from agent.redact import redact_sensitive_text
@@ -23,6 +23,9 @@ from plugins.mention_inbox.proposals import (
 from plugins.mention_inbox.router import InboxDiscordMessage, InboxRouteResult
 from plugins.mention_inbox.store import (
     MentionInboxStore,
+    RecoverableExecution,
+    TerminalReceiptClaim,
+    TerminalReceiptClaimLostError,
     WorkExecution,
     work_execution_id,
 )
@@ -106,6 +109,7 @@ class ApprovedExecutionRequest:
     proposal_id: str
     proposal_revision: int
     proposal_hash: str
+    recovery_token: str
     canonical_proposal_json: str
     subject_key: str
     source_dedupe_key: str
@@ -277,10 +281,21 @@ def render_approved_execution_prompt(request: ApprovedExecutionRequest) -> str:
 
 
 class GatewayExecutionDispatcher:
-    def __init__(self, transport: MentionInboxExecutionTransport) -> None:
+    def __init__(
+        self,
+        transport: MentionInboxExecutionTransport,
+        *,
+        thread_destination_validator: (
+            Callable[[str], Awaitable[bool]] | None
+        ) = None,
+    ) -> None:
         self._transport = transport
+        self._thread_destination_validator = thread_destination_validator
 
     async def dispatch(self, request: ApprovedExecutionRequest) -> DispatchReceipt:
+        validator = self._thread_destination_validator
+        if validator is not None and not await validator(request.thread_id):
+            return DispatchReceipt(accepted=False, dispatch_id=None)
         prompt = render_approved_execution_prompt(request)
         dispatch_id = await self._transport.enqueue_mention_inbox_execution(
             request, prompt
@@ -485,13 +500,24 @@ class ExecutionLifecycleObserver:
         discord: ApprovalDiscordTransport,
         workspace: str,
         loop: asyncio.AbstractEventLoop | None = None,
+        terminal_receipt_lease_seconds: int = 60,
     ) -> None:
+        if (
+            isinstance(terminal_receipt_lease_seconds, bool)
+            or not isinstance(terminal_receipt_lease_seconds, int)
+            or not 1 <= terminal_receipt_lease_seconds <= 3600
+        ):
+            raise ValueError(
+                "terminal_receipt_lease_seconds must be between 1 and 3600"
+            )
         self._store = store
         self._discord = discord
         self._workspace = normalize_execution_workspace_root(workspace)
         self._loop = loop or asyncio.get_running_loop()
         self._pending_lock = threading.Lock()
         self._pending: list[object] = []
+        self._owners: dict[str, tuple[str, str]] = {}
+        self._terminal_receipt_lease_seconds = terminal_receipt_lease_seconds
 
     async def _update_status(self, execution_id: str, content: str) -> None:
         execution = self._store.get_execution(execution_id)
@@ -570,6 +596,8 @@ class ExecutionLifecycleObserver:
         *,
         proposal_hash: str,
         mode: str,
+        recovery_token: str,
+        owner_id: str,
     ) -> None:
         execution = self._store.get_execution(execution_id)
         if execution is None:
@@ -587,6 +615,13 @@ class ExecutionLifecycleObserver:
         )
         if execution.status != "queued":
             raise ValueError("approved execution is not queued")
+        if not self._store.admit_execution_owner(
+            execution_id,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
+        ):
+            raise ValueError("approved execution owner is stale or foreign")
+        self._owners[execution_id] = (recovery_token, owner_id)
         proposal = self._store.get_proposal(
             execution.proposal_id, execution.proposal_revision
         )
@@ -968,7 +1003,13 @@ class ExecutionLifecycleObserver:
         raise ValueError("terminal command is not approved for this proposal")
 
     def authorize_tool_start(
-        self, execution_id: str, tool_name: str, args: Mapping[str, Any]
+        self,
+        execution_id: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        *,
+        recovery_token: str | None = None,
+        owner_id: str | None = None,
     ) -> None:
         if not isinstance(args, Mapping):
             raise ValueError("tool args must be an object")
@@ -1033,7 +1074,27 @@ class ExecutionLifecycleObserver:
                 )
         else:
             raise ValueError("unsupported execution mode")
+        if recovery_token is not None or owner_id is not None:
+            if recovery_token is None or owner_id is None:
+                raise ValueError("execution owner identity must be complete")
+            self._owners[execution_id] = (recovery_token, owner_id)
         self.tool_started(execution_id, tool_name)
+
+    def _owner(self, execution_id: str) -> tuple[str, str]:
+        owner = self._owners.get(execution_id)
+        if owner is None:
+            execution = self._store.get_execution(execution_id)
+            if (
+                execution is None
+                or execution.recovery_token is None
+                or execution.owner_id is None
+            ):
+                raise ValueError("execution owner is unavailable")
+            owner = (execution.recovery_token, execution.owner_id)
+        current = self._store.get_execution(execution_id)
+        if current is None or (current.recovery_token, current.owner_id) != owner:
+            raise ValueError("execution owner is stale or foreign")
+        return owner
 
     def tool_started(self, execution_id: str, tool_name: str) -> None:
         current = self._store.get_execution(execution_id)
@@ -1041,9 +1102,12 @@ class ExecutionLifecycleObserver:
             raise KeyError("execution receipt not found")
         if current.mode == "kanban" and tool_name != "kanban_task":
             raise ValueError("Kanban intake permits only kanban_task")
+        recovery_token, owner_id = self._owner(execution_id)
         execution, changed = self._store.mark_execution_running(
             execution_id,
             tool_name=tool_name,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
             transition_proposal=current.mode != "kanban",
         )
         if not changed:
@@ -1173,11 +1237,14 @@ class ExecutionLifecycleObserver:
         if success and action == "git_verify_commit":
             output = self._result_output(result)
             detail = None if output is None else output.strip()
+        recovery_token, owner_id = self._owner(execution_id)
         self._store.record_execution_tool_completion(
             execution_id,
             tool_name=tool_name,
             success=success,
             exit_code=exit_code,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
             action=action,
             detail=detail,
         )
@@ -1248,8 +1315,12 @@ class ExecutionLifecycleObserver:
         )
 
     async def _block(self, execution_id: str, category: str) -> None:
+        recovery_token, owner_id = self._owner(execution_id)
         execution = self._store.mark_execution_blocked(
-            execution_id, evidence_category=category
+            execution_id,
+            evidence_category=category,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
         )
         proposal = self._store.get_proposal(
             execution.proposal_id, execution.proposal_revision
@@ -1346,14 +1417,42 @@ class ExecutionLifecycleObserver:
         )
         return tuple(evidence[:8])
 
-    async def reconcile_terminal_receipts(self, *, limit: int = 100) -> int:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000")
-        reconciled = 0
-        for _ in range(limit):
-            claim = self._store.claim_terminal_receipt()
-            if claim is None:
-                break
+    async def _reconcile_terminal_receipt_claim(
+        self, claim: TerminalReceiptClaim
+    ) -> bool:
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError(
+                "terminal receipt reconciliation requires an asyncio task"
+            )
+        stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+
+        def renew() -> bool:
+            return self._store.renew_terminal_receipt_lease(
+                claim.execution_id,
+                claim_token=claim.claim_token,
+                lease_seconds=self._terminal_receipt_lease_seconds,
+            )
+
+        async def heartbeat() -> None:
+            interval = max(self._terminal_receipt_lease_seconds / 3, 0.1)
+            while True:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                    return
+                except TimeoutError:
+                    pass
+                if not renew():
+                    lease_lost.set()
+                    if not owner_task.done():
+                        owner_task.cancel()
+                    return
+
+        if not renew():
+            return False
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
             message_id: str | None = None
             if claim.requires_reconciliation:
                 message_id = await self._discord.find_marker(
@@ -1366,10 +1465,41 @@ class ExecutionLifecycleObserver:
                     claim.thread_id,
                     claim.content,
                 )
-            self._store.mark_terminal_receipt_sent(
-                claim.execution_id,
-                message_id=message_id,
+            if lease_lost.is_set() or not renew():
+                return False
+            try:
+                self._store.mark_terminal_receipt_sent(
+                    claim.execution_id,
+                    claim_token=claim.claim_token,
+                    message_id=message_id,
+                )
+            except TerminalReceiptClaimLostError:
+                return False
+            return True
+        except asyncio.CancelledError:
+            if lease_lost.is_set():
+                return False
+            raise
+        finally:
+            stop.set()
+            await heartbeat_task
+
+    async def reconcile_terminal_receipts(self, *, limit: int = 100) -> int:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("limit must be between 1 and 1000")
+        reconciled = 0
+        for _ in range(limit):
+            claim = self._store.claim_terminal_receipt(
+                lease_seconds=self._terminal_receipt_lease_seconds
             )
+            if claim is None:
+                break
+            if not await self._reconcile_terminal_receipt_claim(claim):
+                break
             reconciled += 1
         return reconciled
 
@@ -1399,7 +1529,12 @@ class ExecutionLifecycleObserver:
             if not self._has_kanban_receipt(execution.evidence_json):
                 await self._block(execution_id, "kanban_receipt_missing")
                 return "blocked"
-            execution = self._store.mark_kanban_execution_admitted(execution_id)
+            recovery_token, owner_id = self._owner(execution_id)
+            execution = self._store.mark_kanban_execution_admitted(
+                execution_id,
+                recovery_token=recovery_token,
+                owner_id=owner_id,
+            )
             queued = self._store.get_proposal(
                 execution.proposal_id, execution.proposal_revision
             )
@@ -1416,7 +1551,12 @@ class ExecutionLifecycleObserver:
         if not self._has_verification_evidence(proposal, execution.evidence_json):
             await self._block(execution_id, "verification_missing")
             return "blocked"
-        execution = self._store.mark_execution_verifying(execution_id)
+        recovery_token, owner_id = self._owner(execution_id)
+        execution = self._store.mark_execution_verifying(
+            execution_id,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
+        )
         verifying = self._store.get_proposal(
             execution.proposal_id, execution.proposal_revision
         )
@@ -1436,6 +1576,8 @@ class ExecutionLifecycleObserver:
         execution = self._store.complete_execution_with_terminal_receipt(
             execution_id,
             content=receipt_content,
+            recovery_token=recovery_token,
+            owner_id=owner_id,
         )
         completed = self._store.get_proposal(
             execution.proposal_id, execution.proposal_revision
@@ -1457,6 +1599,10 @@ class ExecutionLifecycleObserver:
         await self._block(execution_id, "agent_failed")
 
 
+class _ExecutionRecoveryLeaseLostError(RuntimeError):
+    """A queued execution recovery claim is no longer owned."""
+
+
 class ApprovalHandler:
     def __init__(
         self,
@@ -1469,7 +1615,16 @@ class ApprovalHandler:
         authorized_approver_ids: frozenset[str],
         workspace: str,
         workspace_manager: RepositoryWorktreeManager | None = None,
+        recovery_lease_seconds: int = 60,
     ) -> None:
+        if (
+            isinstance(recovery_lease_seconds, bool)
+            or not isinstance(recovery_lease_seconds, int)
+            or not 1 <= recovery_lease_seconds <= 3600
+        ):
+            raise ValueError(
+                "recovery_lease_seconds must be between 1 and 3600"
+            )
         self._store = store
         self._source_resolver = source_resolver
         self._dispatcher = dispatcher
@@ -1478,6 +1633,7 @@ class ApprovalHandler:
         self._authorized_approver_ids = authorized_approver_ids
         self._workspace = normalize_execution_workspace_root(workspace)
         self._workspace_manager = workspace_manager
+        self._recovery_lease_seconds = recovery_lease_seconds
 
     def _exact_command(self, message: InboxDiscordMessage) -> bool:
         return " ".join(message.text.split()) == f"{self._bot_mention} 승인"
@@ -1490,12 +1646,14 @@ class ApprovalHandler:
         message: InboxDiscordMessage,
         current: ResolvedSourceState,
         workspace: str,
+        recovery_token: str,
     ) -> ApprovedExecutionRequest:
         return ApprovedExecutionRequest(
             execution_id=execution_id,
             proposal_id=proposal.proposal_id,
             proposal_revision=proposal.revision,
             proposal_hash=proposal.content_hash,
+            recovery_token=recovery_token,
             canonical_proposal_json=proposal_to_json(proposal),
             subject_key=proposal.subject_key,
             source_dedupe_key=proposal.source_dedupe_key,
@@ -1573,172 +1731,316 @@ class ApprovalHandler:
             )
         return len(changed)
 
-    async def recover_queued(self, *, limit: int = 100) -> int:
-        recovered_count = 0
-        for recoverable in self._store.claim_recoverable_executions(limit=limit):
-            execution = recoverable.execution
-            proposal = self._store.get_proposal(
-                execution.proposal_id, execution.proposal_revision
+    async def _run_recovery_claim(
+        self,
+        recoverable: RecoverableExecution,
+        operation: Callable[
+            [
+                Callable[[], Awaitable[None]],
+                Callable[[], bool],
+            ],
+            Awaitable[bool],
+        ],
+    ) -> bool:
+        execution = recoverable.execution
+        token = recoverable.recovery_token
+        if token is None:
+            raise RuntimeError("execution recovery claim token is missing")
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("execution recovery requires an owning task")
+        current_token = [token]
+        stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+
+        async def checkpoint() -> None:
+            renewed = self._store.renew_execution_recovery_lease(
+                execution.execution_id,
+                recovery_token=current_token[0],
+                lease_seconds=self._recovery_lease_seconds,
             )
-            if proposal is None or proposal.content_hash != execution.proposal_hash:
-                self._store.invalidate_execution_for_reapproval(
-                    execution.execution_id, evidence_category="proposal_changed"
+            if renewed is None:
+                raise _ExecutionRecoveryLeaseLostError(
+                    "execution recovery lease is no longer owned"
                 )
-                continue
-            if recoverable.approver_user_id not in self._authorized_approver_ids:
-                self._store.invalidate_execution_for_reapproval(
-                    execution.execution_id, evidence_category="approver_changed"
-                )
-                await self._discord.send_to_thread(
-                    execution.thread_id, render_needs_reapproval(proposal)
-                )
-                continue
-            try:
-                current = await self._source_resolver.resolve(proposal)
-            except Exception:
-                self._store.release_execution_recovery(execution.execution_id)
-                continue
-            if not isinstance(current, ResolvedSourceState):
-                self._store.release_execution_recovery(execution.execution_id)
-                continue
-            if (
-                current.source_revision != proposal.source_revision
-                or current.head_sha != proposal.head_sha
-            ):
-                self._store.invalidate_execution_for_reapproval(
-                    execution.execution_id, evidence_category="source_changed"
-                )
-                stale = self._store.get_proposal(
-                    execution.proposal_id, execution.proposal_revision
-                )
-                if stale is not None:
-                    await self._discord.send_to_thread(
-                        execution.thread_id, render_needs_reapproval(stale)
-                    )
-                continue
-            if (
-                (
-                    self._workspace_manager is None
-                    and execution.workspace != self._workspace
-                )
-                or execution.head_ref != current.head_ref
-                or execution.head_repository != current.head_repository
-            ):
-                self._store.invalidate_execution_for_reapproval(
-                    execution.execution_id,
-                    evidence_category="execution_scope_changed",
-                )
-                stale = self._store.get_proposal(
-                    execution.proposal_id, execution.proposal_revision
-                )
-                if stale is not None:
-                    await self._discord.send_to_thread(
-                        execution.thread_id, render_needs_reapproval(stale)
-                    )
-                continue
-            workspace = execution.workspace or self._workspace
-            if self._workspace_manager is not None:
+            current_token[0] = renewed
+
+        def release_recovery() -> bool:
+            return self._store.release_execution_recovery(
+                execution.execution_id,
+                recovery_token=current_token[0],
+            )
+
+        async def heartbeat() -> None:
+            interval = max(self._recovery_lease_seconds / 3, 0.1)
+            while True:
                 try:
-                    expected_execution_id, expected_workspace, worktree_request = (
-                        self._worktree_request(proposal, current)
-                    )
-                    if (
-                        expected_execution_id != execution.execution_id
-                        or expected_workspace != workspace
-                        or worktree_request is None
-                    ):
-                        raise WorkspacePreparationError(
-                            "recovered workspace scope changed"
-                        )
-                    prepared = await asyncio.to_thread(
-                        self._workspace_manager.prepare,
-                        worktree_request,
-                    )
-                    if str(prepared.resolve()) != workspace:
-                        raise WorkspacePreparationError(
-                            "recovered workspace path changed"
-                        )
-                except (OSError, ValueError, WorkspacePreparationError):
-                    self._store.mark_execution_blocked(
-                        execution.execution_id,
-                        evidence_category="workspace_unavailable",
-                    )
-                    blocked = self._store.get_proposal(
-                        execution.proposal_id,
-                        execution.proposal_revision,
-                    )
-                    if blocked is not None:
-                        await self._discord.send_to_thread(
-                            execution.thread_id,
-                            render_blocked(
-                                blocked,
-                                category="workspace_unavailable",
-                            ),
-                        )
-                    continue
-            expected_dispatch_id = f"{execution.mode}:{execution.execution_id}"
-            if execution.status == "reserved":
-                self._store.mark_execution_dispatched(
-                    execution.execution_id, expected_dispatch_id
-                )
-                proposal = self._store.transition_proposal_status(
-                    proposal.proposal_id,
-                    proposal.revision,
-                    ProposalStatus.QUEUED,
-                    expected_statuses=(ProposalStatus.APPROVED,),
-                )
-                status_message_id = await self._discord.send_to_thread(
-                    execution.thread_id, render_queued(proposal)
-                )
-                self._store.record_execution_message(
-                    execution.execution_id,
-                    status_message_id,
-                )
-            message = InboxDiscordMessage(
-                thread_id=execution.thread_id,
-                message_id=execution.approval_message_id,
-                user_id=recoverable.approver_user_id,
-                text=f"{self._bot_mention} 승인",
-                reply_to_message_id=(
-                    self._store.get_proposal_message_id(
-                        proposal.proposal_id, proposal.revision
-                    )
-                    or execution.approval_message_id
-                ),
-            )
-            request = self._request(
-                execution_id=execution.execution_id,
-                proposal=proposal,
-                message=message,
-                current=current,
-                workspace=workspace,
-            )
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                    return
+                except TimeoutError:
+                    pass
+                try:
+                    await checkpoint()
+                except _ExecutionRecoveryLeaseLostError:
+                    lease_lost.set()
+                    if not owner_task.done():
+                        owner_task.cancel()
+                    return
+
+        await checkpoint()
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            return await operation(checkpoint, release_recovery)
+        except asyncio.CancelledError:
+            if lease_lost.is_set():
+                raise _ExecutionRecoveryLeaseLostError(
+                    "execution recovery lease was reclaimed"
+                ) from None
+            raise
+        finally:
+            stop.set()
+            await heartbeat_task
+
+    async def recover_queued(self, *, limit: int = 100) -> int:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("limit must be between 1 and 1000")
+        recovered_count = 0
+        claims = self._store.claim_recoverable_executions(
+            limit=limit,
+            lease_seconds=self._recovery_lease_seconds,
+        )
+        for recoverable in claims:
             try:
-                receipt = await self._dispatcher.dispatch(request)
-            except Exception:
-                receipt = DispatchReceipt(accepted=False, dispatch_id=None)
-            if (
-                not isinstance(receipt, DispatchReceipt)
-                or not receipt.accepted
-                or receipt.dispatch_id != expected_dispatch_id
-            ):
-                self._store.mark_execution_blocked(
-                    execution.execution_id, evidence_category="recovery_dispatch_failed"
+                recovered = await self._run_recovery_claim(
+                    recoverable,
+                    lambda checkpoint, release_recovery: self._recover_one(
+                        recoverable,
+                        checkpoint=checkpoint,
+                        release_recovery=release_recovery,
+                    ),
                 )
+            except _ExecutionRecoveryLeaseLostError:
+                continue
+            if recovered:
+                recovered_count += 1
+        return recovered_count
+
+    async def _recover_one(
+        self,
+        recoverable: RecoverableExecution,
+        *,
+        checkpoint: Callable[[], Awaitable[None]],
+        release_recovery: Callable[[], bool],
+    ) -> bool:
+        execution = recoverable.execution
+        recovery_token = recoverable.recovery_token
+        if recovery_token is None:
+            raise RuntimeError("execution recovery claim token is missing")
+
+        def invalidate(category: str) -> None:
+            try:
+                self._store.invalidate_execution_for_reapproval(
+                    execution.execution_id,
+                    evidence_category=category,
+                    recovery_token=recovery_token,
+                )
+            except ValueError as exc:
+                raise _ExecutionRecoveryLeaseLostError(
+                    "execution recovery lease is no longer owned"
+                ) from exc
+
+        def block(category: str) -> None:
+            try:
+                self._store.mark_execution_blocked(
+                    execution.execution_id,
+                    evidence_category=category,
+                    recovery_token=recovery_token,
+                    owner_id=None,
+                )
+            except ValueError as exc:
+                raise _ExecutionRecoveryLeaseLostError(
+                    "execution recovery lease is no longer owned"
+                ) from exc
+
+        await checkpoint()
+        proposal = self._store.get_proposal(
+            execution.proposal_id,
+            execution.proposal_revision,
+        )
+        if proposal is None or proposal.content_hash != execution.proposal_hash:
+            await checkpoint()
+            invalidate("proposal_changed")
+            return False
+        if recoverable.approver_user_id not in self._authorized_approver_ids:
+            await checkpoint()
+            invalidate("approver_changed")
+            await self._discord.send_to_thread(
+                execution.thread_id,
+                render_needs_reapproval(proposal),
+            )
+            return False
+        await checkpoint()
+        try:
+            current = await self._source_resolver.resolve(proposal)
+        except Exception:
+            release_recovery()
+            return False
+        await checkpoint()
+        if not isinstance(current, ResolvedSourceState):
+            release_recovery()
+            return False
+        if (
+            current.source_revision != proposal.source_revision
+            or current.head_sha != proposal.head_sha
+        ):
+            await checkpoint()
+            invalidate("source_changed")
+            stale = self._store.get_proposal(
+                execution.proposal_id,
+                execution.proposal_revision,
+            )
+            if stale is not None:
+                await self._discord.send_to_thread(
+                    execution.thread_id,
+                    render_needs_reapproval(stale),
+                )
+            return False
+        if (
+            (
+                self._workspace_manager is None
+                and execution.workspace != self._workspace
+            )
+            or execution.head_ref != current.head_ref
+            or execution.head_repository != current.head_repository
+        ):
+            await checkpoint()
+            invalidate("execution_scope_changed")
+            stale = self._store.get_proposal(
+                execution.proposal_id,
+                execution.proposal_revision,
+            )
+            if stale is not None:
+                await self._discord.send_to_thread(
+                    execution.thread_id,
+                    render_needs_reapproval(stale),
+                )
+            return False
+        workspace = execution.workspace or self._workspace
+        if self._workspace_manager is not None:
+            try:
+                expected_execution_id, expected_workspace, worktree_request = (
+                    self._worktree_request(proposal, current)
+                )
+                if (
+                    expected_execution_id != execution.execution_id
+                    or expected_workspace != workspace
+                    or worktree_request is None
+                ):
+                    raise WorkspacePreparationError(
+                        "recovered workspace scope changed"
+                    )
+                await checkpoint()
+                prepared = await asyncio.to_thread(
+                    self._workspace_manager.prepare,
+                    worktree_request,
+                )
+                await checkpoint()
+                if str(prepared.resolve()) != workspace:
+                    raise WorkspacePreparationError(
+                        "recovered workspace path changed"
+                    )
+            except (OSError, ValueError, WorkspacePreparationError):
+                await checkpoint()
+                block("workspace_unavailable")
                 blocked = self._store.get_proposal(
-                    execution.proposal_id, execution.proposal_revision
+                    execution.proposal_id,
+                    execution.proposal_revision,
                 )
                 if blocked is not None:
                     await self._discord.send_to_thread(
                         execution.thread_id,
                         render_blocked(
                             blocked,
-                            category="recovery_dispatch_failed",
+                            category="workspace_unavailable",
                         ),
                     )
-                continue
-            recovered_count += 1
-        return recovered_count
+                return False
+        expected_dispatch_id = f"{execution.mode}:{execution.execution_id}"
+        if execution.status == "reserved":
+            await checkpoint()
+            self._store.mark_execution_dispatched(
+                execution.execution_id,
+                expected_dispatch_id,
+                lease_seconds=self._recovery_lease_seconds,
+                recovery_token=recoverable.recovery_token,
+            )
+            proposal = self._store.transition_proposal_status(
+                proposal.proposal_id,
+                proposal.revision,
+                ProposalStatus.QUEUED,
+                expected_statuses=(ProposalStatus.APPROVED,),
+            )
+            await checkpoint()
+            status_message_id = await self._discord.send_to_thread(
+                execution.thread_id,
+                render_queued(proposal),
+            )
+            await checkpoint()
+            self._store.record_execution_message(
+                execution.execution_id,
+                status_message_id,
+            )
+        message = InboxDiscordMessage(
+            thread_id=execution.thread_id,
+            message_id=execution.approval_message_id,
+            user_id=recoverable.approver_user_id,
+            text=f"{self._bot_mention} 승인",
+            reply_to_message_id=(
+                self._store.get_proposal_message_id(
+                    proposal.proposal_id,
+                    proposal.revision,
+                )
+                or execution.approval_message_id
+            ),
+        )
+        request = self._request(
+            execution_id=execution.execution_id,
+            proposal=proposal,
+            message=message,
+            current=current,
+            workspace=workspace,
+            recovery_token=recoverable.recovery_token or "",
+        )
+        await checkpoint()
+        try:
+            receipt = await self._dispatcher.dispatch(request)
+        except Exception:
+            receipt = DispatchReceipt(accepted=False, dispatch_id=None)
+        await checkpoint()
+        if (
+            not isinstance(receipt, DispatchReceipt)
+            or not receipt.accepted
+            or receipt.dispatch_id != expected_dispatch_id
+        ):
+            block("recovery_dispatch_failed")
+            blocked = self._store.get_proposal(
+                execution.proposal_id,
+                execution.proposal_revision,
+            )
+            if blocked is not None:
+                await self._discord.send_to_thread(
+                    execution.thread_id,
+                    render_blocked(
+                        blocked,
+                        category="recovery_dispatch_failed",
+                    ),
+                )
+            return False
+        return True
 
     async def approve(
         self, message: InboxDiscordMessage, proposal: WorkProposal
@@ -1844,6 +2146,8 @@ class ApprovalHandler:
                 self._store.mark_execution_blocked(
                     execution.execution_id,
                     evidence_category="workspace_unavailable",
+                    recovery_token=None,
+                    owner_id=None,
                 )
                 blocked = self._store.get_latest_proposal(
                     approved.proposal.subject_key
@@ -1860,18 +2164,23 @@ class ApprovalHandler:
                     blocked,
                     blocked_message_id,
                 )
+        expected_dispatch_id = (
+            f"{approved.proposal.executor_hint}:{execution.execution_id}"
+        )
+        execution = self._store.mark_execution_dispatched(
+            execution.execution_id,
+            expected_dispatch_id,
+            lease_seconds=self._recovery_lease_seconds,
+        )
+        if execution.recovery_token is None:
+            raise RuntimeError("dispatched execution owner token is missing")
         request = self._request(
             execution_id=execution.execution_id,
             proposal=approved.proposal,
             message=message,
             current=current,
             workspace=workspace,
-        )
-        expected_dispatch_id = (
-            f"{approved.proposal.executor_hint}:{execution.execution_id}"
-        )
-        self._store.mark_execution_dispatched(
-            execution.execution_id, expected_dispatch_id
+            recovery_token=execution.recovery_token,
         )
         queued = self._store.transition_proposal_status(
             approved.proposal.proposal_id,
@@ -1896,7 +2205,10 @@ class ApprovalHandler:
             or receipt.dispatch_id != expected_dispatch_id
         ):
             self._store.mark_execution_blocked(
-                execution.execution_id, evidence_category="dispatch_failed"
+                execution.execution_id,
+                evidence_category="dispatch_failed",
+                recovery_token=execution.recovery_token,
+                owner_id=None,
             )
             blocked = self._store.get_latest_proposal(approved.proposal.subject_key)
             if blocked is None or blocked.status is not ProposalStatus.BLOCKED:

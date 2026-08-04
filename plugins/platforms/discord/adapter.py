@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import struct
 import subprocess
 import tempfile
@@ -47,6 +48,7 @@ class _Snowflake:
         self.id = id
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+_DISCORD_MAX_SNOWFLAKE = (1 << 64) - 1
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -62,6 +64,13 @@ _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 _DISCORD_MAX_APP_COMMANDS = 100
 _DISCORD_SELECT_FIELD_LIMIT = 100
 _DISCORD_BUTTON_LABEL_LIMIT = 80
+
+
+def _is_discord_snowflake(value: str) -> bool:
+    return (
+        re.fullmatch(r"[1-9][0-9]{5,19}", value) is not None
+        and int(value) <= _DISCORD_MAX_SNOWFLAKE
+    )
 _DISCORD_ELLIPSIS = "\u2026"
 _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
@@ -275,6 +284,16 @@ def _metadata_marks_nonconversational(metadata: Optional[Dict[str, Any]]) -> boo
     if not isinstance(metadata, dict):
         return False
     return any(bool(metadata.get(key)) for key in _DISCORD_NONCONVERSATIONAL_METADATA_KEYS)
+
+
+def _should_disable_mention_inbox_proposal_controls(
+    result_kind: str,
+) -> bool:
+    return result_kind not in {
+        "proposal_action_unauthorized",
+        "proposal_action_stale",
+        "proposal_action_wrong_destination",
+    }
 
 
 def _looks_like_nonconversational_history_message(content: str) -> bool:
@@ -2897,6 +2916,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                mention_inbox_nonce = (
+                    metadata.get("mention_inbox_nonce")
+                    if metadata and i == 0
+                    else None
+                )
                 try:
                     send_kwargs: Dict[str, Any] = {
                         "content": chunk,
@@ -2904,6 +2928,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     }
                     if metadata and metadata.get("mention_inbox_no_mentions"):
                         send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                    if mention_inbox_nonce is not None:
+                        send_kwargs["nonce"] = mention_inbox_nonce
                     msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
@@ -2929,6 +2955,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         }
                         if metadata and metadata.get("mention_inbox_no_mentions"):
                             retry_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                        if mention_inbox_nonce is not None:
+                            retry_kwargs["nonce"] = mention_inbox_nonce
                         msg = await channel.send(**retry_kwargs)
                     else:
                         raise
@@ -5626,10 +5654,97 @@ class DiscordAdapter(BasePlatformAdapter):
                 raise RuntimeError("Discord thread creation returned no thread ID")
             return str(thread_id)
 
+    async def ensure_mention_inbox_thread_participants(
+        self,
+        thread_id: str,
+        user_ids: frozenset[str],
+    ) -> None:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        participants = tuple(sorted(str(user_id) for user_id in user_ids))
+        if any(
+            not _is_discord_snowflake(user_id)
+            for user_id in participants
+        ):
+            raise ValueError("Discord participant user ID is invalid")
+        if not participants:
+            return
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        add_user = getattr(thread, "add_user", None)
+        if not callable(add_user):
+            raise RuntimeError("Discord thread participant API is unavailable")
+        for user_id in participants:
+            result = add_user(_Snowflake(int(user_id)))
+            if not inspect.isawaitable(result):
+                raise RuntimeError("Discord thread participant API is not async")
+            await result
+
+    async def is_mention_inbox_thread_active(self, thread_id: str) -> bool:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        return (
+            getattr(thread, "archived", None) is False
+            and getattr(thread, "locked", None) is False
+        )
+
+    async def mention_inbox_thread_has_parent(
+        self,
+        thread_id: str,
+        parent_channel_id: str,
+    ) -> bool:
+        value = str(thread_id)
+        parent = str(parent_channel_id)
+        if not _is_discord_snowflake(value) or not _is_discord_snowflake(parent):
+            raise ValueError(
+                "Discord thread and parent IDs must be valid snowflakes"
+            )
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        return str(getattr(thread, "parent_id", "") or "") == parent
+
+    async def activate_mention_inbox_thread(self, thread_id: str) -> None:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        if getattr(thread, "locked", None) is not False:
+            raise RuntimeError("Discord work thread is locked")
+        if getattr(thread, "archived", None) is False:
+            return
+        edit = getattr(thread, "edit", None)
+        if not callable(edit):
+            raise RuntimeError("Discord thread activation API is unavailable")
+        result = edit(archived=False)
+        if not inspect.isawaitable(result):
+            raise RuntimeError("Discord thread activation API is not async")
+        await result
+
     def mark_mention_inbox_thread_participation(self, thread_id: str) -> None:
         value = str(thread_id)
-        if not value.isdigit():
-            raise ValueError("Discord thread ID must be numeric")
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
         tracker = getattr(self, "_threads", None)
         if tracker is None:
             raise RuntimeError("Discord thread participation tracker is unavailable")
@@ -5746,6 +5861,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Admit one approved envelope to the existing thread session rail."""
         execution_id = str(getattr(request, "execution_id", ""))
         proposal_hash = str(getattr(request, "proposal_hash", ""))
+        recovery_token = str(getattr(request, "recovery_token", ""))
         mode = str(getattr(request, "executor_hint", ""))
         approval_message_id = str(getattr(request, "approval_message_id", ""))
         approver_user_id = str(getattr(request, "approver_user_id", ""))
@@ -5758,6 +5874,9 @@ class DiscordAdapter(BasePlatformAdapter):
             raise ValueError("proposal_hash is invalid")
         if mode not in {"direct", "kanban"}:
             raise ValueError("execution mode is invalid")
+        if not recovery_token or len(recovery_token) > 80:
+            raise ValueError("execution recovery token is invalid")
+        owner_id = secrets.token_hex(16)
         if not all(
             value.isdigit()
             for value in (approval_message_id, approver_user_id, thread_id)
@@ -5815,12 +5934,48 @@ class DiscordAdapter(BasePlatformAdapter):
                     "execution_id": execution_id,
                     "proposal_hash": proposal_hash,
                     "mode": mode,
+                    "recovery_token": recovery_token,
+                    "owner_id": owner_id,
                 }
             },
         )
-        if not await self.handle_message(event):
-            raise RuntimeError("approved execution event was not admitted")
-        return f"{mode}:{execution_id}"
+        lock = getattr(
+            self,
+            "_mention_inbox_execution_admission_lock",
+            None,
+        )
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mention_inbox_execution_admission_lock = lock
+        bindings = getattr(
+            self,
+            "_mention_inbox_execution_admissions",
+            None,
+        )
+        if bindings is None:
+            bindings = {}
+            self._mention_inbox_execution_admissions = bindings
+        binding = (proposal_hash, mode, thread_id, recovery_token)
+        dispatch_id = f"{mode}:{execution_id}"
+        async with lock:
+            existing = bindings.get(execution_id)
+            if existing == binding:
+                return dispatch_id
+            if existing is not None:
+                raise ValueError(
+                    "execution_id is already bound to another approved execution"
+                )
+            bindings[execution_id] = binding
+            try:
+                if not await self.handle_message(event):
+                    raise RuntimeError(
+                        "approved execution event was not admitted"
+                    )
+            except BaseException:
+                if bindings.get(execution_id) == binding:
+                    del bindings[execution_id]
+                raise
+        return dispatch_id
 
     async def _route_mention_inbox_message_result(
         self, message: Any, *, thread_id: str, raw_content: str
@@ -7143,10 +7298,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         "proposal_action_unauthorized": "이 작업을 실행할 권한이 없어요.",
                         "proposal_action_stale": "더 최신 요청이 있어 이 버튼은 사용하지 않았어요.",
                     }.get(result_kind, "요청 상태를 thread에서 확인해 주세요.")
-                    if result_kind not in {
-                        "proposal_action_unauthorized",
-                        "proposal_action_stale",
-                    }:
+                    if _should_disable_mention_inbox_proposal_controls(
+                        result_kind
+                    ):
                         for child in self.children:
                             child.disabled = True
                         if message is not None:
@@ -7187,12 +7341,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 proposal_revision=proposal_revision,
                 approval_offered=approval_offered,
             )
+            nonce = hashlib.sha256(
+                (
+                    "mention-inbox-proposal\0"
+                    f"{proposal_id}\0{proposal_revision}"
+                ).encode()
+            ).hexdigest()[:25]
             message = await channel.send(
                 content=self.format_message(content),
                 view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
+                nonce=nonce,
             )
-            return SendResult(success=True, message_id=str(message.id))
+            message_id = str(message.id)
+            self._nonconversational_messages.mark_many([message_id])
+            return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.warning(
                 "[%s] send_mention_inbox_proposal failed: %s",

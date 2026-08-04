@@ -108,7 +108,9 @@ def _seed(
 ):
     store = MentionInboxStore(path, clock=lambda: NOW)
     store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
-    store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
+    store.record_work_item_thread(
+        SUBJECT, "parent-1", "1531851208858275860", "thread-1"
+    )
     proposal = _proposal(
         executor_hint=executor_hint,
         publish=publish,
@@ -205,7 +207,15 @@ class _WorktreeManager:
         return workspace
 
 
-def _handler(store, resolver, dispatcher, discord, *, workspace_manager=None):
+def _handler(
+    store,
+    resolver,
+    dispatcher,
+    discord,
+    *,
+    workspace_manager=None,
+    recovery_lease_seconds: int = 60,
+):
     return ApprovalHandler(
         store=store,
         source_resolver=resolver,
@@ -215,6 +225,7 @@ def _handler(store, resolver, dispatcher, discord, *, workspace_manager=None):
         authorized_approver_ids=frozenset({APPROVER}),
         workspace=WORKSPACE,
         workspace_manager=workspace_manager,
+        recovery_lease_seconds=recovery_lease_seconds,
     )
 
 
@@ -562,6 +573,7 @@ def _approved_request(*, mode: str = "direct") -> ApprovedExecutionRequest:
         proposal_id=proposal.proposal_id,
         proposal_revision=proposal.revision,
         proposal_hash=proposal.content_hash,
+        recovery_token="recovery-token-1",
         canonical_proposal_json=proposal_to_json(proposal),
         subject_key=proposal.subject_key,
         source_dedupe_key=proposal.source_dedupe_key,
@@ -635,6 +647,8 @@ def _seed_queued(
     workspace: str = WORKSPACE,
     workspace_manager: _WorktreeManager | None = None,
     head_sha: str = "head-1",
+    active_owner: bool = True,
+    owner_id: str = "test-owner",
 ):
     store, proposal = _seed(
         path,
@@ -673,6 +687,25 @@ def _seed_queued(
     execution = store.mark_execution_dispatched(
         execution.execution_id, f"{executor_hint}:{execution.execution_id}"
     )
+    assert execution.recovery_token is not None
+    if active_owner:
+        assert store.admit_execution_owner(
+            execution.execution_id,
+            recovery_token=execution.recovery_token,
+            owner_id=owner_id,
+        )
+    else:
+        assert store.release_execution_recovery(
+            execution.execution_id,
+            recovery_token=execution.recovery_token,
+        )
+    execution = store.get_execution(execution.execution_id)
+    assert execution is not None
+    if active_owner:
+        assert execution.owner_id == owner_id
+    else:
+        assert execution.recovery_token is None
+        assert execution.owner_id is None
     store.transition_proposal_status(
         approved.proposal_id,
         approved.revision,
@@ -680,6 +713,42 @@ def _seed_queued(
         expected_statuses=(ProposalStatus.APPROVED,),
     )
     return store, proposal, execution
+
+
+def _stage_terminal_receipt(
+    store: MentionInboxStore,
+    execution,
+    *,
+    content: str = "✅ terminal completion",
+) -> None:
+    assert execution.recovery_token is not None
+    assert execution.owner_id is not None
+    store.mark_execution_running(
+        execution.execution_id,
+        tool_name="terminal",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
+    store.record_execution_tool_completion(
+        execution.execution_id,
+        tool_name="terminal",
+        success=True,
+        exit_code=0,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+        action="verification",
+    )
+    store.mark_execution_verifying(
+        execution.execution_id,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
+    store.complete_execution_with_terminal_receipt(
+        execution.execution_id,
+        content=content,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -733,18 +802,33 @@ async def test_completed_execution_recovers_receipt_after_crash_before_send(
     observer = ExecutionLifecycleObserver(
         store=store, discord=discord, workspace=WORKSPACE
     )
-    store.mark_execution_running(execution.execution_id, tool_name="terminal")
+    assert execution.recovery_token is not None
+    assert execution.owner_id is not None
+    store.mark_execution_running(
+        execution.execution_id,
+        tool_name="terminal",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
     store.record_execution_tool_completion(
         execution.execution_id,
         tool_name="terminal",
         success=True,
         exit_code=0,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
         action="verification",
     )
-    store.mark_execution_verifying(execution.execution_id)
+    store.mark_execution_verifying(
+        execution.execution_id,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
     completed = store.complete_execution_with_terminal_receipt(
         execution.execution_id,
         content="✅ recovered completion",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
     )
 
     assert completed.status == "completed"
@@ -764,18 +848,33 @@ async def test_completed_execution_reconciles_uncertain_send_without_duplicate(
     now = [NOW]
     store, _, execution = _seed_queued(tmp_path / "receipt-after-send.db")
     store._clock = lambda: now[0]
-    store.mark_execution_running(execution.execution_id, tool_name="terminal")
+    assert execution.recovery_token is not None
+    assert execution.owner_id is not None
+    store.mark_execution_running(
+        execution.execution_id,
+        tool_name="terminal",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
     store.record_execution_tool_completion(
         execution.execution_id,
         tool_name="terminal",
         success=True,
         exit_code=0,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
         action="verification",
     )
-    store.mark_execution_verifying(execution.execution_id)
+    store.mark_execution_verifying(
+        execution.execution_id,
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
+    )
     store.complete_execution_with_terminal_receipt(
         execution.execution_id,
         content="✅ uncertain completion",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
     )
     claim = store.claim_terminal_receipt(lease_seconds=10)
     assert claim is not None
@@ -798,6 +897,161 @@ async def test_completed_execution_reconciles_uncertain_send_without_duplicate(
     assert discord.sent == []
     assert store.get_execution(execution.execution_id).terminal_receipt_message_id == (
         "already-sent"
+    )
+
+
+def test_stale_terminal_receipt_claim_cannot_mark_after_replacement(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    store, _, execution = _seed_queued(tmp_path / "receipt-token-fence.db")
+    store._clock = lambda: now[0]
+    _stage_terminal_receipt(store, execution)
+
+    stale = store.claim_terminal_receipt(lease_seconds=10)
+    assert stale is not None
+    assert stale.claim_token not in {execution.recovery_token, execution.owner_id}
+    connection = sqlite3.connect(store.path)
+    persisted_token = connection.execute(
+        "SELECT terminal_receipt_claim_token FROM work_executions "
+        "WHERE execution_id = ?",
+        (execution.execution_id,),
+    ).fetchone()[0]
+    connection.close()
+    assert persisted_token == stale.claim_token
+    now[0] += timedelta(seconds=11)
+    replacement = store.claim_terminal_receipt(lease_seconds=10)
+    assert replacement is not None
+    assert replacement.requires_reconciliation is True
+    assert replacement.claim_token != stale.claim_token
+
+    with pytest.raises(ValueError, match="stale or foreign"):
+        store.mark_terminal_receipt_sent(
+            stale.execution_id,
+            claim_token=stale.claim_token,
+            message_id="stale-message",
+        )
+    marked = store.mark_terminal_receipt_sent(
+        replacement.execution_id,
+        claim_token=replacement.claim_token,
+        message_id="replacement-message",
+    )
+    assert marked.terminal_receipt_message_id == "replacement-message"
+    with pytest.raises(ValueError, match="stale or foreign"):
+        store.mark_terminal_receipt_sent(
+            stale.execution_id,
+            claim_token=stale.claim_token,
+            message_id="replacement-message",
+        )
+
+
+class _TerminalReceiptHeartbeatStore(MentionInboxStore):
+    def __init__(self, path: Path, *, clock) -> None:
+        super().__init__(path, clock=clock)
+        self.receipt_renewed = asyncio.Event()
+
+    def renew_terminal_receipt_lease(
+        self,
+        execution_id: str,
+        *,
+        claim_token: str,
+        lease_seconds: int,
+    ) -> bool:
+        renewed = super().renew_terminal_receipt_lease(
+            execution_id,
+            claim_token=claim_token,
+            lease_seconds=lease_seconds,
+        )
+        self.receipt_renewed.set()
+        return renewed
+
+
+@pytest.mark.asyncio
+async def test_terminal_receipt_heartbeat_keeps_blocked_send_exclusive(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    db = tmp_path / "receipt-heartbeat.db"
+    seeded, _, execution = _seed_queued(db)
+    seeded._clock = lambda: now[0]
+    _stage_terminal_receipt(seeded, execution)
+    store = _TerminalReceiptHeartbeatStore(db, clock=lambda: now[0])
+
+    send_started = asyncio.Event()
+    send_release = asyncio.Event()
+
+    class BlockingDiscord(_Discord):
+        async def send_to_thread(self, thread_id: str, content: str) -> str:
+            self.sent.append((thread_id, content))
+            send_started.set()
+            await send_release.wait()
+            return "terminal-message"
+
+    discord = BlockingDiscord()
+    first_observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=discord,
+        workspace=WORKSPACE,
+        terminal_receipt_lease_seconds=1,
+    )
+    first = asyncio.create_task(first_observer.reconcile_terminal_receipts())
+    await asyncio.wait_for(send_started.wait(), timeout=2)
+
+    second_observer = ExecutionLifecycleObserver(
+        store=MentionInboxStore(db, clock=lambda: now[0]),
+        discord=discord,
+        workspace=WORKSPACE,
+        terminal_receipt_lease_seconds=1,
+    )
+    assert await second_observer.reconcile_terminal_receipts() == 0
+
+    store.receipt_renewed.clear()
+    now[0] += timedelta(milliseconds=500)
+    await asyncio.wait_for(store.receipt_renewed.wait(), timeout=2)
+    now[0] += timedelta(milliseconds=600)
+    assert await second_observer.reconcile_terminal_receipts() == 0
+    assert len(discord.sent) == 1
+
+    send_release.set()
+    assert await asyncio.wait_for(first, timeout=2) == 1
+    assert store.get_execution(execution.execution_id).terminal_receipt_message_id == (
+        "terminal-message"
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_receipt_reconciliation_propagates_cancellation(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(tmp_path / "receipt-cancel.db")
+    _stage_terminal_receipt(store, execution)
+    send_started = asyncio.Event()
+    send_cancelled = asyncio.Event()
+
+    class BlockingDiscord(_Discord):
+        async def send_to_thread(self, thread_id: str, content: str) -> str:
+            del thread_id, content
+            send_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                send_cancelled.set()
+
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=BlockingDiscord(),
+        workspace=WORKSPACE,
+        terminal_receipt_lease_seconds=10,
+    )
+    reconcile = asyncio.create_task(observer.reconcile_terminal_receipts())
+    await asyncio.wait_for(send_started.wait(), timeout=2)
+    reconcile.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(reconcile, timeout=2)
+    await asyncio.wait_for(send_cancelled.wait(), timeout=2)
+    assert (
+        store.get_execution(execution.execution_id).terminal_receipt_message_id is None
     )
 
 
@@ -887,22 +1141,30 @@ async def test_execution_context_must_match_reserved_proposal_and_mode(
         store=store, discord=_Discord(), workspace=WORKSPACE
     )
 
+    assert execution.recovery_token is not None
+    assert execution.owner_id is not None
     observer.validate_execution_context(
         execution.execution_id,
         proposal_hash=proposal.content_hash,
         mode="direct",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
     )
     with pytest.raises(ValueError, match="proposal hash"):
         observer.validate_execution_context(
             execution.execution_id,
             proposal_hash="0" * 64,
             mode="direct",
+            recovery_token=execution.recovery_token,
+            owner_id=execution.owner_id,
         )
     with pytest.raises(ValueError, match="mode"):
         observer.validate_execution_context(
             execution.execution_id,
             proposal_hash=proposal.content_hash,
             mode="kanban",
+            recovery_token=execution.recovery_token,
+            owner_id=execution.owner_id,
         )
 
 
@@ -921,10 +1183,14 @@ async def test_lifecycle_accepts_only_execution_worktree_under_workspace_root(
         workspace=WORKSPACE,
     )
 
+    assert execution.recovery_token is not None
+    assert execution.owner_id is not None
     observer.validate_execution_context(
         execution.execution_id,
         proposal_hash=proposal.content_hash,
         mode="direct",
+        recovery_token=execution.recovery_token,
+        owner_id=execution.owner_id,
     )
 
 
@@ -1240,7 +1506,9 @@ class _RecoveryDispatcher:
 async def test_recovery_revalidates_and_readmits_queued_execution(
     tmp_path: Path,
 ) -> None:
-    store, _, execution = _seed_queued(tmp_path / "recover.db")
+    store, _, execution = _seed_queued(
+        tmp_path / "recover.db", active_owner=False
+    )
     resolver = _Resolver(_state())
     dispatcher = _RecoveryDispatcher()
     discord = _Discord()
@@ -1262,7 +1530,7 @@ async def test_overlapping_recovery_instances_atomically_claim_execution(
     tmp_path: Path,
 ) -> None:
     db = tmp_path / "recover-claim.db"
-    store, _, execution = _seed_queued(db)
+    store, _, execution = _seed_queued(db, active_owner=False)
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -1289,7 +1557,7 @@ async def test_overlapping_recovery_instances_atomically_claim_execution(
     )
 
     first_task = asyncio.create_task(first.recover_queued())
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), timeout=2)
     assert await second.recover_queued() == 0
     release.set()
     assert await first_task == 1
@@ -1297,6 +1565,338 @@ async def test_overlapping_recovery_instances_atomically_claim_execution(
         execution.execution_id
     ]
     assert second_dispatcher.requests == []
+
+
+@pytest.mark.asyncio
+async def test_released_execution_is_not_reclaimed_in_same_recovery_pass(
+    tmp_path: Path,
+) -> None:
+    store, _, execution = _seed_queued(
+        tmp_path / "recover-release-pass.db", active_owner=False
+    )
+    resolver = _Resolver(None)
+    recovery_store = MentionInboxStore(
+        store.path,
+        clock=lambda: NOW + timedelta(seconds=61),
+    )
+    handler = _handler(
+        recovery_store,
+        resolver,
+        _RecoveryDispatcher(),
+        _Discord(),
+    )
+
+    assert await handler.recover_queued() == 0
+    assert resolver.calls == 1
+    assert store.get_execution(execution.execution_id).status == "queued"
+    later_claims = recovery_store.claim_recoverable_executions(
+        limit=1,
+        lease_seconds=60,
+    )
+    assert [claim.execution.execution_id for claim in later_claims] == [
+        execution.execution_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_instances_have_one_durable_side_effect_owner(
+    tmp_path: Path,
+) -> None:
+    first_owner = "adapter-instance-a"
+    store, _, execution = _seed_queued(
+        tmp_path / "durable-run-owner.db",
+        owner_id=first_owner,
+    )
+    assert execution.recovery_token is not None
+    second_owner = "adapter-instance-b"
+
+    first_store = MentionInboxStore(store.path, clock=lambda: NOW)
+    second_store = MentionInboxStore(store.path, clock=lambda: NOW)
+    assert first_store.admit_execution_owner(
+        execution.execution_id,
+        recovery_token=execution.recovery_token,
+        owner_id=first_owner,
+    )
+    assert not second_store.admit_execution_owner(
+        execution.execution_id,
+        recovery_token=execution.recovery_token,
+        owner_id=second_owner,
+    )
+
+    observer = ExecutionLifecycleObserver(
+        store=store,
+        discord=_Discord(),
+        workspace=WORKSPACE,
+    )
+    with pytest.raises(ValueError, match="owner"):
+        observer.authorize_tool_start(
+            execution.execution_id,
+            "terminal",
+            {"command": "python -m pytest tests/unit -q", "workdir": WORKSPACE},
+            recovery_token=execution.recovery_token,
+            owner_id=second_owner,
+        )
+    observer.authorize_tool_start(
+        execution.execution_id,
+        "terminal",
+        {"command": "python -m pytest tests/unit -q", "workdir": WORKSPACE},
+        recovery_token=execution.recovery_token,
+        owner_id=first_owner,
+    )
+    assert store.get_execution(execution.execution_id).status == "running"
+
+
+def test_expired_owner_is_replaced_and_stale_owner_cannot_finalize(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "owner-expiry.db"
+    now = [NOW]
+    _, _, execution = _seed_queued(db)
+    store = MentionInboxStore(db, clock=lambda: now[0])
+    assert execution.recovery_token is not None
+    assert store.admit_execution_owner(
+        execution.execution_id,
+        recovery_token=execution.recovery_token,
+        owner_id="test-owner",
+    )
+
+    now[0] += timedelta(seconds=60)
+    replacement = store.claim_recoverable_executions(limit=1, lease_seconds=60)[0]
+    assert replacement.recovery_token is not None
+    assert replacement.recovery_token != execution.recovery_token
+    assert store.admit_execution_owner(
+        execution.execution_id,
+        recovery_token=replacement.recovery_token,
+        owner_id="replacement-owner",
+    )
+    with pytest.raises(ValueError, match="owner"):
+        store.mark_execution_blocked(
+            execution.execution_id,
+            evidence_category="agent_failed",
+            recovery_token=execution.recovery_token,
+            owner_id="test-owner",
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_heartbeat_keeps_slow_resolver_exclusive(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "recover-heartbeat.db"
+    _, _, execution = _seed_queued(db, active_owner=False)
+    now = [NOW]
+
+    class HeartbeatStore(MentionInboxStore):
+        def __init__(self) -> None:
+            super().__init__(db, clock=lambda: now[0])
+            self.renewed = asyncio.Event()
+
+        def renew_execution_recovery_lease(
+            self,
+            execution_id: str,
+            *,
+            recovery_token: str,
+            lease_seconds: int = 60,
+        ) -> str | None:
+            renewed = super().renew_execution_recovery_lease(
+                execution_id,
+                recovery_token=recovery_token,
+                lease_seconds=lease_seconds,
+            )
+            if renewed is not None:
+                self.renewed.set()
+            return renewed
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingResolver(_Resolver):
+        async def resolve(self, proposal):
+            self.calls += 1
+            entered.set()
+            await release.wait()
+            return self.state
+
+    store = HeartbeatStore()
+    first_dispatcher = _RecoveryDispatcher()
+    first = _handler(
+        store,
+        BlockingResolver(_state()),
+        first_dispatcher,
+        _Discord(),
+        recovery_lease_seconds=1,
+    )
+    second_dispatcher = _RecoveryDispatcher()
+    second = _handler(
+        MentionInboxStore(db, clock=lambda: now[0]),
+        _Resolver(_state()),
+        second_dispatcher,
+        _Discord(),
+        recovery_lease_seconds=1,
+    )
+
+    first_task = asyncio.create_task(first.recover_queued())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    store.renewed.clear()
+    now[0] += timedelta(milliseconds=500)
+    await asyncio.wait_for(store.renewed.wait(), timeout=2)
+    now[0] += timedelta(milliseconds=600)
+
+    assert await second.recover_queued() == 0
+    release.set()
+    assert await first_task == 1
+    assert [request.execution_id for request in first_dispatcher.requests] == [
+        execution.execution_id
+    ]
+    assert second_dispatcher.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_recovery_cancels_stale_worker_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "recover-reclaimed.db"
+    _, _, execution = _seed_queued(db, active_owner=False)
+    now = [NOW]
+
+    class ReclaimedStore(MentionInboxStore):
+        def __init__(self) -> None:
+            super().__init__(db, clock=lambda: now[0])
+            self.reject_renewal = False
+            self.renewal_rejected = asyncio.Event()
+
+        def renew_execution_recovery_lease(
+            self,
+            execution_id: str,
+            *,
+            recovery_token: str,
+            lease_seconds: int = 60,
+        ) -> str | None:
+            if self.reject_renewal:
+                self.renewal_rejected.set()
+                return None
+            return super().renew_execution_recovery_lease(
+                execution_id,
+                recovery_token=recovery_token,
+                lease_seconds=lease_seconds,
+            )
+
+    entered = asyncio.Event()
+
+    class BlockingResolver(_Resolver):
+        async def resolve(self, proposal):
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+            return self.state
+
+    stale_store = ReclaimedStore()
+    stale_dispatcher = _RecoveryDispatcher()
+    stale_handler = _handler(
+        stale_store,
+        BlockingResolver(_state()),
+        stale_dispatcher,
+        _Discord(),
+        recovery_lease_seconds=1,
+    )
+    stale_task = asyncio.create_task(stale_handler.recover_queued())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    stale_store.reject_renewal = True
+    now[0] += timedelta(seconds=2)
+
+    current_store = MentionInboxStore(db, clock=lambda: now[0])
+    current_dispatcher = _RecoveryDispatcher()
+    current_handler = _handler(
+        current_store,
+        _Resolver(_state()),
+        current_dispatcher,
+        _Discord(),
+        recovery_lease_seconds=1,
+    )
+
+    assert await current_handler.recover_queued() == 1
+    await asyncio.wait_for(stale_store.renewal_rejected.wait(), timeout=2)
+    assert await asyncio.wait_for(stale_task, timeout=2) == 0
+    assert stale_dispatcher.requests == []
+    assert [request.execution_id for request in current_dispatcher.requests] == [
+        execution.execution_id
+    ]
+    assert current_store.claim_recoverable_executions(
+        limit=1,
+        lease_seconds=1,
+    ) == ()
+
+
+@pytest.mark.asyncio
+async def test_external_recovery_cancellation_propagates(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "recover-cancelled.db"
+    _seed_queued(db, active_owner=False)
+    entered = asyncio.Event()
+
+    class BlockingResolver(_Resolver):
+        async def resolve(self, proposal):
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+            return self.state
+
+    store = MentionInboxStore(db, clock=lambda: NOW)
+    handler = _handler(
+        store,
+        BlockingResolver(_state()),
+        _RecoveryDispatcher(),
+        _Discord(),
+        recovery_lease_seconds=1,
+    )
+    recovery_task = asyncio.create_task(handler.recover_queued())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    recovery_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery_task
+    assert store.claim_recoverable_executions(
+        limit=1,
+        lease_seconds=1,
+    ) == ()
+
+
+def test_stale_recovery_claim_cannot_release_new_owner(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "recover-token.db"
+    _, _, execution = _seed_queued(db, active_owner=False)
+    now = [NOW]
+    first_store = MentionInboxStore(db, clock=lambda: now[0])
+    first = first_store.claim_recoverable_executions(
+        limit=1,
+        lease_seconds=60,
+    )[0]
+    assert first.recovery_token is not None
+    now[0] += timedelta(seconds=61)
+    second_store = MentionInboxStore(db, clock=lambda: now[0])
+    second = second_store.claim_recoverable_executions(
+        limit=1,
+        lease_seconds=60,
+    )[0]
+    assert second.recovery_token is not None
+    assert second.recovery_token != first.recovery_token
+
+    assert (
+        first_store.release_execution_recovery(
+            execution.execution_id,
+            recovery_token=first.recovery_token,
+        )
+        is False
+    )
+    assert (
+        MentionInboxStore(
+            db,
+            clock=lambda: now[0],
+        ).claim_recoverable_executions(limit=1, lease_seconds=60)
+        == ()
+    )
 
 
 @pytest.mark.asyncio
@@ -1339,6 +1939,7 @@ async def test_recovery_recreates_exact_execution_worktree_before_readmission(
         tmp_path / "recover-worktree.db",
         workspace_manager=manager,
         head_sha=head_sha,
+        active_owner=False,
     )
     dispatcher = _RecoveryDispatcher()
     handler = _handler(
@@ -1361,7 +1962,9 @@ async def test_recovery_recreates_exact_execution_worktree_before_readmission(
 async def test_recovery_marks_stale_head_for_reapproval_without_dispatch(
     tmp_path: Path,
 ) -> None:
-    store, _, execution = _seed_queued(tmp_path / "recover-stale.db")
+    store, _, execution = _seed_queued(
+        tmp_path / "recover-stale.db", active_owner=False
+    )
     resolver = _Resolver(_state("new-head"))
     dispatcher = _RecoveryDispatcher()
     discord = _Discord()

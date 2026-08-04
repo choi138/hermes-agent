@@ -3005,7 +3005,7 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
 
 def _mention_inbox_execution_context(
     event: Any,
-) -> Optional[tuple[str, str, str]]:
+) -> Optional[tuple[str, str, str, str, str]]:
     """Return validated code-owned execution metadata for an internal event."""
     if getattr(event, "internal", False) is not True:
         return None
@@ -3028,7 +3028,17 @@ def _mention_inbox_execution_context(
     mode = context.get("mode")
     if mode not in {"direct", "kanban"}:
         return None
-    return execution_id, proposal_hash, mode
+    recovery_token = context.get("recovery_token")
+    owner_id = context.get("owner_id")
+    if (
+        not isinstance(recovery_token, str)
+        or not recovery_token
+        or len(recovery_token) > 80
+        or not isinstance(owner_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", owner_id) is None
+    ):
+        return None
+    return execution_id, proposal_hash, mode, recovery_token, owner_id
 
 
 def _mention_inbox_execution_id(event: Any) -> Optional[str]:
@@ -13518,7 +13528,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else _mention_execution_context[0]
         )
         _mention_execution_observer = None
-        if _mention_execution_id is not None:
+        if _mention_execution_context is not None:
+            _mention_execution_id = _mention_execution_context[0]
             _mention_adapter = self._adapter_for_source(source)
             _mention_execution_observer = getattr(
                 _mention_adapter, "_mention_inbox_execution_observer", None
@@ -13531,6 +13542,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _mention_execution_id,
                 proposal_hash=_mention_execution_context[1],
                 mode=_mention_execution_context[2],
+                recovery_token=_mention_execution_context[3],
+                owner_id=_mention_execution_context[4],
             )
 
         try:
