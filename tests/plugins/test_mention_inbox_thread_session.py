@@ -211,6 +211,7 @@ def _coordinator(
     external_repository_actions: str = "disabled",
     participant_user_ids: frozenset[str] = frozenset(),
     participant_parent_channel_id: str | None = None,
+    advisor: object | None = None,
 ) -> MentionInboxThreadCoordinator:
     return MentionInboxThreadCoordinator(
         store=MentionInboxStore(path, clock=lambda: NOW),
@@ -225,6 +226,7 @@ def _coordinator(
             if participant_parent_channel_id is None
             else participant_parent_channel_id
         ),
+        advisor=advisor,
     )
 
 
@@ -1139,3 +1141,133 @@ async def test_legacy_pending_is_reconciled_once_from_new_hydration(
     assert expected_notice in rendered
     assert f"{BOT_MENTION} 승인" not in rendered
     assert ("`리뷰 반영해줘`" in rendered) is expected_new_offer
+
+
+class _StubAdvisor:
+    """Records calls and returns a fixed advisory."""
+
+    def __init__(self, text: str = "상황: 명세와 import가 불일치합니다.\n- 범위를 맞춘다") -> None:
+        self.text = text
+        self.calls: list[tuple[str, int]] = []
+
+    async def advise(self, *, context: object) -> str:
+        proposal_actions = getattr(context, "allowed_actions", ())
+        self.calls.append((getattr(context, "repository", ""), len(proposal_actions)))
+        return self.text
+
+
+class _FailingAdvisor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def advise(self, *, context: object) -> str:
+        self.calls += 1
+        raise RuntimeError("model unreachable")
+
+
+@pytest.mark.asyncio
+async def test_advisory_posts_once_beside_the_proposal(tmp_path: Path) -> None:
+    discord = _Discord()
+    advisor = _StubAdvisor()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=advisor)
+    event = _event()
+
+    await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    # A second identical delivery must not re-post either message.
+    await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    messages = discord.messages["thread-1"]
+    assert len(messages) == 2
+    assert len(advisor.calls) == 1
+    proposal_text, advisory_text = messages[0][1], messages[1][1]
+    assert "제 추천" in proposal_text
+    # The advisory is a separate message and never contaminates the proposal.
+    assert "참고 분석" not in proposal_text
+    assert "참고 분석 (모델 작성, 권한 없음)" in advisory_text
+    assert "명세와 import가 불일치" in advisory_text
+    assert "허용 범위를 바꾸지 않아요" in advisory_text
+
+
+@pytest.mark.asyncio
+async def test_proposal_is_delivered_when_the_advisory_fails(tmp_path: Path) -> None:
+    discord = _Discord()
+    advisor = _FailingAdvisor()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=advisor)
+
+    session = await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert advisor.calls == 1
+    assert session.discord_thread_id == "thread-1"
+    # Exactly the deterministic proposal, and the binding was still recorded.
+    assert len(discord.messages["thread-1"]) == 1
+    assert "제 추천" in discord.messages["thread-1"][0][1]
+    stored = MentionInboxStore(tmp_path / "inbox.db").get_latest_proposal(
+        "github:R_repo:PR_7"
+    )
+    assert stored is not None
+    assert (
+        MentionInboxStore(tmp_path / "inbox.db").get_proposal_message_id(
+            stored.proposal_id, stored.revision
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_advisory_does_not_change_proposal_revisions(tmp_path: Path) -> None:
+    # Non-deterministic advisory text must not churn revisions: the proposal
+    # object and its rendered message stay byte-identical across deliveries.
+    discord = _Discord()
+
+    class _VaryingAdvisor:
+        def __init__(self) -> None:
+            self.count = 0
+
+        async def advise(self, *, context: object) -> str:
+            self.count += 1
+            return f"매번 다른 문장 {self.count}"
+
+    coordinator = _coordinator(
+        tmp_path / "inbox.db", discord, advisor=_VaryingAdvisor()
+    )
+    event = _event()
+    for _ in range(3):
+        await coordinator.ensure_thread(
+            event,
+            parent_message_id="parent-1",
+            source_revision="2026-07-29T10:01:00Z",
+        )
+
+    store = MentionInboxStore(tmp_path / "inbox.db")
+    proposal = store.get_latest_proposal("github:R_repo:PR_7")
+    assert proposal is not None
+    assert proposal.revision == 1
+    # One proposal message plus exactly one advisory message.
+    assert len(discord.messages["thread-1"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_advisor_configured_changes_nothing(tmp_path: Path) -> None:
+    discord = _Discord()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=None)
+
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert len(discord.messages["thread-1"]) == 1
+    assert "참고 분석" not in discord.messages["thread-1"][0][1]

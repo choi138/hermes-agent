@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, cast
 
 from plugins.mention_inbox.actionable import GitHubHydrationContext
+from plugins.mention_inbox.advisory import HostProposalAdvisor
 from plugins.mention_inbox.approval import (
     ApprovalHandler,
     ExecutionLifecycleObserver,
@@ -81,6 +82,11 @@ class MentionInboxConfig:
     execution_workspace: str | None = None
     execution_workspace_root: str | None = None
     terminal_cwd: str | None = None
+    # Opt-in: adds one model call per new proposal revision. It only appends an
+    # explanatory message, so turning it off never changes what a proposal
+    # permits — and it stays off by default because the call can add tens of
+    # seconds to a delivery.
+    advisory_summary: bool = False
 
 
 class DiscordDeliveryTransport(Protocol):
@@ -151,6 +157,9 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
     execution_enabled = action_sessions.get("execution_enabled", False)
     if not isinstance(action_sessions_enabled, bool) or not isinstance(execution_enabled, bool):
         raise ValueError("mention_inbox action-session switches must be booleans")
+    advisory_summary = raw.get("advisory_summary", False)
+    if not isinstance(advisory_summary, bool):
+        raise ValueError("mention_inbox.advisory_summary must be a boolean")
     bot_mention = action_sessions.get("bot_mention")
     if bot_mention is not None and (
         not isinstance(bot_mention, str)
@@ -246,6 +255,7 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         execution_workspace=execution_workspace,
         execution_workspace_root=execution_workspace_root,
         terminal_cwd=terminal_cwd,
+        advisory_summary=advisory_summary,
     )
 
 
@@ -1213,6 +1223,11 @@ class MentionInboxGatewayService:
                         self.config.authorized_approver_ids
                     ),
                     participant_parent_channel_id=destination_channel_id,
+                    advisor=(
+                        HostProposalAdvisor()
+                        if self.config.advisory_summary
+                        else None
+                    ),
                 )
                 router = InboxProposalRouter(
                     store=store,

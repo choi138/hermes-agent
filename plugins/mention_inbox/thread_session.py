@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
 
+from plugins.mention_inbox.advisory import ProposalAdvisor, build_advisory_context
 from plugins.mention_inbox.contract import MentionEvent
 from plugins.mention_inbox.preflight import (
     PreApprovalBrief,
@@ -21,12 +23,15 @@ from plugins.mention_inbox.proposals import (
 )
 from plugins.mention_inbox.store import MentionInboxStore, WorkItemSession
 from plugins.mention_inbox.voice import (
+    render_advisory,
     render_execution_enabled_reproposal,
     render_needs_reapproval,
     render_proposal,
     render_thread_opened,
     render_thread_update,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ThreadSessionTransport(Protocol):
@@ -344,6 +349,7 @@ class MentionInboxThreadCoordinator:
         external_repository_actions: str = "disabled",
         participant_user_ids: frozenset[str] = _NO_PARTICIPANT_USER_IDS,
         participant_parent_channel_id: str | None = None,
+        advisor: ProposalAdvisor | None = None,
     ) -> None:
         if executor_hint not in {"direct", "kanban"}:
             raise ValueError("executor_hint must be direct or kanban")
@@ -367,7 +373,51 @@ class MentionInboxThreadCoordinator:
         self._external_repository_actions = external_repository_actions
         self._participant_user_ids: frozenset[str] = participant_user_ids
         self._participant_parent_channel_id = participant_parent_channel_id
+        self._advisor = advisor
         self._locks: dict[str, asyncio.Lock] = {}
+
+    async def _post_advisory(
+        self,
+        event: MentionEvent,
+        *,
+        thread_id: str,
+        proposal: WorkProposal,
+        source_revision: str,
+    ) -> None:
+        """Post the model-written advisory beside a just-sent proposal.
+
+        Best effort by design. A slow or unreachable model, or a reply that
+        sanitizes down to nothing, must leave the delivered proposal and its
+        recorded binding untouched — the advisory is explanatory only. Callers
+        reach this exactly once per revision, right after the proposal message
+        binding is stored, so a failure here cannot cause a duplicate send.
+        """
+
+        advisor = self._advisor
+        if advisor is None:
+            return
+        try:
+            context = build_advisory_context(
+                proposal=proposal,
+                event=event,
+                brief=_bound_brief(event, source_revision=source_revision),
+                code_execution_allowed=(
+                    _metadata(event).get("repository")
+                    in self._trusted_repositories
+                ),
+            )
+            if context is None:
+                return
+            advisory = render_advisory(await advisor.advise(context=context))
+            if not advisory:
+                return
+            await self._discord.send_to_thread(thread_id, advisory)
+        except Exception:
+            logger.warning(
+                "Mention-inbox proposal advisory unavailable; "
+                "delivered the deterministic proposal only",
+                exc_info=True,
+            )
 
     def _lock(self, subject_key: str) -> asyncio.Lock:
         lock = self._locks.get(subject_key)
@@ -656,6 +706,12 @@ class MentionInboxThreadCoordinator:
                     proposal.revision,
                     message_id,
                     approval_offered=approval_offered,
+                )
+                await self._post_advisory(
+                    event,
+                    thread_id=thread_id,
+                    proposal=proposal,
+                    source_revision=source_revision,
                 )
 
             restored = self._store.get_active_work_item_session(subject)

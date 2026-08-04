@@ -217,6 +217,34 @@ def _render_bounded_with_footer(
     return f"{body}\n\n{footer_text}"
 
 
+def render_advisory(advisory: str) -> str:
+    """Render the model-written advisory as its own message.
+
+    Kept out of the proposal message on purpose: that text must render
+    identically for one revision so the crash-recovery lookup in
+    ``ensure_thread`` can recognize an already-sent proposal, and model output is
+    not reproducible. Returns '' when there is nothing usable to post, which the
+    caller treats as "skip the advisory".
+    """
+
+    if not isinstance(advisory, str):
+        return ""
+    lines = [" ".join(line.split()) for line in advisory.split("\n")]
+    body = "\n".join(line for line in lines if line).strip()
+    if not body:
+        return ""
+    if len(body) > 1200:
+        body = body[:1199].rstrip() + "…"
+    return "\n".join(
+        (
+            "참고 분석 (모델 작성, 권한 없음)",
+            body,
+            "",
+            "이 분석은 설명용이며 위 제안의 허용 범위를 바꾸지 않아요.",
+        )
+    )
+
+
 def render_approval_reply_required(bot_mention: str) -> str:
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")

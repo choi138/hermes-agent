@@ -75,6 +75,29 @@ There is intentionally no `to_prompt()` helper. A later LLM consumer must place
 raw content in a clearly delimited data block under fixed trusted instructions;
 it must not interpolate external text into system or developer instructions.
 
+### Model consumers
+
+Two consumers exist, and both follow that rule: the thread conversation
+responder (`conversation.py`) and the proposal advisory (`advisory.py`). Each
+builds a fixed system message, serializes only already-validated and
+length-bounded data into a JSON value in the user turn, runs with `tools=[]`,
+and re-bounds the reply before it can reach Discord.
+
+`advisory.py` is explanatory only and holds no authority. It never constructs or
+mutates a `WorkProposal`, so it cannot widen `allowed_actions`, offer approval,
+or change `verification`. Its output is posted as a **separate** message rather
+than inside the proposal message, because a proposal must render identically for
+one revision: `_matches_proposal_content` compares that rendering to decide
+whether a new revision is warranted, and `ensure_thread` looks the exact text up
+in the thread to recognize an already-sent proposal after a crash. Model output
+is not reproducible, so embedding it would churn revisions and defeat the
+duplicate-send guard.
+
+The advisory is best effort. A slow, unreachable, or unusable reply leaves the
+delivered proposal and its recorded message binding untouched. It is gated by
+`mention_inbox.advisory_summary`, which defaults to `false` because the call adds
+one model round trip — tens of seconds with a reasoning model — to a delivery.
+
 ## Ingress versus storage
 
 | Property | `ingest_event` | `restore_event` |
