@@ -10,6 +10,10 @@ from typing import Any
 import pytest
 
 from plugins.mention_inbox import MentionInboxStore, ingest_event
+from plugins.mention_inbox.approval import (
+    ApprovedExecutionRequest,
+    GatewayExecutionDispatcher,
+)
 from plugins.mention_inbox.contract import event_to_json
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
 from plugins.mention_inbox.operational import (
@@ -22,6 +26,7 @@ from plugins.mention_inbox.operational import (
     render_discord_event,
 )
 from plugins.mention_inbox.store import SCHEMA_VERSION
+from plugins.mention_inbox.thread_session import ThreadDestinationMismatchError
 
 NOW = datetime(2026, 7, 29, 9, 0, tzinfo=timezone.utc)
 DESTINATION = "discord:1531851208858275860"
@@ -95,6 +100,25 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     ):
         with pytest.raises(ValueError):
             parse_mention_inbox_config({"mention_inbox": invalid})
+
+
+@pytest.mark.parametrize(
+    "invalid_user_id",
+    (str(2**64), "9999999999999999999999999"),
+)
+def test_config_rejects_out_of_range_discord_snowflakes(
+    invalid_user_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="authorized_approver_ids"):
+        parse_mention_inbox_config({
+            "mention_inbox": {
+                "action_sessions": {
+                    "enabled": True,
+                    "bot_mention": "<@1525050677381279865>",
+                    "authorized_approver_ids": [invalid_user_id],
+                }
+            }
+        })
 
 
 def test_execution_config_requires_scoped_workspace_and_terminal_cwd() -> None:
@@ -184,10 +208,18 @@ def test_outbox_first_send_same_revision_retry_and_changed_revision(tmp_path: Pa
     assert store.pending_delivery_count() == 1
     claimed = store.claim_delivery(DESTINATION, lease_seconds=60)
     assert claimed is not None and claimed.revision_number == 1
-    store.release_delivery(claimed.delivery_id, error_category="discord_send")
+    store.release_delivery(
+        claimed.delivery_id,
+        claim_token=claimed.token,
+        error_category="discord_send",
+    )
     retry = store.claim_delivery(DESTINATION, lease_seconds=60)
     assert retry is not None and retry.delivery_id == claimed.delivery_id
-    store.mark_delivery_sent(retry.delivery_id, message_id="m1")
+    store.mark_delivery_sent(
+        retry.delivery_id,
+        claim_token=retry.token,
+        message_id="m1",
+    )
     assert store.pending_delivery_count() == 0
     same = store.upsert(event, source_revision="2026-07-29T08:05:00Z")
     assert not same.content_changed
@@ -205,7 +237,11 @@ def test_concurrent_claim_and_restart_use_single_durable_delivery(tmp_path: Path
     second = MentionInboxStore(db, clock=lambda: NOW).claim_delivery(DESTINATION, lease_seconds=60)
     assert first is not None
     assert second is None
-    MentionInboxStore(db, clock=lambda: NOW).mark_delivery_sent(first.delivery_id, message_id="m1")
+    MentionInboxStore(db, clock=lambda: NOW).mark_delivery_sent(
+        first.delivery_id,
+        claim_token=first.token,
+        message_id="m1",
+    )
     assert MentionInboxStore(db, clock=lambda: NOW).claim_delivery(DESTINATION, lease_seconds=60) is None
 
 
@@ -222,6 +258,56 @@ def test_expired_uncertain_lease_requires_reconciliation(tmp_path: Path) -> None
     assert recovered.requires_reconciliation is True
 
 
+@pytest.mark.parametrize(
+    ("stored_lease", "comparison_time", "expected"),
+    [
+        (
+            "2026-07-29T09:00:10.500000Z",
+            NOW + timedelta(seconds=10),
+            True,
+        ),
+        (
+            "2026-07-29T09:00:10Z",
+            NOW + timedelta(seconds=10, milliseconds=100),
+            False,
+        ),
+        (
+            "2026-07-29T10:00:10+01:00",
+            NOW + timedelta(seconds=10),
+            False,
+        ),
+    ],
+)
+def test_lease_renewal_uses_sqlite_timestamp_order(
+    tmp_path: Path,
+    stored_lease: str,
+    comparison_time: datetime,
+    expected: bool,
+) -> None:
+    now = [NOW]
+    db = tmp_path / "inbox.db"
+    store = MentionInboxStore(db, clock=lambda: now[0])
+    store.upsert(_event(), source_revision="2026-07-29T08:00:00Z")
+    claim = store.claim_delivery(DESTINATION, lease_seconds=10)
+    assert claim is not None
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "UPDATE delivery_outbox SET lease_until = ? WHERE delivery_id = ?",
+            (stored_lease, claim.delivery_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    now[0] = comparison_time
+
+    assert store.renew_delivery_lease(
+        claim.delivery_id,
+        expected_attempt=claim.token,
+        lease_seconds=10,
+    ) is expected
+
+
 class _Discord:
     def __init__(self, *, history: list[dict[str, str]] | None = None, fail: bool = False):
         self.history = history or []
@@ -234,7 +320,14 @@ class _Discord:
                 return item["id"]
         return None
 
-    async def send(self, channel_id: str, content: str, *, allowed_mentions: dict[str, Any]) -> str:
+    async def send(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        allowed_mentions: dict[str, Any],
+        nonce: str,
+    ) -> str:
         self.sends.append((channel_id, content, allowed_mentions))
         if self.fail:
             raise RuntimeError("private discord failure body")
@@ -260,6 +353,9 @@ async def test_uncertain_send_reconciles_marker_without_duplicate(tmp_path: Path
 class _GatewayAdapter:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str | None, dict[str, Any]]] = []
+        self.remembered_parents: list[tuple[str, str]] = []
+        self.thread_parent_matches = True
+        self.parent_checks: list[tuple[str, str]] = []
 
     async def send(
         self,
@@ -271,6 +367,63 @@ class _GatewayAdapter:
     ) -> SimpleNamespace:
         self.calls.append((thread_id, content, reply_to, metadata))
         return SimpleNamespace(success=True, message_id=f"message-{len(self.calls)}")
+
+    def remember_mention_inbox_parent(
+        self,
+        message_id: str,
+        channel_id: str,
+    ) -> None:
+        self.remembered_parents.append((message_id, channel_id))
+
+    async def mention_inbox_thread_has_parent(
+        self,
+        thread_id: str,
+        parent_channel_id: str,
+    ) -> bool:
+        self.parent_checks.append((thread_id, parent_channel_id))
+        return self.thread_parent_matches
+
+
+def test_gateway_transport_restores_durable_parent_mapping() -> None:
+    adapter = _GatewayAdapter()
+    transport = GatewayDiscordTransport(adapter, parent_channel_id="55")
+
+    transport.remember_parent_message("99", "55")
+
+    assert adapter.remembered_parents == [("99", "55")]
+
+
+@pytest.mark.asyncio
+async def test_gateway_transport_forwards_parent_nonce() -> None:
+    adapter = _GatewayAdapter()
+    transport = GatewayDiscordTransport(adapter)
+
+    message_id = await transport.send(
+        "55",
+        "parent",
+        allowed_mentions={
+            "parse": [],
+            "users": [],
+            "roles": [],
+            "replied_user": False,
+        },
+        nonce="0123456789abcdef01234567",
+    )
+
+    assert message_id == "message-1"
+    assert adapter.calls == [
+        (
+            "55",
+            "parent",
+            None,
+            {
+                "non_conversational": True,
+                "mention_inbox_no_mentions": True,
+                "mention_inbox_nonce": "0123456789abcdef01234567",
+            },
+        )
+    ]
+    assert adapter.remembered_parents == [("message-1", "55")]
 
 
 @pytest.mark.asyncio
@@ -292,12 +445,83 @@ async def test_gateway_transport_correlates_notice_to_inbound_message() -> None:
             "user-message-1",
             {
                 "thread_id": "thread-1",
-                "nonconversational": True,
+                "non_conversational": True,
                 "mention_inbox_no_mentions": True,
                 "notify": True,
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_transport_rejects_wrong_destination_thread_write() -> None:
+    adapter = _GatewayAdapter()
+    adapter.thread_parent_matches = False
+    transport = GatewayDiscordTransport(
+        adapter,
+        parent_channel_id="55",
+    )
+
+    with pytest.raises(ThreadDestinationMismatchError):
+        await transport.send_to_thread("thread-1", "notice")
+
+    assert adapter.parent_checks == [("thread-1", "55")]
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_execution_dispatcher_rejects_wrong_destination_thread() -> None:
+    class ExecutionTransport:
+        def __init__(self) -> None:
+            self.calls: list[ApprovedExecutionRequest] = []
+
+        async def enqueue_mention_inbox_execution(
+            self,
+            request: ApprovedExecutionRequest,
+            prompt: str,
+        ) -> str:
+            self.calls.append(request)
+            return "dispatch-1"
+
+    async def validate_destination(thread_id: str) -> bool:
+        assert thread_id == "thread-1"
+        return False
+
+    transport = ExecutionTransport()
+    dispatcher = GatewayExecutionDispatcher(
+        transport,
+        thread_destination_validator=validate_destination,
+    )
+    request = ApprovedExecutionRequest(
+        execution_id="execution-1",
+        proposal_id="proposal-1",
+        proposal_revision=1,
+        proposal_hash="hash-1",
+        recovery_token="recovery-token-1",
+        canonical_proposal_json="{}",
+        subject_key="github:R_repo:PR_7",
+        source_dedupe_key="github:n1:github:me",
+        source_revision="2026-07-29T10:01:00Z",
+        head_sha=None,
+        head_ref=None,
+        head_repository=None,
+        workspace="/tmp/hermes-workspace",
+        goal="Review the change",
+        steps=("Inspect",),
+        allowed_actions=("read_repository",),
+        forbidden_actions=("push_current_branch",),
+        verification=("Run tests",),
+        executor_hint="direct",
+        approval_message_id="approval-1",
+        approver_user_id="user-1",
+        thread_id="thread-1",
+    )
+
+    receipt = await dispatcher.dispatch(request)
+
+    assert receipt.accepted is False
+    assert receipt.dispatch_id is None
+    assert transport.calls == []
 
 
 @pytest.mark.asyncio
@@ -340,18 +564,40 @@ async def test_runtime_singleton_restores_schedule_and_cancels(tmp_path: Path) -
     poller = _Poller(store)
     delivery = _Delivery()
     unblock = asyncio.Event()
+    recovered = asyncio.Event()
+    recovery_calls = 0
+
+    async def recover_executions() -> int:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        recovered.set()
+        return 0
 
     async def sleep(seconds: float) -> None:
         sleeps.append(seconds)
         await unblock.wait()
 
-    runtime = MentionInboxRuntime(config=_enabled_config(), store=store, poller=poller, delivery=delivery, clock=lambda: now[0], sleep=sleep)
+    runtime = MentionInboxRuntime(
+        config=_enabled_config(),
+        store=store,
+        poller=poller,
+        delivery=delivery,
+        clock=lambda: now[0],
+        sleep=sleep,
+        recover_executions=recover_executions,
+    )
     first = runtime.start()
     second = runtime.start()
     assert first is second
-    await asyncio.sleep(0)
+    await asyncio.wait_for(recovered.wait(), timeout=2)
+    assert recovery_calls == 1
     assert sleeps == [40.0]
     assert poller.calls == 0
+    recovered.clear()
+    now[0] += timedelta(seconds=40)
+    unblock.set()
+    await asyncio.wait_for(recovered.wait(), timeout=2)
+    assert recovery_calls == 2
     await runtime.stop()
     assert first.cancelled()
 
@@ -362,7 +608,11 @@ def test_retention_prunes_payload_but_preserves_delivery_audit(tmp_path: Path) -
     store.upsert(_event(), source_revision="2026-07-29T08:00:00Z")
     claim = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert claim is not None
-    store.mark_delivery_sent(claim.delivery_id, message_id="m1")
+    store.mark_delivery_sent(
+        claim.delivery_id,
+        claim_token=claim.token,
+        message_id="m1",
+    )
     now[0] += timedelta(days=31)
     assert store.prune(retention_days=30) == 1
     assert store.get(_event().dedupe_key) is None
@@ -398,14 +648,22 @@ def test_outbox_claims_each_queued_revision_from_immutable_snapshot(tmp_path: Pa
     assert first is not None
     assert first.revision_number == 1
     assert first.event.untrusted.body == "revision one"
-    store.mark_delivery_sent(first.delivery_id, message_id="m1")
+    store.mark_delivery_sent(
+        first.delivery_id,
+        claim_token=first.token,
+        message_id="m1",
+    )
 
     second = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert second is not None
     assert second.revision_number == 2
     assert second.event.untrusted.body == "revision two"
     assert second.delivery_id != first.delivery_id
-    store.mark_delivery_sent(second.delivery_id, message_id="m2")
+    store.mark_delivery_sent(
+        second.delivery_id,
+        claim_token=second.token,
+        message_id="m2",
+    )
     assert store.claim_delivery(DESTINATION, lease_seconds=10) is None
 
 
@@ -419,7 +677,11 @@ def test_prune_then_same_source_revision_is_noop(tmp_path: Path) -> None:
     first = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert first_result.revision_number == 1
     assert first is not None
-    store.mark_delivery_sent(first.delivery_id, message_id="m1")
+    store.mark_delivery_sent(
+        first.delivery_id,
+        claim_token=first.token,
+        message_id="m1",
+    )
 
     now[0] += timedelta(days=31)
     assert store.prune(retention_days=30) == 1
@@ -455,7 +717,11 @@ def test_prune_then_newer_source_revision_uses_monotonic_delivery_identity(
     first = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert first_result.revision_number == 1
     assert first is not None
-    store.mark_delivery_sent(first.delivery_id, message_id="m1")
+    store.mark_delivery_sent(
+        first.delivery_id,
+        claim_token=first.token,
+        message_id="m1",
+    )
     first_audit = store.delivery_audit(first.delivery_id)
 
     now[0] += timedelta(days=31)
@@ -561,8 +827,9 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
     connection.commit()
     connection.close()
 
-    store = MentionInboxStore(db, clock=lambda: NOW)
-    MentionInboxStore(db, clock=lambda: NOW)
+    now = [NOW]
+    store = MentionInboxStore(db, clock=lambda: now[0])
+    MentionInboxStore(db, clock=lambda: now[0])
 
     connection = sqlite3.connect(db)
     connection.row_factory = sqlite3.Row
@@ -588,6 +855,7 @@ def test_pre_snapshot_schema_migrates_idempotently_without_losing_delivery_state
     connection.close()
     assert store.get_cursor("github.notifications") == "cursor-1"
     assert store.pending_delivery_count() == 2
+    now[0] += timedelta(hours=1, seconds=1)
     claim = store.claim_delivery(DESTINATION, lease_seconds=10)
     assert claim is not None
     assert claim.event.untrusted.body == "pending payload"
@@ -767,6 +1035,10 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
     expected_handler: bool,
 ) -> None:
     import plugins.mention_inbox.operational as operational
+    from plugins.mention_inbox.thread_session import (
+        MentionInboxThreadCoordinator,
+        ThreadParticipantReconciliation,
+    )
 
     class Client:
         def __init__(self, *, token: str) -> None:
@@ -785,6 +1057,19 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
 
     monkeypatch.setattr(operational, "GitHubNotificationsClient", Client)
     monkeypatch.setattr(operational.MentionInboxRuntime, "start", lambda self: None)
+    reconciled_participants: list[frozenset[str]] = []
+
+    async def reconcile_participants(
+        coordinator: MentionInboxThreadCoordinator,
+    ) -> ThreadParticipantReconciliation:
+        reconciled_participants.append(coordinator._participant_user_ids)
+        return ThreadParticipantReconciliation(0, 0, 0, 0)
+
+    monkeypatch.setattr(
+        MentionInboxThreadCoordinator,
+        "reconcile_thread_participants",
+        reconcile_participants,
+    )
     adapter = Adapter()
     config = MentionInboxConfig(
         enabled=True,
@@ -815,6 +1100,204 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
     coordinator = service._runtime.delivery._thread_coordinator
     assert coordinator._executor_hint == "kanban"
     assert coordinator._approval_available is expected_handler
+    assert coordinator._participant_parent_channel_id == DESTINATION.split(":", 1)[1]
+    assert reconciled_participants == [frozenset({"396159160201658368"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reconciliation_case", "expected_category"),
+    (
+        ("failed", "discord_thread_participant_sync_failed"),
+        ("overflow", "discord_thread_participant_reconciliation_incomplete"),
+    ),
+)
+async def test_participant_reconciliation_failure_degrades_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reconciliation_case: str,
+    expected_category: str,
+) -> None:
+    import plugins.mention_inbox.operational as operational
+    from plugins.mention_inbox.thread_session import (
+        MentionInboxThreadCoordinator,
+        ThreadParticipantReconciliation,
+    )
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            assert token == "opaque-token"
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.router = None
+            self.execution_observer = None
+
+        def set_mention_inbox_router(self, router) -> None:
+            self.router = router
+
+        def set_mention_inbox_execution_observer(self, observer) -> None:
+            self.execution_observer = observer
+
+    async def failed_reconciliation(
+        coordinator: MentionInboxThreadCoordinator,
+    ) -> ThreadParticipantReconciliation:
+        return (
+            ThreadParticipantReconciliation(1, 0, 0, 1)
+            if reconciliation_case == "failed"
+            else ThreadParticipantReconciliation(1000, 1000, 0, 0, 1)
+        )
+
+    monkeypatch.setattr(operational, "GitHubNotificationsClient", Client)
+    monkeypatch.setattr(operational.MentionInboxRuntime, "start", lambda self: None)
+    monkeypatch.setattr(
+        MentionInboxThreadCoordinator,
+        "reconcile_thread_participants",
+        failed_reconciliation,
+    )
+    adapter = Adapter()
+    service = MentionInboxGatewayService(
+        MentionInboxConfig(
+            enabled=True,
+            repositories=("silviahealth/content",),
+            destination=DESTINATION,
+            action_sessions_enabled=True,
+            proposal_bot_mention="<@1525050677381279865>",
+            authorized_approver_ids=("396159160201658368",),
+            execution_enabled=True,
+            execution_mode="kanban",
+            execution_workspace="Documents/hermes-workspaces/silviahealth-content",
+            terminal_cwd="/Users/test",
+        ),
+        adapter,
+        environ={"GITHUB_PAT_TOKEN": "opaque-token"},
+        db_path=tmp_path / "failed-reconciliation.db",
+    )
+
+    await service.start()
+
+    assert service.health()["status"] == "degraded"
+    assert service.health()["error_category"] == expected_category
+    assert adapter.router is None
+    assert adapter.execution_observer is None
+    assert service._router_installed is False
+    assert service._execution_observer_installed is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_participant_reconciliation_rolls_back_installed_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plugins.mention_inbox.operational as operational
+    from plugins.mention_inbox.thread_session import MentionInboxThreadCoordinator
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            assert token == "opaque-token"
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.router = None
+            self.execution_observer = None
+
+        def set_mention_inbox_router(self, router) -> None:
+            self.router = router
+
+        def set_mention_inbox_execution_observer(self, observer) -> None:
+            self.execution_observer = observer
+
+    reconciliation_started = asyncio.Event()
+
+    async def blocked_reconciliation(
+        coordinator: MentionInboxThreadCoordinator,
+    ):
+        reconciliation_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(operational, "GitHubNotificationsClient", Client)
+    monkeypatch.setattr(operational.MentionInboxRuntime, "start", lambda self: None)
+    monkeypatch.setattr(
+        MentionInboxThreadCoordinator,
+        "reconcile_thread_participants",
+        blocked_reconciliation,
+    )
+    adapter = Adapter()
+    service = MentionInboxGatewayService(
+        MentionInboxConfig(
+            enabled=True,
+            repositories=("silviahealth/content",),
+            destination=DESTINATION,
+            action_sessions_enabled=True,
+            proposal_bot_mention="<@1525050677381279865>",
+            authorized_approver_ids=("396159160201658368",),
+            execution_enabled=True,
+            execution_mode="kanban",
+            execution_workspace="Documents/hermes-workspaces/silviahealth-content",
+            terminal_cwd="/Users/test",
+        ),
+        adapter,
+        environ={"GITHUB_PAT_TOKEN": "opaque-token"},
+        db_path=tmp_path / "cancelled-reconciliation.db",
+    )
+
+    start_task = asyncio.create_task(service.start())
+    await asyncio.wait_for(reconciliation_started.wait(), timeout=2)
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert adapter.router is None
+    assert adapter.execution_observer is None
+    assert service._router_installed is False
+    assert service._execution_observer_installed is False
+
+
+@pytest.mark.asyncio
+async def test_router_install_failure_rolls_back_published_router(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plugins.mention_inbox.operational as operational
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            assert token == "opaque-token"
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.router = None
+
+        def set_mention_inbox_router(self, router) -> None:
+            self.router = router
+            if router is not None:
+                raise RuntimeError("persistent view restore failed")
+
+        def set_mention_inbox_execution_observer(self, observer) -> None:
+            return None
+
+    monkeypatch.setattr(operational, "GitHubNotificationsClient", Client)
+    monkeypatch.setattr(operational.MentionInboxRuntime, "start", lambda self: None)
+    adapter = Adapter()
+    service = MentionInboxGatewayService(
+        MentionInboxConfig(
+            enabled=True,
+            repositories=("silviahealth/content",),
+            destination=DESTINATION,
+            action_sessions_enabled=True,
+            proposal_bot_mention="<@1525050677381279865>",
+            authorized_approver_ids=("396159160201658368",),
+        ),
+        adapter,
+        environ={"GITHUB_PAT_TOKEN": "opaque-token"},
+        db_path=tmp_path / "router-install-failed.db",
+    )
+
+    await service.start()
+
+    assert service.health()["error_category"] == "startup_failed"
+    assert adapter.router is None
+    assert service._router_installed is False
 
 
 @pytest.mark.asyncio

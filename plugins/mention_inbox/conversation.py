@@ -297,8 +297,14 @@ class HostReadOnlyConversationResponder:
         self,
         *,
         llm_call: LlmCall | None = None,
-        request_timeout: float = 20.0,
-        wall_timeout: float = 35.0,
+        # A reasoning model spends most of its output budget on reasoning before
+        # emitting any content, so a short ceiling times out every call and the
+        # thread never gets an answer. Measured against the configured
+        # moonshotai/kimi-k3-free at max_tokens=450: 35.6s to first usable
+        # content. The old 20s/35s pair could not fit that, which is why every
+        # in-thread question failed. These match the advisory generator.
+        request_timeout: float = 45.0,
+        wall_timeout: float = 60.0,
         max_concurrency: int = 2,
         hermes_home: Path | None = None,
     ) -> None:

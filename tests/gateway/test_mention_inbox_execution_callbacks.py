@@ -25,6 +25,8 @@ def _event(*, internal: bool, execution_id: str = "wx_" + "a" * 24):
                 "execution_id": execution_id,
                 "proposal_hash": "b" * 64,
                 "mode": "direct",
+                "recovery_token": "recovery-token-1",
+                "owner_id": "1" * 32,
             }
         },
     )

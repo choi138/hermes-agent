@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -247,3 +248,13 @@ def test_response_normalization_is_bounded_and_removes_controls() -> None:
     assert "\n\n\n" not in response
     assert len(response) == 1800
     assert response.endswith("…")
+
+
+def test_timeouts_fit_a_reasoning_model() -> None:
+    # The configured model spends its budget on reasoning before emitting
+    # content; measured at 35.6s to first usable content. Defaults below that
+    # made every in-thread question fail, so they must leave headroom.
+    responder = HostReadOnlyConversationResponder(hermes_home=Path("/tmp"))
+
+    assert responder._request_timeout >= 40.0
+    assert responder._wall_timeout > responder._request_timeout

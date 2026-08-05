@@ -75,6 +75,29 @@ There is intentionally no `to_prompt()` helper. A later LLM consumer must place
 raw content in a clearly delimited data block under fixed trusted instructions;
 it must not interpolate external text into system or developer instructions.
 
+### Model consumers
+
+Two consumers exist, and both follow that rule: the thread conversation
+responder (`conversation.py`) and the proposal advisory (`advisory.py`). Each
+builds a fixed system message, serializes only already-validated and
+length-bounded data into a JSON value in the user turn, runs with `tools=[]`,
+and re-bounds the reply before it can reach Discord.
+
+`advisory.py` is explanatory only and holds no authority. It never constructs or
+mutates a `WorkProposal`, so it cannot widen `allowed_actions`, offer approval,
+or change `verification`. Its output is posted as a **separate** message rather
+than inside the proposal message, because a proposal must render identically for
+one revision: `_matches_proposal_content` compares that rendering to decide
+whether a new revision is warranted, and `ensure_thread` looks the exact text up
+in the thread to recognize an already-sent proposal after a crash. Model output
+is not reproducible, so embedding it would churn revisions and defeat the
+duplicate-send guard.
+
+The advisory is best effort. A slow, unreachable, or unusable reply leaves the
+delivered proposal and its recorded message binding untouched. It is gated by
+`mention_inbox.advisory_summary`, which defaults to `false` because the call adds
+one model round trip — tens of seconds with a reasoning model — to a delivery.
+
 ## Ingress versus storage
 
 | Property | `ingest_event` | `restore_event` |
@@ -373,6 +396,42 @@ mention_inbox:
   retention_days: 30
   lease_seconds: 60
 ```
+
+`action_sessions.authorized_approver_ids` has two coupled responsibilities:
+those Discord users are allowed to approve eligible proposals, and they are
+idempotently added as members of every durable work-item thread before a
+proposal is posted. This membership synchronization also applies when
+`execution_enabled=false`, so review-only threads remain visible to the
+configured reviewers. The Discord bot therefore needs permission to view the
+destination, create public threads, send messages in threads, and add guild
+members to those threads. Configured Discord IDs must be positive uint64
+snowflakes; impossible out-of-range values fail configuration before any API
+write.
+
+On gateway startup, the runtime reconciles at most 1,000 active work-item
+sessions whose Discord parent matches the currently configured destination. It
+repairs membership for active, unlocked threads without creating messages or
+replacement threads. Sessions without a thread, sessions from another
+destination, and archived or locked threads are skipped rather than reopened
+solely for startup backfill. A genuine later PR revision may unarchive its
+unlocked durable thread before membership synchronization and proposal
+delivery; a locked thread fails closed. Discord's add-member operation is
+idempotent, so repeating reconciliation is safe. More than 1,000 active
+sessions degrades startup with
+`discord_thread_participant_reconciliation_incomplete` instead of silently
+reporting full coverage. Metadata, activation, or membership failures use
+`discord_thread_participant_sync_failed`.
+
+Delivery renews its durable outbox lease while thread activation, participant
+sync, and proposal reconciliation are in flight. If another worker has already
+reclaimed the attempt, the stale worker is cancelled before it can post
+proposal controls and cannot overwrite the current attempt's error state.
+Proposal sends also use a deterministic revision-specific Discord nonce so an
+uncertain concurrent accept converges on one visible message.
+Read-only external proposals (`inspect_only`) never route write-like requests
+to the full tool-capable agent, even when the requester is an authorized
+approver. Membership is additive: removing an ID from configuration or rolling
+back this code does not remove members already added to Discord threads.
 
 Read replay is limited to at most seven days and ten pages even when configured
 explicitly. It is GET-only and never changes GitHub notification read state.

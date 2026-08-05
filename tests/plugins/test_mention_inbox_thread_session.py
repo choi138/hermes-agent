@@ -13,6 +13,8 @@ from plugins.mention_inbox.thread_session import MentionInboxThreadCoordinator
 
 NOW = datetime(2026, 7, 29, 11, 0, tzinfo=timezone.utc)
 BOT_MENTION = "<@1525050525641805886>"
+PARENT_CHANNEL = "1531851208858275860"
+ALT_PARENT_CHANNEL = "1531851208858275861"
 
 
 def _event(
@@ -84,11 +86,27 @@ def _event(
 class _Discord:
     def __init__(self) -> None:
         self.threads: dict[str, str] = {}
+        self.active_threads: dict[str, bool] = {}
+        self.thread_parents: dict[str, str] = {}
+        self.archived_threads: set[str] = set()
+        self.locked_threads: set[str] = set()
+        self.activated_threads: list[str] = []
         self.created: list[tuple[str, str, int]] = []
+        self.participant_syncs: list[tuple[str, frozenset[str]]] = []
+        self.participant_failures: set[str] = set()
+        self.thread_members: dict[str, set[str]] = {}
         self.marked: list[str] = []
         self.messages: dict[str, list[tuple[str, str]]] = {}
         self.proposal_controls: list[dict[str, object]] = []
+        self.operations: list[str] = []
         self.next_message = 1
+
+    def remember_parent_message(
+        self, parent_message_id: str, parent_channel_id: str
+    ) -> None:
+        self.operations.append(
+            f"remember_parent:{parent_message_id}:{parent_channel_id}"
+        )
 
     async def find_anchored_thread(self, parent_message_id: str) -> str | None:
         return self.threads.get(parent_message_id)
@@ -101,11 +119,57 @@ class _Discord:
             return existing
         thread_id = f"thread-{len(self.threads) + 1}"
         self.threads[parent_message_id] = thread_id
+        self.active_threads[thread_id] = True
+        self.thread_parents[thread_id] = PARENT_CHANNEL
         self.created.append((parent_message_id, name, auto_archive_duration))
+        self.operations.append("create_thread")
         return thread_id
+
+    async def ensure_thread_participants(
+        self,
+        thread_id: str,
+        user_ids: frozenset[str],
+    ) -> None:
+        self.participant_syncs.append((thread_id, user_ids))
+        self.operations.append("sync_participants")
+        if thread_id in self.archived_threads or thread_id in self.locked_threads:
+            raise RuntimeError("thread is not active")
+        if thread_id in self.participant_failures:
+            raise RuntimeError("participant sync failed")
+        self.thread_members.setdefault(thread_id, set()).update(user_ids)
+
+    async def is_thread_active(self, thread_id: str) -> bool:
+        return (
+            self.active_threads.get(thread_id, False)
+            and thread_id not in self.archived_threads
+            and thread_id not in self.locked_threads
+        )
+
+    async def thread_has_parent(
+        self,
+        thread_id: str,
+        parent_channel_id: str,
+    ) -> bool:
+        return (
+            self.thread_parents.get(thread_id, PARENT_CHANNEL)
+            == parent_channel_id
+        )
+
+    async def activate_thread(self, thread_id: str) -> None:
+        if thread_id in self.locked_threads:
+            raise RuntimeError("thread is locked")
+        if (
+            thread_id not in self.archived_threads
+            and self.active_threads.get(thread_id, False)
+        ):
+            return
+        self.archived_threads.discard(thread_id)
+        self.active_threads[thread_id] = True
+        self.activated_threads.append(thread_id)
 
     def mark_thread_participation(self, thread_id: str) -> None:
         self.marked.append(thread_id)
+        self.operations.append("mark_participation")
 
     async def find_message_content(
         self, thread_id: str, content: str, *, limit: int
@@ -116,6 +180,7 @@ class _Discord:
         return None
 
     async def send_to_thread(self, thread_id: str, content: str) -> str:
+        self.operations.append("send_to_thread")
         message_id = f"proposal-message-{self.next_message}"
         self.next_message += 1
         self.messages.setdefault(thread_id, []).append((message_id, content))
@@ -144,6 +209,9 @@ def _coordinator(
     *,
     approval_available: bool = True,
     external_repository_actions: str = "disabled",
+    participant_user_ids: frozenset[str] = frozenset(),
+    participant_parent_channel_id: str | None = None,
+    advisor: object | None = None,
 ) -> MentionInboxThreadCoordinator:
     return MentionInboxThreadCoordinator(
         store=MentionInboxStore(path, clock=lambda: NOW),
@@ -152,6 +220,13 @@ def _coordinator(
         approval_available=approval_available,
         trusted_repositories=frozenset({"silviahealth/content"}),
         external_repository_actions=external_repository_actions,
+        participant_user_ids=participant_user_ids,
+        participant_parent_channel_id=(
+            PARENT_CHANNEL
+            if participant_parent_channel_id is None
+            else participant_parent_channel_id
+        ),
+        advisor=advisor,
     )
 
 
@@ -184,6 +259,219 @@ async def test_same_subject_creates_one_thread_and_one_proposal(tmp_path: Path) 
         "approval_offered": True,
     }]
     assert discord.marked == ["thread-1", "thread-1"]
+
+
+@pytest.mark.asyncio
+async def test_new_thread_syncs_participants_before_proposal(tmp_path: Path) -> None:
+    discord = _Discord()
+    coordinator = _coordinator(
+        tmp_path / "inbox.db",
+        discord,
+        participant_user_ids=frozenset({"222222", "111111"}),
+    )
+
+    session = await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert discord.participant_syncs == [
+        (session.discord_thread_id, frozenset({"222222", "111111"}))
+    ]
+    assert discord.operations.index("sync_participants") < discord.operations.index(
+        "send_to_thread"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovered_thread_syncs_participants_before_proposal(
+    tmp_path: Path,
+) -> None:
+    discord = _Discord()
+    discord.threads["parent-1"] = "thread-existing"
+    coordinator = _coordinator(
+        tmp_path / "inbox.db",
+        discord,
+        participant_user_ids=frozenset({"111111"}),
+    )
+
+    session = await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert session.discord_thread_id == "thread-existing"
+    assert discord.created == []
+    assert discord.participant_syncs == [
+        ("thread-existing", frozenset({"111111"}))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_later_revision_resyncs_existing_thread_participants(
+    tmp_path: Path,
+) -> None:
+    discord = _Discord()
+    coordinator = _coordinator(
+        tmp_path / "inbox.db",
+        discord,
+        participant_user_ids=frozenset({"111111"}),
+    )
+
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    discord.archived_threads.add("thread-1")
+    discord.active_threads["thread-1"] = False
+    await coordinator.ensure_thread(
+        _event(
+            event_id="RC_124",
+            source_revision="2026-07-29T10:02:00Z",
+            body="두 번째 줄도 확인해 주세요.",
+        ),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:02:00Z",
+    )
+
+    assert len(discord.created) == 1
+    assert discord.activated_threads == ["thread-1"]
+    assert discord.participant_syncs == [
+        ("thread-1", frozenset({"111111"})),
+        ("thread-1", frozenset({"111111"})),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_participant_set_is_explicit_no_op(tmp_path: Path) -> None:
+    discord = _Discord()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord)
+
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert discord.participant_syncs == []
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_repairs_only_active_threads(
+    tmp_path: Path,
+) -> None:
+    store = MentionInboxStore(tmp_path / "inbox.db", clock=lambda: NOW)
+
+    def record_session(subject: str, thread_id: str | None) -> None:
+        event = _event(event_id=f"event-{subject}", subject_key=subject)
+        store.reserve_work_item_session(
+            subject,
+            event.dedupe_key,
+            "2026-07-29T10:01:00Z",
+        )
+        store.prepare_work_item_parent(
+            subject, f"parent-{subject}", PARENT_CHANNEL
+        )
+        if thread_id is not None:
+            store.record_work_item_thread(
+                subject,
+                f"parent-{subject}",
+                PARENT_CHANNEL,
+                thread_id,
+            )
+
+    record_session("github:R_repo:PR_active", "thread-active")
+    record_session("github:R_repo:PR_archived", "thread-archived")
+    record_session("github:R_repo:PR_failed", "thread-failed")
+    record_session("github:R_repo:PR_missing", None)
+    record_session("github:R_repo:PR_other_destination", "thread-other")
+    discord = _Discord()
+    discord.active_threads.update({
+        "thread-active": True,
+        "thread-archived": False,
+        "thread-failed": True,
+        "thread-other": True,
+    })
+    discord.thread_parents.update({
+        "thread-active": PARENT_CHANNEL,
+        "thread-archived": PARENT_CHANNEL,
+        "thread-failed": PARENT_CHANNEL,
+        "thread-other": ALT_PARENT_CHANNEL,
+    })
+    discord.participant_failures.add("thread-failed")
+    coordinator = MentionInboxThreadCoordinator(
+        store=store,
+        discord=discord,
+        bot_mention=BOT_MENTION,
+        participant_user_ids=frozenset({"789391209067446323"}),
+        participant_parent_channel_id=PARENT_CHANNEL,
+    )
+
+    first = await coordinator.reconcile_thread_participants()
+
+    assert first.examined == 5
+    assert first.repaired == 1
+    assert first.skipped == 3
+    assert first.failed == 1
+    assert discord.thread_members == {
+        "thread-active": {"789391209067446323"}
+    }
+
+    discord.participant_failures.clear()
+    second = await coordinator.reconcile_thread_participants()
+
+    assert second.examined == 5
+    assert second.repaired == 2
+    assert second.skipped == 3
+    assert second.failed == 0
+    assert discord.thread_members == {
+        "thread-active": {"789391209067446323"},
+        "thread-failed": {"789391209067446323"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_reports_sessions_beyond_limit(
+    tmp_path: Path,
+) -> None:
+    class SnapshotStore(MentionInboxStore):
+        def active_work_item_session_count(self) -> int:
+            raise AssertionError(
+                "overflow must share the session-list query snapshot"
+            )
+
+    store = SnapshotStore(tmp_path / "inbox.db", clock=lambda: NOW)
+    discord = _Discord()
+    for index in range(1001):
+        subject = f"github:R_repo:PR_{index:04d}"
+        event = _event(event_id=f"event-{index}", subject_key=subject)
+        parent = f"parent-{index}"
+        thread = f"thread-{index}"
+        store.reserve_work_item_session(
+            subject,
+            event.dedupe_key,
+            "2026-07-29T10:01:00Z",
+        )
+        store.prepare_work_item_parent(subject, parent, PARENT_CHANNEL)
+        store.record_work_item_thread(subject, parent, PARENT_CHANNEL, thread)
+        discord.active_threads[thread] = True
+    coordinator = MentionInboxThreadCoordinator(
+        store=store,
+        discord=discord,
+        bot_mention=BOT_MENTION,
+        participant_user_ids=frozenset({"789391209067446323"}),
+    )
+
+    result = await coordinator.reconcile_thread_participants(limit=1000)
+
+    assert result.examined == 1000
+    assert result.repaired == 1000
+    assert result.skipped == 0
+    assert result.failed == 0
+    assert result.overflow == 1
 
 
 @pytest.mark.asyncio
@@ -333,6 +621,134 @@ async def test_execution_activation_reconciles_same_head_to_one_new_revision(
 
 
 @pytest.mark.asyncio
+async def test_execution_activation_skips_archived_thread_at_startup(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archived-activation.db"
+    event = _event()
+    store = MentionInboxStore(path, clock=lambda: NOW)
+    store.upsert(event, source_revision="2026-07-29T10:01:00Z")
+    discord = _Discord()
+    await _coordinator(path, discord, approval_available=False).ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    discord.archived_threads.add("thread-1")
+    discord.active_threads["thread-1"] = False
+
+    coordinator = _coordinator(path, discord, approval_available=True)
+
+    assert await coordinator.reconcile_execution_activation() == 0
+    latest = MentionInboxStore(path).get_latest_proposal(event.thread.thread_id)
+    assert latest is not None and latest.revision == 1
+    assert discord.activated_threads == []
+    assert len(discord.messages["thread-1"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_activation_skips_thread_from_other_destination(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cross-destination-activation.db"
+    event = _event()
+    store = MentionInboxStore(path, clock=lambda: NOW)
+    store.upsert(event, source_revision="2026-07-29T10:01:00Z")
+    discord = _Discord()
+    await _coordinator(path, discord, approval_available=False).ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    discord.thread_parents["thread-1"] = "other-destination"
+
+    coordinator = _coordinator(
+        path,
+        discord,
+        approval_available=True,
+        participant_parent_channel_id=PARENT_CHANNEL,
+    )
+
+    assert await coordinator.reconcile_execution_activation() == 0
+    latest = MentionInboxStore(path).get_latest_proposal(event.thread.thread_id)
+    assert latest is not None and latest.revision == 1
+    assert len(discord.messages["thread-1"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_existing_thread_delivery_fails_closed_after_destination_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cross-destination-delivery.db"
+    discord = _Discord()
+    coordinator = _coordinator(
+        path,
+        discord,
+        participant_parent_channel_id=PARENT_CHANNEL,
+    )
+    event = _event()
+    await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    discord.thread_parents["thread-1"] = "other-destination"
+
+    with pytest.raises(
+        RuntimeError,
+        match="configured Discord destination",
+    ):
+        await coordinator.deliver_to_existing_thread(
+            _event(
+                body="새 목적지에서만 전달되어야 합니다.",
+                source_revision="2026-07-29T10:02:00Z",
+            ),
+            source_revision="2026-07-29T10:02:00Z",
+        )
+
+    assert len(discord.messages["thread-1"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_participant_writes_are_preceded_by_delivery_checkpoints(
+    tmp_path: Path,
+) -> None:
+    checkpoints: list[int] = []
+
+    class CheckpointDiscord(_Discord):
+        async def activate_thread(self, thread_id: str) -> None:
+            assert len(checkpoints) >= 2
+            await super().activate_thread(thread_id)
+
+        async def ensure_thread_participants(
+            self,
+            thread_id: str,
+            user_ids: frozenset[str],
+        ) -> None:
+            assert len(checkpoints) >= 3
+            await super().ensure_thread_participants(thread_id, user_ids)
+
+    async def checkpoint() -> None:
+        checkpoints.append(len(checkpoints) + 1)
+
+    discord = CheckpointDiscord()
+    coordinator = _coordinator(
+        tmp_path / "participant-checkpoints.db",
+        discord,
+        participant_user_ids=frozenset({"789391209067446323"}),
+    )
+
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+        delivery_checkpoint=checkpoint,
+    )
+
+    assert len(checkpoints) >= 4
+
+
+@pytest.mark.asyncio
 async def test_non_approvable_preflight_stays_review_only_when_execution_exists(
     tmp_path: Path,
 ) -> None:
@@ -418,7 +834,9 @@ async def test_interrupted_creation_recovers_existing_anchored_thread(
         event.dedupe_key,
         "2026-07-29T10:01:00Z",
     )
-    store.prepare_work_item_parent(event.thread.thread_id, "parent-1")
+    store.prepare_work_item_parent(
+        event.thread.thread_id, "parent-1", PARENT_CHANNEL
+    )
 
     discord = _Discord()
     discord.threads["parent-1"] = "existing-thread"
@@ -429,8 +847,78 @@ async def test_interrupted_creation_recovers_existing_anchored_thread(
     )
 
     assert session.discord_thread_id == "existing-thread"
+    assert session.parent_channel_id == PARENT_CHANNEL
     assert discord.created == []
+    assert discord.operations[0] == (
+        f"remember_parent:parent-1:{PARENT_CHANNEL}"
+    )
     assert len(discord.messages["existing-thread"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_rehydrates_durable_parent_before_reusing_recorded_thread(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "recorded-thread-restart.db"
+    event = _event()
+    store = MentionInboxStore(path, clock=lambda: NOW)
+    store.reserve_work_item_session(
+        event.thread.thread_id,
+        event.dedupe_key,
+        "2026-07-29T10:01:00Z",
+    )
+    store.record_work_item_thread(
+        event.thread.thread_id,
+        "parent-1",
+        PARENT_CHANNEL,
+        "existing-thread",
+    )
+    discord = _Discord()
+
+    session = await _coordinator(path, discord).ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        parent_channel_id=PARENT_CHANNEL,
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert session.discord_thread_id == "existing-thread"
+    assert discord.operations[0] == (
+        f"remember_parent:parent-1:{PARENT_CHANNEL}"
+    )
+    assert discord.created == []
+
+
+@pytest.mark.asyncio
+async def test_durable_parent_channel_config_mismatch_fails_before_discord_work(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "parent-channel-mismatch.db"
+    event = _event()
+    store = MentionInboxStore(path, clock=lambda: NOW)
+    store.reserve_work_item_session(
+        event.thread.thread_id,
+        event.dedupe_key,
+        "2026-07-29T10:01:00Z",
+    )
+    store.prepare_work_item_parent(
+        event.thread.thread_id, "parent-1", ALT_PARENT_CHANNEL
+    )
+    discord = _Discord()
+
+    with pytest.raises(
+        RuntimeError,
+        match="configured Discord destination",
+    ):
+        await _coordinator(path, discord).ensure_thread(
+            event,
+            parent_message_id="parent-1",
+            parent_channel_id=PARENT_CHANNEL,
+            source_revision="2026-07-29T10:01:00Z",
+        )
+
+    assert discord.operations == []
+    assert discord.created == []
 
 
 @pytest.mark.asyncio
@@ -586,7 +1074,9 @@ async def test_legacy_pending_is_reconciled_once_from_new_hydration(
         event.dedupe_key,
         "2026-07-29T09:00:00Z",
     )
-    store.record_work_item_thread(event.thread.thread_id, "parent-1", "thread-1")
+    store.record_work_item_thread(
+        event.thread.thread_id, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
     legacy = build_work_proposal(
         revision=1,
         source_dedupe_key=event.dedupe_key,
@@ -651,3 +1141,133 @@ async def test_legacy_pending_is_reconciled_once_from_new_hydration(
     assert expected_notice in rendered
     assert f"{BOT_MENTION} 승인" not in rendered
     assert ("`리뷰 반영해줘`" in rendered) is expected_new_offer
+
+
+class _StubAdvisor:
+    """Records calls and returns a fixed advisory."""
+
+    def __init__(self, text: str = "상황: 명세와 import가 불일치합니다.\n- 범위를 맞춘다") -> None:
+        self.text = text
+        self.calls: list[tuple[str, int]] = []
+
+    async def advise(self, *, context: object) -> str:
+        proposal_actions = getattr(context, "allowed_actions", ())
+        self.calls.append((getattr(context, "repository", ""), len(proposal_actions)))
+        return self.text
+
+
+class _FailingAdvisor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def advise(self, *, context: object) -> str:
+        self.calls += 1
+        raise RuntimeError("model unreachable")
+
+
+@pytest.mark.asyncio
+async def test_advisory_posts_once_beside_the_proposal(tmp_path: Path) -> None:
+    discord = _Discord()
+    advisor = _StubAdvisor()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=advisor)
+    event = _event()
+
+    await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    # A second identical delivery must not re-post either message.
+    await coordinator.ensure_thread(
+        event,
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    messages = discord.messages["thread-1"]
+    assert len(messages) == 2
+    assert len(advisor.calls) == 1
+    proposal_text, advisory_text = messages[0][1], messages[1][1]
+    assert "제 추천" in proposal_text
+    # The advisory is a separate message and never contaminates the proposal.
+    assert "참고 분석" not in proposal_text
+    assert "참고 분석 (모델 작성, 권한 없음)" in advisory_text
+    assert "명세와 import가 불일치" in advisory_text
+    assert "허용 범위를 바꾸지 않아요" in advisory_text
+
+
+@pytest.mark.asyncio
+async def test_proposal_is_delivered_when_the_advisory_fails(tmp_path: Path) -> None:
+    discord = _Discord()
+    advisor = _FailingAdvisor()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=advisor)
+
+    session = await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert advisor.calls == 1
+    assert session.discord_thread_id == "thread-1"
+    # Exactly the deterministic proposal, and the binding was still recorded.
+    assert len(discord.messages["thread-1"]) == 1
+    assert "제 추천" in discord.messages["thread-1"][0][1]
+    stored = MentionInboxStore(tmp_path / "inbox.db").get_latest_proposal(
+        "github:R_repo:PR_7"
+    )
+    assert stored is not None
+    assert (
+        MentionInboxStore(tmp_path / "inbox.db").get_proposal_message_id(
+            stored.proposal_id, stored.revision
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_advisory_does_not_change_proposal_revisions(tmp_path: Path) -> None:
+    # Non-deterministic advisory text must not churn revisions: the proposal
+    # object and its rendered message stay byte-identical across deliveries.
+    discord = _Discord()
+
+    class _VaryingAdvisor:
+        def __init__(self) -> None:
+            self.count = 0
+
+        async def advise(self, *, context: object) -> str:
+            self.count += 1
+            return f"매번 다른 문장 {self.count}"
+
+    coordinator = _coordinator(
+        tmp_path / "inbox.db", discord, advisor=_VaryingAdvisor()
+    )
+    event = _event()
+    for _ in range(3):
+        await coordinator.ensure_thread(
+            event,
+            parent_message_id="parent-1",
+            source_revision="2026-07-29T10:01:00Z",
+        )
+
+    store = MentionInboxStore(tmp_path / "inbox.db")
+    proposal = store.get_latest_proposal("github:R_repo:PR_7")
+    assert proposal is not None
+    assert proposal.revision == 1
+    # One proposal message plus exactly one advisory message.
+    assert len(discord.messages["thread-1"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_advisor_configured_changes_nothing(tmp_path: Path) -> None:
+    discord = _Discord()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=None)
+
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+
+    assert len(discord.messages["thread-1"]) == 1
+    assert "참고 분석" not in discord.messages["thread-1"][0][1]

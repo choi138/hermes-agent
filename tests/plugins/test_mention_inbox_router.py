@@ -6,11 +6,16 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import pytest
 
 from plugins.mention_inbox import ingest_event
-from plugins.mention_inbox.proposals import ProposalStatus, build_work_proposal
+from plugins.mention_inbox.proposals import (
+    ProposalStatus,
+    WorkProposal,
+    build_work_proposal,
+)
 from plugins.mention_inbox.router import (
     InboxDiscordMessage,
     InboxProposalRouter,
@@ -90,7 +95,12 @@ def _seed(
     *,
     approval_offered: bool = True,
     with_preapproval_evidence: bool = False,
-) -> tuple[MentionInboxStore, object]:
+    allowed_actions: tuple[str, ...] = (
+        "read_repository",
+        "edit_scoped_files",
+        "run_tests",
+    ),
+) -> tuple[MentionInboxStore, WorkProposal]:
     store = MentionInboxStore(path, clock=lambda: NOW)
     source_dedupe_key = "github:RC_123:U_recent"
     if with_preapproval_evidence:
@@ -100,7 +110,9 @@ def _seed(
     store.reserve_work_item_session(
         SUBJECT, source_dedupe_key, "2026-07-29T10:01:00Z"
     )
-    store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
+    store.record_work_item_thread(
+        SUBJECT, "parent-1", "1531851208858275860", "thread-1"
+    )
     proposal = build_work_proposal(
         revision=1,
         source_dedupe_key=source_dedupe_key,
@@ -109,7 +121,7 @@ def _seed(
         head_sha="head-1",
         goal="리뷰 의견을 확인한다.",
         steps=("diff를 확인한다.",),
-        allowed_actions=("read_repository", "edit_scoped_files", "run_tests"),
+        allowed_actions=allowed_actions,
         forbidden_actions=("merge", "deploy", "delete", "read_secrets"),
         verification=("대상 테스트 통과",),
         executor_hint="direct",
@@ -147,6 +159,9 @@ def _router(
     *,
     handler: object | None = None,
     responder: object | None = None,
+    thread_destination_validator: (
+        Callable[[str], Awaitable[bool]] | None
+    ) = None,
 ) -> InboxProposalRouter:
     return InboxProposalRouter(
         store=store,
@@ -155,6 +170,7 @@ def _router(
         authorized_approver_ids=frozenset({USER}),
         approval_handler=handler,
         conversation_responder=responder,
+        thread_destination_validator=thread_destination_validator,
     )
 
 
@@ -387,6 +403,29 @@ async def test_local_workspace_passthrough_requires_execution_feature(
     assert result.kind == "agent_passthrough_not_enabled"
     assert result.agent_text is None
     assert "도구 실행 기능" in discord.messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_inspect_only_proposal_cannot_reach_full_agent_tools(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(
+        tmp_path / "inspect-only-agent-tools.db",
+        approval_offered=False,
+        allowed_actions=("read_repository",),
+    )
+    discord = _Discord()
+    handler = _Handler()
+
+    result = await _router(store, discord, handler=handler).handle_message(
+        _message("external/project 파일 수정해줘")
+    )
+
+    assert result.handled is True
+    assert result.kind == "agent_passthrough_not_offered"
+    assert result.agent_text is None
+    assert "검토용" in discord.messages[-1][1]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -959,3 +998,68 @@ def test_persistent_control_bindings_restore_exact_pending_message(
             approval_offered=True,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_proposal_action_fails_closed_outside_current_destination(
+    tmp_path: Path,
+) -> None:
+    store, proposal = _seed(tmp_path / "cross-destination-action.db")
+    checked_threads: list[str] = []
+
+    async def validate_destination(thread_id: str) -> bool:
+        checked_threads.append(thread_id)
+        return False
+
+    handler = _Handler()
+    router = _router(
+        store,
+        _Discord(),
+        handler=handler,
+        thread_destination_validator=validate_destination,
+    )
+
+    result = await router.handle_action(
+        thread_id="thread-1",
+        proposal_id=proposal.proposal_id,
+        proposal_revision=proposal.revision,
+        proposal_message_id="proposal-message-1",
+        user_id=USER,
+        interaction_id="interaction-wrong-destination",
+        action="start",
+    )
+
+    assert result.kind == "proposal_action_wrong_destination"
+    assert checked_threads == ["thread-1"]
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_work_thread_message_fails_closed_outside_current_destination(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed(tmp_path / "cross-destination-message.db")
+    checked_threads: list[str] = []
+
+    async def validate_destination(thread_id: str) -> bool:
+        checked_threads.append(thread_id)
+        return False
+
+    discord = _Discord()
+    router = _router(
+        store,
+        discord,
+        handler=_Handler(),
+        thread_destination_validator=validate_destination,
+    )
+
+    result = await router.handle_message(
+        _message(
+            f"{BOT_MENTION} 승인",
+            reply_to="proposal-message-1",
+        )
+    )
+
+    assert result.kind == "work_thread_wrong_destination"
+    assert checked_threads == ["thread-1"]
+    assert discord.messages == []

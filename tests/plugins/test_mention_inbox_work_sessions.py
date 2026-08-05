@@ -25,6 +25,7 @@ SUBJECT = "github:R_repo:PR_7"
 DEDUPE = "github:IC_99:U_recent"
 SOURCE_REVISION = "2026-07-29T10:01:00Z"
 APPROVER = "396159160201658368"
+PARENT_CHANNEL = "1531851208858275860"
 
 
 def _store(path: Path) -> MentionInboxStore:
@@ -54,11 +55,17 @@ def test_one_active_thread_per_subject_and_record_is_idempotent(tmp_path: Path) 
 
     assert first.subject_key == second.subject_key == SUBJECT
     assert second.discord_thread_id is None
-    recorded = store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
-    repeated = store.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
+    recorded = store.record_work_item_thread(
+        SUBJECT, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
+    repeated = store.record_work_item_thread(
+        SUBJECT, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
     assert recorded.discord_thread_id == repeated.discord_thread_id == "thread-1"
     with pytest.raises(ValueError, match="different thread"):
-        store.record_work_item_thread(SUBJECT, "parent-2", "thread-2")
+        store.record_work_item_thread(
+            SUBJECT, "parent-2", PARENT_CHANNEL, "thread-2"
+        )
 
     connection = sqlite3.connect(store.path)
     assert (
@@ -76,7 +83,9 @@ def test_interrupted_thread_creation_retry_survives_restart(tmp_path: Path) -> N
     assert restored is not None
     assert restored.parent_message_id is None
     assert restored.discord_thread_id is None
-    restarted.record_work_item_thread(SUBJECT, "parent-1", "thread-1")
+    restarted.record_work_item_thread(
+        SUBJECT, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
     assert (
         restarted.get_active_work_item_session(SUBJECT).discord_thread_id == "thread-1"
     )
@@ -89,14 +98,33 @@ def test_github_pr_identity_and_parent_message_are_unique(tmp_path: Path) -> Non
     assert first.repository_node_id == "R_repo"
     assert first.pr_node_id == "PR_7"
 
-    store.prepare_work_item_parent(SUBJECT, "parent-1")
+    store.prepare_work_item_parent(SUBJECT, "parent-1", PARENT_CHANNEL)
     store.reserve_work_item_session(
         "github:R_other:PR_8",
         "github:IC_100:U_recent",
         SOURCE_REVISION,
     )
     with pytest.raises(sqlite3.IntegrityError):
-        store.prepare_work_item_parent("github:R_other:PR_8", "parent-1")
+        store.prepare_work_item_parent(
+            "github:R_other:PR_8", "parent-1", PARENT_CHANNEL
+        )
+
+
+@pytest.mark.parametrize(
+    "parent_channel_id",
+    ("not-a-snowflake", "12345", str(1 << 64)),
+)
+def test_parent_channel_rejects_invalid_discord_snowflakes(
+    tmp_path: Path,
+    parent_channel_id: str,
+) -> None:
+    store = _store(tmp_path / "invalid-parent-channel.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+
+    with pytest.raises(ValueError, match="valid Discord snowflake"):
+        store.prepare_work_item_parent(
+            SUBJECT, "parent-1", parent_channel_id
+        )
 
 
 def test_v7_session_rows_backfill_immutable_github_identity(tmp_path: Path) -> None:

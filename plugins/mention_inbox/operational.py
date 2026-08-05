@@ -9,13 +9,15 @@ channel history using the deterministic marker before any retry.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol, cast
 
 from plugins.mention_inbox.actionable import GitHubHydrationContext
+from plugins.mention_inbox.advisory import HostProposalAdvisor
 from plugins.mention_inbox.approval import (
     ApprovalHandler,
     ExecutionLifecycleObserver,
@@ -28,15 +30,33 @@ from plugins.mention_inbox.github_client import GitHubNotificationsClient
 from plugins.mention_inbox.github_collector import GitHubNotificationCollector
 from plugins.mention_inbox.runtime import GitHubMentionPoller
 from plugins.mention_inbox.store import DEFAULT_DESTINATION, MentionInboxStore
+from .thread_session import (
+    ThreadDestinationMismatchError,
+    ThreadParticipantReconciliationIncompleteError,
+    ThreadParticipantSyncError,
+)
 from plugins.mention_inbox.voice import RenderedDiscordEvent, render_action_alert
 from plugins.mention_inbox.workspace import RepositoryWorktreeManager
 
 _ALLOWED_REPOSITORY = "silviahealth/content"
 _ALLOWED_ENV = "GITHUB_PAT_TOKEN"
 _COLLECTOR_KEY = "github.notifications"
+_DISCORD_MAX_SNOWFLAKE = (1 << 64) - 1
 _ALLOWED_MENTIONS_NONE: dict[str, Any] = {
     "parse": [], "users": [], "roles": [], "replied_user": False,
 }
+
+
+def _is_discord_snowflake(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[1-9][0-9]{5,19}", value) is not None
+        and int(value) <= _DISCORD_MAX_SNOWFLAKE
+    )
+
+
+class _DeliveryLeaseLostError(RuntimeError):
+    """The durable outbox claim was reclaimed by another delivery worker."""
 
 
 @dataclass(frozen=True)
@@ -62,11 +82,23 @@ class MentionInboxConfig:
     execution_workspace: str | None = None
     execution_workspace_root: str | None = None
     terminal_cwd: str | None = None
+    # Opt-in: adds one model call per new proposal revision. It only appends an
+    # explanatory message, so turning it off never changes what a proposal
+    # permits — and it stays off by default because the call can add tens of
+    # seconds to a delivery.
+    advisory_summary: bool = False
 
 
 class DiscordDeliveryTransport(Protocol):
     async def find_marker(self, channel_id: str, marker: str, *, limit: int) -> str | None: ...
-    async def send(self, channel_id: str, content: str, *, allowed_mentions: dict[str, Any]) -> str: ...
+    async def send(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        allowed_mentions: dict[str, Any],
+        nonce: str,
+    ) -> str: ...
 
 
 def _positive_int(value: object, name: str, default: int) -> int:
@@ -106,7 +138,11 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
     external_repository_actions = raw.get("external_repository_actions", "disabled")
     if external_repository_actions not in {"disabled", "inspect_only", "own_pr_write"}:
         raise ValueError("mention_inbox.external_repository_actions is invalid")
-    if not isinstance(destination, str) or re.fullmatch(r"discord:[1-9][0-9]{5,24}", destination) is None:
+    if (
+        not isinstance(destination, str)
+        or not destination.startswith("discord:")
+        or not _is_discord_snowflake(destination.split(":", 1)[1])
+    ):
         raise ValueError("mention_inbox.destination must be a Discord channel destination")
     team_mentions = raw.get("team_mentions", False)
     team_review_requests = raw.get("team_review_requests", False)
@@ -121,16 +157,19 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
     execution_enabled = action_sessions.get("execution_enabled", False)
     if not isinstance(action_sessions_enabled, bool) or not isinstance(execution_enabled, bool):
         raise ValueError("mention_inbox action-session switches must be booleans")
+    advisory_summary = raw.get("advisory_summary", False)
+    if not isinstance(advisory_summary, bool):
+        raise ValueError("mention_inbox.advisory_summary must be a boolean")
     bot_mention = action_sessions.get("bot_mention")
     if bot_mention is not None and (
         not isinstance(bot_mention, str)
-        or re.fullmatch(r"<@[1-9][0-9]{5,24}>", bot_mention) is None
+        or re.fullmatch(r"<@([1-9][0-9]{5,19})>", bot_mention) is None
+        or not _is_discord_snowflake(bot_mention[2:-1])
     ):
         raise ValueError("mention_inbox.action_sessions.bot_mention is invalid")
     approver_ids = action_sessions.get("authorized_approver_ids", [])
     if not isinstance(approver_ids, list) or any(
-        not isinstance(value, str)
-        or re.fullmatch(r"[1-9][0-9]{5,24}", value) is None
+        not _is_discord_snowflake(value)
         for value in approver_ids
     ):
         raise ValueError("mention_inbox.action_sessions.authorized_approver_ids is invalid")
@@ -216,6 +255,7 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         execution_workspace=execution_workspace,
         execution_workspace_root=execution_workspace_root,
         terminal_cwd=terminal_cwd,
+        advisory_summary=advisory_summary,
     )
 
 
@@ -228,9 +268,14 @@ def _neutralize(value: str, limit: int) -> str:
 
 
 def _marker(event: MentionEvent, revision_number: int, destination: str) -> str:
-    import hashlib
     identity = f"{event.dedupe_key}\0{revision_number}\0{destination}"
     return "[hermes-inbox:" + hashlib.sha256(identity.encode()).hexdigest()[:24] + "]"
+
+
+def _parent_nonce(marker: str) -> str:
+    return hashlib.sha256(
+        f"mention-inbox-parent\0{marker}".encode()
+    ).hexdigest()[:25]
 
 
 def render_discord_event(
@@ -287,34 +332,109 @@ class DiscordMentionDelivery:
         self._lease_seconds = lease_seconds
         self._thread_coordinator = thread_coordinator
 
+    async def _run_claim_operation(
+        self,
+        claim,
+        operation: Callable[[Callable[[], Awaitable[None]]], Awaitable[Any]],
+    ) -> Any:
+        async def checkpoint() -> None:
+            if not self._store.renew_delivery_lease(
+                claim.delivery_id,
+                expected_attempt=claim.token,
+                lease_seconds=self._lease_seconds,
+            ):
+                raise _DeliveryLeaseLostError("delivery lease is no longer owned")
+
+        await checkpoint()
+        stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("delivery lease heartbeat requires an asyncio task")
+
+        async def heartbeat() -> None:
+            interval = max(self._lease_seconds / 3, 0.1)
+            while True:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                    return
+                except TimeoutError:
+                    if self._store.renew_delivery_lease(
+                        claim.delivery_id,
+                        expected_attempt=claim.token,
+                        lease_seconds=self._lease_seconds,
+                    ):
+                        continue
+                    lease_lost.set()
+                    owner.cancel()
+                    return
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            return await operation(checkpoint)
+        except asyncio.CancelledError as exc:
+            if lease_lost.is_set():
+                raise _DeliveryLeaseLostError(
+                    "delivery lease was reclaimed during thread operation"
+                ) from exc
+            raise
+        finally:
+            stop.set()
+            await heartbeat_task
+
     async def deliver_once(self) -> str:
         claim = self._store.claim_delivery(
             self._destination, lease_seconds=self._lease_seconds
         )
         if claim is None:
             return "idle"
-        if self._thread_coordinator is not None:
+        thread_coordinator = self._thread_coordinator
+        if thread_coordinator is not None:
             route_existing = getattr(
-                self._thread_coordinator,
+                thread_coordinator,
                 "deliver_to_existing_thread",
                 None,
             )
             if callable(route_existing):
+                typed_route_existing = cast(
+                    Callable[..., Awaitable[str | None]],
+                    route_existing,
+                )
                 try:
-                    thread_message_id = await route_existing(
-                        claim.event,
-                        source_revision=claim.source_revision,
+                    thread_message_id = await self._run_claim_operation(
+                        claim,
+                        lambda checkpoint: typed_route_existing(
+                            claim.event,
+                            source_revision=claim.source_revision,
+                            delivery_checkpoint=checkpoint,
+                        ),
                     )
-                except Exception:
+                except Exception as exc:
+                    if isinstance(exc, ThreadDestinationMismatchError):
+                        self._store.note_delivery_error(
+                            claim.delivery_id,
+                            error_category=(
+                                "discord_thread_destination_mismatch"
+                            ),
+                            claim_token=claim.token,
+                        )
+                    elif isinstance(exc, ThreadParticipantSyncError):
+                        self._store.note_delivery_error(
+                            claim.delivery_id,
+                            error_category="discord_thread_participant_sync_failed",
+                            claim_token=claim.token,
+                        )
                     # The coordinator is idempotent against proposal bindings.
                     # Keep the lease so an uncertain thread send is reconciled
                     # after expiry instead of posting a second channel card.
                     return "error"
                 if thread_message_id is not None:
-                    self._store.mark_delivery_sent(
+                    if not self._store.mark_delivery_sent(
                         claim.delivery_id,
+                        claim_token=claim.token,
                         message_id=thread_message_id,
-                    )
+                    ):
+                        return "error"
                     return (
                         "reconciled"
                         if claim.requires_reconciliation
@@ -328,15 +448,30 @@ class DiscordMentionDelivery:
         confirmed_message_id = claim.message_id
         try:
             if confirmed_message_id is not None:
-                if self._thread_coordinator is not None:
-                    await self._thread_coordinator.ensure_thread(
-                        claim.event,
-                        parent_message_id=confirmed_message_id,
-                        source_revision=claim.source_revision,
-                    )
-                self._store.mark_delivery_sent(
-                    claim.delivery_id, message_id=confirmed_message_id
+                remember_parent = getattr(
+                    self._discord,
+                    "remember_parent_message",
+                    None,
                 )
+                if callable(remember_parent):
+                    remember_parent(confirmed_message_id, self._channel_id)
+                if thread_coordinator is not None:
+                    await self._run_claim_operation(
+                        claim,
+                        lambda checkpoint: thread_coordinator.ensure_thread(
+                            claim.event,
+                            parent_message_id=confirmed_message_id,
+                            parent_channel_id=self._channel_id,
+                            source_revision=claim.source_revision,
+                            delivery_checkpoint=checkpoint,
+                        ),
+                    )
+                if not self._store.mark_delivery_sent(
+                    claim.delivery_id,
+                    claim_token=claim.token,
+                    message_id=confirmed_message_id,
+                ):
+                    return "error"
                 return "reconciled"
             if claim.requires_reconciliation:
                 existing = await self._discord.find_marker(
@@ -344,62 +479,135 @@ class DiscordMentionDelivery:
                 )
                 if existing is not None:
                     confirmed_message_id = existing
-                    self._store.mark_delivery_parent_confirmed(
-                        claim.delivery_id, message_id=existing
+                    remember_parent = getattr(
+                        self._discord,
+                        "remember_parent_message",
+                        None,
                     )
-                    if self._thread_coordinator is not None:
-                        await self._thread_coordinator.ensure_thread(
-                            claim.event,
-                            parent_message_id=existing,
-                            source_revision=claim.source_revision,
+                    if callable(remember_parent):
+                        remember_parent(existing, self._channel_id)
+                    if not self._store.mark_delivery_parent_confirmed(
+                        claim.delivery_id,
+                        claim_token=claim.token,
+                        message_id=existing,
+                    ):
+                        raise _DeliveryLeaseLostError(
+                            "delivery lease was lost before parent confirmation"
                         )
-                    self._store.mark_delivery_sent(
-                        claim.delivery_id, message_id=existing
-                    )
+                    if thread_coordinator is not None:
+                        await self._run_claim_operation(
+                            claim,
+                            lambda checkpoint: thread_coordinator.ensure_thread(
+                                claim.event,
+                                parent_message_id=existing,
+                                parent_channel_id=self._channel_id,
+                                source_revision=claim.source_revision,
+                                delivery_checkpoint=checkpoint,
+                            ),
+                        )
+                    if not self._store.mark_delivery_sent(
+                        claim.delivery_id,
+                        claim_token=claim.token,
+                        message_id=existing,
+                    ):
+                        return "error"
                     return "reconciled"
-            message_id = await self._discord.send(
-                self._channel_id,
-                rendered.content,
-                allowed_mentions=rendered.allowed_mentions,
+            if not self._store.renew_delivery_lease(
+                claim.delivery_id,
+                expected_attempt=claim.token,
+                lease_seconds=self._lease_seconds,
+            ):
+                raise _DeliveryLeaseLostError(
+                    "delivery lease was lost before parent send"
+                )
+            message_id = await self._run_claim_operation(
+                claim,
+                lambda checkpoint: self._discord.send(
+                    self._channel_id,
+                    rendered.content,
+                    allowed_mentions=rendered.allowed_mentions,
+                    nonce=_parent_nonce(rendered.marker),
+                ),
             )
             confirmed_message_id = message_id
-            self._store.mark_delivery_parent_confirmed(
-                claim.delivery_id, message_id=message_id
-            )
-            if self._thread_coordinator is not None:
-                await self._thread_coordinator.ensure_thread(
-                    claim.event,
-                    parent_message_id=message_id,
-                    source_revision=claim.source_revision,
+            if not self._store.mark_delivery_parent_confirmed(
+                claim.delivery_id,
+                claim_token=claim.token,
+                message_id=message_id,
+            ):
+                raise _DeliveryLeaseLostError(
+                    "delivery lease was lost before parent confirmation"
                 )
-        except Exception:
+            remember_parent = getattr(
+                self._discord,
+                "remember_parent_message",
+                None,
+            )
+            if callable(remember_parent):
+                remember_parent(message_id, self._channel_id)
+            if thread_coordinator is not None:
+                await self._run_claim_operation(
+                    claim,
+                    lambda checkpoint: thread_coordinator.ensure_thread(
+                        claim.event,
+                        parent_message_id=message_id,
+                        parent_channel_id=self._channel_id,
+                        source_revision=claim.source_revision,
+                        delivery_checkpoint=checkpoint,
+                    ),
+                )
+        except Exception as exc:
             if confirmed_message_id is None and not claim.requires_reconciliation:
-                self._store.release_delivery(
-                    claim.delivery_id, error_category="discord_send"
+                self._store.note_delivery_error(
+                    claim.delivery_id,
+                    claim_token=claim.token,
+                    error_category="discord_send",
+                )
+            elif isinstance(exc, ThreadDestinationMismatchError):
+                self._store.note_delivery_error(
+                    claim.delivery_id,
+                    error_category="discord_thread_destination_mismatch",
+                    claim_token=claim.token,
+                )
+            elif isinstance(exc, ThreadParticipantSyncError):
+                self._store.note_delivery_error(
+                    claim.delivery_id,
+                    error_category="discord_thread_participant_sync_failed",
+                    claim_token=claim.token,
                 )
             # A returned/reconciled message ID proves the parent alert exists.
             # Keep the sending lease intact so the next expired claim resumes
             # from the durable ID, or marker-reconciles if that write failed.
             return "error"
-        self._store.mark_delivery_sent(claim.delivery_id, message_id=message_id)
-        return "sent"
+        return (
+            "sent"
+            if self._store.mark_delivery_sent(
+                claim.delivery_id,
+                claim_token=claim.token,
+                message_id=message_id,
+            )
+            else "error"
+        )
 
 
 Clock = Callable[[], datetime]
 Sleep = Callable[[float], Awaitable[None]]
+RecoverExecutions = Callable[[], Awaitable[int]]
 
 
 class MentionInboxRuntime:
     """Cancellation-safe singleton poll/delivery loop for one profile DB."""
     def __init__(self, *, config: MentionInboxConfig, store: MentionInboxStore,
                  poller: Any, delivery: Any, clock: Clock | None = None,
-                 sleep: Sleep = asyncio.sleep) -> None:
+                 sleep: Sleep = asyncio.sleep,
+                 recover_executions: RecoverExecutions | None = None) -> None:
         self.config = config
         self.store = store
         self.poller = poller
         self.delivery = delivery
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
+        self._recover_executions = recover_executions
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> asyncio.Task[None]:
@@ -422,6 +630,8 @@ class MentionInboxRuntime:
 
     async def _run(self) -> None:
         while True:
+            if self._recover_executions is not None:
+                await self._recover_executions()
             await self._drain_delivery()
             status = self.store.get_collector_status(_COLLECTOR_KEY)
             now = self._clock().astimezone(timezone.utc)
@@ -440,8 +650,44 @@ class MentionInboxRuntime:
 
 class GatewayDiscordTransport:
     """Narrow Discord adapter bridge with bot-only history reconciliation."""
-    def __init__(self, adapter: Any) -> None:
+    def __init__(
+        self,
+        adapter: Any,
+        *,
+        parent_channel_id: str | None = None,
+    ) -> None:
         self._adapter = adapter
+        self._parent_channel_id = parent_channel_id
+
+    def remember_parent_message(
+        self, parent_message_id: str, parent_channel_id: str
+    ) -> None:
+        if (
+            self._parent_channel_id is not None
+            and self._parent_channel_id != parent_channel_id
+        ):
+            raise ThreadDestinationMismatchError(
+                "Discord work thread does not belong to the configured "
+                "Discord destination"
+            )
+        self._adapter.remember_mention_inbox_parent(
+            parent_message_id,
+            parent_channel_id,
+        )
+
+    async def _require_thread_destination(self, thread_id: str) -> None:
+        parent_channel_id = self._parent_channel_id
+        if (
+            parent_channel_id is not None
+            and not await self.thread_has_parent(
+                thread_id,
+                parent_channel_id,
+            )
+        ):
+            raise ThreadDestinationMismatchError(
+                "Discord work thread does not belong to the configured "
+                "Discord destination"
+            )
 
     async def _channel(self, channel_id: str) -> Any:
         client = self._adapter._client
@@ -458,10 +704,24 @@ class GatewayDiscordTransport:
                 return message_id
         return None
 
-    async def send(self, channel_id: str, content: str, *, allowed_mentions: dict[str, Any]) -> str:
+    async def send(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        allowed_mentions: dict[str, Any],
+        nonce: str,
+    ) -> str:
+        if allowed_mentions != _ALLOWED_MENTIONS_NONE:
+            raise RuntimeError("mention-inbox parent mentions must be disabled")
         result = await self._adapter.send(
-            channel_id, content,
-            metadata={"nonconversational": True, "mention_inbox_no_mentions": True},
+            channel_id,
+            content,
+            metadata={
+                "non_conversational": True,
+                "mention_inbox_no_mentions": True,
+                "mention_inbox_nonce": nonce,
+            },
         )
         if not result.success or not result.message_id:
             raise RuntimeError("discord_send_failed")
@@ -480,6 +740,34 @@ class GatewayDiscordTransport:
             name,
             auto_archive_duration,
         )
+
+    async def ensure_thread_participants(
+        self,
+        thread_id: str,
+        user_ids: frozenset[str],
+    ) -> None:
+        await self._require_thread_destination(thread_id)
+        await self._adapter.ensure_mention_inbox_thread_participants(
+            thread_id,
+            user_ids,
+        )
+
+    async def is_thread_active(self, thread_id: str) -> bool:
+        return await self._adapter.is_mention_inbox_thread_active(thread_id)
+
+    async def thread_has_parent(
+        self,
+        thread_id: str,
+        parent_channel_id: str,
+    ) -> bool:
+        return await self._adapter.mention_inbox_thread_has_parent(
+            thread_id,
+            parent_channel_id,
+        )
+
+    async def activate_thread(self, thread_id: str) -> None:
+        await self._require_thread_destination(thread_id)
+        await self._adapter.activate_mention_inbox_thread(thread_id)
 
     def mark_thread_participation(self, thread_id: str) -> None:
         self._adapter.mark_mention_inbox_thread_participation(thread_id)
@@ -506,9 +794,10 @@ class GatewayDiscordTransport:
         *,
         reply_to_message_id: str | None = None,
     ) -> str:
+        await self._require_thread_destination(thread_id)
         metadata: dict[str, Any] = {
             "thread_id": thread_id,
-            "nonconversational": True,
+            "non_conversational": True,
             "mention_inbox_no_mentions": True,
         }
         if reply_to_message_id is not None:
@@ -529,13 +818,14 @@ class GatewayDiscordTransport:
         message_id: str,
         content: str,
     ) -> None:
+        await self._require_thread_destination(thread_id)
         result = await self._adapter.edit_message(
             thread_id,
             message_id,
             content,
             finalize=True,
             metadata={
-                "nonconversational": True,
+                "non_conversational": True,
                 "mention_inbox_no_mentions": True,
             },
         )
@@ -551,6 +841,7 @@ class GatewayDiscordTransport:
         proposal_revision: int,
         approval_offered: bool,
     ) -> str:
+        await self._require_thread_destination(thread_id)
         sender = getattr(self._adapter, "send_mention_inbox_proposal", None)
         if not callable(sender):
             return await self.send_to_thread(thread_id, content)
@@ -844,7 +1135,11 @@ class MentionInboxGatewayService:
                 ),
                 max_replay_pages=self.config.read_replay_max_pages,
             )
-            discord_transport = GatewayDiscordTransport(self._discord_adapter)
+            destination_channel_id = self.config.destination.split(":", 1)[1]
+            discord_transport = GatewayDiscordTransport(
+                self._discord_adapter,
+                parent_channel_id=destination_channel_id,
+            )
             thread_coordinator = None
             if self.config.action_sessions_enabled:
                 from plugins.mention_inbox.thread_session import (
@@ -879,10 +1174,10 @@ class MentionInboxGatewayService:
                         discord=discord_transport,
                         workspace=workspace,
                     )
+                    self._execution_observer_installed = True
                     self._discord_adapter.set_mention_inbox_execution_observer(
                         execution_observer
                     )
-                    self._execution_observer_installed = True
                     approval_handler = ApprovalHandler(
                         store=store,
                         source_resolver=GitHubSubjectStateResolver(
@@ -896,7 +1191,15 @@ class MentionInboxGatewayService:
                                 self.config.external_repository_actions
                             ),
                         ),
-                        dispatcher=GatewayExecutionDispatcher(self._discord_adapter),
+                        dispatcher=GatewayExecutionDispatcher(
+                            self._discord_adapter,
+                            thread_destination_validator=lambda thread_id: (
+                                discord_transport.thread_has_parent(
+                                    thread_id,
+                                    destination_channel_id,
+                                )
+                            ),
+                        ),
                         discord=discord_transport,
                         bot_mention=self.config.proposal_bot_mention,
                         authorized_approver_ids=frozenset(
@@ -916,6 +1219,15 @@ class MentionInboxGatewayService:
                     external_repository_actions=(
                         self.config.external_repository_actions
                     ),
+                    participant_user_ids=frozenset(
+                        self.config.authorized_approver_ids
+                    ),
+                    participant_parent_channel_id=destination_channel_id,
+                    advisor=(
+                        HostProposalAdvisor()
+                        if self.config.advisory_summary
+                        else None
+                    ),
                 )
                 router = InboxProposalRouter(
                     store=store,
@@ -926,9 +1238,26 @@ class MentionInboxGatewayService:
                     ),
                     approval_handler=approval_handler,
                     conversation_responder=HostReadOnlyConversationResponder(),
+                    thread_destination_validator=lambda thread_id: (
+                        discord_transport.thread_has_parent(
+                            thread_id,
+                            destination_channel_id,
+                        )
+                    ),
                 )
-                self._discord_adapter.set_mention_inbox_router(router)
                 self._router_installed = True
+                self._discord_adapter.set_mention_inbox_router(router)
+                participant_reconciliation = (
+                    await thread_coordinator.reconcile_thread_participants()
+                )
+                if participant_reconciliation.failed:
+                    raise ThreadParticipantSyncError(
+                        "Discord thread participant reconciliation failed"
+                    )
+                if participant_reconciliation.overflow:
+                    raise ThreadParticipantReconciliationIncompleteError(
+                        "Discord thread participant reconciliation exceeded its limit"
+                    )
                 if approval_handler is not None:
                     await execution_observer.reconcile_terminal_receipts()
                     await approval_handler.reconcile_execution_policy(
@@ -947,22 +1276,45 @@ class MentionInboxGatewayService:
                 thread_coordinator=thread_coordinator,
             )
             self._runtime = MentionInboxRuntime(
-                config=self.config, store=store, poller=poller, delivery=delivery
+                config=self.config,
+                store=store,
+                poller=poller,
+                delivery=delivery,
+                recover_executions=(
+                    None
+                    if approval_handler is None
+                    else approval_handler.recover_queued
+                ),
             )
             self._runtime.start()
             self._degraded_category = None
+        except asyncio.CancelledError:
+            self._remove_installed_hooks()
+            raise
+        except ThreadParticipantSyncError:
+            self._remove_installed_hooks()
+            self._degraded_category = "discord_thread_participant_sync_failed"
+        except ThreadParticipantReconciliationIncompleteError:
+            self._remove_installed_hooks()
+            self._degraded_category = (
+                "discord_thread_participant_reconciliation_incomplete"
+            )
         except Exception:
+            self._remove_installed_hooks()
             self._degraded_category = "startup_failed"
 
-    async def stop(self) -> None:
-        if self._runtime is not None:
-            await self._runtime.stop()
+    def _remove_installed_hooks(self) -> None:
         if self._router_installed and self._discord_adapter is not None:
             self._discord_adapter.set_mention_inbox_router(None)
             self._router_installed = False
         if self._execution_observer_installed and self._discord_adapter is not None:
             self._discord_adapter.set_mention_inbox_execution_observer(None)
             self._execution_observer_installed = False
+
+    async def stop(self) -> None:
+        if self._runtime is not None:
+            await self._runtime.stop()
+        self._remove_installed_hooks()
 
     def health(self) -> dict[str, object]:
         if self._runtime is not None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 from plugins.mention_inbox.conversation import (
     ReadOnlyConversationResponder,
@@ -183,6 +183,9 @@ class InboxProposalRouter:
         authorized_approver_ids: frozenset[str],
         approval_handler: object | None = None,
         conversation_responder: ReadOnlyConversationResponder | None = None,
+        thread_destination_validator: (
+            Callable[[str], Awaitable[bool]] | None
+        ) = None,
     ) -> None:
         self._store = store
         self._discord = discord
@@ -190,6 +193,19 @@ class InboxProposalRouter:
         self._authorized_approver_ids = authorized_approver_ids
         self._approval_handler = approval_handler
         self._conversation_responder = conversation_responder
+        self._thread_destination_validator = thread_destination_validator
+
+    async def _is_current_destination(self, thread_id: str) -> bool:
+        validator = self._thread_destination_validator
+        if validator is None:
+            return True
+        try:
+            return await validator(thread_id)
+        except Exception:
+            logger.exception(
+                "Failed to validate Discord work-thread destination",
+            )
+            return False
 
     def _is_exact_approval(self, message: InboxDiscordMessage) -> bool:
         return " ".join(message.text.split()) == f"{self._bot_mention} 승인"
@@ -322,6 +338,11 @@ class InboxProposalRouter:
             raise ValueError("proposal action is invalid")
         if user_id not in self._authorized_approver_ids:
             return InboxRouteResult(True, "proposal_action_unauthorized")
+        if not await self._is_current_destination(thread_id):
+            return InboxRouteResult(
+                True,
+                "proposal_action_wrong_destination",
+            )
         session = self._store.get_work_item_session_by_thread(thread_id)
         proposal = self._store.get_proposal(proposal_id, proposal_revision)
         if session is None or proposal is None:
@@ -629,6 +650,17 @@ class InboxProposalRouter:
                 proposal=latest,
                 content=render_agent_tools_unauthorized(),
             )
+        if (
+            binding is None
+            or not binding.approval_offered
+            or "edit_scoped_files" not in latest.allowed_actions
+        ):
+            return await self._notice_result(
+                message,
+                kind="agent_passthrough_not_offered",
+                proposal=latest,
+                content=render_approval_not_offered(),
+            )
         if self._approval_handler is None:
             return await self._notice_result(
                 message,
@@ -661,6 +693,11 @@ class InboxProposalRouter:
         session = self._store.get_work_item_session_by_thread(message.thread_id)
         if session is None:
             return InboxRouteResult(False, "not_work_thread")
+        if not await self._is_current_destination(message.thread_id):
+            return InboxRouteResult(
+                True,
+                "work_thread_wrong_destination",
+            )
         feedback = _feedback_text(message.text)
         if not feedback:
             return InboxRouteResult(True, "empty_message")
