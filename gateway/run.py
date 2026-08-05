@@ -23328,6 +23328,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"),
+        # Aperture of the preflight deferral predicate. Baked into the
+        # compressor at construction (agent_init) exactly like the
+        # proactive_prune_* keys above, so a live edit must rebuild the cached
+        # agent or the dial would silently have no effect until an unrelated
+        # eviction. Absent keys read as None and contribute nothing to the
+        # signature, so adding them cannot cause a spurious rebuild.
+        ("compression", "preflight_defer_growth_tokens"),
+        ("compression", "preflight_defer_growth_ratio"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),

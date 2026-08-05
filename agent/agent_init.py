@@ -1910,6 +1910,55 @@ def init_agent(
             compression_min_tail_users = 1
     if compression_min_tail_users < 1:
         compression_min_tail_users = 1
+    # Aperture of the EXISTING preflight deferral predicate
+    # (ContextCompressor.should_defer_preflight_to_real_usage).  Defaults 4096 /
+    # 0.05 reproduce the previously hardcoded
+    # `max(4096, int(threshold_tokens * 0.05))` exactly, so an unset key is
+    # behavior-neutral.  Same parser semantics as min_tail_user_messages /
+    # max_attempts above: booleans rejected (bool subclasses int, so int(True)
+    # would silently become 1), fractional floats rejected for the integral
+    # tokens value rather than truncated, non-numeric values fall back to the
+    # default.  Both floored at 0 so a malformed or hostile value degrades
+    # toward NEVER deferring (today's most conservative behavior) instead of
+    # silently widening the aperture.
+    _raw_defer_growth_tokens = _compression_cfg.get(
+        "preflight_defer_growth_tokens", 4096
+    )
+    if isinstance(_raw_defer_growth_tokens, bool):
+        compression_preflight_defer_growth_tokens = 4096
+    elif isinstance(_raw_defer_growth_tokens, int):
+        compression_preflight_defer_growth_tokens = _raw_defer_growth_tokens
+    elif isinstance(_raw_defer_growth_tokens, float):
+        compression_preflight_defer_growth_tokens = (
+            int(_raw_defer_growth_tokens)
+            if _raw_defer_growth_tokens.is_integer()
+            else 4096
+        )
+    else:
+        try:
+            compression_preflight_defer_growth_tokens = int(
+                str(_raw_defer_growth_tokens).strip()
+            )
+        except (TypeError, ValueError):
+            compression_preflight_defer_growth_tokens = 4096
+    if compression_preflight_defer_growth_tokens < 0:
+        compression_preflight_defer_growth_tokens = 0
+    _raw_defer_growth_ratio = _compression_cfg.get(
+        "preflight_defer_growth_ratio", 0.05
+    )
+    if isinstance(_raw_defer_growth_ratio, bool):
+        compression_preflight_defer_growth_ratio = 0.05
+    elif isinstance(_raw_defer_growth_ratio, (int, float)):
+        compression_preflight_defer_growth_ratio = float(_raw_defer_growth_ratio)
+    else:
+        try:
+            compression_preflight_defer_growth_ratio = float(
+                str(_raw_defer_growth_ratio).strip()
+            )
+        except (TypeError, ValueError):
+            compression_preflight_defer_growth_ratio = 0.05
+    if compression_preflight_defer_growth_ratio < 0:
+        compression_preflight_defer_growth_ratio = 0.0
     # Cap on compression retry rounds before a turn gives up with "max
     # compression attempts reached" (compression.max_attempts).  Hardcoding 3
     # strands sessions that legitimately need more rounds — e.g. a restart
@@ -2489,6 +2538,12 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            preflight_defer_growth_tokens=(
+                compression_preflight_defer_growth_tokens
+            ),
+            preflight_defer_growth_ratio=(
+                compression_preflight_defer_growth_ratio
+            ),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

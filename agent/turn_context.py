@@ -880,7 +880,19 @@ def build_turn_context(
             _max_preflight_passes = max(
                 1, int(getattr(agent, "max_compression_attempts", 3) or 3)
             )
+            # R5 probe (DEBUG only, inert): wall time of the WHOLE preflight
+            # block, aggregated across every pass. No shipped metric can see
+            # this stall — _touch_turn() starts the turn slot on `pre_llm_call`,
+            # which is dispatched AFTER this loop, so
+            # hermes.turn.first_useful_result_ms provably cannot move even if
+            # this block were reduced to zero. Measuring the aggregate rather
+            # than a single attempt's duration_ms is also what catches the
+            # regression shape where pass 1 looks fast while the prologue as a
+            # whole got slower.
+            _preflight_t0 = time.monotonic()
+            _preflight_passes_run = 0
             for _pass in range(_max_preflight_passes):
+                _preflight_passes_run += 1
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
                 _preflight_input = messages
@@ -943,6 +955,12 @@ def build_turn_context(
                         f"{_preflight_tokens:,}",
                     )
                     break
+            logger.debug(
+                "hermes.r5probe preflight_block_ms=%d passes=%d blocked=%s",
+                int((time.monotonic() - _preflight_t0) * 1000),
+                _preflight_passes_run,
+                _preflight_compression_blocked,
+            )
         elif _compress_block_reason:
             # Context is already over the compression threshold, but compression
             # is blocked (summary LLM cooldown or anti-thrashing). Without a

@@ -2239,6 +2239,8 @@ class ContextCompressor(ContextEngine):
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
+        preflight_defer_growth_tokens: int = 4096,
+        preflight_defer_growth_ratio: float = 0.05,
         min_tail_user_messages: int = 1,
     ):
         self.model = model
@@ -2293,6 +2295,26 @@ class ContextCompressor(ContextEngine):
         # cache break. 0 disables the gate (commit any non-zero prune).
         self.proactive_prune_min_reclaim_tokens = max(
             0, int(proactive_prune_min_reclaim_tokens or 0)
+        )
+        # Aperture of should_defer_preflight_to_real_usage(). These two scalars
+        # are read by that ONE predicate and by nothing else — not by
+        # compress(), not by _generate_summary(), not by any boundary or commit
+        # path — so no code that reshapes or persists a transcript can observe
+        # them. They are immutable configuration, never per-attempt state, so
+        # they need no entry in _COMPRESSOR_ATTEMPT_STATE_FIELDS and cannot
+        # survive or defeat a compression rollback.
+        #
+        # Defaults 4096 / 0.05 make the derived tolerance identical to the
+        # previously hardcoded max(4096, int(threshold_tokens * 0.05)).
+        # Clamped defensively (same idiom as proactive_prune_min_reclaim_tokens
+        # above) so a hostile config value degrades toward zero tolerance —
+        # i.e. NEVER defer, today's most conservative behavior — rather than
+        # toward an unbounded aperture.
+        self.preflight_defer_growth_tokens = max(
+            0, int(preflight_defer_growth_tokens or 0)
+        )
+        self.preflight_defer_growth_ratio = min(
+            1.0, max(0.0, float(preflight_defer_growth_ratio or 0.0))
         )
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
@@ -2449,6 +2471,19 @@ class ContextCompressor(ContextEngine):
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
+            # R5 probe (DEBUG only, inert): pairs the provider's REAL prompt
+            # count with the rough estimate that drove the last compaction for
+            # the same conversation. The estimate-vs-real gap is the quantity
+            # that decides whether foreground preflight compression is necessary
+            # at all; it is reconstructable from a log file at zero provider
+            # cost. Deliberately NOT a metric — the observability funnel and its
+            # closed compression_failure vocabulary stay read-only for R5.
+            logger.debug(
+                "hermes.r5probe real_usage prompt_tokens=%d "
+                "last_compression_rough=%d threshold=%d",
+                self.last_prompt_tokens, self.last_compression_rough_tokens,
+                self.threshold_tokens,
+            )
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
@@ -2545,10 +2580,34 @@ class ContextCompressor(ContextEngine):
             return False
 
         growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
+        # Aperture is configurable (compression.preflight_defer_growth_tokens /
+        # .preflight_defer_growth_ratio) but defaults to the historically
+        # hardcoded max(4096, int(threshold_tokens * 0.05)) — the same integer,
+        # so the truth table below is unchanged at defaults. Widening it is
+        # bounded by PROVIDER TRUTH, not by the estimate: the
+        # ``last_real_prompt_tokens >= self.threshold_tokens`` guard above
+        # returns False the moment the provider reports a real count at or above
+        # the trigger, so the ratchet assignment below cannot compound
+        # indefinitely.
+        tolerated_growth = max(
+            int(self.preflight_defer_growth_tokens),
+            int(self.threshold_tokens * self.preflight_defer_growth_ratio),
+        )
         if growth > tolerated_growth:
+            logger.debug(
+                "hermes.r5probe preflight_defer refused rough=%d baseline=%d "
+                "growth=%d tolerated=%d last_real=%d threshold=%d",
+                rough_tokens, baseline, growth, tolerated_growth,
+                self.last_real_prompt_tokens, self.threshold_tokens,
+            )
             return False
 
+        logger.debug(
+            "hermes.r5probe preflight_defer granted rough=%d baseline=%d "
+            "growth=%d tolerated=%d last_real=%d threshold=%d",
+            rough_tokens, baseline, growth, tolerated_growth,
+            self.last_real_prompt_tokens, self.threshold_tokens,
+        )
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 

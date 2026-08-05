@@ -596,6 +596,41 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
+        "preflight_defer_growth_tokens": 4096,  # aperture of the EXISTING preflight
+                                      # deferral predicate
+                                      # (ContextCompressor.should_defer_preflight_to_real_usage).
+                                      # That predicate skips a foreground preflight
+                                      # compaction while the ROUGH request estimate has
+                                      # grown only modestly since a request the provider
+                                      # proved fit under the threshold — provider
+                                      # `prompt_tokens` are a better signal than
+                                      # repeating compaction from the same rough
+                                      # tool-schema overhead. The tolerated growth is
+                                      # max(preflight_defer_growth_tokens,
+                                      #     threshold_tokens * preflight_defer_growth_ratio),
+                                      # and these defaults (4096 / 0.05) reproduce the
+                                      # previously hardcoded
+                                      # `max(4096, int(threshold_tokens * 0.05))`
+                                      # EXACTLY, so an unset or default-valued key is
+                                      # byte-for-byte behavior-neutral.
+                                      # Raising these trades a foreground compression
+                                      # stall for reliance on the provider-proven
+                                      # recovery path (413 / context-length-exceeded),
+                                      # which is bounded — the predicate refuses to
+                                      # defer as soon as a real provider reading lands
+                                      # at or above the threshold. Do NOT raise them
+                                      # without the estimate-vs-real evidence described
+                                      # in the R5 measurement procedure: if the real
+                                      # headroom is smaller than assumed you get a
+                                      # failed round trip PLUS a synchronous
+                                      # compression, which is strictly worse than
+                                      # compressing up front.
+        "preflight_defer_growth_ratio": 0.05,  # see above; fraction of
+                                      # threshold_tokens tolerated as rough-estimate
+                                      # growth before preflight compression is no
+                                      # longer deferred. Clamped to [0.0, 1.0]; 0
+                                      # disables growth-based deferral (never defer =
+                                      # today's most conservative behavior).
         "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
                                       # no-LLM tool-result prune, run independently of
                                       # `threshold` above. On large-window models
