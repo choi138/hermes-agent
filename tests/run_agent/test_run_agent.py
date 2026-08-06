@@ -2341,16 +2341,40 @@ class TestPathsOverlap:
 
 
 class TestParallelScopePathNormalization:
-    def test_extract_parallel_scope_path_normalizes_relative_to_cwd(self, tmp_path, monkeypatch):
+    def test_extract_parallel_scope_path_refuses_to_guess_a_relative_base(self, tmp_path, monkeypatch):
+        """Relative + no execution_cwd must NOT anchor to the process cwd.
+
+        Supersedes the previous assertion (``scoped == tmp_path / "notes.txt"``),
+        which pinned exactly the behaviour that caused the race: the file tools
+        anchor relative paths via ``_resolve_base_dir``
+        (``get_session_cwd`` -> registered override -> absolute
+        ``$TERMINAL_CWD`` -> process cwd), so the process cwd is the LAST resort
+        there and anchoring to it here can key the same runtime file differently.
+        The safety property the old test protected is asserted below and by
+        ``test_should_parallelize_tool_batch_rejects_same_file_with_mixed_path_spellings``,
+        both of which still hold.
+        """
+        from agent.tool_dispatch_helpers import _UNRESOLVED_SCOPE
         from run_agent import _extract_parallel_scope_path
 
         monkeypatch.chdir(tmp_path)
 
         scoped = _extract_parallel_scope_path("write_file", {"path": "./notes.txt"})
 
-        assert scoped == tmp_path / "notes.txt"
+        assert scoped is _UNRESOLVED_SCOPE
+        # An explicit execution_cwd is a deliberate base, not a guess, so it is
+        # still honoured.
+        from agent.tool_dispatch_helpers import _canonical_path
+
+        assert _canonical_path("./notes.txt", tmp_path) == (tmp_path / "notes.txt").resolve()
 
     def test_extract_parallel_scope_path_treats_relative_and_absolute_same_file_as_same_scope(self, tmp_path, monkeypatch):
+        """The load-bearing property: the two spellings must still CONFLICT.
+
+        Previously this held because both canonicalised to the same path. Now it
+        holds because the relative spelling is unresolved and unresolved overlaps
+        everything — a strictly more conservative route to the same guarantee.
+        """
         from run_agent import _extract_parallel_scope_path, _paths_overlap
 
         monkeypatch.chdir(tmp_path)
@@ -2359,8 +2383,8 @@ class TestParallelScopePathNormalization:
         rel_scoped = _extract_parallel_scope_path("write_file", {"path": "notes.txt"})
         abs_scoped = _extract_parallel_scope_path("write_file", {"path": str(abs_path)})
 
-        assert rel_scoped == abs_scoped
         assert _paths_overlap(rel_scoped, abs_scoped)
+        assert _paths_overlap(abs_scoped, rel_scoped)
 
     def test_should_parallelize_tool_batch_rejects_same_file_with_mixed_path_spellings(self, tmp_path, monkeypatch):
         from run_agent import _should_parallelize_tool_batch

@@ -246,14 +246,47 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     return len(segments) == 1 and segments[0][0] == "parallel"
 
 
+# Sentinel for a scope this planner cannot anchor the way the file tools will.
+# A distinct object (compared with ``is``) rather than a magic path string, so no
+# real filesystem path can ever collide with it. ``_paths_overlap`` treats it as
+# overlapping everything, which makes the planner conservative exactly where it
+# cannot prove non-overlap.
+_UNRESOLVED_SCOPE = Path("\0hermes-unresolved-scope")
+
+
 def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path:
     """Return a canonical, OS-aware path for overlap detection.
 
     Uses ``os.path.realpath`` to resolve symlinks on existing path components
     and ``os.path.normcase`` for case-insensitive platforms (Windows).
-    Falls back to ``Path.cwd()`` when *execution_cwd* is not supplied.
+
+    A RELATIVE path with NO *execution_cwd* returns ``_UNRESOLVED_SCOPE``
+    instead of being anchored to the process cwd. The process cwd is a pure
+    guess here: the file tools anchor relative paths with
+    ``tools/file_tools._resolve_base_dir``, whose chain is
+    ``terminal_tool.get_session_cwd`` -> a registered session override -> a
+    sentinel-free absolute ``$TERMINAL_CWD`` -> only then the process cwd. That
+    same file's docstring calls the mismatch "the worktree-cwd divergence bug":
+    anchoring to the process cwd here can canonicalise a relative write and an
+    absolute read to DIFFERENT keys while they hit the SAME file at runtime,
+    admitting them to one parallel run and racing. Because
+    ``_UNRESOLVED_SCOPE`` overlaps everything, a relative reader still runs
+    parallel with other readers (reader<->reader never conflicts, so bare
+    ``search_files`` keeps its read parallelism), while any writer sharing the
+    run closes it and is ordered.
+
+    When *execution_cwd* IS supplied it comes from
+    ``get_active_env(task_id).cwd`` — the cwd of the environment the tool will
+    actually execute in — so it is a deliberate base rather than a guess and is
+    used as before. RESIDUAL RISK, deliberately not closed here: that base can
+    still differ from ``get_session_cwd(task_id)``, which is what the file tools
+    consult first. Closing that would require this planner to call the file
+    tools' resolver, which brings an import cycle and container-path
+    (``PurePosixPath``) semantics this module does not model.
     """
     expanded = Path(raw_path).expanduser()
+    if not expanded.is_absolute() and execution_cwd is None:
+        return _UNRESOLVED_SCOPE
     base = execution_cwd if execution_cwd is not None else Path.cwd()
     candidate = expanded if expanded.is_absolute() else base / expanded
     # realpath resolves symlinks on path components that exist; for
@@ -334,7 +367,14 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     Both *left* and *right* must already be canonical (as returned by
     ``_extract_parallel_scope_paths`` / ``_canonical_path``) so that
     symlink aliases and case differences are already normalised.
+
+    ``_UNRESOLVED_SCOPE`` overlaps EVERYTHING. It marks a path this planner
+    could not anchor the way the file tools will at runtime (see
+    ``_canonical_path``), so non-overlap is unprovable and the only sound
+    answer is "may be the same subtree".
     """
+    if left is _UNRESOLVED_SCOPE or right is _UNRESOLVED_SCOPE:
+        return True
     left_parts = left.parts
     right_parts = right.parts
     if not left_parts or not right_parts:

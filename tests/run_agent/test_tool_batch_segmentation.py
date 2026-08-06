@@ -982,3 +982,77 @@ class TestPathCanonicalization:
         assert _paths_overlap(upper, lower), (
             "Case-insensitive aliases must overlap on Windows"
         )
+
+
+# ── cwd-divergence race (found during R4, fixed 2026-08-06) ─────────────
+
+
+class TestRelativeScopeIsConservative:
+    """A relative path cannot be anchored the way the file tools will.
+
+    The planner anchors with ``get_active_env(task_id).cwd`` (or the process
+    cwd); the file tools anchor with ``tools/file_tools._resolve_base_dir``,
+    whose chain starts at ``terminal_tool.get_session_cwd``. Those can disagree
+    — file_tools' own docstring names it "the worktree-cwd divergence bug" — so
+    anchoring here can canonicalise a relative write and an absolute read to
+    DIFFERENT keys while they hit the SAME file, admitting them to one parallel
+    run and racing.
+    """
+
+    def test_relative_path_is_not_anchored(self):
+        from agent.tool_dispatch_helpers import _UNRESOLVED_SCOPE, _canonical_path
+
+        assert _canonical_path("foo/bar.txt") is _UNRESOLVED_SCOPE
+        assert _canonical_path("./bar.txt") is _UNRESOLVED_SCOPE
+        assert _canonical_path(".") is _UNRESOLVED_SCOPE
+        assert _canonical_path("/tmp/abs.txt") is not _UNRESOLVED_SCOPE
+
+    def test_unresolved_scope_overlaps_everything(self):
+        from pathlib import Path
+
+        from agent.tool_dispatch_helpers import _UNRESOLVED_SCOPE, _paths_overlap
+
+        assert _paths_overlap(_UNRESOLVED_SCOPE, Path("/tmp/anything"))
+        assert _paths_overlap(Path("/tmp/anything"), _UNRESOLVED_SCOPE)
+        assert _paths_overlap(_UNRESOLVED_SCOPE, _UNRESOLVED_SCOPE)
+        # Unrelated absolute paths must still NOT overlap, or every batch
+        # would collapse to sequential.
+        assert not _paths_overlap(Path("/tmp/a"), Path("/tmp/b"))
+
+    def test_relative_write_batched_with_absolute_read_is_ordered(self):
+        """The actual race: planner keys differ, runtime file is the same."""
+        calls = [
+            _tc("write_file", json.dumps({"path": "notes.txt", "content": "x"})),
+            _tc("read_file", json.dumps({"path": "/tmp/whatever/notes.txt"})),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        kinds = [kind for kind, _ in segments]
+        assert "parallel" not in kinds, (
+            "a relative write must never share a parallel run with a read; "
+            f"got {kinds}"
+        )
+
+    def test_relative_readers_still_run_in_parallel(self):
+        """Conservatism must not cost read parallelism.
+
+        reader<->reader never conflicts, so bare ``search_files`` (which
+        reserves the relative default root ``.``) keeps its parallelism — the
+        case _extract_parallel_scope_paths' docstring explicitly protects.
+        """
+        calls = [
+            _tc("search_files", json.dumps({"pattern": "alpha"})),
+            _tc("search_files", json.dumps({"pattern": "beta"})),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert [kind for kind, _ in segments] == ["parallel"], segments
+
+    def test_relative_write_closes_the_run_for_a_bare_search(self):
+        calls = [
+            _tc("search_files", json.dumps({"pattern": "alpha"})),
+            _tc("write_file", json.dumps({"path": "out.txt", "content": "y"})),
+            _tc("search_files", json.dumps({"pattern": "gamma"})),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert [kind for kind, _ in segments] != ["parallel"], (
+            "a relative write sharing a run with searches is the race"
+        )
