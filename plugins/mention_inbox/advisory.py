@@ -268,7 +268,7 @@ def split_advisory(text: object) -> tuple[str, str]:
             line = line[len("요청:"):].strip()
             if not line:
                 continue
-        elif line.startswith(("판정:", "근거:", "다음:")):
+        elif line.startswith(("판정:", "근거:", "해야 할 일:", "다음:")):
             target = verdict_parts
         if target is None:
             continue
@@ -308,8 +308,8 @@ _SYSTEM_MESSAGE = (
     "- 셋째 줄은 '근거: '으로 시작해서, 그 판정을 뒷받침하는 diff_hunk의 특정 줄이나 "
     "심볼 이름을 짧게 따옴표 안에 옮기고, 그것이 왜 그 판정으로 이어지는지 1~2문장으로 "
     "쓰세요.\n"
-    "- 넷째 줄은 '다음: '으로 시작해서 손댈 순서를 1~2개만 짧게 쓰세요. 반박이나 정보 "
-    "부족이면 무엇을 더 봐야 하는지 쓰세요.\n"
+    "- 넷째 줄은 '해야 할 일: '으로 시작해서 손댈 순서를 1~2개만 짧게 쓰세요. 반박이나 "
+    "정보 부족이면 무엇을 더 봐야 하는지 쓰세요.\n"
     "- diff_hunk가 없거나, 있어도 판정에 필요한 부분이 잘려 있으면 반드시 '정보 부족'을 "
     "고르고 어떤 코드가 더 필요한지 밝히세요. 추측으로 수용이나 반박을 고르지 마세요.\n"
     "- preflight_disposition은 이미 계산된 사전 분류일 뿐 당신의 판정이 아닙니다. "

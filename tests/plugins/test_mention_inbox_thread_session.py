@@ -1150,7 +1150,7 @@ class _StubAdvisor:
         "요청: 명세와 import가 불일치한다는 지적이에요.\n"
         "판정: 수용 권장\n"
         "근거: \u201cimport spec\u201d이 명세와 다른 이름을 가리켜요.\n"
-        "다음: import 경로를 명세에 맞춰요."
+        "해야 할 일: import 경로를 명세에 맞춰요."
     )
 
     def __init__(self, text: str | None = None) -> None:
@@ -1291,7 +1291,7 @@ async def test_narrative_is_persisted_so_a_varying_model_cannot_repost(
                 f"요청: 매번 다른 요약 {self.count}\n"
                 f"판정: 부분 수용\n"
                 f"근거: 매번 다른 근거 {self.count}\n"
-                f"다음: 매번 다른 다음 {self.count}"
+                f"해야 할 일: 매번 다른 조치 {self.count}"
             )
 
     advisor = _VaryingAdvisor()

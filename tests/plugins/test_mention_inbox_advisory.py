@@ -244,13 +244,13 @@ def test_split_advisory_separates_the_request_summary_from_the_verdict() -> None
         "요청: 탭 바의 키보드 조작이 회귀했다는 지적이에요.\n"
         "판정: 정보 부족\n"
         "근거: \u201c.gesture(dragGesture(for: tab))\u201d는 보이지만 선언부가 잘려 있어요.\n"
-        "다음: 탭 항목의 선언부를 확인해요."
+        "해야 할 일: 탭 항목의 선언부를 확인해요."
     )
 
     assert summary == "탭 바의 키보드 조작이 회귀했다는 지적이에요."
     assert verdict.startswith("판정: 정보 부족")
     assert "근거:" in verdict
-    assert "다음:" in verdict
+    assert "해야 할 일:" in verdict
     assert "요청:" not in verdict
 
 
