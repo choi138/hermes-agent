@@ -53,9 +53,10 @@ async def test_installing_router_registers_no_persistent_view() -> None:
         proposal_message_id="555",
         approval_offered=True,
     )
+    # The router no longer exposes a control surface at all; the stub keeps the
+    # attributes only to prove the adapter never reaches for them.
     router = SimpleNamespace(
         persistent_control_bindings=MagicMock(return_value=(binding,)),
-        handle_action=AsyncMock(),
     )
     client = MagicMock()
     adapter = DiscordAdapter(
