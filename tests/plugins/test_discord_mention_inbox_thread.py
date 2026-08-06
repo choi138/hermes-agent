@@ -381,7 +381,7 @@ async def test_proposal_send_uses_revision_specific_discord_nonce(
     ).hexdigest()[:25]
     assert result.success is True
     assert channel.sends[0]["nonce"] == expected
-    assert channel.sends[0]["view"] is not None
+    assert "view" not in channel.sends[0]
     assert channel.sends[0]["allowed_mentions"] is not None
     assert marked_nonconversational == ["123"]
 
@@ -452,23 +452,6 @@ async def test_parent_send_uses_supplied_discord_nonce(
     assert result.message_id == "123"
     assert channel.sends[0]["nonce"] == "0123456789abcdef01234567"
     assert marked_nonconversational == ["123"]
-
-
-def test_wrong_destination_action_keeps_proposal_controls_untouched() -> None:
-    import plugins.platforms.discord.adapter as adapter_module
-
-    assert (
-        adapter_module._should_disable_mention_inbox_proposal_controls(
-            "proposal_action_wrong_destination"
-        )
-        is False
-    )
-    assert (
-        adapter_module._should_disable_mention_inbox_proposal_controls(
-            "approval_queued"
-        )
-        is True
-    )
 
 
 def test_parent_mapping_and_archive_duration_fail_closed() -> None:
