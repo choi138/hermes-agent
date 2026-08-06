@@ -119,7 +119,9 @@ def _action_phrase(kind: str, actor: str) -> str:
 
 
 def _status_label(disposition: PreApprovalDisposition | None) -> str:
-    return _STATUS_LABELS.get(disposition, "🟠 Review needed")
+    # Korean like every other label: an unknown disposition used to render
+    # the only English string on the surface.
+    return _STATUS_LABELS.get(disposition, "🟡 상태 확인")
 
 
 def render_action_alert(

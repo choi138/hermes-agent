@@ -254,14 +254,27 @@ The client can issue only these requests:
 - `GET https://api.github.com/user`
 - `GET https://api.github.com/notifications?participating=true&per_page=50`
 - pagination URLs with the exact same HTTPS origin and `/notifications` path
+- `GET /notifications/threads/{id}` to re-read one accepted notification
 - subject enrichment for exact
   `/repos/{owner}/{repo}/issues/{number}` or
   `/repos/{owner}/{repo}/pulls/{number}` paths
+- the latest event behind an accepted subject, for exact
+  `/repos/{owner}/{repo}/issues/comments/{id}` or
+  `/repos/{owner}/{repo}/pulls/comments/{id}` paths
+- `GET /repos/{owner}/{repo}/issues/{number}/timeline`
+- `GET /repos/{owner}/{repo}/pulls/{number}/reviews`
+- `GET /repos/{owner}/{repo}/pulls/{number}/comments`
+- `GET /orgs/{org}/teams/{slug}/memberships/{user}` to confirm team membership
+
+Every repository-scoped path above is derived from the accepted notification's
+repository and cross-checked against it, so a subject URL supplied by GitHub
+cannot redirect a read elsewhere. There is no path that reads repository file
+contents.
 
 Look-alike hosts, userinfo URLs, HTTP URLs, fragments, other subject paths, and
 subject repositories that do not match the accepted notification repository are
 rejected before transport. `subject.url` 404 uses the no-detail fallback; it
-does not trigger a broader lookup.
+does not widen the repository or the path set beyond this list.
 
 There is no method for notification read-state mutation, thread subscription,
 issue/comment creation, PR review submission, reaction, acknowledgement, or any
