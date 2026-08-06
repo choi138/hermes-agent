@@ -351,6 +351,8 @@ def _handle_kanban_task(args: dict[str, Any], **_kwargs: Any) -> str:
     goal_max_turns, error = _positive_int(args, "goal_max_turns")
     if error:
         return tool_error(error)
+    if goal_mode and goal_max_turns is None:
+        return tool_error("goal_max_turns must be >= 1 when goal_mode is true")
     max_retries, error = _positive_int(args, "max_retries")
     if error:
         return tool_error(error)

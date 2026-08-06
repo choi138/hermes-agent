@@ -71,6 +71,9 @@ def _make_discord_runner(
     runner._profile_adapters = profile_adapters or {}
     runner._kanban_notifier_profile = active_profile
     runner._kanban_sub_fail_counts = {}
+    # These integration tests exercise the dispatch owner, which is the only
+    # process allowed to claim legacy subscriptions without a profile stamp.
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 

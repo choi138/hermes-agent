@@ -490,6 +490,34 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
+    # Oneshot bypasses HermesCLI, which normally translates
+    # ``agent.max_turns`` into AIAgent.max_iterations. Keep the same bound here
+    # instead of silently falling back to AIAgent's constructor default (90).
+    default_max_iterations = 90
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    try:
+        configured_max_iterations = int(
+            agent_cfg.get("max_turns", default_max_iterations)
+        )
+    except (TypeError, ValueError):
+        configured_max_iterations = default_max_iterations
+    if configured_max_iterations < 1:
+        configured_max_iterations = default_max_iterations
+
+    # Ensure MCP tools are discovered before building the agent.  Oneshot
+    # bypasses cli.py's _prepare_agent_startup MCP background path and
+    # HermesCLI._init_agent's wait — it builds AIAgent directly here, so the
+    # tool snapshot at construction time misses any MCP server that hasn't
+    # registered yet.  This helper starts discovery if needed (idempotent) and
+    # bounded-waits with the larger single-query bound (default 15s) because
+    # there is only ONE turn and no between-turns late-binding refresh (#38448).
+    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+
+    ensure_mcp_discovery_before_agent_build(
+        logger=logging.getLogger(__name__),
+        single_query=True,
+    )
+
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
@@ -506,8 +534,10 @@ def _run_agent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
+            requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            max_iterations=configured_max_iterations,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
@@ -540,10 +570,15 @@ def _run_agent(
         _cleanup_oneshot_resources(agent, session_db)
 
 
-def _oneshot_clarify_callback(question: str, choices=None) -> str:
+def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:
     """Clarify is disabled in oneshot mode — tell the agent to pick a
     default and proceed instead of stalling or erroring."""
     if choices:
+        if multi_select:
+            return (
+                f"[oneshot mode: no user available. Pick the best subset from "
+                f"{choices} using your own judgment and continue.]"
+            )
         return (
             f"[oneshot mode: no user available. Pick the best option from "
             f"{choices} using your own judgment and continue.]"

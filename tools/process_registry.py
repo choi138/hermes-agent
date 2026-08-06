@@ -29,6 +29,7 @@ Usage:
     process_registry.kill(session.id)
 """
 
+import codecs
 import json
 import logging
 import os
@@ -117,6 +118,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    completion_suppressed: bool = False          # Explicit session stop: never notify/re-enter
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -155,6 +157,9 @@ class ProcessRegistry:
         "no job control in this shell",
         "cannot set terminal process group",
         "tcsetattr: Inappropriate ioctl for device",
+    )
+    _PROCESS_NOTIFICATION_TYPES = frozenset(
+        {"completion", "watch_match", "watch_disabled"}
     )
 
     def __init__(self):
@@ -232,6 +237,28 @@ class ProcessRegistry:
         except Exception:
             pass
 
+    def _queue_process_notification(
+        self,
+        session: ProcessSession,
+        event: Dict[str, Any],
+        *,
+        require_notify_on_complete: bool = False,
+    ) -> bool:
+        """Queue a process event unless an explicit session stop suppressed it.
+
+        ``cancel_for_session()`` and all process-owned producers share
+        ``self._lock`` as their notification admission boundary. This closes
+        the race where ``/stop`` drained the queue just before a reader thread
+        enqueued a late completion or watch event.
+        """
+        with self._lock:
+            if session.completion_suppressed:
+                return False
+            if require_notify_on_complete and not session.notify_on_complete:
+                return False
+            self.completion_queue.put(event)
+        return True
+
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
 
@@ -245,7 +272,11 @@ class ProcessRegistry:
         notify_on_complete semantics — one notification when the process
         actually exits, no more mid-process spam.
         """
-        if not session.watch_patterns or session._watch_disabled:
+        if (
+            session.completion_suppressed
+            or not session.watch_patterns
+            or session._watch_disabled
+        ):
             return
         # Suppress-after-exit: once the reader loop has declared the process
         # exited, any late chunk we still see is post-exit noise. Dropping these
@@ -313,7 +344,7 @@ class ProcessRegistry:
             if should_disable:
                 # Emit exactly one "watch disabled, falling back to notify_on_complete"
                 # summary event so the agent/user sees why things went quiet.
-                self.completion_queue.put({
+                self._queue_process_notification(session, {
                     "session_id": session.id,
                     "session_key": session.session_key,
                     "command": session.command,
@@ -344,7 +375,7 @@ class ProcessRegistry:
         if not self._global_watch_admit(now):
             return
 
-        self.completion_queue.put({
+        self._queue_process_notification(session, {
             "session_id": session.id,
             "session_key": session.session_key,
             "command": session.command,
@@ -600,7 +631,7 @@ class ProcessRegistry:
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding='utf-8', errors='replace',
                     timeout=10,
                     creationflags=windows_hide_flags(),
                     stdin=subprocess.DEVNULL,
@@ -705,6 +736,15 @@ class ProcessRegistry:
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
         """
+        # Guard against the `A && B &` subshell-wait trap (issue #68915).
+        # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
+        # the stdout pipe open forever when B is a long-running server.
+        # The rewriter wraps it to ``A && { B & }`` so no subshell fork.
+        # Lazy import avoids circular dependency (terminal_tool imports this).
+        from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
+
+        safe_command = _rewrite_bg(command)
+
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -725,7 +765,7 @@ class ProcessRegistry:
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
+                    [user_shell, "-lic", f"set +m; {safe_command}"],
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -769,7 +809,7 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            [user_shell, "-lic", f"set +m; {safe_command}"],
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -934,39 +974,120 @@ class ProcessRegistry:
         block until EOF (or a large buffer fills), which makes "live" output land
         in one burst at process exit. ``buffer.read1(4096)`` yields incremental
         chunks as bytes become available, then we decode to text.
+
+        Orphaned-pipe guard (issue #68915): when the user's command backgrounds
+        a long-lived process (``node server.js &``, ``sleep 300 &``), that
+        grandchild inherits the write end of our stdout pipe via ``fork()``.
+        The direct ``bash`` child exits promptly, but the pipe never reaches
+        EOF while the grandchild lives — so a blocking read would park this
+        thread forever, ``session.exited`` would never flip, and
+        ``notify_on_complete`` would never fire (``_reconcile_local_exit``
+        only runs lazily from poll()/wait(), which an autonomous notification
+        can't rely on). On POSIX we therefore ``select()`` with a short poll
+        interval and stop draining shortly after the direct child exits, even
+        if the pipe hasn't EOF'd — mirroring the foreground fix in
+        ``tools/environments/base.py::_wait_for_process`` (#8340). Windows
+        pipes don't support select(); the blocking path is kept there and the
+        lazy reconcile in poll()/wait() remains the safety net.
         """
         first_chunk = True
+        # Incremental decoder: raw pipe reads can split a multibyte UTF-8
+        # character across two read1() chunks. A stateless per-chunk
+        # ``bytes.decode(errors="replace")`` turns both halves into U+FFFD
+        # mojibake. The incremental decoder holds the partial sequence until
+        # the continuation bytes arrive — same treatment the foreground path
+        # already has in ``tools/environments/base.py::_wait_for_process``.
+        # (Ported from openclaw/openclaw#112325.)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+        def _append_chunk(chunk: str):
+            nonlocal first_chunk
+            if first_chunk:
+                chunk = self._clean_shell_noise(chunk)
+                first_chunk = False
+            with session._lock:
+                session.output_buffer += chunk
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._check_watch_patterns(session, chunk)
+            self._emit_output(session, chunk)
+
         try:
-            stdout = session.process.stdout
-            if stdout is None:
+            proc = session.process
+            if proc is None or proc.stdout is None:
                 return
+            stdout = proc.stdout
 
             raw_read = getattr(getattr(stdout, "buffer", None), "read1", None)
-            while True:
-                if raw_read is not None:
-                    raw = raw_read(4096)
-                    if not raw:
-                        break
-                    chunk = raw.decode("utf-8", errors="replace")
-                else:
-                    # Fallback for mocked/alternate streams without a buffered raw
-                    # interface. This may be less "live", but keeps compatibility.
-                    chunk = stdout.read(4096)
-                    if not chunk:
-                        break
 
-                if first_chunk:
-                    chunk = self._clean_shell_noise(chunk)
-                    first_chunk = False
-                with session._lock:
-                    session.output_buffer += chunk
-                    if len(session.output_buffer) > session.max_output_chars:
-                        session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                self._check_watch_patterns(session, chunk)
-                self._emit_output(session, chunk)
+            # Resolve a real OS fd for the select() path. Mocked streams
+            # (unit tests, adapters) may lack fileno() — fall back to the
+            # historical blocking loop for those.
+            fd = None
+            if raw_read is not None and not _IS_WINDOWS:
+                fileno = getattr(stdout, "fileno", None)
+                try:
+                    candidate = fileno() if callable(fileno) else None
+                except Exception:
+                    candidate = None
+                if isinstance(candidate, int) and candidate >= 0:
+                    fd = candidate
+
+            if fd is not None:
+                import select as _select
+
+                idle_after_exit = 0
+                while True:
+                    try:
+                        ready, _, _ = _select.select([fd], [], [], 0.2)
+                    except (ValueError, OSError):
+                        break  # fd already closed
+                    if ready:
+                        raw = raw_read(4096)
+                        if not raw:
+                            break  # true EOF — all writers closed
+                        chunk = decoder.decode(raw)
+                        if chunk:
+                            _append_chunk(chunk)
+                        idle_after_exit = 0
+                    elif proc.poll() is not None:
+                        # Direct child is gone and the pipe was idle for
+                        # ~200ms. Give it a few more cycles to catch any
+                        # buffered tail, then stop — otherwise we would wait
+                        # forever on a pipe held open by an orphaned
+                        # grandchild (issue #68915).
+                        idle_after_exit += 1
+                        if idle_after_exit >= 3:
+                            break
+            else:
+                while True:
+                    if raw_read is not None:
+                        raw = raw_read(4096)
+                        if not raw:
+                            break
+                        chunk = decoder.decode(raw)
+                        if not chunk:
+                            continue  # partial multibyte sequence — wait for more bytes
+                    else:
+                        # Fallback for mocked/alternate streams without a buffered raw
+                        # interface. This may be less "live", but keeps compatibility.
+                        chunk = stdout.read(4096)
+                        if not chunk:
+                            break
+
+                    _append_chunk(chunk)
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
+            # Flush any bytes still pending in the incremental decoder (a
+            # truncated multibyte sequence at EOF becomes one U+FFFD instead
+            # of being dropped silently).
+            try:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    _append_chunk(tail)
+            except Exception:
+                pass
             # Always reap the child to prevent zombie processes.
             try:
                 session.process.wait(timeout=5)
@@ -1039,25 +1160,42 @@ class ProcessRegistry:
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
         pty = session._pty
+        # PTY reads can split a multibyte UTF-8 character across chunks just
+        # like pipe reads — hold partial sequences until the rest arrives.
+        # (Ported from openclaw/openclaw#112325.)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+        def _append_text(text: str):
+            with session._lock:
+                session.output_buffer += text
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._check_watch_patterns(session, text)
+            self._emit_output(session, text)
+
         try:
             while pty.isalive():
                 try:
                     chunk = pty.read(4096)
                     if chunk:
-                        # ptyprocess returns bytes
-                        text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
-                        with session._lock:
-                            session.output_buffer += text
-                            if len(session.output_buffer) > session.max_output_chars:
-                                session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                        self._check_watch_patterns(session, text)
-                        self._emit_output(session, text)
+                        # ptyprocess returns bytes; pywinpty returns str
+                        text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
+                        if text:
+                            _append_text(text)
                 except EOFError:
                     break
                 except Exception:
                     break
         except Exception as e:
             logger.debug("PTY stdout reader ended: %s", e)
+
+        # Flush any partial multibyte sequence held by the decoder.
+        try:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                _append_text(tail)
+        except Exception:
+            pass
 
         # Process exited
         try:
@@ -1086,29 +1224,41 @@ class ProcessRegistry:
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
+        if was_running:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-                # Stable producer identity across checkpoint recovery; unlike
-                # a consumer-observed completion timestamp, this does not vary
-                # based on which watcher notices exit first.
-                "started_at": session.started_at,
-            })
+            self._queue_process_notification(
+                session,
+                {
+                    "type": "completion",
+                    "session_id": session.id,
+                    "session_key": session.session_key,
+                    "command": session.command,
+                    "exit_code": session.exit_code,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                    "output": output_tail,
+                    # Stable producer identity across checkpoint recovery;
+                    # unlike a consumer-observed completion timestamp, this
+                    # does not vary based on which watcher notices exit first.
+                    "started_at": session.started_at,
+                },
+                require_notify_on_complete=True,
+            )
 
     # ----- Query Methods -----
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    def is_completion_suppressed(self, session_id: str) -> bool:
+        """Whether ``/stop`` permanently suppressed this process incarnation."""
+        if not session_id:
+            return False
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+            return bool(session and session.completion_suppressed)
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1238,6 +1388,11 @@ class ProcessRegistry:
             # session owns (or legacy ownerless ordinary events). Routing must
             # happen first so a foreign session cannot drop the owner's event.
             _evt_sid = evt.get("session_id", "")
+            if (
+                evt.get("type", "completion") in self._PROCESS_NOTIFICATION_TYPES
+                and self.is_completion_suppressed(_evt_sid)
+            ):
+                continue
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
@@ -1490,11 +1645,32 @@ class ProcessRegistry:
             "status": "timeout",
             "command": session.command,
             "output": strip_ansi(session.output_buffer[-1000:]),
+            # A wait window elapsing is NOT a failure — 511 exact-duplicate
+            # process calls in a production window show models re-issuing
+            # identical waits after misreading this result as an error.
+            "process_running": True,
         }
-        if timeout_note:
-            result["timeout_note"] = timeout_note
+        uptime = time.time() - session.started_at if session.started_at else None
+        base_note = (
+            f"Wait window of {effective_timeout}s elapsed — the process is "
+            "still running. This is not an error."
+        )
+        if uptime is not None:
+            base_note += f" Uptime: {int(uptime)}s."
+        if session.notify_on_complete:
+            base_note += (
+                " notify_on_complete is set: you will be notified on exit — "
+                "do more work instead of waiting again."
+            )
         else:
-            result["timeout_note"] = f"Waited {effective_timeout}s, process still running"
+            base_note += (
+                " Poll again later or use terminal(background=true, "
+                "notify_on_complete=true) next time for automatic notification."
+            )
+        if timeout_note:
+            result["timeout_note"] = f"{timeout_note}. {base_note}"
+        else:
+            result["timeout_note"] = base_note
         return result
 
     def kill_process(
@@ -1509,7 +1685,10 @@ class ProcessRegistry:
         ``consume_output`` is true for explicit tool/RPC kills because their
         caller observes the returned output. Bulk cleanup passes false: it
         discards each result and therefore must not suppress an autonomous
-        output-bearing completion notification.
+        output-bearing completion notification. Exception: abandoned-turn
+        reaping (``kill_started_since``) is bulk cleanup that deliberately
+        passes true — a killed abandoned process must not enqueue a synthetic
+        follow-up that revives work the timeout/interrupt stopped.
         """
         from tools.ansi_strip import strip_ansi
 
@@ -1548,8 +1727,23 @@ class ProcessRegistry:
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # Non-local -- terminate descendants before their tracked root.
+                # Killing only the wrapper reparents its still-running children
+                # to PID 1, which is especially visible through the SSH backend.
+                terminate_tree = getattr(
+                    session.env_ref,
+                    "terminate_process_tree",
+                    None,
+                )
+                if callable(terminate_tree):
+                    terminate_tree(session.pid, timeout=5)
+                else:
+                    # Compatibility for third-party environments that do not yet
+                    # inherit the BaseEnvironment tree-termination primitive.
+                    session.env_ref.execute(
+                        f"kill {session.pid} 2>/dev/null",
+                        timeout=5,
+                    )
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
@@ -1758,6 +1952,122 @@ class ProcessRegistry:
 
     # ----- Session/Task Queries (for gateway integration) -----
 
+    def cancel_for_session(
+        self,
+        session_key: str,
+        reason: str = "session_stop",
+    ) -> int:
+        """Suppress notifications and terminate processes owned by one session.
+
+        Suppression is installed before any kill attempt. Therefore a failed
+        backend/OS termination cannot later revive the stopped conversation via
+        ``notify_on_complete``. Queued events and pending watcher registrations
+        for other sessions retain their order and remain untouched.
+
+        Returns the number of distinct active or pending process producers
+        affected. Repeating the call after a successful cancellation returns
+        zero.
+        """
+        session_key = str(session_key or "")
+        if not session_key:
+            return 0
+
+        affected_ids: set[str] = set()
+        kill_ids: list[str] = []
+        matched_sessions: Dict[str, ProcessSession] = {}
+
+        with self._lock:
+            for session in (
+                list(self._running.values()) + list(self._finished.values())
+            ):
+                if session.session_key == session_key:
+                    matched_sessions[session.id] = session
+
+            target_ids = set(matched_sessions)
+
+            retained_watchers = []
+            for watcher in self.pending_watchers:
+                watcher_id = str(watcher.get("session_id") or "")
+                if (
+                    watcher_id in target_ids
+                    or str(watcher.get("session_key") or "") == session_key
+                ):
+                    if watcher_id:
+                        affected_ids.add(watcher_id)
+                    continue
+                retained_watchers.append(watcher)
+            self.pending_watchers = retained_watchers
+
+            retained_events = []
+            while True:
+                try:
+                    event = self.completion_queue.get_nowait()
+                except Exception:
+                    break
+                event_type = (
+                    event.get("type", "completion")
+                    if isinstance(event, dict)
+                    else ""
+                )
+                event_id = (
+                    str(event.get("session_id") or "")
+                    if isinstance(event, dict)
+                    else ""
+                )
+                event_key = (
+                    str(event.get("session_key") or "")
+                    if isinstance(event, dict)
+                    else ""
+                )
+                if (
+                    event_type in self._PROCESS_NOTIFICATION_TYPES
+                    and (event_id in target_ids or event_key == session_key)
+                ):
+                    if event_id:
+                        affected_ids.add(event_id)
+                    continue
+                retained_events.append(event)
+            for event in retained_events:
+                self.completion_queue.put(event)
+
+            for session_id, session in matched_sessions.items():
+                if session_id in self._running and not session.exited:
+                    affected_ids.add(session_id)
+                    kill_ids.append(session_id)
+
+                # ``completion_suppressed`` is authoritative. Clear the legacy
+                # producer flags too so checkpoint recovery and already-running
+                # watcher tasks naturally stay quiet.
+                session.completion_suppressed = True
+                session.notify_on_complete = False
+                session.watcher_interval = 0
+                session.watch_patterns = []
+                session._watch_disabled = True
+
+        # Persist the suppression fence before touching the OS/backend. A kill
+        # can fail or the gateway can crash during it; neither may resurrect a
+        # completion on restart.
+        if matched_sessions:
+            self._write_checkpoint()
+
+        for session_id in kill_ids:
+            result = self.kill_process(
+                session_id,
+                source=reason,
+                consume_output=False,
+            )
+            if result.get("status") not in {"killed", "already_exited"}:
+                logger.warning(
+                    "Failed to terminate background process %s for session %s "
+                    "(%s): %s",
+                    session_id,
+                    session_key,
+                    reason,
+                    result.get("error") or result.get("status"),
+                )
+
+        return len(affected_ids)
+
     def has_active_processes(self, task_id: str) -> bool:
         """Check if there are active (running) processes for a task_id."""
         with self._lock:
@@ -1821,20 +2131,64 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def kill_all(self, task_id: str = None) -> int:
+    def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
+        """Capture running process IDs owned by ``task_id``.
+
+        Gateway turns use this as a boundary marker: if a turn times out, only
+        processes absent from its starting snapshot belong to the abandoned
+        turn. Older session processes must survive because background tasks
+        intentionally span successful turns.
+        """
+        with self._lock:
+            return frozenset(
+                s.id
+                for s in self._running.values()
+                if s.task_id == task_id and not s.exited
+            )
+
+    def kill_started_since(
+        self,
+        task_id: str,
+        baseline_ids,
+        *,
+        source: str,
+    ) -> int:
+        """Kill processes created for ``task_id`` after a prior snapshot.
+
+        ``consume_output`` is forced on: abandoned-turn output must not
+        enqueue a synthetic follow-up that revives work the timeout
+        deliberately stopped.
+        """
+        return self.kill_all(
+            task_id,
+            exclude_ids=frozenset(baseline_ids or ()),
+            source=source,
+            consume_output=True,
+        )
+
+    def kill_all(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        exclude_ids: frozenset = frozenset(),
+        source: str = "kill_all",
+        consume_output: bool = False,
+    ) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if (task_id is None or s.task_id == task_id)
+                and s.id not in exclude_ids
+                and not s.exited
             ]
 
         killed = 0
         for session in targets:
             result = self.kill_process(
                 session.id,
-                source="kill_all",
-                consume_output=False,
+                source=source,
+                consume_output=consume_output,
             )
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
@@ -1907,6 +2261,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "completion_suppressed": s.completion_suppressed,
                             "watch_patterns": s.watch_patterns,
                         })
             
@@ -1966,6 +2321,9 @@ class ProcessRegistry:
                     )
                 continue
 
+            completion_suppressed = bool(
+                entry.get("completion_suppressed", False)
+            )
             session = ProcessSession(
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
@@ -1983,17 +2341,29 @@ class ProcessRegistry:
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
-                watcher_interval=entry.get("watcher_interval", 0),
-                notify_on_complete=entry.get("notify_on_complete", False),
-                watch_patterns=entry.get("watch_patterns", []),
+                watcher_interval=(
+                    0 if completion_suppressed
+                    else entry.get("watcher_interval", 0)
+                ),
+                notify_on_complete=(
+                    False if completion_suppressed
+                    else entry.get("notify_on_complete", False)
+                ),
+                completion_suppressed=completion_suppressed,
+                watch_patterns=(
+                    [] if completion_suppressed
+                    else entry.get("watch_patterns", [])
+                ),
             )
+            if completion_suppressed:
+                session._watch_disabled = True
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
 
             # Re-enqueue watcher so gateway can resume notifications
-            if session.watcher_interval > 0:
+            if session.watcher_interval > 0 and not session.completion_suppressed:
                 self.pending_watchers.append({
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
@@ -2238,7 +2608,11 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "For bounded jobs, prefer notify_on_complete and continue useful work or end the "
+        "turn instead of repeatedly polling. If a dependent next step must wait now, call "
+        "'wait' once with timeout omitted; it uses the configured terminal timeout, returns "
+        "early on exit, and remains interruptible."
     ),
     "parameters": {
         "type": "object",
@@ -2246,7 +2620,9 @@ PROCESS_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
-                "description": "Action to perform on background processes"
+                "description": (
+                    "Action to perform. Avoid repeated short poll/wait loops for bounded jobs."
+                )
             },
             "session_id": {
                 "type": "string",
@@ -2258,7 +2634,10 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": (
+                    "Max seconds for 'wait'. Omit to use the configured terminal timeout "
+                    "(180s by default); returns immediately on exit or partial output on timeout."
+                ),
                 "minimum": 1
             },
             "offset": {

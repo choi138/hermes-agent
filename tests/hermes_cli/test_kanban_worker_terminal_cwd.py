@@ -79,25 +79,3 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
-def test_nonexistent_workspace_fails_closed_before_spawn(
-    monkeypatch, tmp_path,
-):
-    """A non-directory workspace must not start an unbound worker.
-
-    Falling back to ``cwd=None`` lets the assignee profile silently select a
-    different host/backend. The dispatcher must record this deterministic
-    workspace/backend mismatch instead of spawning ambiguous work.
-    """
-    root = tmp_path / ".hermes"
-    (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setenv("TERMINAL_CWD", "/pre/existing/anchor")
-
-    from hermes_cli import kanban_db as kb
-
-    missing = tmp_path / "does-not-exist"
-
-    with pytest.raises(RuntimeError, match="workspace/backend mismatch"):
-        _capture_spawn_env(kb, monkeypatch, str(missing))

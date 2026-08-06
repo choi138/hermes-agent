@@ -1,7 +1,9 @@
-"""Behavior contracts for the opt-in delay between sequential tool calls."""
+"""Compatibility contracts for the removed sequential-tool delay."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -71,15 +73,17 @@ def test_sequential_tool_delay_is_disabled_by_default():
 
     dispatch, sleep = _run_sequential_batch(agent)
 
-    assert agent.tool_delay == 0.0
+    assert not hasattr(agent, "tool_delay")
     assert dispatch.call_count == 3
     sleep.assert_not_called()
 
 
-def test_explicit_sequential_tool_delay_remains_opt_in():
-    agent = _make_agent(tool_delay=0.25)
+def test_explicit_sequential_tool_delay_is_deprecated_and_ignored():
+    with pytest.warns(DeprecationWarning, match="tool_delay"):
+        agent = _make_agent(tool_delay=0.25)
 
     dispatch, sleep = _run_sequential_batch(agent)
 
+    assert not hasattr(agent, "tool_delay")
     assert dispatch.call_count == 3
-    assert sleep.call_args_list == [call(0.25), call(0.25)]
+    sleep.assert_not_called()

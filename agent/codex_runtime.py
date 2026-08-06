@@ -18,14 +18,44 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.background_review_policy import is_successful_review_outcome
 
 logger = logging.getLogger(__name__)
+
+
+def _begin_codex_wire_attempt(agent):
+    """Stamp one physical codex_responses request. Never raises (bare factory)."""
+    try:
+        from agent.chat_completion_helpers import begin_wire_attempt
+
+        return begin_wire_attempt(agent, "codex_responses")
+    except Exception:
+        return None
+
+
+def _stamp_codex_first_frame(token) -> None:
+    """Record the first wire frame of one codex attempt. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.stamp_first_frame(token)
+    except Exception:
+        pass
+
+
+def _finish_codex_wire_attempt(token) -> None:
+    """Record one codex attempt's terminal instant. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.finish_wire_attempt(token, "")
+    except Exception:
+        pass
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -74,7 +104,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             try:
                 if not agent._session_db_created:
                     agent._ensure_db_session()
-                agent._session_db.update_token_counts(
+                # Enqueued for the SessionDB background writer — keeps the
+                # per-call accounting write off the turn thread (see
+                # conversation_loop's queue_token_counts call).
+                agent._session_db.queue_token_counts(
                     agent.session_id,
                     model=agent.model,
                     billing_provider=agent.provider,
@@ -154,7 +187,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             if not agent._session_db_created:
                 agent._ensure_db_session()
-            agent._session_db.update_token_counts(
+            # Enqueued for the SessionDB background writer (see above).
+            agent._session_db.queue_token_counts(
                 agent.session_id,
                 input_tokens=canonical_usage.input_tokens,
                 output_tokens=canonical_usage.output_tokens,
@@ -702,6 +736,16 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+        _user_interrupted = bool(
+            getattr(agent, "_interrupt_requested", False)
+        )
+        _interrupt_message = (
+            getattr(agent, "_interrupt_message", None)
+            if _user_interrupted
+            else None
+        )
+        if _user_interrupted:
+            agent.clear_interrupt()
         return {
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
@@ -711,8 +755,26 @@ def run_codex_app_server_turn(
             "api_calls": 0,
             "completed": False,
             "partial": True,
+            "interrupted": _user_interrupted,
+            **(
+                {"interrupt_message": _interrupt_message}
+                if _interrupt_message
+                else {}
+            ),
             "error": str(exc),
         }
+
+    # This runtime bypasses the normal conversation-loop finalizer. Mirror its
+    # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
+    # message-bearing compatibility interrupt can still be replayed by callers.
+    _user_interrupted = bool(
+        turn.interrupted and getattr(agent, "_interrupt_requested", False)
+    )
+    _interrupt_message = (
+        getattr(agent, "_interrupt_message", None) if _user_interrupted else None
+    )
+    if _user_interrupted:
+        agent.clear_interrupt()
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
@@ -750,11 +812,26 @@ def run_codex_app_server_turn(
         # the already-flushed user turn). See gateway/run.py agent_persisted.
         if getattr(agent, "_session_db", None) is not None:
             try:
-                agent._flush_messages_to_session_db(messages)
+                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
             except Exception:
-                logger.debug(
+                _codex_flush_ok = False
+                logger.warning(
                     "codex app-server projected-message flush failed",
                     exc_info=True,
+                )
+            if _codex_flush_ok is False:
+                # Unlike the chat-completions loop (which fails closed BEFORE
+                # projection — see conversation_loop session_persistence_failed),
+                # codex output has already streamed to the user by the time this
+                # flush runs, so there is nothing left to withhold. We cannot
+                # flip agent_persisted=False either: the gateway fallback write
+                # would re-INSERT the already-flushed user turn (#860/#42039).
+                # Surface the durability gap loudly instead of a silent debug.
+                logger.warning(
+                    "codex app-server turn was delivered but could NOT be "
+                    "persisted to the session DB (session=%s) — this turn "
+                    "will be missing after restart/resume",
+                    getattr(agent, "session_id", None),
                 )
 
 
@@ -762,26 +839,39 @@ def run_codex_app_server_turn(
     # _turns_since_memory and _user_turn_count are ALREADY incremented
     # in the run_conversation() pre-loop block (lines ~11793-11817) so we
     # do NOT touch them here — that would double-count.
-    # Only _iters_since_skill needs explicit increment, since the
-    # chat_completions loop bumps it per tool iteration (line ~12110)
-    # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+    # Commit cadence only after a successful primary turn. This prevents
+    # delegated Codex workers and errored/partial transcripts from creating
+    # automatic review work.
+    review_eligible = is_successful_review_outcome(
+        agent,
+        final_response=turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+        failed=turn.error is not None,
+        interrupted=turn.interrupted,
     )
+    if (
+        review_eligible
+        and agent._skill_nudge_interval > 0
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        agent._iters_since_skill = (
+            getattr(agent, "_iters_since_skill", 0) + max(int(turn.tool_iterations or 0), 1)
+        )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
 
-    # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
+    # Check the skill nudge after successful work was committed.
     should_review_skills = False
     if (
-        agent._skill_nudge_interval > 0
+        review_eligible
+        and agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
         and "skill_manage" in agent.valid_tool_names
     ):
         should_review_skills = True
-        agent._iters_since_skill = 0
+
+    should_review_memory = bool(should_review_memory and review_eligible)
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
@@ -800,16 +890,20 @@ def run_codex_app_server_turn(
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
-        and not turn.interrupted
+        review_eligible
         and (should_review_memory or should_review_skills)
     ):
         try:
-            agent._spawn_background_review(
+            accepted = agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )
+            if accepted is not False:
+                if should_review_memory:
+                    agent._turns_since_memory = 0
+                if should_review_skills:
+                    agent._iters_since_skill = 0
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
@@ -819,6 +913,12 @@ def run_codex_app_server_turn(
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
+        "interrupted": _user_interrupted,
+        **(
+            {"interrupt_message": _interrupt_message}
+            if _interrupt_message
+            else {}
+        ),
         "error": turn.error,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
@@ -1190,6 +1290,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """
     import httpx as _httpx
 
+    from agent import relay_llm
+
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1205,57 +1307,112 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_commentary_message(text: str) -> None:
         agent._fire_streamed_codex_commentary(text)
 
+    # Per-PHYSICAL-attempt TTFT slot. ``_on_event`` is defined OUTSIDE the
+    # attempt loop below, so it must read the CURRENT attempt's token from this
+    # mutable dict rather than closing over a value.
+    _wire = {"token": None}
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
+        # First wire frame of this attempt: _consume_codex_event_stream invokes
+        # on_event at the very top of its event loop before any event_type
+        # branching. Deliberately not the on_first_delta site, which codex does
+        # not fire on reasoning deltas while chat_completions does — those two
+        # are not comparable.
+        _stamp_codex_first_frame(_wire["token"])
         agent._touch_activity("receiving stream response")
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        stream_kwargs = dict(api_kwargs)
-        stream_kwargs["stream"] = True
+        intercepted_events = []
+        writer_token = {"value": None}
+
+        def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            stream_kwargs = dict(next_api_kwargs)
+            stream_kwargs["stream"] = True
+            # Inside the factory AND inside the attempt loop, so each internal
+            # reconnect gets its own TTFT denominator. Bare body — the helper
+            # swallows everything and returns None.
+            _wire["token"] = _begin_codex_wire_attempt(agent)
+            return active_client.responses.create(**stream_kwargs)
+
+        def _codex_stream_created(_raw_stream: Any) -> None:
+            # Claim the delta sink for THIS physical attempt. A newer attempt
+            # supersedes this token and fences late deltas out of the turn.
+            writer_token["value"] = claim_stream_writer(agent)
+
+        def _accept_codex_chunk(_chunk: Any) -> bool:
+            token = writer_token["value"]
+            if token is None or stream_writer_is_current(agent, token):
+                return True
+            logger.warning(
+                "Codex streaming attempt superseded by a newer stream; "
+                "stopping consumption to preserve the single-writer "
+                "invariant (model=%s).",
+                api_kwargs.get("model", "unknown"),
+            )
+            return False
+
+        def _finalize_codex_stream() -> Any:
+            return _consume_codex_event_stream(
+                list(intercepted_events),
+                model=api_kwargs.get("model"),
+            )
 
         try:
-            event_stream = active_client.responses.create(**stream_kwargs)
-        except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            event_stream = relay_llm.stream(
+                dict(api_kwargs),
+                _open_codex_stream,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                name=str(getattr(agent, "provider", "") or "codex"),
+                model_name=str(api_kwargs.get("model") or ""),
+                finalizer=_finalize_codex_stream,
+                on_stream_created=_codex_stream_created,
+                on_chunk=intercepted_events.append,
+                chunk_adapter=lambda chunk: chunk,
+                accept_chunk=_accept_codex_chunk,
+                completed_response_predicate=lambda response: bool(
+                    hasattr(response, "output") and not hasattr(response, "__iter__")
+                ),
+                metadata={
+                    "api_mode": "codex_responses",
+                    "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "retry_count": attempt,
+                },
+                defer_logical_completion=True,
+            )
+        except (
+            _httpx.RemoteProtocolError,
+            _httpx.ReadTimeout,
+            _httpx.ConnectError,
+            ConnectionError,
+        ) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
-                    "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
-                    attempt + 1, max_stream_retries + 1,
-                    agent._client_log_context(), exc,
+                    "Codex Responses stream connect failed (attempt %s/%s); "
+                    "retrying. %s error=%s",
+                    attempt + 1,
+                    max_stream_retries + 1,
+                    agent._client_log_context(),
+                    exc,
                 )
                 continue
             raise
 
-        # Claim the delta sink for THIS attempt (#65991) — parity with the
-        # chat_completions/anthropic/bedrock paths. If a prior attempt's
-        # stream is somehow still alive, this claim supersedes it so its
-        # late deltas are fenced out of the turn; conversely, a newer
-        # attempt supersedes us and the interrupt_check below stops our
-        # consumption immediately.
-        _writer_token = claim_stream_writer(agent)
-
-        def _interrupt_or_superseded(_tok=_writer_token) -> bool:
-            if agent._interrupt_requested:
-                return True
-            if not stream_writer_is_current(agent, _tok):
-                logger.warning(
-                    "Codex streaming attempt superseded by a newer stream; "
-                    "stopping consumption to preserve the single-writer "
-                    "invariant (model=%s).",
-                    api_kwargs.get("model", "unknown"),
-                )
-                return True
-            return False
+        def _interrupt_or_superseded() -> bool:
+            return bool(agent._interrupt_requested)
 
         try:
-            # Compatibility: some mocks/providers return a concrete response
-            # instead of an iterable.  Pass it straight through.
-            if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
-                return event_stream
-
             try:
                 final = _consume_codex_event_stream(
                     event_stream,
@@ -1284,6 +1441,29 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     )
                     continue
                 raise
+            except RuntimeError:
+                if event_stream.final_response is not None:
+                    return event_stream.final_response
+                raise
+
+            # A terminal response has already been assembled at this point
+            # (``final`` is built), so a transport error while draining the
+            # rest of the iterator — done only to let Relay run its response
+            # finalizer — must NOT discard it or trigger a new physical
+            # request. Record it as a non-fatal finalization warning and
+            # still return the already-completed, already-billed response.
+            if not agent._interrupt_requested:
+                try:
+                    for _ignored in event_stream:
+                        pass
+                except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                    logger.warning(
+                        "Codex Responses stream transport finalization failed "
+                        "after a terminal response was already received; "
+                        "returning the completed response instead of "
+                        "retrying. %s error=%s",
+                        agent._client_log_context(), exc,
+                    )
 
             if final.status in {"incomplete", "failed"}:
                 logger.warning(
@@ -1296,12 +1476,28 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             return final
         finally:
+            # Terminal instant for THIS physical attempt; the outcome is filled
+            # in by the recorder from the terminal lifecycle hook.
+            _finish_codex_wire_attempt(_wire["token"])
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:
                     close_fn()
                 except Exception:
-                    pass
+                    # A failed close can leave this response's connection
+                    # checked out of the httpx pool while the caller's finally
+                    # reports a reuse-reason close (e.g. interrupt_check broke
+                    # the event loop with collected output) — caching the
+                    # client with the leaked connection. Poison the slot so
+                    # that close really closes the pool (owner-thread abort;
+                    # mirrors the chat-streaming interrupt-break handling).
+                    # ``client is None`` means the shared primary client,
+                    # which is never reuse-cached and must not have its
+                    # sockets force-shut here.
+                    if client is not None:
+                        agent._abort_request_openai_client(
+                            active_client, reason="codex_stream_close_failed"
+                        )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

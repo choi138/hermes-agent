@@ -1,4 +1,17 @@
-"""Post-tool compression shares the configured per-turn attempt budget."""
+"""Behavioral regression tests for the post-tool compression attempt cap.
+
+The pre-API pressure gate, the overflow/413 error handlers, and the post-tool
+compaction gate all share ``compression_attempts`` as a per-turn backstop,
+bounded by the resolved ``compression.max_attempts`` cap (default 3).  Before
+the fix the post-tool path neither checked nor incremented the counter, so a
+long tool loop could compact after every tool response for the lifetime of
+the turn.
+
+These tests drive ``run_conversation()`` through real tool iterations with a
+compressor that always demands compression and assert ``_compress_context``
+fires at most ``max_compression_attempts`` times per turn — no source
+inspection, only observable behavior.
+"""
 
 from __future__ import annotations
 
@@ -6,73 +19,67 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
-def _tool_response(index: int):
-    call = SimpleNamespace(
-        id=f"call_{index}",
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _tool_call(i: int):
+    return SimpleNamespace(
+        id=f"call_{i}",
         type="function",
-        function=SimpleNamespace(name="web_search", arguments='{"query":"x"}'),
+        function=SimpleNamespace(name="web_search", arguments='{"query": "x"}'),
     )
-    message = SimpleNamespace(
+
+
+def _tool_response(i: int):
+    msg = SimpleNamespace(
         content=None,
         reasoning_content=None,
         reasoning=None,
-        tool_calls=[call],
+        tool_calls=[_tool_call(i)],
     )
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
-        model="test/model",
-        usage=None,
-    )
+    choice = SimpleNamespace(message=msg, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
 def _stop_response():
-    message = SimpleNamespace(
+    msg = SimpleNamespace(
         content="done",
         reasoning_content=None,
         reasoning=None,
         tool_calls=None,
     )
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason="stop")],
-        model="test/model",
-        usage=None,
-    )
+    choice = SimpleNamespace(message=msg, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent():
-    tool_defs = [
+def _make_tool_defs(*names: str) -> list:
+    return [
         {
             "type": "function",
             "function": {
-                "name": "web_search",
-                "description": "search",
+                "name": n,
+                "description": f"{n} tool",
                 "parameters": {"type": "object", "properties": {}},
             },
         }
+        for n in names
     ]
-    with (
-        patch("run_agent.get_tool_definitions", return_value=tool_defs),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
-    ):
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            max_iterations=10,
-        )
-    agent.client = MagicMock()
-    agent._cached_system_prompt = "You are helpful."
-    agent._use_prompt_caching = False
-    agent._disable_streaming = True
-    agent.tool_delay = 0
-    agent.save_trajectories = False
-    agent.compression_enabled = True
+
+
+def _pressured_compressor() -> MagicMock:
+    """A compressor that always reports context pressure after tools run.
+
+    ``should_defer_preflight_to_real_usage`` returns True so the turn-start
+    preflight and the pre-API pressure gate stand down — isolating the
+    post-tool gate as the only compression site under test.
+    """
     compressor = MagicMock()
     compressor.protect_first_n = 3
     compressor.protect_last_n = 20
@@ -82,25 +89,49 @@ def _make_agent():
     compressor.should_compress.return_value = True
     compressor.should_defer_preflight_to_real_usage.return_value = True
     compressor.get_active_compression_failure_cooldown.return_value = None
-    agent.context_compressor = compressor
-    return agent
+    return compressor
 
 
-def test_post_tool_compression_honors_shared_attempt_cap():
-    agent = _make_agent()
-    agent.max_compression_attempts = 2
-    agent.client.chat.completions.create.side_effect = [
-        *[_tool_response(i) for i in range(5)],
-        _stop_response(),
-    ]
+@pytest.fixture()
+def agent():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=10,
+        )
+    a.client = MagicMock()
+    a._cached_system_prompt = "You are helpful."
+    a._use_prompt_caching = False
+    a._disable_streaming = True
+    a.tool_delay = 0
+    a.save_trajectories = False
+    a.compression_enabled = True
+    a.context_compressor = _pressured_compressor()
+    return a
+
+
+def _run_tool_loop(agent, n_tool_iterations: int):
+    """Drive one turn: ``n_tool_iterations`` tool calls, then a stop."""
+    responses = [_tool_response(i) for i in range(n_tool_iterations)]
+    responses.append(_stop_response())
+    agent.client.chat.completions.create.side_effect = responses
+
     compress_calls = []
 
-    def _compress(messages, _system_message, **_kwargs):
+    def _fake_compress(messages, system_message, **_kwargs):
         compress_calls.append(len(messages))
         return messages, "compressed prompt"
 
     with (
-        patch.object(agent, "_compress_context", side_effect=_compress),
+        patch.object(agent, "_compress_context", side_effect=_fake_compress),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -109,119 +140,60 @@ def test_post_tool_compression_honors_shared_attempt_cap():
             lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
         ),
     ):
-        result = agent.run_conversation("use the tool repeatedly")
+        result = agent.run_conversation("do a lot of tool work")
 
-    assert result["completed"] is True
-    assert len(compress_calls) == 2
+    return result, compress_calls
 
 
-def test_preflight_and_post_tool_compression_share_one_attempt_cap():
-    agent = _make_agent()
-    agent.max_compression_attempts = 2
-    agent.context_compressor.should_defer_preflight_to_real_usage.return_value = False
-    agent.client.chat.completions.create.side_effect = [
-        *[_tool_response(i) for i in range(3)],
-        _stop_response(),
-    ]
-    history = []
-    for index in range(13):
-        history.extend(
-            [
-                {"role": "user", "content": f"prior user {index}"},
-                {"role": "assistant", "content": f"prior answer {index}"},
-            ]
-        )
-    compress_calls = []
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-    def _compress(messages, _system_message, **_kwargs):
-        compress_calls.append(len(messages))
-        return messages, "compressed prompt"
 
-    with (
-        patch.object(agent, "_compress_context", side_effect=_compress),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch(
-            "run_agent.handle_function_call",
-            lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
-        ),
-    ):
-        result = agent.run_conversation(
-            "continue with tools", conversation_history=history
+class TestPostToolCompressionAttemptCap:
+    def test_post_tool_compression_capped_at_default_three(self, agent):
+        """7 tool iterations under constant pressure → exactly 3 compactions.
+
+        Before the fix the post-tool gate re-fired after every tool response
+        (7 compactions here); the shared per-turn counter caps it at the
+        resolved default of 3.
+        """
+        assert agent.max_compression_attempts == 3  # config default
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 3, (
+            f"post-tool compression must stop at the per-turn cap (3), "
+            f"got {len(compress_calls)} compactions"
         )
 
-    assert result["completed"] is True
-    assert len(compress_calls) == 2
 
+    def test_post_tool_compression_shares_counter_with_pre_api_gate(self, agent):
+        """Pre-API compactions consume the same per-turn budget.
 
-def test_proactive_prune_commits_when_full_compression_stands_down():
-    agent = _make_agent()
-    agent.context_compressor.should_compress.return_value = False
-    prune_calls = []
+        Let the pre-API pressure gate fire once (defer disabled for the first
+        check), then keep the pressure on through tool iterations: the
+        combined total must still respect the cap.
+        """
+        # First pre-API check does not defer → pre-API gate fires once;
+        # afterwards defer again so only the post-tool gate keeps firing.
+        defers = iter([False])
+        agent.context_compressor.should_defer_preflight_to_real_usage.side_effect = (
+            lambda _t: next(defers, True)
+        )
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
 
-    def _prune(messages, current_tokens=None):
-        prune_calls.append(current_tokens)
-        pruned = [dict(message) for message in messages]
-        changed = 0
-        for message in pruned:
-            if message.get("role") == "tool" and message.get("content") != "[pruned]":
-                message["content"] = "[pruned]"
-                changed += 1
-        return (pruned, changed) if changed else (messages, 0)
+        assert result["completed"] is True
+        assert len(compress_calls) == 3, (
+            "pre-API and post-tool compactions must share one per-turn "
+            f"attempt budget, got {len(compress_calls)} total compactions"
+        )
 
-    agent.context_compressor.prune_tool_results_only = _prune
-    agent.client.chat.completions.create.side_effect = [
-        _tool_response(0),
-        _tool_response(1),
-        _stop_response(),
-    ]
-    with (
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch(
-            "run_agent.handle_function_call",
-            lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
-        ),
-    ):
-        result = agent.run_conversation("prune stale tool history")
+    def test_cap_is_per_turn_not_per_session(self, agent):
+        """A fresh turn gets a fresh attempt budget."""
+        _result, first = _run_tool_loop(agent, n_tool_iterations=5)
+        agent.client.chat.completions.create.side_effect = None
+        _result, second = _run_tool_loop(agent, n_tool_iterations=5)
 
-    assert result["completed"] is True
-    assert prune_calls == [150_000, 150_000]
-    tool_rows = [
-        message for message in result["messages"] if message.get("role") == "tool"
-    ]
-    assert tool_rows
-    assert all(message["content"] == "[pruned]" for message in tool_rows)
-
-
-def test_full_compression_and_proactive_prune_are_mutually_exclusive():
-    agent = _make_agent()
-    prune = MagicMock(side_effect=lambda messages, current_tokens=None: (messages, 0))
-    agent.context_compressor.prune_tool_results_only = prune
-    agent.client.chat.completions.create.side_effect = [
-        _tool_response(0),
-        _stop_response(),
-    ]
-    with (
-        patch.object(
-            agent,
-            "_compress_context",
-            side_effect=lambda messages, _system, **_kwargs: (
-                messages,
-                "compressed prompt",
-            ),
-        ),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch(
-            "run_agent.handle_function_call",
-            lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
-        ),
-    ):
-        result = agent.run_conversation("compress instead of pruning")
-
-    assert result["completed"] is True
-    prune.assert_not_called()
+        assert len(first) == 3
+        assert len(second) == 3

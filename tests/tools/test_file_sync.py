@@ -3,13 +3,19 @@
 import io
 import os
 import tarfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.environments.file_sync import FileSyncManager, _FORCE_SYNC_ENV, iter_sync_files
+from tools.environments.file_sync import (
+    FileSyncManager,
+    FileSyncState,
+    _FORCE_SYNC_ENV,
+    iter_sync_files,
+)
 
 
 @pytest.fixture
@@ -54,20 +60,78 @@ class TestMtimeSkip:
         mgr.sync(force=True)
         assert upload.call_count == 0, "unchanged files should not be re-uploaded"
 
-    def test_changed_file_re_uploaded(self, tmp_files):
-        upload = MagicMock()
-        mgr = _make_manager(tmp_files, upload=upload)
 
-        mgr.sync(force=True)
-        upload.reset_mock()
+    def test_equivalent_managers_reuse_the_committed_snapshot(self, tmp_files):
+        state = FileSyncState()
+        first_upload = MagicMock()
+        second_upload = MagicMock()
+        first = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=first_upload,
+            delete_fn=MagicMock(),
+            shared_state=state,
+        )
+        second = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=second_upload,
+            delete_fn=MagicMock(),
+            shared_state=state,
+        )
 
-        # Touch one file
+        first.sync(force=True)
+        second.sync(force=True)
+
+        assert first_upload.call_count == 3
+        second_upload.assert_not_called()
+        assert second._synced_files == first._synced_files
+
+    def test_shared_snapshot_still_detects_later_changes(self, tmp_files):
+        state = FileSyncState()
+        first = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            shared_state=state,
+        )
+        second_upload = MagicMock()
+        second = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=second_upload,
+            delete_fn=MagicMock(),
+            shared_state=state,
+        )
+        first.sync(force=True)
+
         time.sleep(0.05)
-        Path(tmp_files["cred_a.json"]).write_text("updated content")
+        Path(tmp_files["skill_main.py"]).write_text("changed by another task")
+        second.sync(force=True)
 
-        mgr.sync(force=True)
-        assert upload.call_count == 1
-        assert tmp_files["cred_a.json"] in upload.call_args[0][0]
+        second_upload.assert_called_once()
+        assert second_upload.call_args.args[0] == tmp_files["skill_main.py"]
+
+    def test_shared_state_snapshot_round_trip(self, tmp_files):
+        state = FileSyncState()
+        manager = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            shared_state=state,
+        )
+        assert manager.sync(force=True) is True
+
+        restored = FileSyncState()
+        snapshot = state.export_snapshot()
+        restored.restore_snapshot(
+            {
+                path: (float(value[0]), int(value[1]))
+                for path, value in snapshot["synced_files"].items()
+            },
+            snapshot["pushed_hashes"],
+        )
+
+        assert restored.synced_files == state.synced_files
+        assert restored.pushed_hashes == state.pushed_hashes
+        assert restored.last_sync_time == 0
 
     def test_new_file_detected(self, tmp_files, tmp_path):
         upload = MagicMock()
@@ -183,26 +247,37 @@ class TestRateLimiting:
         mgr.sync()
         assert upload.call_count == 0
 
-    def test_force_bypasses_rate_limit(self, tmp_files, tmp_path):
-        upload = MagicMock()
+
+    def test_concurrent_sync_calls_share_one_upload_cycle(self, tmp_files):
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def bulk_upload(files):
+            calls.append(list(files))
+            entered.set()
+            assert release.wait(timeout=2)
+
         mgr = FileSyncManager(
             get_files_fn=_make_get_files(tmp_files),
-            upload_fn=upload,
+            upload_fn=MagicMock(),
             delete_fn=MagicMock(),
+            bulk_upload_fn=bulk_upload,
             sync_interval=10.0,
         )
 
-        mgr.sync(force=True)
-        upload.reset_mock()
+        first = threading.Thread(target=mgr.sync)
+        second = threading.Thread(target=mgr.sync)
+        first.start()
+        assert entered.wait(timeout=2)
+        second.start()
+        release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
 
-        # Add a new file and force sync
-        new_file = tmp_path / "forced.txt"
-        new_file.write_text("forced")
-        tmp_files["forced.txt"] = str(new_file)
-        mgr._get_files_fn = _make_get_files(tmp_files)
-
-        mgr.sync(force=True)
-        assert upload.call_count == 1
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(calls) == 1
 
     def test_env_var_forces_sync(self, tmp_files, tmp_path):
         upload = MagicMock()
@@ -294,6 +369,48 @@ class TestEdgeCases:
         mgr.sync(force=True)
         upload.assert_not_called()  # _file_mtime_key returns None, skipped
 
+    def test_iter_sync_files_excludes_delegation_live_logs(
+        self, tmp_path, monkeypatch
+    ):
+        durable = tmp_path / "result.json"
+        durable.write_text("durable")
+        live = tmp_path / "task.log"
+        live.write_text("changing")
+
+        monkeypatch.setattr(
+            "tools.credential_files.get_credential_file_mounts", lambda: []
+        )
+        monkeypatch.setattr(
+            "tools.credential_files.iter_skills_files",
+            lambda container_base="/root/.hermes": [],
+        )
+        monkeypatch.setattr(
+            "tools.credential_files.iter_cache_files",
+            lambda container_base="/root/.hermes": [
+                {
+                    "host_path": str(durable),
+                    "container_path": (
+                        f"{container_base}/cache/delegation/results/result.json"
+                    ),
+                },
+                {
+                    "host_path": str(live),
+                    "container_path": (
+                        f"{container_base}/cache/delegation/live/task/task.log"
+                    ),
+                },
+            ],
+        )
+
+        files = iter_sync_files("/home/test/.hermes")
+
+        assert files == [
+            (
+                str(durable),
+                "/home/test/.hermes/cache/delegation/results/result.json",
+            )
+        ]
+
 
 class TestSyncBackSecurity:
     def test_sync_back_does_not_overwrite_uploaded_credential_files(self, tmp_path, monkeypatch):
@@ -370,18 +487,6 @@ class TestBulkUpload:
         files_arg = bulk_upload.call_args[0][0]
         assert len(files_arg) == 3
 
-    def test_fallback_to_upload_fn_when_no_bulk(self, tmp_files):
-        """Without bulk_upload_fn, per-file upload_fn is used (backwards compat)."""
-        upload = MagicMock()
-        mgr = FileSyncManager(
-            get_files_fn=_make_get_files(tmp_files),
-            upload_fn=upload,
-            delete_fn=MagicMock(),
-            bulk_upload_fn=None,
-        )
-
-        mgr.sync(force=True)
-        assert upload.call_count == 3
 
     def test_bulk_upload_rollback_on_failure(self, tmp_files):
         """Bulk upload failure rolls back synced state so next sync retries."""

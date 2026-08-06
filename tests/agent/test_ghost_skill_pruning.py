@@ -1,205 +1,298 @@
-"""Compression cannot leave the model believing removed skills are loaded."""
+"""Ghost-skill defense tests (#32106, salvage of PR #44166).
+
+When compaction reduces an old ``skill_view`` result to a metadata-only
+summary, the model still believes the skill is loaded even though its
+instructions are gone. The defense has three layers:
+
+- P0/P1: the pruned tool-result summary carries a canonical
+  ``[SKILL_PRUNED: ...]`` marker with the exact reload call, and the
+  system prompt (SKILLS_GUIDANCE) tells the model how to react to it.
+- Phase-1 protection: a skill loaded just before compaction (or actively
+  referenced in the protected tail) keeps its full body through the
+  ordinary prune passes.
+- P2: markers entering the summarizer are extracted BEFORE the aux LLM
+  call and deterministically re-injected if the model paraphrased them
+  away — including on the static fallback path.
+
+Test patterns for the marker emit checks adapted from PR #32375
+(@LeonSGP43) with credit.
+"""
 
 from unittest.mock import MagicMock, patch
 
 from agent.context_compressor import (
+    SKILL_PRUNED_MARKER_PREFIX,
+    SUMMARY_PREFIX,
     ContextCompressor,
+    _collect_protected_skill_names,
+    _extract_pruned_skill_names,
+    _MAX_PRUNED_SKILL_MARKERS,
+    _reinject_pruned_skill_markers,
     _skill_pruned_marker,
     _summarize_tool_result,
 )
-from agent.prompt_builder import SKILLS_GUIDANCE
 
 
-def test_large_skill_view_summary_emits_canonical_reload_marker():
-    summary = _summarize_tool_result(
-        "skill_view", '{"name":"pdf"}', "instructions\n" + "x" * 6_000
+def _make_compressor(**overrides):
+    kwargs = dict(
+        model="test/model",
+        quiet_mode=True,
+        protect_first_n=1,
+        protect_last_n=2,
     )
-    marker = (
-        "[SKILL_PRUNED: content lost in compression; "
-        "reload with skill_view(name='pdf')]"
-    )
-    assert summary.startswith("[skill_view] name=pdf")
-    assert marker in summary
-    assert "## Skill Safety Rule" in SKILLS_GUIDANCE
-    assert "DEDUP" in SKILLS_GUIDANCE
-
-
-def test_small_skill_and_non_view_metadata_do_not_emit_marker():
-    small = _summarize_tool_result("skill_view", '{"name":"pdf"}', "x" * 1_000)
-    listing = _summarize_tool_result("skills_list", '{"name":"pdf"}', "x" * 6_000)
-    assert "SKILL_PRUNED" not in small
-    assert "SKILL_PRUNED" not in listing
-
-
-def _compressor():
+    kwargs.update(overrides)
     with patch(
-        "agent.context_compressor.get_model_context_length", return_value=100_000
+        "agent.context_compressor.get_model_context_length", return_value=100000
     ):
-        return ContextCompressor(
-            model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2
-        )
+        return ContextCompressor(**kwargs)
 
 
-def _skill_pair(name, *, size=6_000):
+def _skill_view_pair(call_id, skill_name, size=6000):
     return [
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [
-                {
-                    "id": f"call_{name}",
-                    "type": "function",
-                    "function": {
-                        "name": "skill_view",
-                        "arguments": f'{{"name":"{name}"}}',
-                    },
-                }
-            ],
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "skill_view",
+                    "arguments": f'{{"name":"{skill_name}"}}',
+                },
+            }],
         },
         {
             "role": "tool",
-            "tool_call_id": f"call_{name}",
-            "content": f"# {name} instructions\n" + "x" * size,
+            "tool_call_id": call_id,
+            "content": f"# {skill_name} instructions\n" + "x" * size,
         },
     ]
 
 
-def _filler(count, *, start=0):
-    return [
-        {
-            "role": "user" if (start + index) % 2 == 0 else "assistant",
-            "content": f"filler {start + index} " + "y" * 400,
-        }
-        for index in range(count)
-    ]
+class TestSkillPrunedMarkerEmit:
+    """Marker emit — patterns adapted from PR #32375 (@LeonSGP43)."""
+
+    def test_skill_view_summary_marks_pruned_content(self):
+        summary = _summarize_tool_result(
+            "skill_view", '{"name":"docker-management"}', "x" * 6000
+        )
+        assert summary.startswith("[skill_view] name=docker-management (6,000 chars)")
+        assert _skill_pruned_marker("docker-management") in summary
+        assert "reload with skill_view(name='docker-management')" in summary
+
+    def test_small_skill_view_summary_not_marked(self):
+        summary = _summarize_tool_result(
+            "skill_view", '{"name":"docker-management"}', "x" * 1234
+        )
+        assert summary == "[skill_view] name=docker-management (1,234 chars)"
+        assert SKILL_PRUNED_MARKER_PREFIX not in summary
 
 
-def test_recently_loaded_and_tail_referenced_skills_survive_ordinary_prune():
-    compressor = _compressor()
-    recent = _filler(10) + _skill_pair("fresh") + _filler(6, start=10)
-    recent_result, _ = compressor._prune_old_tool_results(
-        recent, protect_tail_count=4
-    )
-    assert recent_result[11]["content"].startswith("# fresh instructions")
+    def test_marker_extractor_round_trips_the_emitted_marker(self):
+        """Emit and check sides share one canonical string.
 
-    referenced = (
-        _skill_pair("steered")
-        + _filler(14)
-        + [{"role": "user", "content": "keep following the steered steps"}]
-    )
-    referenced_result, _ = compressor._prune_old_tool_results(
-        referenced, protect_tail_count=4
-    )
-    assert referenced_result[1]["content"].startswith("# steered instructions")
+        The original PR #44166 emitted ``[SKILL_PRUNED:`` but presence-
+        checked ``[SKILL_PRUNED]`` — re-injection fired even when the
+        marker had survived. Pin the round trip.
+        """
+        summary = _summarize_tool_result("skill_view", '{"name":"pdf"}', "x" * 6000)
+        assert _extract_pruned_skill_names(summary) == ["pdf"]
+        assert _skill_pruned_marker("pdf") in summary
 
 
-def test_pressure_override_can_demote_a_recent_skill_body():
-    compressor = _compressor()
-    messages = (
-        _filler(2)
-        + _skill_pair("fresh", size=60_000)
-        + [{"role": "user", "content": "active ask"}]
-    )
-    result, count = compressor._prune_old_tool_results(
-        messages,
-        protect_tail_count=4,
-        protect_tail_tokens=100,
-    )
-    assert count >= 1
-    assert "[SKILL_PRUNED:" in result[3]["content"]
+class TestReinjectPrunedSkillMarkers:
+
+    def test_reinjects_when_marker_paraphrased_away(self):
+        out = _reinject_pruned_skill_markers(
+            "The pdf skill was loaded earlier but its content was summarized.",
+            ["pdf"],
+        )
+        assert _skill_pruned_marker("pdf") in out
+        assert "## Pruned Skills" in out
+
+    def test_partial_survival_reinjects_only_missing(self):
+        marker_a = _skill_pruned_marker("alpha")
+        out = _reinject_pruned_skill_markers("body\n" + marker_a, ["alpha", "beta"])
+        assert out.count(_skill_pruned_marker("alpha")) == 1
+        assert out.count(_skill_pruned_marker("beta")) == 1
 
 
-def _summary_response(text):
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    response.choices[0].message.content = text
-    return response
+
+    def test_reinjected_summary_still_classifies_standalone(self):
+        body = _reinject_pruned_skill_markers("## Goal\nwork\n", ["pdf"])
+        full = SUMMARY_PREFIX + "\n\n" + body
+        assert ContextCompressor.classify_summary_content(full) == "standalone"
 
 
-def test_raw_skill_body_gets_marker_when_summarizer_drops_instructions():
-    compressor = _compressor()
-    turns = [
-        {"role": "user", "content": "Build the report with the pdf skill"},
-        *_skill_pair("pdf", size=8_000),
-    ]
-    with patch(
-        "agent.context_compressor.call_llm",
-        return_value=_summary_response("## Goal\nBuild the report."),
-    ):
-        summary = compressor._generate_summary(turns)
-    assert _skill_pruned_marker("pdf") in summary
-    assert _skill_pruned_marker("pdf") in compressor._previous_summary
+class TestProtectedSkillPrune:
+    """Phase-1 prune must not demote a just-loaded skill (#32106)."""
+
+    def _filler(self, n, start=0):
+        out = []
+        for i in range(n):
+            role = "user" if (start + i) % 2 == 0 else "assistant"
+            out.append({"role": role, "content": f"filler {start + i} " + "y" * 400})
+        return out
 
 
-def test_parallel_raw_skill_bodies_each_get_their_own_reload_marker():
-    compressor = _compressor()
-    turns = [
-        {"role": "user", "content": "Use both skills"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
+    def test_recently_loaded_skill_survives_prune(self):
+        c = _make_compressor()
+        # skill loaded within the last 10 messages, but OUTSIDE the
+        # protected tail count — without the guard it would be demoted.
+        msgs = (
+            self._filler(10)
+            + _skill_view_pair("call_s", "fresh-skill")
+            + self._filler(6, start=10)
+        )
+        result, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
+        skill_row = result[11]
+        assert skill_row["content"].startswith("# fresh-skill instructions")
+        assert SKILL_PRUNED_MARKER_PREFIX not in skill_row["content"]
+
+
+    def test_pressure_demotion_overrides_skill_protection(self):
+        """Pass-4 must still demote protected skill bodies (#61932 guard)."""
+        c = _make_compressor()
+        msgs = (
+            self._filler(2)
+            + _skill_view_pair("call_s", "fresh-skill", size=60000)
+            + [{"role": "user", "content": "active ask"}]
+        )
+        # Tiny token budget → protected region exceeds the soft ceiling and
+        # the pressure pass must reclaim the skill body despite protection.
+        result, pruned = c._prune_old_tool_results(
+            msgs, protect_tail_count=4, protect_tail_tokens=100
+        )
+        skill_row = result[3]
+        assert pruned >= 1
+        assert _skill_pruned_marker("fresh-skill") in skill_row["content"]
+
+
+class TestMarkerSurvivesRealCompress:
+    """P2 layer: markers survive a real compress() with a mocked aux LLM."""
+
+    def _mock_response(self, text):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = text
+        return response
+
+    def _messages_with_pruned_skill_in_middle(self):
+        """Transcript whose compressed middle carries a prune marker row."""
+        pruned_row_content = (
+            "[skill_view] name=pdf (48,201 chars) " + _skill_pruned_marker("pdf")
+        )
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Build the PDF report"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
                     "id": "call_pdf",
                     "type": "function",
                     "function": {
                         "name": "skill_view",
                         "arguments": '{"name":"pdf"}',
                     },
-                },
-                {
-                    "id": "call_spreadsheets",
-                    "type": "function",
-                    "function": {
-                        "name": "skill_view",
-                        "arguments": '{"name":"spreadsheets"}',
-                    },
-                },
-            ],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_pdf",
-            "content": "# pdf instructions\n" + "x" * 8_000,
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_spreadsheets",
-            "content": "# spreadsheets instructions\n" + "y" * 8_000,
-        },
-    ]
-    with patch(
-        "agent.context_compressor.call_llm",
-        return_value=_summary_response("## Goal\nUse both skills."),
-    ):
-        summary = compressor._generate_summary(turns)
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_pdf", "content": pruned_row_content},
+            {"role": "assistant", "content": "Loaded the skill, working."},
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "more work " + "z" * 500},
+            {"role": "user", "content": "latest ask"},
+            {"role": "assistant", "content": "ack"},
+        ]
+        return msgs
 
-    assert _skill_pruned_marker("pdf") in summary
-    assert _skill_pruned_marker("spreadsheets") in summary
+    def _summary_text_of(self, result):
+        for msg in result:
+            if ContextCompressor.classify_summary_content(msg.get("content")):
+                return msg["content"]
+        raise AssertionError(f"no summary message found in {result!r}")
 
-
-def test_marker_survives_iterative_summary_rewrite_without_duplication():
-    compressor = _compressor()
-    compressor._previous_summary = (
-        "## Goal\nPrior work.\n\n## Pruned Skills\n" + _skill_pruned_marker("pdf")
-    )
-    with patch(
-        "agent.context_compressor.call_llm",
-        return_value=_summary_response("## Goal\nNew work."),
-    ):
-        summary = compressor._generate_summary(
-            [{"role": "user", "content": "continue"}]
+    def test_marker_reinjected_when_summarizer_drops_it(self):
+        c = _make_compressor(protect_first_n=1, protect_last_n=2)
+        msgs = self._messages_with_pruned_skill_in_middle()
+        drop_response = self._mock_response(
+            "## Goal\nBuild the PDF report.\n\n## Completed Actions\n"
+            "1. Loaded some skills and worked on the report."
         )
-    assert summary.count(_skill_pruned_marker("pdf")) == 1
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=7),
+            patch(
+                "agent.context_compressor.call_llm", return_value=drop_response
+            ) as mock_call,
+        ):
+            result = c.compress(msgs, force=True)
+        assert mock_call.called
+        summary_text = self._summary_text_of(result)
+        assert _skill_pruned_marker("pdf") in summary_text
+        # Stored iterative-update state carries the marker too.
+        assert _skill_pruned_marker("pdf") in c._previous_summary
 
 
-def test_static_fallback_marks_raw_skill_body():
-    compressor = _compressor()
-    summary = compressor._build_static_fallback_summary(
-        [
-            {"role": "user", "content": "Use the pdf skill"},
-            *_skill_pair("pdf", size=8_000),
-        ],
-        reason="provider unavailable",
-    )
-    assert _skill_pruned_marker("pdf") in summary
+
+
+    def test_marker_survives_iterative_recompression(self):
+        """Markers in a rehydrated handoff summary survive iterative rewrites.
+
+        On re-compression the previous handoff (carrying the marker) is
+        rehydrated into ``_previous_summary``; even when the summarizer's
+        iterative update drops the marker, re-injection restores it.
+        """
+        c = _make_compressor(protect_first_n=1, protect_last_n=2)
+        prior_handoff = (
+            SUMMARY_PREFIX
+            + "\n\n## Goal\nOld work.\n\n## Pruned Skills\n"
+            + _skill_pruned_marker("pdf")
+        )
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": prior_handoff},
+        ] + [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": f"turn {i} " + "q" * 300}
+            for i in range(8)
+        ]
+        drop_response = self._mock_response("## Goal\nNext task in flight.")
+        with (
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=8),
+            patch("agent.context_compressor.call_llm", return_value=drop_response),
+        ):
+            result = c.compress(msgs, force=True)
+        summary_text = self._summary_text_of(result)
+        assert _skill_pruned_marker("pdf") in summary_text
+
+
+class TestReinjectionBoundsAndRedaction:
+    def test_marker_list_is_capped(self):
+        names = [f"skill-{i}" for i in range(_MAX_PRUNED_SKILL_MARKERS + 15)]
+        out = _reinject_pruned_skill_markers("body", names)
+        assert out.count(SKILL_PRUNED_MARKER_PREFIX) == len(names)
+        # The cap is applied at the collection sites in _generate_summary /
+        # _build_static_fallback_summary; the helper itself is mechanical.
+
+    def test_reinjection_block_is_redacted(self, monkeypatch):
+        import agent.redact as redact_mod
+
+        # force=True redaction must win even when redaction is disabled.
+        monkeypatch.setattr(redact_mod, "_REDACT_ENABLED", False, raising=False)
+        secret = "ghp_" + "a1B2" * 6
+        out = _reinject_pruned_skill_markers("body", [f"x {secret}"])
+        assert secret not in out
+
+
+class TestSkillsGuidanceSafetyRule:
+    def test_safety_rule_present_with_real_newlines(self):
+        from agent.prompt_builder import SKILLS_GUIDANCE
+
+        assert "## Skill Safety Rule" in SKILLS_GUIDANCE
+        assert "[SKILL_PRUNED]" in SKILLS_GUIDANCE
+        assert "skill_view(name='...')" in SKILLS_GUIDANCE
+        # The rule list must use REAL newlines — the original PR hunk risked
+        # literal backslash-n escape text rendering into the system prompt.
+        assert "\\n" not in SKILLS_GUIDANCE
+        assert SKILLS_GUIDANCE.count("\n") >= 6
+        for rule in ("UNAVAILABLE", "RELOAD", "WAIT", "DEDUP"):
+            assert rule in SKILLS_GUIDANCE

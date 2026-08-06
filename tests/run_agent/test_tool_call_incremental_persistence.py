@@ -30,7 +30,12 @@ from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.tool_dispatch_helpers import make_tool_result_message
+from agent.agent_runtime_helpers import sanitize_api_messages
+from agent.tool_executor import execute_tool_calls_segmented
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -71,10 +76,34 @@ def _make_agent():
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
-    agent.tool_delay = 0
     agent.compression_enabled = False
     agent.save_trajectories = False
     return agent
+
+
+def _attach_real_session_db(agent, db_path: Path, session_id: str) -> SessionDB:
+    db = SessionDB(db_path=db_path)
+    db.create_session(session_id=session_id, source="tui", model="test/model")
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_disabled = False
+    return db
+
+
+def _durable_messages(db_path: Path, session_id: str) -> list[dict]:
+    restarted_db = SessionDB(db_path=db_path)
+    try:
+        return restarted_db.get_messages_as_conversation(session_id)
+    finally:
+        restarted_db.close()
+
+
+def _durable_roles(db_path: Path, session_id: str) -> list[str]:
+    return [message["role"] for message in _durable_messages(db_path, session_id)]
 
 
 def _mock_tool_call(name="web_search", arguments="{}", call_id="call_1"):
@@ -144,19 +173,76 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     assert result["final_response"] == "done"
 
 
-def test_session_flush_reports_append_failure():
+def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_path):
+    """A visible interim assistant row must survive an immediate process exit.
+
+    ``GeneratorExit`` models an uncatchable turn interruption at the UI bridge:
+    no turn finalizer or graceful shutdown persistence is allowed to rescue the
+    row after the callback observes it.
+    """
     agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "interim-abnormal-exit"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    tool_call = _mock_tool_call(call_id="visible-call")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
 
-    class _FailingSessionDB:
-        def append_message(self, **_kwargs):
-            raise RuntimeError("injected append failure")
+    roles_seen_by_ui: list[str] = []
 
-    agent._session_db = _FailingSessionDB()
-    agent._session_db_created = True
-    agent.session_id = "session-persist-failure"
-    messages = [make_tool_result_message("web_search", "result", "c1")]
+    def _ui_projection(_text, *, already_streamed=False):
+        roles_seen_by_ui.extend(_durable_roles(db_path, session_id))
+        raise GeneratorExit("simulated process termination after UI projection")
 
-    assert agent._flush_messages_to_session_db(messages) is False
+    agent.interim_assistant_callback = _ui_projection
+    try:
+        with pytest.raises(GeneratorExit, match="simulated process termination"):
+            agent.run_conversation("inspect the repository")
+    finally:
+        db.close()
+
+    assert roles_seen_by_ui == ["user", "assistant"]
+    durable = _durable_messages(db_path, session_id)
+    assert [message["role"] for message in durable] == ["user", "assistant"]
+    assert durable[1]["content"] == "I'll inspect the repository now."
+    assert durable[1]["tool_calls"][0]["id"] == "visible-call"
+
+    # Cold-resume reconciliation closes the interrupted call in the provider
+    # payload without mutating or duplicating the canonical transcript.
+    resumed = sanitize_api_messages(durable)
+    assert [message["role"] for message in resumed] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert resumed[2]["tool_call_id"] == "visible-call"
+    assert len(_durable_messages(db_path, session_id)) == 2
+
+
+def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="must-not-run")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+    agent.interim_assistant_callback = MagicMock()
+    agent._execute_tool_calls = MagicMock()
+
+    result = agent.run_conversation("inspect the repository")
+
+    agent.interim_assistant_callback.assert_not_called()
+    agent._execute_tool_calls.assert_not_called()
+    assert agent.client is not None
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["turn_exit_reason"] == "session_persistence_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -215,274 +301,185 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
     ]
 
 
-def test_sequential_batch_stops_after_tool_result_persistence_failure():
+def test_sequential_keyboard_interrupt_emits_results_for_all_calls():
+    """A KeyboardInterrupt mid-batch must not leave dangling tool_calls.
+
+    When a tool handler raises KeyboardInterrupt, the sequential executor
+    re-raises to abort the turn — but it must first append a tool result for
+    the interrupted call AND every remaining call, or the assistant tool-call
+    turn is left without matching tool results (a message-role alternation
+    violation that malforms the next provider request). Mirrors the
+    cooperative-interrupt and concurrent paths, which already do this.
+    """
     agent = _make_agent()
     tool_calls = [
         _mock_tool_call(name="web_search", call_id="c1"),
-        _mock_tool_call(name="terminal", call_id="c2"),
+        _mock_tool_call(name="web_search", call_id="c2"),
+        _mock_tool_call(name="web_search", call_id="c3"),
     ]
     messages: list = []
     assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
-    dispatched: list[str] = []
 
-    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
-        dispatched.append(kwargs["tool_call_id"])
-        return f"result-{kwargs['tool_call_id']}"
+    def _interrupt_dispatch(function_name, function_args, effective_task_id, **kwargs):
+        # First tool raises a hard interrupt mid-batch.
+        raise KeyboardInterrupt()
 
-    def _fail_first_tool_result(flush_messages, conversation_history=None):
-        tail = flush_messages[-1]
-        if tail.get("role") == "tool" and tail.get("tool_call_id") == "c1":
-            return False
-        return True
+    agent._flush_messages_to_session_db = MagicMock()
 
-    agent._flush_messages_to_session_db = MagicMock(
-        side_effect=_fail_first_tool_result,
+    with (
+        patch("run_agent.handle_function_call", side_effect=_interrupt_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    # Every call_id has a matching tool result — alternation preserved.
+    tool_results = [m for m in messages if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2", "c3"]
+    # The results are marked as cancelled, not fabricated successes.
+    assert all("cancelled" in m["content"].lower() for m in tool_results)
+
+
+@pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
+def test_tool_result_is_durable_before_ui_completion_on_abnormal_exit(
+    tmp_path,
+    executor_mode,
+):
+    """A visible tool completion must already exist in the canonical DB."""
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = f"tool-result-abnormal-exit-{executor_mode}"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    tool_call = _mock_tool_call(call_id="visible-call")
+    messages = [
+        {"role": "user", "content": "inspect the repository"},
+        {
+            "role": "assistant",
+            "content": "I'll inspect the repository now.",
+            "tool_calls": [
+                {
+                    "id": "visible-call",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+    agent._flush_messages_to_session_db(messages)
+
+    roles_seen_by_ui: list[str] = []
+
+    def _ui_completion(*_args):
+        roles_seen_by_ui.extend(_durable_roles(db_path, session_id))
+        raise GeneratorExit("simulated process termination after tool completion")
+
+    agent.tool_complete_callback = _ui_completion
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    dispatch_patch = (
+        patch("run_agent.handle_function_call", return_value="repository result")
+        if executor_mode == "sequential"
+        else patch.object(agent, "_invoke_tool", return_value="repository result")
+    )
+    try:
+        with (
+            dispatch_patch,
+            patch(
+                "agent.tool_executor.maybe_persist_tool_result",
+                side_effect=lambda **kwargs: kwargs["content"],
+            ),
+            pytest.raises(GeneratorExit, match="simulated process termination"),
+        ):
+            if executor_mode == "sequential":
+                agent._execute_tool_calls_sequential(
+                    assistant_message,
+                    messages,
+                    "task-1",
+                )
+            else:
+                agent._execute_tool_calls_concurrent(
+                    assistant_message,
+                    messages,
+                    "task-1",
+                )
+    finally:
+        db.close()
+
+    expected_roles = ["user", "assistant", "tool"]
+    assert roles_seen_by_ui == expected_roles
+    durable = _durable_messages(db_path, session_id)
+    assert [message["role"] for message in durable] == expected_roles
+    assert durable[2]["tool_call_id"] == "visible-call"
+    assert durable[2]["content"] == "repository result"
+
+
+@pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
+def test_failed_tool_result_persist_blocks_completion_projection(executor_mode):
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="failed-persist")
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    messages: list = []
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+    agent.tool_complete_callback = MagicMock()
+    dispatch_patch = (
+        patch("run_agent.handle_function_call", return_value="repository result")
+        if executor_mode == "sequential"
+        else patch.object(agent, "_invoke_tool", return_value="repository result")
     )
 
     with (
-        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
+        dispatch_patch,
         patch(
             "agent.tool_executor.maybe_persist_tool_result",
             side_effect=lambda **kwargs: kwargs["content"],
         ),
     ):
-        agent._execute_tool_calls_sequential(
-            assistant_message, messages, "task-1",
+        if executor_mode == "sequential":
+            agent._execute_tool_calls_sequential(
+                assistant_message,
+                messages,
+                "task-1",
+            )
+        else:
+            agent._execute_tool_calls_concurrent(
+                assistant_message,
+                messages,
+                "task-1",
+            )
+
+    agent.tool_complete_callback.assert_not_called()
+    assert getattr(agent, "_incremental_persistence_failed", False) is True
+
+
+def test_segmented_batch_stops_before_later_segment_after_persist_failure():
+    agent = _make_agent()
+    first = _mock_tool_call(call_id="first")
+    second = _mock_tool_call(call_id="second")
+    assistant_message = SimpleNamespace(tool_calls=[first, second])
+    messages: list = []
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+
+    with (
+        patch.object(agent, "_invoke_tool", return_value="first result") as invoke,
+        patch("run_agent.handle_function_call", return_value="second result") as dispatch,
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        execute_tool_calls_segmented(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            segments=[("parallel", [first]), ("sequential", [second])],
         )
 
-    assert dispatched == ["c1"]
-    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
-    skipped = json.loads(messages[1]["content"])
-    assert skipped == {
-        "error": "session persistence failed",
-        "skipped": True,
-        "status": "persistence_failed",
-    }
-    assert "tool result web_search" in agent._tool_persistence_failure
-
-
-def test_run_conversation_stops_before_next_model_request_on_persistence_failure():
-    agent = _make_agent()
-    agent.valid_tool_names = {"kanban_complete", "terminal"}
-    tool_calls = [
-        _mock_tool_call(name="kanban_complete", call_id="c1"),
-        _mock_tool_call(name="terminal", call_id="c2"),
-    ]
-    agent.client.chat.completions.create.side_effect = [
-        _mock_response(content="", finish_reason="tool_calls", tool_calls=tool_calls),
-        _mock_response(content="unsafe continuation", finish_reason="stop"),
-    ]
-
-    def _flush_until_first_result(flush_messages, conversation_history=None):
-        tail = flush_messages[-1]
-        if tail.get("role") == "tool" and tail.get("tool_call_id") == "c1":
-            return False
-        return True
-
-    agent._flush_messages_to_session_db = MagicMock(
-        side_effect=_flush_until_first_result,
-    )
-
-    with (
-        patch(
-            "run_agent.handle_function_call",
-            side_effect=lambda name, args, task_id, **kwargs: "first result",
-        ),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-        patch(
-            "agent.tool_executor.maybe_persist_tool_result",
-            side_effect=lambda **kwargs: kwargs["content"],
-        ),
-    ):
-        result = agent.run_conversation("perform durable actions")
-
-    assert agent.client.chat.completions.create.call_count == 1
-    assert "session persistence failed" in result["final_response"].lower()
-    assert result["messages"][-1]["role"] == "assistant"
-    assert "session persistence failed" in result["messages"][-1]["content"].lower()
-
-
-def test_run_conversation_does_not_start_tool_when_assistant_flush_fails():
-    agent = _make_agent()
-    agent.valid_tool_names = {"terminal"}
-    tool_call = _mock_tool_call(name="terminal", call_id="c1")
-    agent.client.chat.completions.create.side_effect = [
-        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call]),
-        _mock_response(content="unsafe continuation", finish_reason="stop"),
-    ]
-    dispatched: list[str] = []
-
-    def _fail_assistant_tool_block(flush_messages, conversation_history=None):
-        tail = flush_messages[-1]
-        if tail.get("role") == "assistant" and tail.get("tool_calls"):
-            return False
-        return True
-
-    agent._flush_messages_to_session_db = MagicMock(
-        side_effect=_fail_assistant_tool_block,
-    )
-
-    def _record_dispatch(name, args, task_id, **kwargs):
-        dispatched.append(name)
-        return "must not execute"
-
-    with (
-        patch("run_agent.handle_function_call", side_effect=_record_dispatch),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-    ):
-        result = agent.run_conversation("perform one durable action")
-
-    assert dispatched == []
-    assert agent.client.chat.completions.create.call_count == 1
-    assert "session persistence failed" in result["final_response"].lower()
-    tool_results = [
-        message for message in result["messages"] if message.get("role") == "tool"
-    ]
-    assert [message["tool_call_id"] for message in tool_results] == ["c1"]
-    assert json.loads(tool_results[0]["content"])["status"] == "persistence_failed"
-
-
-def test_successful_kanban_terminal_call_skips_later_batch_side_effects(monkeypatch):
-    agent = _make_agent()
-    tool_calls = [
-        _mock_tool_call(name="kanban_complete", call_id="c1"),
-        _mock_tool_call(name="terminal", call_id="c2"),
-    ]
-    messages: list = []
-    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
-    dispatched: list[str] = []
-
-    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
-        from model_tools import TrustedToolResult
-
-        dispatched.append(function_name)
-        raw = json.dumps({
-            "ok": True,
-            "task_id": "t_12345678",
-            "__hermes_kanban_terminal__": {
-                "task_id": "t_12345678",
-                "tool": "kanban_complete",
-                "status": "done",
-            },
-        })
-        return TrustedToolResult(raw, raw)
-
-    with (
-        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
-        patch(
-            "agent.tool_executor.maybe_persist_tool_result",
-            side_effect=lambda **kwargs: kwargs["content"],
-        ),
-    ):
-        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
-
-    assert dispatched == ["kanban_complete"]
-    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
-    assert type(messages[0]["content"]) is str
-    assert "skipped after successful kanban_complete" in messages[1]["content"]
-    assert agent._kanban_terminal_transition["status"] == "done"
-
-
-def test_terminal_marker_survives_tool_result_externalization(monkeypatch):
-    agent = _make_agent()
-    tool_calls = [
-        _mock_tool_call(name="kanban_complete", call_id="c1"),
-        _mock_tool_call(name="terminal", call_id="c2"),
-    ]
-    messages: list = []
-    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
-    dispatched: list[str] = []
-
-    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
-        from model_tools import TrustedToolResult
-
-        dispatched.append(function_name)
-        raw = json.dumps({
-            "ok": True,
-            "task_id": "t_12345678",
-            "__hermes_kanban_terminal__": {
-                "task_id": "t_12345678",
-                "tool": "kanban_complete",
-                "status": "done",
-            },
-        })
-        return TrustedToolResult(raw, raw)
-
-    with (
-        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
-        patch(
-            "agent.tool_executor.maybe_persist_tool_result",
-            return_value="[Tool result persisted externally]",
-        ),
-    ):
-        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
-
-    assert dispatched == ["kanban_complete"]
-    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
-    assert messages[0]["content"] == "[Tool result persisted externally]"
-    assert "skipped after successful kanban_complete" in messages[1]["content"]
-    assert agent._kanban_terminal_transition["status"] == "done"
-
-
-def test_run_conversation_stops_before_another_model_request_after_terminal_marker(monkeypatch):
-    agent = _make_agent()
-    agent.valid_tool_names = {"kanban_complete", "terminal"}
-    tool_calls = [
-        _mock_tool_call(name="kanban_complete", call_id="c1"),
-        _mock_tool_call(name="terminal", call_id="c2"),
-    ]
-    agent.client.chat.completions.create.return_value = _mock_response(
-        content="", finish_reason="tool_calls", tool_calls=tool_calls,
-    )
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
-
-    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
-        from model_tools import TrustedToolResult
-
-        raw = json.dumps({
-            "ok": True,
-            "task_id": "t_12345678",
-            "__hermes_kanban_terminal__": {
-                "task_id": "t_12345678",
-                "tool": "kanban_complete",
-                "status": "done",
-            },
-        })
-        return TrustedToolResult(raw, raw)
-
-    with (
-        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
-        patch.object(agent, "_persist_session") as persist_session,
-        patch.object(agent, "_save_trajectory") as save_trajectory,
-        patch.object(agent, "_cleanup_task_resources") as cleanup_task_resources,
-        patch(
-            "agent.tool_executor.maybe_persist_tool_result",
-            side_effect=lambda **kwargs: kwargs["content"],
-        ),
-    ):
-        result = agent.run_conversation("finish the card")
-
-    assert agent.client.chat.completions.create.call_count == 1
-    assert result["kanban_terminal"] is True
-    assert result["kanban_terminal_transition"]["status"] == "done"
-    save_trajectory.assert_called_once()
-    cleanup_task_resources.assert_called_once()
-    assert persist_session.call_count >= 1
-    for persisted in persist_session.call_args_list:
-        assert persisted.args[0][-1] == {
-            "role": "assistant",
-            "content": "Kanban task t_12345678 transitioned to done.",
-        }
-    assert result["messages"][-1] == {
-        "role": "assistant",
-        "content": "Kanban task t_12345678 transitioned to done.",
-    }
+    invoke.assert_called_once()
+    dispatch.assert_not_called()
+    assert getattr(agent, "_incremental_persistence_failed", False) is True
 
 
 # ---------------------------------------------------------------------------

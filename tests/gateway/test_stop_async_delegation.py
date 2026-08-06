@@ -6,28 +6,46 @@ cancel both lanes, suppress an already-queued completion, and clear any
 restart auto-resume marker without affecting another thread.
 """
 
+import asyncio
 import queue
 import threading
 import time
 from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.platforms.base import MessageEvent, MessageType, Platform
+from gateway.config import PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    Platform,
+    _COMPLETION_ADMISSION_REJECTED_KEY,
+    _COMPLETION_ADMISSION_TOKEN_KEY,
+)
 from gateway.run import GatewayRunner, _INTERRUPT_REASON_STOP
 from gateway.session import SessionSource, build_session_key
 from tools import async_delegation as ad
-from tools.process_registry import process_registry
+from tools.process_registry import ProcessSession, process_registry
 
 
 @pytest.fixture(autouse=True)
 def _clean_async_delegations():
     ad._reset_for_tests()
+    with process_registry._lock:
+        process_registry._running.clear()
+        process_registry._finished.clear()
+    process_registry.pending_watchers = []
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
     ad._reset_for_tests()
+    with process_registry._lock:
+        process_registry._running.clear()
+        process_registry._finished.clear()
+    process_registry.pending_watchers = []
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
 
@@ -54,6 +72,20 @@ class _SessionStore:
         return changed
 
 
+class _AdmissionAdapter(BasePlatformAdapter):
+    async def connect(self, *, is_reconnect: bool = False):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, **kwargs):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
 def _source(thread_id):
     return SessionSource(
         platform=Platform.DISCORD,
@@ -68,6 +100,74 @@ def _wait_for_inactive(timeout=5):
     deadline = time.monotonic() + timeout
     while ad.active_count() and time.monotonic() < deadline:
         time.sleep(0.02)
+
+
+def _take_completion(delegation_id):
+    while not process_registry.completion_queue.empty():
+        candidate = process_registry.completion_queue.get_nowait()
+        if candidate.get("delegation_id") == delegation_id:
+            return candidate
+    return None
+
+
+def _delivery_runner(*, mock_injection=True):
+    runner = object.__new__(GatewayRunner)
+    runner._completion_delivery_lock = threading.Lock()
+    runner._completion_deliveries_inflight = set()
+    runner._completion_deliveries_delivered = OrderedDict()
+    runner._completion_delivery_retention = 16
+    if mock_injection:
+        runner._inject_watch_notification = AsyncMock(return_value=True)
+    session_db = MagicMock()
+    session_db.get_session = AsyncMock(
+        return_value={"id": "parent-a", "ended_at": None}
+    )
+    runner._session_db = session_db
+    return runner
+
+
+def _admission_adapter(runner):
+    adapter = _AdmissionAdapter(
+        PlatformConfig(enabled=True, token="test-token"),
+        Platform.DISCORD,
+    )
+    handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(handler)
+    adapter.set_completion_admission_validator(
+        runner._validate_completion_admission
+    )
+    return adapter, handler
+
+
+def _install_admission_barrier(
+    adapter: _AdmissionAdapter,
+    entered: threading.Event,
+    release: threading.Event,
+) -> None:
+    """Pause a synthetic event after delivery handoff but before admission."""
+    original_handle_message = adapter.handle_message
+
+    async def blocked_handle_message(event):
+        entered.set()
+        await asyncio.to_thread(release.wait, 5)
+        await original_handle_message(event)
+
+    adapter.handle_message = blocked_handle_message
+
+
+def _tokenized_completion(runner, source):
+    session_key = build_session_key(source)
+    return MessageEvent(
+        text="[SYSTEM: background delegation completed]",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        metadata={
+            _COMPLETION_ADMISSION_TOKEN_KEY: (
+                runner._capture_completion_admission(session_key)
+            )
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -213,6 +313,145 @@ async def test_stop_with_only_background_work_is_scoped_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_stop_cancels_terminal_process_and_drops_its_notifications(
+    tmp_path, monkeypatch
+):
+    """A stopped chat must not be revived by terminal notify_on_complete."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source_a = _source("thread-a")
+    source_b = _source("thread-b")
+    key_a = build_session_key(source_a)
+    key_b = build_session_key(source_b)
+    entry = _SessionEntry(key_a, "parent-a")
+    store = _SessionStore(entry)
+
+    mine = ProcessSession(
+        id="proc_mine",
+        command="long-running-test",
+        session_key=key_a,
+        started_at=time.time(),
+        pid=1001,
+        process=MagicMock(pid=1001),
+        watcher_interval=5,
+        notify_on_complete=True,
+    )
+    other = ProcessSession(
+        id="proc_other",
+        command="other-session-test",
+        session_key=key_b,
+        started_at=time.time(),
+        pid=1002,
+        process=MagicMock(pid=1002),
+        watcher_interval=5,
+        notify_on_complete=True,
+    )
+    with process_registry._lock:
+        process_registry._running[mine.id] = mine
+        process_registry._running[other.id] = other
+    process_registry.pending_watchers = [
+        {"session_id": mine.id, "session_key": key_a},
+        {"session_id": other.id, "session_key": key_b},
+    ]
+    process_registry.completion_queue.put(
+        {
+            "type": "completion",
+            "session_id": mine.id,
+            "session_key": key_a,
+            "started_at": mine.started_at,
+        }
+    )
+    process_registry.completion_queue.put(
+        {
+            "type": "completion",
+            "session_id": other.id,
+            "session_key": key_b,
+            "started_at": other.started_at,
+        }
+    )
+    terminate = MagicMock()
+    monkeypatch.setattr(process_registry, "_terminate_host_pid", terminate)
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner.session_store = store
+    runner.adapters = {}
+    runner._is_user_authorized = lambda _source: True
+    event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.TEXT,
+        source=source_a,
+    )
+
+    first = await runner._handle_stop_command(event)
+
+    assert "no active" not in str(first).lower()
+    assert mine.exited is True
+    assert mine.completion_reason == "killed"
+    assert other.exited is False
+    terminate.assert_called_once_with(1001, None)
+    assert process_registry.pending_watchers == [
+        {"session_id": other.id, "session_key": key_b}
+    ]
+    queued = []
+    while not process_registry.completion_queue.empty():
+        queued.append(process_registry.completion_queue.get_nowait())
+    assert [item["session_id"] for item in queued] == [other.id]
+
+    second = await runner._handle_stop_command(event)
+    assert "no active" in str(second).lower()
+    terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_drops_already_finished_terminal_completion(
+    tmp_path, monkeypatch
+):
+    """A queued completion remains cancellable after its process has exited."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    entry = _SessionEntry(session_key, "parent-a")
+    store = _SessionStore(entry)
+    finished = ProcessSession(
+        id="proc_finished",
+        command="already-done",
+        session_key=session_key,
+        started_at=time.time(),
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    with process_registry._lock:
+        process_registry._finished[finished.id] = finished
+    process_registry.completion_queue.put(
+        {
+            "type": "completion",
+            "session_id": finished.id,
+            "session_key": session_key,
+            "started_at": finished.started_at,
+        }
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner.session_store = store
+    runner.adapters = {}
+    runner._is_user_authorized = lambda _source: True
+    event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    result = await runner._handle_stop_command(event)
+
+    assert "no active" not in str(result).lower()
+    assert finished.completion_suppressed is True
+    assert finished.notify_on_complete is False
+    assert process_registry.completion_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_gateway_drops_completion_suppressed_by_stop(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     dispatched = ad.dispatch_async_delegation(
@@ -233,20 +472,10 @@ async def test_gateway_drops_completion_suppressed_by_stop(tmp_path, monkeypatch
         reason="stop_command",
     ) == 1
 
-    evt = None
-    while not process_registry.completion_queue.empty():
-        candidate = process_registry.completion_queue.get_nowait()
-        if candidate.get("delegation_id") == dispatched["delegation_id"]:
-            evt = candidate
-            break
+    evt = _take_completion(dispatched["delegation_id"])
     assert evt is not None
 
-    runner = object.__new__(GatewayRunner)
-    runner._completion_delivery_lock = threading.Lock()
-    runner._completion_deliveries_inflight = set()
-    runner._completion_deliveries_delivered = OrderedDict()
-    runner._completion_delivery_retention = 16
-    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner = _delivery_runner()
 
     assert await runner._deliver_completion_notification("synthetic", evt) is None
     runner._inject_watch_notification.assert_not_awaited()
@@ -272,12 +501,7 @@ async def test_gateway_revalidates_claim_when_stop_wins_delivery_race(
     _wait_for_inactive()
     assert ad.active_count() == 0
 
-    evt = None
-    while not process_registry.completion_queue.empty():
-        candidate = process_registry.completion_queue.get_nowait()
-        if candidate.get("delegation_id") == dispatched["delegation_id"]:
-            evt = candidate
-            break
+    evt = _take_completion(dispatched["delegation_id"])
     assert evt is not None
 
     real_claim = ad.claim_completion_delivery
@@ -293,15 +517,275 @@ async def test_gateway_revalidates_claim_when_stop_wins_delivery_race(
 
     monkeypatch.setattr(ad, "claim_completion_delivery", claim_then_stop)
 
-    runner = object.__new__(GatewayRunner)
-    runner._completion_delivery_lock = threading.Lock()
-    runner._completion_deliveries_inflight = set()
-    runner._completion_deliveries_delivered = OrderedDict()
-    runner._completion_delivery_retention = 16
-    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner = _delivery_runner()
 
     assert await runner._deliver_completion_notification("synthetic", evt) is None
     runner._inject_watch_notification.assert_not_awaited()
     durable = ad.get_durable_delegation(dispatched["delegation_id"])
     assert durable["state"] == "cancelled"
     assert durable["delivery_state"] == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_stop_after_claim_revalidation_blocks_adapter_admission(
+    tmp_path, monkeypatch
+):
+    """A stop during adapter handoff wins after the final durable-claim read."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    dispatched = ad.dispatch_async_delegation(
+        goal="post-claim race",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key=session_key,
+        parent_session_id="parent-a",
+        runner=lambda: {"status": "completed", "summary": "must not re-enter"},
+    )
+    _wait_for_inactive()
+    evt = _take_completion(dispatched["delegation_id"])
+    assert evt is not None
+
+    runner = _delivery_runner(mock_injection=False)
+    adapter, handler = _admission_adapter(runner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={session_key: SimpleNamespace(origin=source)},
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        clear_resume_pending=AsyncMock(return_value=False),
+    )
+
+    admission_entered = threading.Event()
+    release_admission = threading.Event()
+    _install_admission_barrier(adapter, admission_entered, release_admission)
+    delivery_task = asyncio.create_task(
+        runner._deliver_completion_notification("synthetic", evt)
+    )
+
+    entered = await asyncio.wait_for(
+        asyncio.to_thread(admission_entered.wait, 3),
+        timeout=4,
+    )
+    cancelled = -1
+    if entered:
+        try:
+            cancelled = await runner._cancel_session_background_work(
+                session_key,
+                parent_session_id="parent-a",
+                reason="stop_command",
+            )
+        finally:
+            release_admission.set()
+    else:
+        release_admission.set()
+
+    result = await asyncio.wait_for(delivery_task, timeout=5)
+    await adapter.cancel_background_tasks()
+
+    assert entered is True
+    assert cancelled == 1
+    assert result is None
+    handler.assert_not_awaited()
+    assert session_key not in adapter._active_sessions
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert durable["state"] == "cancelled"
+    assert durable["delivery_state"] == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_completion_stop_race_blocks_adapter_admission(
+    tmp_path, monkeypatch
+):
+    """A terminal completion already handed to the adapter loses to /stop."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    finished = ProcessSession(
+        id="proc_admission_race",
+        command="race-test",
+        session_key=session_key,
+        started_at=time.time(),
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    with process_registry._lock:
+        process_registry._finished[finished.id] = finished
+    evt = {
+        "type": "completion",
+        "session_id": finished.id,
+        "session_key": session_key,
+        "platform": Platform.DISCORD.value,
+        "chat_type": source.chat_type,
+        "chat_id": source.chat_id,
+        "thread_id": source.thread_id,
+        "user_id": source.user_id,
+        "started_at": finished.started_at,
+        "command": finished.command,
+        "exit_code": 0,
+        "output": "done",
+    }
+
+    runner = _delivery_runner(mock_injection=False)
+    adapter, handler = _admission_adapter(runner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={session_key: SimpleNamespace(origin=source)},
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        clear_resume_pending=AsyncMock(return_value=False),
+    )
+
+    admission_entered = threading.Event()
+    release_admission = threading.Event()
+    _install_admission_barrier(adapter, admission_entered, release_admission)
+    delivery_task = asyncio.create_task(
+        runner._deliver_completion_notification("synthetic", evt)
+    )
+
+    entered = await asyncio.wait_for(
+        asyncio.to_thread(admission_entered.wait, 3),
+        timeout=4,
+    )
+    if entered:
+        try:
+            await runner._cancel_session_background_work(
+                session_key,
+                parent_session_id="parent-a",
+                reason="stop_command",
+            )
+        finally:
+            release_admission.set()
+    else:
+        release_admission.set()
+
+    result = await asyncio.wait_for(delivery_task, timeout=5)
+    await adapter.cancel_background_tasks()
+
+    assert entered is True
+    assert result is None
+    assert finished.completion_suppressed is True
+    handler.assert_not_awaited()
+    assert session_key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_other_session_terminal_completion_is_admitted():
+    """An unrelated process completion keeps its own admission epoch."""
+    source = _source("thread-b")
+    session_key = build_session_key(source)
+    finished = ProcessSession(
+        id="proc_other_completion",
+        command="other-test",
+        session_key=session_key,
+        started_at=time.time(),
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    with process_registry._lock:
+        process_registry._finished[finished.id] = finished
+    evt = {
+        "type": "completion",
+        "session_id": finished.id,
+        "session_key": session_key,
+        "platform": Platform.DISCORD.value,
+        "chat_type": source.chat_type,
+        "chat_id": source.chat_id,
+        "thread_id": source.thread_id,
+        "user_id": source.user_id,
+        "started_at": finished.started_at,
+        "command": finished.command,
+        "exit_code": 0,
+        "output": "done",
+    }
+
+    runner = _delivery_runner(mock_injection=False)
+    adapter, handler = _admission_adapter(runner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    processed = asyncio.Event()
+
+    async def mark_processed(_event):
+        processed.set()
+
+    handler.side_effect = mark_processed
+
+    result = await runner._deliver_completion_notification("synthetic", evt)
+    await asyncio.wait_for(processed.wait(), timeout=2)
+    await adapter.cancel_background_tasks()
+
+    assert result is True
+    handler.assert_awaited_once()
+    delivered_event = handler.await_args.args[0]
+    admission = delivered_event.metadata[_COMPLETION_ADMISSION_TOKEN_KEY]
+    assert admission["session_key"] == session_key
+    assert admission["epoch"] == runner._current_completion_admission_epoch(
+        session_key
+    )
+    assert _COMPLETION_ADMISSION_REJECTED_KEY not in delivered_event.metadata
+
+
+@pytest.mark.asyncio
+async def test_stale_queued_completion_is_not_drained_after_stop_epoch():
+    runner = object.__new__(GatewayRunner)
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    adapter, handler = _admission_adapter(runner)
+    command_guard = asyncio.Event()
+    adapter._active_sessions[session_key] = command_guard
+    event = _tokenized_completion(runner, source)
+
+    await adapter.handle_message(event)
+    assert adapter._pending_messages[session_key] is event
+
+    runner._invalidate_completion_admission_epoch(
+        session_key,
+        reason="stop_command",
+    )
+    await adapter._drain_pending_after_session_command(
+        session_key,
+        command_guard,
+    )
+    await asyncio.sleep(0)
+
+    handler.assert_not_awaited()
+    assert event.metadata[_COMPLETION_ADMISSION_REJECTED_KEY] is True
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
+
+
+@pytest.mark.asyncio
+async def test_current_queued_completion_drains_normally():
+    runner = object.__new__(GatewayRunner)
+    source = _source("thread-a")
+    session_key = build_session_key(source)
+    adapter, handler = _admission_adapter(runner)
+    processed = asyncio.Event()
+
+    async def mark_processed(_event):
+        processed.set()
+
+    handler.side_effect = mark_processed
+    command_guard = asyncio.Event()
+    adapter._active_sessions[session_key] = command_guard
+    event = _tokenized_completion(runner, source)
+
+    await adapter.handle_message(event)
+    assert adapter._pending_messages[session_key] is event
+
+    await adapter._drain_pending_after_session_command(
+        session_key,
+        command_guard,
+    )
+    await asyncio.wait_for(processed.wait(), timeout=2)
+    await adapter.cancel_background_tasks()
+
+    handler.assert_awaited_once_with(event)
+    assert _COMPLETION_ADMISSION_REJECTED_KEY not in event.metadata

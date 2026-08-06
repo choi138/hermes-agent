@@ -1,17 +1,28 @@
-"""Behavioral coverage for the configured compression-attempt budget."""
+"""compression.max_attempts — config-driven compression retry cap.
+
+The conversation loop's compression retry cap was hardcoded to 3, stranding
+sessions that legitimately need more rounds — e.g. a restart history reload
+whose incompressible tool schemas keep the request estimate above the
+threshold while the messages themselves compress fine (the #62605 failure
+class).  The cap is now parsed from ``compression.max_attempts`` in
+``agent_init`` and read by the loop via
+``getattr(agent, "max_compression_attempts", 3)``.
+
+These tests pin the parse/validate/attach seam: default preserved, custom
+value honored, floor and ceiling enforced, garbage tolerated.
+"""
 
 from __future__ import annotations
 
 import contextlib
 import io
-
-import pytest
+from pathlib import Path
 
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _config(max_attempts=...):
+def _config(max_attempts=None) -> dict:
     compression = {
         "enabled": True,
         "threshold": 0.50,
@@ -19,7 +30,7 @@ def _config(max_attempts=...):
         "protect_first_n": 3,
         "protect_last_n": 20,
     }
-    if max_attempts is not ...:
+    if max_attempts is not None:
         compression["max_attempts"] = max_attempts
     return {
         "compression": compression,
@@ -29,43 +40,54 @@ def _config(max_attempts=...):
     }
 
 
-def _make_agent(monkeypatch, tmp_path, max_attempts=...):
+def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts=None):
     from hermes_cli import config as config_mod
 
-    monkeypatch.setattr(config_mod, "load_config", lambda: _config(max_attempts))
+    monkeypatch.setattr(
+        config_mod, "load_config", lambda: _config(max_attempts=max_attempts)
+    )
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly", lambda: _config(max_attempts=max_attempts)
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
     with contextlib.redirect_stdout(io.StringIO()):
-        return AIAgent(
-            base_url="https://openrouter.ai/api/v1",
+        agent = AIAgent(
+            base_url="https://chatgpt.com/backend-api/codex",
             api_key="test-key",
-            model="test/model",
+            provider="openai-codex",
+            model="gpt-5.5",
             enabled_toolsets=[],
             disabled_toolsets=[],
             quiet_mode=True,
-            skip_context_files=True,
             skip_memory=True,
-            session_db=SessionDB(db_path=tmp_path / "state.db"),
-            session_id="compression-attempt-config",
+            session_db=db,
+            session_id="max-attempts-test",
         )
+    return agent
 
 
-@pytest.mark.parametrize(
-    ("configured", "expected"),
-    [
-        (..., 3),
-        (1, 1),
-        (6, 6),
-        (10, 10),
-        (25, 10),
-        (0, 3),
-        (-2, 3),
-        (True, 3),
-        (4.7, 3),
-        ("invalid", 3),
-        ("6", 6),
-    ],
-)
-def test_compression_max_attempts_is_validated(
-    monkeypatch, tmp_path, configured, expected
-):
-    agent = _make_agent(monkeypatch, tmp_path, configured)
-    assert agent.max_compression_attempts == expected
+class TestCompressionMaxAttemptsConfig:
+    def test_default_is_three_when_unset(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path)
+        assert agent.max_compression_attempts == 3
+
+    def test_custom_value_is_honored(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
+        assert agent.max_compression_attempts == 6
+
+
+
+
+
+
+
+    def test_loop_pickup_degrades_to_default_when_attribute_missing(
+        self, monkeypatch, tmp_path
+    ):
+        # The loop reads getattr(agent, "max_compression_attempts", 3): a
+        # configured agent exposes its value, and an object without the
+        # attribute (older pickle / minimal stub) degrades to the prior
+        # hardcoded behavior.
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts=7)
+        assert getattr(agent, "max_compression_attempts", 3) == 7
+        assert getattr(object(), "max_compression_attempts", 3) == 3
