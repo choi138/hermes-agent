@@ -26,8 +26,8 @@ _MAX_REVISION_CHARS = 80
 _MAX_SHA_CHARS = 128
 # A hunk is kept tail-anchored, so these bound the window that survives,
 # not the hunk GitHub sent.  See :func:`_diff_hunk`.
-_MAX_DIFF_HUNK_CHARS = 900
-_MAX_DIFF_HUNK_LINES = 14
+_MAX_DIFF_HUNK_CHARS = 1800
+_MAX_DIFF_HUNK_LINES = 32
 _ELIDED_HUNK_MARKER = "[... {count} earlier lines elided ...]"
 
 

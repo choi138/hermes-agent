@@ -6,6 +6,8 @@ from typing import Any
 
 from plugins.mention_inbox.actionable import GitHubActionKind, GitHubHydrationContext
 from plugins.mention_inbox.preflight import (
+    _MAX_DIFF_HUNK_CHARS,
+    _MAX_DIFF_HUNK_LINES,
     PreApprovalDisposition,
     brief_from_metadata,
     brief_to_metadata,
@@ -225,8 +227,8 @@ def test_diff_hunk_keeps_the_commented_line_and_the_enclosing_header() -> None:
     assert kept[0] == _HUNK_HEADER
     assert kept[-1] == _COMMENTED_LINE
     assert "earlier lines elided" in kept[1]
-    assert len(kept) <= 14
-    assert len(finding.diff_hunk) <= 900
+    assert len(kept) <= _MAX_DIFF_HUNK_LINES
+    assert len(finding.diff_hunk) <= _MAX_DIFF_HUNK_CHARS
     assert brief_from_metadata(brief_to_metadata(brief)) == brief
 
 
