@@ -29,6 +29,40 @@ inserting their plugin dir on ``sys.path[0]`` race for
 first wins; the other fails with ``ImportError``, and the polluted
 ``sys.path`` cascades into unrelated tests. See PR #17764 for the
 incident.
+
+Known unfixed discord pollution
+-------------------------------
+Two files force ``AllowedMentions`` onto whatever is in
+``sys.modules["discord"]`` at *import* time and never restore it:
+``test_discord_allowed_mentions.py`` and ``test_discord_connect.py``. Their
+stand-in has the four boolean flags but no ``none()`` classmethod, so any test
+that later calls ``discord.AllowedMentions.none()`` — which
+``plugins/platforms/discord/adapter.py`` does on every send — fails.
+
+A second, separate mechanism compounds it. ``adapter.py`` binds
+``discord = None`` in its ImportError fallback (adapter.py:131-137), and that
+binding is cached with the module. If any test leaves
+``sys.modules["discord"]`` set to ``None`` before the adapter is first
+imported, every later ``monkeypatch.setattr(discord_platform.discord, ...)``
+fails with ``None has no attribute ...`` — the same shape as the telegram
+``ChatType = None`` incident above.
+
+Together these make four tests in ``test_discord_send.py`` fail in a
+full-suite run while passing in isolation:
+``test_mention_inbox_send_forces_allowed_mentions_none``,
+``test_send_video_uses_path_based_files_kwarg``,
+``test_send_video_fails_loud_when_message_has_no_attachments`` and
+``test_send_file_attachment_forum_uses_files_kwarg``.
+
+Adding ``none()`` to the stand-ins does not fix it: the first test assigns
+``AllowedMentions.none.return_value``, which needs a ``MagicMock`` rather than
+a real class, and the other three are the ``discord = None`` mechanism, not the
+``AllowedMentions`` one. A real fix has to snapshot and restore the
+``discord*`` **and** ``plugins.platforms.discord*`` entries of ``sys.modules``
+around each test, because the adapter caches its binding; the per-file
+``_ensure_discord_mock`` helpers run at import time and cannot be moved into a
+fixture without also deferring the adapter import. Expect that change to
+surface further order dependencies these four failures currently mask.
 """
 
 import ast
