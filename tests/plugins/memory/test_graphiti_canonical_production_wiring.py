@@ -1,4 +1,4 @@
-"""Production-wiring test for the context-only Graphiti memory provider."""
+"""Production-wiring test for the read-only Graphiti memory provider."""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ def _live_server(profile_home, config, session):
     return server
 
 
-def test_aiagent_loads_real_context_only_provider_and_calls_bound_registry_handler(
+def test_aiagent_loads_filtered_search_wrapper_but_keeps_raw_mcp_tools_hidden(
     tmp_path, monkeypatch
 ):
     config = _config()
@@ -180,7 +180,15 @@ def test_aiagent_loads_real_context_only_provider_and_calls_bound_registry_handl
             )
 
         assert agent._memory_manager is not None
-        assert agent._memory_manager.get_all_tool_schemas() == []
+        assert [
+            schema["name"]
+            for schema in agent._memory_manager.get_all_tool_schemas()
+        ] == ["search_memory_facts"]
+        assert any(
+            tool.get("function", {}).get("name") == "search_memory_facts"
+            for tool in agent.tools
+            if isinstance(tool, dict)
+        )
         assert not any(
             tool.get("function", {}).get("name", "").startswith(
                 "mcp__graphiti_canonical__"
@@ -192,14 +200,26 @@ def test_aiagent_loads_real_context_only_provider_and_calls_bound_registry_handl
         provider = agent._memory_manager._providers[0]
         assert provider.name == "graphiti_canonical"
         with _running_mcp_loop(monkeypatch):
+            tool_result = json.loads(
+                agent._memory_manager.handle_tool_call(
+                    "search_memory_facts",
+                    {"query": "continue the previous P1 project"},
+                )
+            )
             context = provider.prefetch("continue the previous P1 project")
 
+        assert tool_result["status"] == "ok"
+        assert "P1 branch is hermes/all-work." in tool_result["recall"]
         assert "P1 branch is hermes/all-work." in context
         assert session.calls == [
             (
                 "search_memory_facts",
                 {"query": "continue the previous P1 project", "max_facts": 12},
-            )
+            ),
+            (
+                "search_memory_facts",
+                {"query": "continue the previous P1 project", "max_facts": 12},
+            ),
         ]
     finally:
         server._deregister_tools()

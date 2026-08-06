@@ -13,12 +13,519 @@ from plugins.memory import graphiti_canonical as graphiti_module
 from plugins.memory.graphiti_canonical import GraphitiCanonicalMemoryProvider
 
 
-def test_graphiti_canonical_provider_is_discoverable_and_context_only():
+def test_graphiti_canonical_provider_exposes_only_bounded_read_only_search():
     provider = load_memory_provider("graphiti_canonical")
 
     assert provider is not None
     assert provider.name == "graphiti_canonical"
-    assert provider.get_tool_schemas() == []
+    schemas = provider.get_tool_schemas()
+    assert [schema["name"] for schema in schemas] == ["search_memory_facts"]
+    assert schemas[0]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Historical memory query (never a credential request).",
+                "minLength": 2,
+                "maxLength": 4000,
+            },
+            "max_facts": {
+                "type": "integer",
+                "description": "Maximum number of filtered facts to return.",
+                "minimum": 1,
+                "maximum": 12,
+                "default": 4,
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    description = schemas[0]["description"].lower()
+    assert "before browser" in description
+    assert "status=empty" in description
+    assert "fallback_allowed=true" in description
+    assert "do not fall back" in description
+
+
+def test_memory_manager_registers_graphiti_model_search_tool():
+    provider = GraphitiCanonicalMemoryProvider()
+    manager = MemoryManager()
+
+    manager.add_provider(provider)
+
+    assert manager.has_tool("search_memory_facts") is True
+    assert [schema["name"] for schema in manager.get_all_tool_schemas()] == [
+        "search_memory_facts"
+    ]
+
+
+def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    def fake_dispatch(tool_name, args, *, deadline, hermes_home):
+        calls.append((tool_name, args, deadline, hermes_home))
+        return {
+            "facts": [
+                {
+                    "uuid": "edge-safe",
+                    "name": "PREFERS",
+                    "fact": "Alice prefers concise Korean answers for project updates.",
+                },
+                {
+                    "uuid": "edge-secret",
+                    "name": "HAS_SECRET",
+                    "fact": "Alice has secret synthetic-value.",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", fake_dispatch)
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts",
+            {"query": "What answer style does Alice prefer?", "max_facts": 1},
+        )
+    )
+
+    assert result == {
+        "status": "ok",
+        "source": "graphiti_historical_memory",
+        "returned_count": 1,
+        "candidate_count": 2,
+        "fetch_limit": 12,
+        "reached_fetch_limit": False,
+        "has_more": True,
+        "total_unknown": False,
+        "fallback_allowed": False,
+        "recall": (
+            "# Graphiti Recall (read-only historical context)\n"
+            "Current user instructions and built-in USER/MEMORY override conflicts.\n"
+            "- [PREFERS; edge=edge-safe] Alice prefers concise Korean answers for "
+            "project updates."
+        ),
+    }
+    assert len(calls) == 1
+    tool_name, args, deadline, hermes_home = calls[0]
+    assert tool_name == "mcp__graphiti_canonical__search_memory_facts"
+    assert args == {
+        "query": "What answer style does Alice prefer?",
+        "max_facts": 12,
+    }
+    assert deadline > time.monotonic()
+    assert hermes_home == str(tmp_path.resolve())
+
+
+def test_model_search_tool_distinguishes_empty_results_from_failures(
+    monkeypatch, tmp_path
+):
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {"structuredContent": {"facts": []}},
+    )
+    empty = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {"error": "synthetic detail must not leak"},
+    )
+    reported_error = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: json.dumps(
+            {"error": "synthetic string detail must not leak"}
+        ),
+    )
+    reported_string_error = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    def fail_dispatch(*args, **kwargs):
+        raise TimeoutError("synthetic timeout detail must not leak")
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", fail_dispatch)
+    failed = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    assert empty == {
+        "status": "empty",
+        "source": "graphiti_historical_memory",
+        "returned_count": 0,
+        "candidate_count": 0,
+        "fetch_limit": 12,
+        "reached_fetch_limit": False,
+        "has_more": False,
+        "total_unknown": False,
+        "fallback_allowed": True,
+        "recall": "",
+    }
+    assert reported_error == {
+        "status": "error",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search failed",
+    }
+    assert reported_string_error == {
+        "status": "error",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search failed",
+    }
+    assert failed == {
+        "status": "timeout",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search timed out",
+    }
+    assert "synthetic" not in json.dumps(reported_error)
+    assert "synthetic" not in json.dumps(reported_string_error)
+    assert "synthetic" not in json.dumps(failed)
+
+
+def test_model_search_tool_reports_filtered_candidates_without_allowing_fallback(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "facts": [
+                {
+                    "uuid": "instagram-edge",
+                    "name": "LIKES",
+                    "fact": "na liked content from example_creator on Instagram.",
+                }
+            ]
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "Instagram", "max_facts": 4}
+        )
+    )
+
+    assert result == {
+        "status": "filtered",
+        "source": "graphiti_historical_memory",
+        "returned_count": 0,
+        "candidate_count": 1,
+        "fetch_limit": 12,
+        "reached_fetch_limit": False,
+        "has_more": True,
+        "total_unknown": False,
+        "fallback_allowed": False,
+        "recall": "",
+    }
+
+
+def test_prefetch_allows_fallback_only_for_confirmed_empty_graphiti_result(
+    monkeypatch, tmp_path
+):
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {"structuredContent": {"facts": []}},
+    )
+    empty = provider.prefetch("Instagram에서 마지막으로 연락한 사람은 누구야?")
+
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "facts": [
+                {
+                    "uuid": "instagram-edge",
+                    "name": "LIKES",
+                    "fact": "na liked content from example_creator on Instagram.",
+                }
+            ]
+        },
+    )
+    filtered = provider.prefetch("Instagram에서 마지막으로 연락한 사람은 누구야?")
+
+    assert "# Graphiti Lookup Status" in empty
+    assert "source: graphiti_historical_memory" in empty
+    assert "routing_policy: graphiti_first" in empty
+    assert "status: empty" in empty
+    assert "fallback_allowed: true" in empty
+    assert "candidate_count: 0" in empty
+    assert "status: filtered" in filtered
+    assert "routing_policy: graphiti_first" in filtered
+    assert "fallback_allowed: false" in filtered
+    assert "candidate_count: 1" in filtered
+
+
+def test_prefetch_does_not_treat_application_error_as_missing_information(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "structuredContent": {"error": "synthetic detail must not leak"}
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = provider.prefetch("Instagram에서 마지막으로 연락한 사람은 누구야?")
+
+    assert "status: error" in result
+    assert "routing_policy: graphiti_first" in result
+    assert "fallback_allowed: false" in result
+    assert "synthetic" not in result
+
+
+def test_prefetch_timeout_blocks_fallback_instead_of_looking_empty(monkeypatch, tmp_path):
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+    monkeypatch.setattr(graphiti_module, "_PREFETCH_TIMEOUT_SECONDS", 0.02)
+    release = threading.Event()
+
+    def blocked_dispatch(*args, **kwargs):
+        release.wait(1)
+        return {"facts": []}
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", blocked_dispatch)
+    try:
+        result = provider.prefetch("Instagram에서 마지막으로 연락한 사람은 누구야?")
+    finally:
+        release.set()
+
+    assert "status: timeout" in result
+    assert "routing_policy: graphiti_first" in result
+    assert "fallback_allowed: false" in result
+
+
+def test_model_search_tool_marks_fetch_limit_as_unknown_total(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "facts": [
+                {
+                    "uuid": f"edge-{index}",
+                    "name": "RELATED_TO",
+                    "fact": f"P1 relates to Graphiti artifact {index}.",
+                }
+                for index in range(12)
+            ]
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "P1 Graphiti artifacts", "max_facts": 12}
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["source"] == "graphiti_historical_memory"
+    assert result["returned_count"] == 12
+    assert result["candidate_count"] == 12
+    assert result["fetch_limit"] == 12
+    assert result["reached_fetch_limit"] is True
+    assert result["has_more"] is None
+    assert result["total_unknown"] is True
+    assert result["fallback_allowed"] is False
+
+
+def test_model_search_tool_treats_structured_application_error_as_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "structuredContent": {
+                "error": "synthetic application detail must not leak"
+            },
+            "content": [
+                {
+                    "type": "text",
+                    "text": "synthetic human-readable failure must not leak",
+                }
+            ],
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search failed",
+    }
+    assert "synthetic" not in json.dumps(result)
+
+
+def test_model_search_tool_treats_malformed_payload_as_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "structuredContent": {
+                "unexpected": "synthetic malformed detail must not leak"
+            }
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    assert result == {
+        "status": "error",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search failed",
+    }
+    assert "synthetic" not in json.dumps(result)
+
+
+def test_model_search_tool_bounds_post_dispatch_processing(monkeypatch, tmp_path):
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    monkeypatch.setattr(graphiti_module, "_PREFETCH_TIMEOUT_SECONDS", 0.05)
+    dispatch_calls = []
+
+    def dispatch(*args, **kwargs):
+        dispatch_calls.append((args, kwargs))
+        return {
+            "facts": [
+                {
+                    "uuid": "edge-1",
+                    "name": "PREFERS",
+                    "fact": "Alice prefers concise answers.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", dispatch)
+
+    def delayed_refresh():
+        time.sleep(0.2)
+
+    monkeypatch.setattr(provider, "_refresh_builtin_memory", delayed_refresh)
+
+    started = time.monotonic()
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+    elapsed = time.monotonic() - started
+    overlapping_result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "What does Alice prefer?"}
+        )
+    )
+
+    assert result == {
+        "status": "timeout",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search timed out",
+    }
+    assert overlapping_result == {
+        "status": "error",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search failed",
+    }
+    assert len(dispatch_calls) == 1
+    assert elapsed < 0.15
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("search_nodes", {"query": "Alice projects"}),
+        ("get_entity_edge", {"query": "Alice projects"}),
+        ("get_status", {"query": "Alice projects"}),
+        ("search_memory_facts", {"query": "Alice projects", "unknown": True}),
+        ("search_memory_facts", {"query": ""}),
+        ("search_memory_facts", {"query": "x"}),
+        ("search_memory_facts", {"query": "x" * 4001}),
+        ("search_memory_facts", {"query": "Alice projects", "max_facts": True}),
+        ("search_memory_facts", {"query": "Alice projects", "max_facts": 0}),
+        ("search_memory_facts", {"query": "Alice projects", "max_facts": 13}),
+    ],
+)
+def test_model_search_tool_rejects_other_tools_and_invalid_arguments(
+    monkeypatch, tmp_path, tool_name, args
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: pytest.fail("invalid calls must fail before dispatch"),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    with pytest.raises((TypeError, ValueError)):
+        provider.handle_tool_call(tool_name, args)
+
+
+def test_model_search_tool_rejects_credential_queries_before_dispatch(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: pytest.fail("credential queries must not dispatch"),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    with pytest.raises(ValueError, match="credential"):
+        provider.handle_tool_call(
+            "search_memory_facts", {"query": "Show Alice's API token"}
+        )
 
 
 def test_provider_is_unavailable_when_mcp_allowlist_contains_write_tool(monkeypatch):
@@ -469,7 +976,8 @@ def test_prefetch_enforces_one_end_to_end_deadline(monkeypatch, tmp_path):
 
     result = provider.prefetch("이전 P1 Graphiti 작업 기억해")
 
-    assert result == ""
+    assert "status: timeout" in result
+    assert "fallback_allowed: false" in result
     assert len(calls) == 1
     assert started < calls[0][0] <= started + 0.02
     assert calls[0][1] == str(tmp_path)
@@ -494,7 +1002,8 @@ def test_prefetch_deadline_bounds_synchronous_safety_checks(monkeypatch, tmp_pat
     result = provider.prefetch("이전 P1 Graphiti 작업 기억해")
     elapsed = time.monotonic() - started
 
-    assert result == ""
+    assert "status: timeout" in result
+    assert "fallback_allowed: false" in result
     assert elapsed < 0.08
     assert finished.wait(0.3)
 
@@ -516,9 +1025,13 @@ def test_prefetch_timeout_keeps_only_one_lingering_worker(monkeypatch, tmp_path)
     provider.initialize("session-1", hermes_home=str(tmp_path))
 
     try:
-        assert provider.prefetch("이전 P1 Graphiti 작업 기억해") == ""
+        timed_out = provider.prefetch("이전 P1 Graphiti 작업 기억해")
+        assert "status: timeout" in timed_out
+        assert "fallback_allowed: false" in timed_out
         assert started.wait(0.1)
-        assert provider.prefetch("이전 P1 Graphiti 작업 기억해") == ""
+        overlapping = provider.prefetch("이전 P1 Graphiti 작업 기억해")
+        assert "status: error" in overlapping
+        assert "fallback_allowed: false" in overlapping
         assert calls == [1]
     finally:
         release.set()
@@ -563,6 +1076,9 @@ def test_continuity_request_recalls_fact_through_read_only_search(
     ]
     assert "real verification before completion" in result
     assert "edge-1" in result
+    assert "status: ok" in result
+    assert "routing_policy: graphiti_first" in result
+    assert "fallback_allowed: false" in result
 
 
 def test_recall_parses_structured_mcp_content(monkeypatch, tmp_path):
@@ -1357,7 +1873,7 @@ def test_recall_rejects_overlong_final_query_after_scope_append(monkeypatch, tmp
     assert calls == []
 
 
-def test_recall_fails_open_without_memory_on_search_timeout(monkeypatch, tmp_path):
+def test_recall_reports_timeout_without_allowing_fallback(monkeypatch, tmp_path):
     def timeout(_tool, _args, **_kwargs):
         raise TimeoutError("synthetic Graphiti timeout")
 
@@ -1365,7 +1881,9 @@ def test_recall_fails_open_without_memory_on_search_timeout(monkeypatch, tmp_pat
     provider = GraphitiCanonicalMemoryProvider()
     provider.initialize("session-1", hermes_home=str(tmp_path))
 
-    assert provider.prefetch("이전 프로젝트 작업 계속") == ""
+    result = provider.prefetch("이전 프로젝트 작업 계속")
+    assert "status: timeout" in result
+    assert "fallback_allowed: false" in result
 
 
 def test_recall_uses_daemon_worker_around_bounded_mcp_handler(monkeypatch, tmp_path):
@@ -1385,7 +1903,9 @@ def test_recall_uses_daemon_worker_around_bounded_mcp_handler(monkeypatch, tmp_p
 
     monkeypatch.setattr(graphiti_module.threading, "Thread", recording_thread)
 
-    assert provider.prefetch("이전 프로젝트 작업 계속") == ""
+    result = provider.prefetch("이전 프로젝트 작업 계속")
+    assert "status: error" in result
+    assert "fallback_allowed: false" in result
     assert len(created) == 1
     assert created[0]["daemon"] is True
     assert created[0]["name"] == "graphiti-canonical-prefetch"
@@ -1425,28 +1945,31 @@ def test_preference_dependent_request_triggers_selective_recall(monkeypatch, tmp
     assert "preference-edge" in result
 
 
-def test_unrelated_temporal_question_yields_no_recall_context(monkeypatch, tmp_path):
-    """An off-topic question costs one search but injects nothing.
+def test_unrelated_temporal_question_reports_confirmed_empty(monkeypatch, tmp_path):
+    """An off-topic question costs one search and permits fallback only after empty.
 
     The gate used to require a work-context term alongside the temporal one,
     which skipped the dispatch entirely. That allowlist also blocked 92% of
     real requests, so the gate is now a denylist and off-topic turns pay one
-    bounded search. Correctness is unchanged — the relevance filter still
-    drops every fact — but the round-trip is no longer avoided. Revisit via
-    queue_prefetch if the measured per-turn cost matters.
+    bounded search. A valid empty response is explicit so downstream routing
+    can distinguish absent data from transport or application failure.
     """
     calls = []
     monkeypatch.setattr(
         graphiti_module,
         "_dispatch_tool",
-        lambda tool, args, **_kwargs: calls.append((tool, args)) or "{}",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
     )
     provider = GraphitiCanonicalMemoryProvider()
     provider.initialize("session-1", hermes_home=str(tmp_path))
 
     result = provider.prefetch("지난밤 서울 날씨는 어땠어?")
 
-    assert result == ""
+    assert "status: empty" in result
+    assert "routing_policy: advisory" in result
+    assert "fallback_allowed: true" in result
     assert [call[1]["query"] for call in calls] == ["지난밤 서울 날씨는 어땠어?"]
 
 
@@ -2016,7 +2539,9 @@ def test_provider_integrates_with_memory_manager_without_exposing_mutation_tools
 
     assert "integration-edge" in recalled
     assert "non-authoritative" in manager.build_system_prompt()
-    assert manager.get_all_tool_schemas() == []
+    assert [schema["name"] for schema in manager.get_all_tool_schemas()] == [
+        "search_memory_facts"
+    ]
 
 
 def test_provider_prompt_declares_recall_non_authoritative_and_read_only():
@@ -2027,6 +2552,19 @@ def test_provider_prompt_declares_recall_non_authoritative_and_read_only():
     assert "current user instructions" in block
     assert "built-in" in block
     assert "live state" in block
+    assert "before browser" in block
+    assert "before session history" in block
+    assert "only when status=empty and fallback_allowed=true" in block
+    assert "filtered" in block
+    assert "timeout" in block
+    assert "error" in block
+    assert "do not silently fall back" in block
+    assert "runtime guard" in block
+    assert "denied fallback" in block
+    assert "explicitly directs a live" in block
+    assert "graphiti records" in block
+    assert "returned_count" in block
+    assert "not the total" in block
 
 
 def test_memory_context_fence_treats_recall_as_informational():
@@ -2540,3 +3078,118 @@ def test_ephemeral_status_fact_cannot_ride_along_with_a_durable_fact():
     assert "edge=durable" in result
     assert "edge=ephemeral" not in result
     assert "queued for retry" not in result
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Graphiti에서 지난 작업 찾아줘", True),
+        ("instagram에서 나랑 가장 마지막으로 연락한 사람 이름", True),
+        ("전에 P1, P2 중 어떤 작업을 하고 있었지?", True),
+        ("내가 어제 뭐했지?", True),
+        ("최근 뉴스 알려줘", False),
+        ("지난밤 서울 날씨", False),
+        ("Instagram 실시간 화면에서 마지막 연락 상대를 직접 확인해", False),
+        ("전에 하던 작업을 확인하고 웹 문서도 검색해", False),
+        ("파이썬 테스트 고쳐줘", False),
+        ("안녕", False),
+    ],
+)
+def test_graphiti_first_routing_is_scoped_to_explicit_or_personal_history_queries(
+    query, expected
+):
+    assert graphiti_module._requires_graphiti_first(query) is expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"facts": []},
+        {"structuredContent": {"facts": []}},
+        {"content": [{"type": "text", "text": '{"facts": []}'}]},
+    ],
+)
+def test_model_search_tool_maps_supported_empty_mcp_envelopes_to_empty(
+    monkeypatch, tmp_path, raw
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: raw,
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    result = json.loads(
+        provider.handle_tool_call("search_memory_facts", {"query": "P1 history"})
+    )
+
+    assert result["status"] == "empty"
+    assert result["fallback_allowed"] is True
+    assert result["candidate_count"] == 0
+
+
+def test_formatter_returns_count_without_reparsing_rendered_text():
+    recall, returned_count = graphiti_module._format_facts_with_count(
+        [
+            {
+                "uuid": "edge-format-count",
+                "name": "RELATED_TO",
+                "fact": "P1 relates to Graphiti output containing literal - [ text.",
+            }
+        ],
+        query="P1 Graphiti output",
+        identity_terms=set(),
+    )
+
+    assert returned_count == 1
+    assert "edge-format-count" in recall
+
+
+def test_model_search_schema_returns_independent_copies():
+    provider = GraphitiCanonicalMemoryProvider()
+
+    first = provider.get_tool_schemas()
+    first[0]["description"] = "mutated"
+    first[0]["parameters"]["properties"]["query"]["description"] = "mutated"
+    second = provider.get_tool_schemas()
+
+    assert second[0]["description"] != "mutated"
+    assert second[0]["parameters"]["properties"]["query"]["description"] != "mutated"
+    assert first[0] is not second[0]
+
+
+def test_prefetch_and_model_search_share_one_inflight_gate(monkeypatch, tmp_path):
+    monkeypatch.setattr(graphiti_module, "_PREFETCH_TIMEOUT_SECONDS", 0.05)
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_dispatch(*args, **kwargs):
+        calls.append(1)
+        started.set()
+        release.wait(1)
+        return {"facts": []}
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", blocked_dispatch)
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+    prefetch_thread = threading.Thread(
+        target=lambda: provider.prefetch("이전 작업 기록을 찾아줘"), daemon=True
+    )
+    prefetch_thread.start()
+    assert started.wait(0.5)
+
+    try:
+        result = json.loads(
+            provider.handle_tool_call(
+                "search_memory_facts", {"query": "이전 작업 기록을 찾아줘"}
+            )
+        )
+    finally:
+        release.set()
+        prefetch_thread.join(timeout=1)
+
+    assert result["status"] == "error"
+    assert result["fallback_allowed"] is False
+    assert calls == [1]

@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager, inject_memory_provider_tools
+from agent.memory_manager import (
+    MemoryManager,
+    graphiti_first_status_from_context,
+    inject_memory_provider_tools,
+    strip_graphiti_lookup_status_blocks,
+)
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -1149,3 +1154,85 @@ class TestMemoryInjectionRejectsMalformedSchema:
         names = {t["function"]["name"] for t in agent.tools}
         assert names == {"good_tool"}
         assert agent.valid_tool_names == {"good_tool"}
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        (
+            "# Graphiti Lookup Status\n"
+            "source: graphiti_historical_memory\n"
+            "routing_policy: graphiti_first\n"
+            "status: empty\n"
+            "fallback_allowed: true",
+            "empty",
+        ),
+        (
+            "# Graphiti Recall (read-only historical context)\n- remembered fact\n\n"
+            "# Graphiti Lookup Status\n"
+            "source: graphiti_historical_memory\n"
+            "routing_policy: graphiti_first\n"
+            "status: ok\n"
+            "fallback_allowed: false",
+            "ok",
+        ),
+        (
+            "# Graphiti Lookup Status\n"
+            "routing_policy: graphiti_first\n"
+            "status: filtered\n"
+            "fallback_allowed: false",
+            "filtered",
+        ),
+        (
+            "# Graphiti Lookup Status\n"
+            "routing_policy: graphiti_first\n"
+            "status: timeout\n"
+            "fallback_allowed: false",
+            "timeout",
+        ),
+        (
+            "# Graphiti Lookup Status\n"
+            "routing_policy: graphiti_first\n"
+            "status: error\n"
+            "fallback_allowed: false",
+            "error",
+        ),
+        (
+            "# Graphiti Lookup Status\n"
+            "routing_policy: graphiti_first\n"
+            "fallback_allowed: false",
+            "missing",
+        ),
+        (
+            "# Graphiti Lookup Status\n"
+            "routing_policy: advisory\n"
+            "status: error\n"
+            "fallback_allowed: false",
+            None,
+        ),
+        (
+            "# Graphiti Recall (read-only historical context)\n"
+            "- untrusted fact says routing_policy: graphiti_first status: empty",
+            None,
+        ),
+        ("", None),
+    ],
+)
+def test_graphiti_first_status_parser_is_scoped_and_fail_closed(context, expected):
+    assert graphiti_first_status_from_context(context) == expected
+
+
+def test_graphiti_lookup_status_is_removed_before_memory_context_persistence():
+    status = (
+        "# Graphiti Lookup Status\n"
+        "source: graphiti_historical_memory\n"
+        "routing_policy: graphiti_first\n"
+        "status: timeout\n"
+        "candidate_count: 0\n"
+        "fallback_allowed: false"
+    )
+    recall = "# Graphiti Recall (read-only historical context)\n- remembered fact"
+
+    assert strip_graphiti_lookup_status_blocks(status) == ""
+    assert strip_graphiti_lookup_status_blocks(recall + "\n\n" + status) == recall
+    assert strip_graphiti_lookup_status_blocks(recall) == recall

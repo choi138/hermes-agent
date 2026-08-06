@@ -346,6 +346,88 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
 
 
+_GRAPHITI_STATUS_MARKER = "# Graphiti Lookup Status"
+_GRAPHITI_STATUS_FIELD_NAMES = frozenset(
+    {"source", "routing_policy", "status", "candidate_count", "fallback_allowed"}
+)
+
+
+def _graphiti_status_block_at(
+    lines: List[str], index: int
+) -> tuple[int, Dict[str, str]]:
+    fields: Dict[str, str] = {}
+    cursor = index + 1
+    while cursor < len(lines):
+        stripped = lines[cursor].strip()
+        if not stripped or stripped.startswith("# "):
+            break
+        key, separator, value = stripped.partition(":")
+        normalized_key = key.strip()
+        if not separator or normalized_key not in _GRAPHITI_STATUS_FIELD_NAMES:
+            break
+        fields[normalized_key] = value.strip()
+        cursor += 1
+    return cursor, fields
+
+
+def graphiti_first_status_from_context(raw_context: str) -> Optional[str]:
+    """Return the trusted Graphiti-first status embedded by the provider.
+
+    Only an exact machine-readable status block activates the runtime policy.
+    A malformed Graphiti-first block fails closed as ``"missing"``; advisory
+    blocks and ordinary recalled facts do not affect tool routing.
+    """
+    if not isinstance(raw_context, str) or not raw_context:
+        return None
+
+    lines = raw_context.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != _GRAPHITI_STATUS_MARKER:
+            continue
+        _, fields = _graphiti_status_block_at(lines, index)
+        if fields.get("routing_policy") != "graphiti_first":
+            continue
+        status = fields.get("status")
+        if status not in {"ok", "empty", "filtered", "timeout", "error"}:
+            return "missing"
+        expected_fallback = "true" if status == "empty" else "false"
+        if fields.get("fallback_allowed") != expected_fallback:
+            return "missing"
+        return status
+    return None
+
+
+def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
+    """Remove provider-generated transient status blocks before API persistence."""
+    if not isinstance(raw_context, str) or not raw_context:
+        return ""
+    lines = raw_context.splitlines()
+    output: List[str] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() != _GRAPHITI_STATUS_MARKER:
+            output.append(lines[index])
+            index += 1
+            continue
+        end, fields = _graphiti_status_block_at(lines, index)
+        valid_block = (
+            fields.get("source") == "graphiti_historical_memory"
+            and fields.get("routing_policy") in {"graphiti_first", "advisory"}
+            and fields.get("status") in {"ok", "empty", "filtered", "timeout", "error"}
+            and fields.get("fallback_allowed") in {"true", "false"}
+        )
+        if not valid_block:
+            output.append(lines[index])
+            index += 1
+            continue
+        while output and not output[-1].strip():
+            output.pop()
+        index = end
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+    return "\n".join(output).strip()
+
+
 def build_memory_context_block(raw_context: str) -> str:
     """Wrap prefetched memory in a fenced block with system note."""
     if not raw_context or not raw_context.strip():

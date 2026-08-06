@@ -24,6 +24,7 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "web_search",
         "web_extract",
         "session_search",
+        "search_memory_facts",
         "browser_snapshot",
         "browser_console",
         "browser_get_images",
@@ -57,6 +58,13 @@ MUTATING_TOOL_NAMES = frozenset(
         "delegate_task",
         "process",
     }
+)
+
+_GRAPHITI_FALLBACK_TOOL_NAMES = frozenset(
+    {"web_search", "web_extract", "session_search", "computer_use"}
+)
+_GRAPHITI_ROUTING_STATUSES = frozenset(
+    {"ok", "empty", "filtered", "timeout", "error", "missing"}
 )
 
 
@@ -194,7 +202,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | deny | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -287,6 +295,16 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._graphiti_routing_status: str | None = None
+
+    def set_graphiti_routing_status(self, status: str | None) -> None:
+        """Set the current turn's Graphiti-first fallback decision."""
+        if status is None:
+            self._graphiti_routing_status = None
+            return
+        self._graphiti_routing_status = (
+            status if status in _GRAPHITI_ROUTING_STATUSES else "missing"
+        )
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -294,6 +312,26 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+
+        graphiti_status = self._graphiti_routing_status
+        is_fallback_tool = (
+            tool_name in _GRAPHITI_FALLBACK_TOOL_NAMES
+            or tool_name.startswith("browser_")
+        )
+        if is_fallback_tool and graphiti_status not in {None, "empty"}:
+            return ToolGuardrailDecision(
+                action="deny",
+                code="graphiti_fallback_not_allowed",
+                message=(
+                    f"Blocked {tool_name}: Graphiti-first routing permits another "
+                    "source only after a confirmed status=empty result. The current "
+                    f"Graphiti status is {graphiti_status}. Report that status instead "
+                    "of silently falling back, unless the user explicitly directs a "
+                    "different source."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may
@@ -357,6 +395,22 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
+        if tool_name == "search_memory_facts":
+            parsed = safe_json_loads(result or "")
+            if isinstance(parsed, dict):
+                status = parsed.get("status")
+                fallback_allowed = parsed.get("fallback_allowed")
+                if status == "empty" and fallback_allowed is True:
+                    self._graphiti_routing_status = "empty"
+                elif (
+                    status in {"ok", "filtered", "timeout", "error"}
+                    and fallback_allowed is False
+                ):
+                    self._graphiti_routing_status = status
+                else:
+                    self._graphiti_routing_status = "missing"
+            else:
+                self._graphiti_routing_status = "missing"
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
