@@ -20,12 +20,6 @@ _MAX_RESPONSE_BYTES = 1_048_576
 _REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _LOGIN_RE = re.compile(r"[A-Za-z0-9-]+")
 _TEAM_SLUG_RE = re.compile(r"[A-Za-z0-9_-]+")
-# One page of changed files is a deliberate truncation, reported through
-# PullRequestFiles.truncated so a reader is never told a partial diff is whole.
-_MAX_PULL_FILES = 30
-# Generous on purpose: the relevant region is picked downstream, where the
-# commented line number is known, so cutting here would cut blindly.
-_MAX_PATCH_CHARS = 20_000
 
 
 @dataclass(frozen=True)
@@ -33,31 +27,6 @@ class GitHubHttpResponse:
     status: int
     headers: Mapping[str, str]
     body: bytes
-
-
-@dataclass(frozen=True)
-class PullRequestFile:
-    """One changed file, with its diff bounded for downstream prompts."""
-
-    filename: str
-    status: str
-    patch: str
-    patch_truncated: bool
-
-
-@dataclass(frozen=True)
-class PullRequestFiles:
-    """Best-effort diff context for one pull request.
-
-    ``unavailable`` is the honest answer when the read failed, and it is not
-    the same as an empty ``files``: a reader must never conclude "this pull
-    request changed nothing" — or refute a review comment — from evidence it
-    never received.
-    """
-
-    files: tuple[PullRequestFile, ...]
-    truncated: bool
-    unavailable: bool
 
 
 @dataclass(frozen=True)
@@ -308,26 +277,6 @@ def _subject_coordinates(subject_url: str, repository: str) -> tuple[str, str, s
     if match is None:
         raise ValueError("GitHub hydration URL escaped the allowed repository or endpoint")
     return owner, name, match.group(1), int(match.group(2))
-
-
-def _pull_request_file(item: Mapping[str, Any]) -> PullRequestFile | None:
-    filename = item.get("filename")
-    if not isinstance(filename, str) or not filename:
-        return None
-    raw_patch = item.get("patch")
-    # GitHub omits `patch` for binary files and for files past its own diff
-    # limit, so an absent diff is normal and must not fail the read.
-    patch = raw_patch if isinstance(raw_patch, str) else ""
-    truncated = len(patch) > _MAX_PATCH_CHARS
-    if truncated:
-        patch = patch[: _MAX_PATCH_CHARS - 1].rstrip() + "\u2026"
-    status = item.get("status")
-    return PullRequestFile(
-        filename=filename,
-        status=status if isinstance(status, str) else "",
-        patch=patch,
-        patch_truncated=truncated,
-    )
 
 
 def _bounded_limit(limit: int) -> int:
@@ -593,49 +542,6 @@ class GitHubNotificationsClient:
             + urlencode({"per_page": str(limit)})
         )
         return self._fetch_collection(url, event_type="review_comment")
-
-    def fetch_pull_files(
-        self, subject_url: str, *, repository: str, limit: int = _MAX_PULL_FILES
-    ) -> PullRequestFiles:
-        """Read the changed files of one pull request, diffs included.
-
-        A review comment carries only the hunk around itself, which often does
-        not contain the code the comment is really about.  This is the wider,
-        still repository-scoped view: the subject URL is cross-checked against
-        the allowlisted repository by :func:`_subject_coordinates`, exactly as
-        every other pull-scoped read is, so a poisoned notification cannot
-        redirect it elsewhere.
-        """
-
-        limit = _bounded_limit(limit)
-        owner, name, kind, number = _subject_coordinates(subject_url, repository)
-        if kind != "pulls":
-            return PullRequestFiles(files=(), truncated=False, unavailable=False)
-        url = (
-            f"{GITHUB_API_BASE}/repos/{quote(owner)}/{quote(name)}/pulls/{number}/files?"
-            + urlencode({"per_page": str(limit)})
-        )
-        try:
-            payload = self._fetch_collection(url, event_type=None)
-        except GitHubClientError as exc:
-            if exc.category != "protocol_error":
-                raise
-            # A large pull request's file list can exceed _MAX_RESPONSE_BYTES.
-            # _decode_json raises a *retryable* protocol_error for that, and
-            # runtime._backoff_seconds would then retry the poll forever without
-            # ever delivering the notification.  Wider diff context is best
-            # effort, so degrade honestly instead of poisoning the poll loop.
-            return PullRequestFiles(files=(), truncated=False, unavailable=True)
-        files = tuple(
-            item
-            for item in (_pull_request_file(entry) for entry in payload)
-            if item is not None
-        )
-        return PullRequestFiles(
-            files=files,
-            truncated=len(payload) >= limit,
-            unavailable=False,
-        )
 
     def is_active_team_member(self, team_slug: str, username: str) -> bool:
         if not isinstance(team_slug, str) or team_slug.count("/") != 1:
