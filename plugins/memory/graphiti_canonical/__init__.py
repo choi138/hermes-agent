@@ -1097,7 +1097,17 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             or _query_requests_credentials(raw_scope)
         )
         self._scope_hint = _safe_scope_hint(raw_scope)
-        hermes_home = Path(kwargs.get("hermes_home") or "").resolve()
+        # Path("").resolve() is the CWD, and a CWD that is not the profile home
+        # makes bind_read_only_mcp_tool raise "profile context mismatch" on every
+        # recall — silently, since _bounded_search swallows it. Only the caller
+        # in the parked wip branch passes hermes_home; origin's does not, so the
+        # kwarg cannot be relied on. Resolve the profile home directly instead.
+        raw_home = kwargs.get("hermes_home")
+        if not raw_home:
+            from hermes_constants import get_hermes_home
+
+            raw_home = get_hermes_home()
+        hermes_home = Path(raw_home).resolve()
         self._hermes_home = str(hermes_home)
         self._identity_terms = _load_identity_terms(hermes_home)
         self._identity_terms.update(_runtime_identity_terms(kwargs))
