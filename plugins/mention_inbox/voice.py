@@ -284,14 +284,14 @@ def render_approval_unauthorized() -> str:
 def render_agent_tools_unauthorized() -> str:
     return (
         "이 work thread에서 코드나 로컬 작업공간을 확인할 권한이 없어요. "
-        "요청을 실행하지 않았습니다."
+        "요청은 실행하지 않았어요."
     )
 
 
 def render_agent_tools_not_enabled() -> str:
     return (
         "이 work thread의 도구 실행 기능이 현재 연결되지 않았어요. "
-        "요청을 실행하지 않았습니다."
+        "요청은 실행하지 않았어요."
     )
 
 
@@ -450,53 +450,53 @@ def render_proposal(
         )
     elif approval_unavailable_reason == "execution_unavailable":
         footer = (
-            "현재 자동 실행이 연결되지 않아 분석 결과만 갱신했습니다.",
+            "현재 자동 실행이 연결되지 않아 분석 결과만 갱신했어요.",
         )
     elif approval_unavailable_reason == "preflight_not_approvable":
         footer = (
-            "현재 근거만으로 자동 변경하지 않고 추가 확인이 필요합니다.",
+            "현재 근거만으로 자동 변경하지 않고 추가 확인이 필요해요.",
         )
     else:
         footer = (
-            "현재는 분석 결과만 갱신했습니다.",
+            "현재는 분석 결과만 갱신했어요.",
         )
     return _render_bounded_with_footer(lines, footer)
 
 
 def render_queued(proposal: WorkProposal) -> str:
     return (
-        "작업 요청을 확인했습니다. 실행 순서를 기다리고 있어요. "
-        "아직 시작되지 않았고, 실제로 시작되면 이 thread에 바로 남기겠습니다."
+        "작업 요청을 확인했어요. 실행 순서를 기다리고 있어요. "
+        "아직 시작되지 않았고, 실제로 시작되면 이 thread에 바로 남길게요."
     )
 
 
 def render_running(proposal: WorkProposal) -> str:
-    return "지금 작업을 시작했습니다. 요청된 범위와 검증 방법 안에서만 진행하겠습니다."
+    return "지금 작업을 시작했어요. 요청된 범위와 검증 방법 안에서만 진행할게요."
 
 
 def render_verifying(proposal: WorkProposal) -> str:
-    return "작업 결과를 검증하고 있어요. 확인 근거가 갖춰지기 전에는 완료로 표시하지 않겠습니다."
+    return "작업 결과를 검증하고 있어요. 확인 근거가 갖춰지기 전에는 완료로 표시하지 않을게요."
 
 
 def render_kanban_registering(proposal: WorkProposal) -> str:
-    return "요청된 범위를 Kanban의 durable queue에 등록하고 있어요. 아직 구현을 시작한 상태는 아닙니다."
+    return "요청된 범위를 Kanban의 durable queue에 등록하고 있어요. 아직 구현을 시작한 상태는 아니에요."
 
 
 def render_kanban_queued(proposal: WorkProposal) -> str:
     return (
-        "Kanban 작업으로 등록했습니다. 구현 완료가 아니라 실행 대기 상태예요. "
-        "실제 진행과 검증 근거는 이 thread의 후속 상태로 확인하겠습니다."
+        "Kanban 작업으로 등록했어요. 구현 완료가 아니라 실행 대기 상태예요. "
+        "실제 진행과 검증 근거는 이 thread의 후속 상태로 확인할게요."
     )
 
 
 _BLOCKED_REASONS = {
-    "no_tool_activity": "실제 도구 실행 기록이 없어 완료로 인정하지 않았습니다.",
-    "verification_missing": "필수 검증·commit·push 근거가 모두 확인되지 않았습니다.",
-    "agent_failed": "실행 agent가 정상 완료 상태를 반환하지 않았습니다.",
-    "kanban_receipt_missing": "durable Kanban 등록 근거를 확인하지 못했습니다.",
-    "dispatch_failed": "요청된 실행 session을 시작하지 못했습니다.",
-    "recovery_dispatch_failed": "재시작 후 실행 session 복구에 실패했습니다.",
-    "execution_scope_changed": "저장된 workspace 또는 PR branch 범위가 달라졌습니다.",
+    "no_tool_activity": "실제 도구 실행 기록이 없어 완료로 인정하지 않았어요.",
+    "verification_missing": "필수 검증·commit·push 근거가 모두 확인되지 않았어요.",
+    "agent_failed": "실행 agent가 정상 완료 상태를 반환하지 않았어요.",
+    "kanban_receipt_missing": "durable Kanban 등록 근거를 확인하지 못했어요.",
+    "dispatch_failed": "요청된 실행 session을 시작하지 못했어요.",
+    "recovery_dispatch_failed": "재시작 후 실행 session 복구에 실패했어요.",
+    "execution_scope_changed": "저장된 workspace 또는 PR branch 범위가 달라졌어요.",
 }
 
 
@@ -513,7 +513,7 @@ def render_blocked(
         )
     reason = _BLOCKED_REASONS.get(
         category,
-        "안전하게 완료를 입증할 실행 근거가 부족했습니다.",
+        "안전하게 완료를 입증할 실행 근거가 부족했어요.",
     )
     safe_category = (
         category
@@ -531,14 +531,14 @@ def render_blocked(
 
 def render_execution_enabled_reproposal(proposal: WorkProposal) -> str:
     return (
-        "실행 기능이 활성화되어 같은 원본과 PR HEAD에 결속된 실행 범위를 갱신합니다."
+        "실행 기능이 활성화되어 같은 원본과 PR HEAD에 결속된 실행 범위를 갱신할게요."
     )
 
 
 def render_needs_reapproval(proposal: WorkProposal) -> str:
     return (
         "원본 내용이나 PR HEAD가 달라졌어요. 이전 실행 요청은 사용하지 않고 "
-        "최신 상태를 반영해 작업 범위를 다시 계산하겠습니다."
+        "최신 상태를 반영해 작업 범위를 다시 계산할게요."
     )
 
 
