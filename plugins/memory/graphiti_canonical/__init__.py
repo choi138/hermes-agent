@@ -728,6 +728,62 @@ def _extract_facts(raw: Any) -> List[Dict[str, Any]]:
     return _extract_facts_with_presence(raw)[1]
 
 
+_ANCHOR_QUERY_ALIASES = (
+    ("인스타그램", "Instagram"),
+    ("디스코드", "Discord"),
+    ("깃허브", "GitHub"),
+)
+_ANCHOR_QUERY_SERVICES = {
+    "discord": "Discord",
+    "facebook": "Facebook",
+    "github": "GitHub",
+    "instagram": "Instagram",
+    "linkedin": "LinkedIn",
+    "notion": "Notion",
+    "slack": "Slack",
+    "twitter": "Twitter",
+    "youtube": "YouTube",
+}
+
+
+def _fallback_anchor_query(query: str) -> str:
+    primary = str(query or "").splitlines()[0]
+    lowered = primary.lower()
+    for localized, canonical in _ANCHOR_QUERY_ALIASES:
+        if localized in lowered:
+            return canonical
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{3,}", primary):
+        canonical = _ANCHOR_QUERY_SERVICES.get(token.lower())
+        if canonical and canonical.lower() != primary.strip().lower():
+            return canonical
+    return ""
+
+
+def _dispatch_search_with_anchor_fallback(
+    query: str, *, deadline: float, hermes_home: str
+) -> str | dict:
+    raw = _dispatch_tool(
+        _SEARCH_TOOL,
+        {"query": query, "max_facts": _FETCH_LIMIT},
+        deadline=deadline,
+        hermes_home=hermes_home,
+    )
+    if time.monotonic() >= deadline or _search_result_reports_error(raw):
+        return raw
+    found, facts = _extract_facts_with_presence(raw)
+    if not found or facts:
+        return raw
+    anchor = _fallback_anchor_query(query)
+    if not anchor or time.monotonic() >= deadline:
+        return raw
+    return _dispatch_tool(
+        _SEARCH_TOOL,
+        {"query": anchor, "max_facts": _FETCH_LIMIT},
+        deadline=deadline,
+        hermes_home=hermes_home,
+    )
+
+
 def _requires_graphiti_first(query: Any) -> bool:
     normalized = " ".join(str(query or "").lower().split())
     if not normalized:
@@ -1340,9 +1396,8 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
     def _bounded_search(self, query: str, *, deadline: float) -> List[Dict[str, Any]]:
         """Run one exact read-only MCP call within the turn's overall deadline."""
         try:
-            raw = _dispatch_tool(
-                _SEARCH_TOOL,
-                {"query": query, "max_facts": _FETCH_LIMIT},
+            raw = _dispatch_search_with_anchor_fallback(
+                query,
                 deadline=deadline,
                 hermes_home=self._hermes_home,
             )
@@ -1549,9 +1604,8 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
 
         def _run_model_search() -> None:
             try:
-                raw = _dispatch_tool(
-                    _SEARCH_TOOL,
-                    {"query": query, "max_facts": _FETCH_LIMIT},
+                raw = _dispatch_search_with_anchor_fallback(
+                    query,
                     deadline=deadline,
                     hermes_home=self._hermes_home,
                 )

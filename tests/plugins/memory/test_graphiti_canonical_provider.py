@@ -3193,3 +3193,42 @@ def test_prefetch_and_model_search_share_one_inflight_gate(monkeypatch, tmp_path
     assert result["status"] == "error"
     assert result["fallback_allowed"] is False
     assert calls == [1]
+
+
+def test_mixed_language_empty_search_retries_once_with_graphiti_anchor(
+    monkeypatch, tmp_path
+):
+    query = "Instagram에서 나랑 가장 마지막으로 연락한 사람"
+    calls = []
+
+    def fake_dispatch(_tool, args, **_kwargs):
+        calls.append(args["query"])
+        if args["query"] == query:
+            return {"facts": []}
+        assert args["query"] == "Instagram"
+        return {
+            "facts": [
+                {
+                    "uuid": "anchor-edge",
+                    "name": "PREFERS",
+                    "fact": "Alice prefers Instagram project history.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", fake_dispatch)
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    direct = json.loads(
+        provider.handle_tool_call("search_memory_facts", {"query": query})
+    )
+    assert direct["status"] == "ok"
+    assert direct["fallback_allowed"] is False
+    assert calls == [query, "Instagram"]
+
+    calls.clear()
+    prefetched = provider.prefetch(query)
+    assert "status: ok" in prefetched
+    assert "fallback_allowed: false" in prefetched
+    assert calls == [query, "Instagram"]
