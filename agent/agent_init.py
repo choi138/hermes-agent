@@ -2075,6 +2075,15 @@ def init_agent(
     compression_micro_compact = is_truthy_value(
         _compression_cfg.get("micro_compact"), default=False
     )
+    # Opt-in (default False): read-only R5 measurement probe. It records whether
+    # the summariser prompt's auto-derived focus block survives from the last
+    # quiescent point to the next compaction. No provider call, no cached
+    # summary, no behaviour change — it cannot make a compaction faster. Parsed
+    # through is_truthy_value so a MagicMock or a plugin engine's bare
+    # truthiness cannot satisfy the strict `is True` gates downstream.
+    compression_summary_prompt_drift_probe = is_truthy_value(
+        _compression_cfg.get("summary_prompt_drift_probe"), default=False
+    )
     # How often a pass runs, in completed turns. Each pass rewrites
     # already-sent history and costs one prompt-cache break, so this is the
     # dial for how often that cost is paid: 1 = every turn (most aggressive
@@ -2563,6 +2572,13 @@ def init_agent(
         _cc._micro_compact_defrag_threshold_tokens = (
             compression_micro_compact_defrag_tokens
         )
+    # Read-only R5 prompt-drift measurement probe (feature is opt-in). The
+    # hasattr guard skips alternate compression engines; it only passes because
+    # ContextCompressor.__init__ declares the attribute, so that declaration is
+    # load-bearing — without it this stamp is a silent no-op and the probe would
+    # report zero observations, indistinguishable from a zero hit rate.
+    if _cc is not None and hasattr(_cc, "_r5_prompt_drift_probe_enabled"):
+        _cc._r5_prompt_drift_probe_enabled = compression_summary_prompt_drift_probe
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (

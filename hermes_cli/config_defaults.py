@@ -654,6 +654,19 @@ DEFAULT_CONFIG = {
                                       # prompt-cache invalidation amortized: one big
                                       # episodic break instead of a tiny break every
                                       # tool iteration. 0 = commit any non-zero prune.
+        "summary_prompt_drift_probe": False,  # opt-in, read-only R5 MEASUREMENT
+                                      # probe. Records whether the summariser
+                                      # prompt's auto-derived focus block at the
+                                      # last quiescent point matches the one used
+                                      # at the next compaction. It makes NO
+                                      # provider call, stores no summary, changes
+                                      # no behaviour, and can never speed
+                                      # anything up — there is no cache and no
+                                      # reuse path. Cost when enabled: one
+                                      # auto-focus derivation per completed turn,
+                                      # paid inline on the turn thread. Enable
+                                      # only while measuring; see
+                                      # agent/summary_prompt_drift.py.
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead

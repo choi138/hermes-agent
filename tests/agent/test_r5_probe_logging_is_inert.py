@@ -371,3 +371,107 @@ class TestPreflightBlockProbe:
 
         assert not self._probe_lines(caplog)
         agent._compress_context.assert_not_called()
+
+
+class TestSummaryPromptDriftProbeIsInertAtEveryLoggingLevel:
+    """The two ``drift_park`` / ``drift_observe`` lines added by the
+    summariser-prompt drift probe join the same contract as the sites above:
+    lazy %-args, no f-strings, no side effects in any argument expression, and
+    no path through ``hermes_cli/observability``.
+
+    The probe is default-off, so these run with the gate forced ON — the only
+    configuration in which the new lines can be emitted at all.
+    """
+
+    def _run_compress_with_gate_on(self, *, logging_enabled: bool):
+        from agent import summary_prompt_drift
+
+        summary_prompt_drift.reset()
+        compressor = _compressor()
+        compressor._session_id = "r5-drift-inert"
+        compressor._r5_prompt_drift_probe_enabled = True
+        messages = _messages()
+        summary_prompt_drift.park(
+            session_id="r5-drift-inert",
+            focus_block="Recent user focus:\n- something",
+            prev_summary_redacted="",
+            has_user_turn=True,
+            today_str="2026-08-04",
+            msg_count=len(messages),
+            turn_seq=1,
+            elapsed_ms=0,
+        )
+        names = (
+            "agent.context_compressor",
+            "agent.summary_prompt_drift",
+        )
+        previous = {name: logging.getLogger(name).disabled for name in names}
+        for name in names:
+            logging.getLogger(name).disabled = not logging_enabled
+        try:
+            with patch(
+                "agent.context_compressor.call_llm",
+                return_value=_summary_response(),
+            ) as call_llm:
+                result = compressor.compress(
+                    messages, current_tokens=999_999, force=True
+                )
+        finally:
+            for name in names:
+                logging.getLogger(name).disabled = previous[name]
+        telemetry = {
+            field: getattr(compressor, field, "<missing>")
+            for field in TELEMETRY_FIELDS
+        }
+        snapshot = summary_prompt_drift.snapshot()
+        summary_prompt_drift.reset()
+        return result, telemetry, snapshot, call_llm.call_count
+
+    def test_compress_output_and_counters_are_identical_either_way(self):
+        on_result, on_telemetry, on_snap, on_calls = (
+            self._run_compress_with_gate_on(logging_enabled=True)
+        )
+        off_result, off_telemetry, off_snap, off_calls = (
+            self._run_compress_with_gate_on(logging_enabled=False)
+        )
+        assert on_result == off_result
+        assert len(on_result) < len(_messages())
+        # The provider call happens either way: there is no cache in this
+        # slice, so nothing can ever be skipped.
+        assert on_calls == off_calls == 1
+        for field in TELEMETRY_FIELDS:
+            left, right = on_telemetry[field], off_telemetry[field]
+            assert type(left) is type(right), field
+            if isinstance(left, dict) and isinstance(right, dict):
+                assert set(left) == set(right), field
+        for key in ("observe", "focus_agree", "focus_differ", "focus_both_none"):
+            assert on_snap[key] == off_snap[key], key
+
+    def test_drift_lines_carry_the_pinned_prefix_and_never_hit_observability(
+        self, caplog
+    ):
+        with caplog.at_level(logging.DEBUG):
+            self._run_compress_with_gate_on(logging_enabled=True)
+        probe_records = [
+            record
+            for record in caplog.records
+            if PROBE_PREFIX in record.getMessage()
+        ]
+        assert probe_records, "expected drift probe records at DEBUG"
+        text = "\n".join(record.getMessage() for record in probe_records)
+        assert "drift_park" in text
+        assert "drift_observe" in text
+        for record in probe_records:
+            assert not record.name.startswith("hermes_cli.observability"), (
+                f"probe leaked into the read-only telemetry funnel: {record.name}"
+            )
+            assert record.levelno == logging.DEBUG, record.levelname
+
+    def test_drift_lines_are_silent_at_default_verbosity(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._run_compress_with_gate_on(logging_enabled=True)
+        assert not [
+            record
+            for record in caplog.records
+            if PROBE_PREFIX in record.getMessage()
+        ]

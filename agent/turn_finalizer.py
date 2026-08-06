@@ -873,6 +873,96 @@ def finalize_turn(
         messages=messages,
     )
 
+    # ── R5 summariser-prompt drift probe: park (read-only, default OFF) ────
+    # The quiescent point: the session is persisted, the result dict is built
+    # and the interrupt state is cleared, so the transcript is stable for the
+    # rest of this function.
+    #
+    # This is a MEASUREMENT, not a precompute. It records the SHA-256 of the
+    # auto-derived focus block as it stands now, so the next compaction can say
+    # whether the block it actually sends is the same one. It stores no summary,
+    # makes no provider call and cannot make any compaction faster.
+    #
+    # Runs INLINE on this thread. There is no thread, no executor and no
+    # deepcopy: `_derive_auto_focus_topic` is a classmethod that only reads
+    # message dicts and returns a new string, `_redact_compaction_text` is pure,
+    # and the list is never retained past this block — so the mutation hazards
+    # that would force a snapshot (compress()'s in-place marker popping and
+    # tool-result pruning) are unreachable from here.
+    #
+    # There is deliberately NO compaction-imminence predicate. A conservative
+    # one would decline exactly the busy turns and bias the sample toward quiet
+    # turns, which are systematically the most likely to agree — inflating the
+    # number this probe exists to establish honestly. The cost is measured as
+    # park_ms instead.
+    _r5_drift_compressor = getattr(agent, "context_compressor", None)
+    if (
+        _r5_drift_compressor is not None
+        and getattr(
+            _r5_drift_compressor, "_r5_prompt_drift_probe_enabled", False
+        ) is True
+        # Persistence-isolated agents (background review fork) replay a
+        # throwaway transcript — same exclusion the micro-compaction block
+        # above uses, and for the same reason: their turns are not real turns.
+        and not getattr(agent, "_persist_disabled", False)
+        and not getattr(agent, "is_subagent", False)
+        and getattr(agent, "session_id", "")
+    ):
+        try:
+            import time as _r5_time
+
+            from agent.context_compressor import (
+                _redact_compaction_text as _r5_redact,
+            )
+
+            _r5_t0 = _r5_time.monotonic()
+            _r5_focus_block = _r5_drift_compressor._derive_auto_focus_topic(messages)
+            # The foreground redacts `_previous_summary` IN PLACE before it
+            # builds the prompt, so hash the redacted form here too or the two
+            # sides would disagree for a reason that is not drift. This call
+            # computes the redacted form without storing it back.
+            _r5_prev = _r5_redact(
+                getattr(_r5_drift_compressor, "_previous_summary", None) or ""
+            )
+            try:
+                from hermes_time import now as _r5_now
+
+                _r5_today = _r5_now().strftime("%Y-%m-%d")
+            except Exception:
+                _r5_today = ""
+            _r5_seq = int(getattr(agent, "_r5_drift_turn_seq", 0)) + 1
+            agent._r5_drift_turn_seq = _r5_seq
+            # Microseconds too: the derivation is sub-millisecond on ordinary
+            # transcripts, and an all-zero ms histogram cannot answer whether
+            # the measurement is itself too expensive to leave enabled.
+            _r5_elapsed_us = int((_r5_time.monotonic() - _r5_t0) * 1_000_000)
+
+            from agent.summary_prompt_drift import park as _r5_drift_park
+
+            _r5_drift_park(
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                focus_block=_r5_focus_block,
+                prev_summary_redacted=_r5_prev,
+                has_user_turn=getattr(
+                    _r5_drift_compressor, "_summary_has_user_turn", None
+                ),
+                today_str=_r5_today,
+                msg_count=len(messages),
+                turn_seq=_r5_seq,
+                elapsed_ms=_r5_elapsed_us // 1000,
+                elapsed_us=_r5_elapsed_us,
+            )
+        except Exception:
+            # A measurement probe must never affect a turn's outcome.
+            try:
+                from agent.summary_prompt_drift import (
+                    record_park_failure as _r5_park_failed,
+                )
+
+                _r5_park_failed()
+            except Exception:
+                pass
+
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
     if _review_eligible and (_should_review_memory or _should_review_skills):

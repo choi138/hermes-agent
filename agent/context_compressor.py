@@ -1375,6 +1375,16 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_tokens_saved_total = 0
         self._micro_compact_turns_since_pass = 0
 
+        # R5 drift probe: /new and /reset are also real session boundaries, so
+        # the parked fingerprint must not survive them either.
+        if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+            try:
+                from agent.summary_prompt_drift import clear as _r5_drift_clear
+
+                _r5_drift_clear(getattr(self, "_session_id", "") or "")
+            except Exception:  # pragma: no cover - probe cleanup is best-effort
+                pass
+
     def _begin_compression_telemetry(
         self,
         *,
@@ -1647,6 +1657,18 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        # R5 drift probe: drop the parked fingerprint on the same boundary this
+        # method exists to police. Defence in depth only — entries are keyed by
+        # session_id, the observe path rejects a foreign session, and the store
+        # is LRU-capped — but the probe's lifecycle should match every other
+        # per-session compaction field.
+        if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+            try:
+                from agent.summary_prompt_drift import clear as _r5_drift_clear
+
+                _r5_drift_clear(session_id)
+            except Exception:  # pragma: no cover - probe cleanup is best-effort
+                pass
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -2337,6 +2359,15 @@ class ContextCompressor(ContextEngine):
         # the prompt-cache prefix every turn instead of at an episodic
         # boundary. Operators opt in via `compression.micro_compact: true`.
         self._micro_compact_enabled: bool = False
+        # ── R5 summariser-prompt drift probe (read-only measurement) ──
+        # Default: OFF. When on, ``_generate_summary`` records whether the
+        # auto-derived focus block it is about to send matches the one derived
+        # at the previous quiescent point (parked by turn_finalizer). Records
+        # only hashes and counters — no cached summary, no provider call
+        # skipped, no behaviour change at any setting. Stamped from
+        # ``compression.summary_prompt_drift_probe`` in agent_init; that stamp
+        # is hasattr-guarded, so this declaration is what makes it effective.
+        self._r5_prompt_drift_probe_enabled: bool = False
         self._micro_compact_cursor: int = 0
         self._micro_compact_rolling_summary: str = ""
         self._micro_compact_consecutive_failures: int = 0
@@ -3642,6 +3673,47 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _today_str = _hermes_now().strftime("%Y-%m-%d")
         except Exception:  # pragma: no cover - clock resolution is best-effort
             _today_str = ""
+
+        # ── R5 summariser-prompt drift probe (read-only, default OFF) ─────
+        # Every prompt component is already a local variable at this point, so
+        # capturing the complete fingerprint costs only hashing — no extraction
+        # of a pure `_build_summary_prompt` is needed, and not one prompt byte
+        # moves. This seam is deliberately AFTER the cooldown early-return
+        # above (a suppressed attempt must produce no observation) and the
+        # pre-LLM feasibility skip never reaches _generate_summary at all, so
+        # both denominator-pollution cases are excluded structurally.
+        #
+        # This records; it never decides. There is no cache lookup here and no
+        # branch anywhere below that consults one: the provider call remains
+        # unconditional at every gate setting.
+        if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+            try:
+                from agent.summary_prompt_drift import observe as _r5_drift_observe
+
+                _r5_drift_observe(
+                    session_id=getattr(self, "_session_id", "") or "",
+                    focus_topic=focus_topic,
+                    # compress() collapses a user-supplied `/compress <focus>`
+                    # and an auto-derived block into one argument, so the
+                    # attribution marker is set at that call site.
+                    explicit_focus=bool(
+                        getattr(self, "_r5_focus_was_explicit", False)
+                    ),
+                    prev_summary=self._previous_summary or "",
+                    has_user_turn=has_user_turn,
+                    today_str=_today_str,
+                    window_text=content_to_summarize,
+                    window_bounded=(
+                        "...[summary input truncated: omitted "
+                        in content_to_summarize
+                    ),
+                    budget=summary_budget,
+                    memory_context=_sanitized_memory_context,
+                    span_len=len(turns_to_summarize),
+                    msg_count=None,
+                )
+            except Exception:  # pragma: no cover - a probe must never break compaction
+                pass
 
         # Preamble shared by both first-compaction and iterative-update prompts.
         # Keep the wording deliberately plain: Azure/OpenAI-compatible content
@@ -6453,6 +6525,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Deriving the auto focus topic scans recent user turns — only pay
             # for it when a summary will actually be generated.
             summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+            # R5 drift probe attribution only (gate-scoped, read by no
+            # behavioural path): `_generate_summary` receives one collapsed
+            # argument and so cannot tell a user-supplied `/compress <focus>`
+            # from an auto-derived block. Rewritten on every compaction that
+            # reaches the summariser, so it can never go stale. Deliberately
+            # NOT cleared at the observe seam: the main-model retry re-enters
+            # `_generate_summary` with the same focus_topic and must keep the
+            # same attribution.
+            if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+                self._r5_focus_was_explicit = bool(focus_topic)
             try:
                 summary = self._generate_summary(
                     turns_to_summarize,
