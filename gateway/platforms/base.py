@@ -3376,10 +3376,7 @@ class BasePlatformAdapter(ABC):
         not acknowledged as successfully admitted.
         """
         metadata = getattr(event, "metadata", None)
-        if (
-            not isinstance(metadata, dict)
-            or _COMPLETION_ADMISSION_TOKEN_KEY not in metadata
-        ):
+        if not isinstance(metadata, dict) or _COMPLETION_ADMISSION_TOKEN_KEY not in metadata:
             return True
 
         validator = getattr(self, "_completion_admission_validator", None)

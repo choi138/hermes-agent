@@ -275,7 +275,7 @@ def _prune_durable_records() -> None:
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
     """Persist a terminal result unless the owning session cancelled it.
 
-    Returns ``False`` when a durable session cancellation won the race.  A
+    Returns ``False`` when a durable session cancellation won the race. A
     missing row is treated as a legacy/non-durable event and remains
     publishable for backward compatibility.
     """
@@ -298,7 +298,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
         return row is None
 
 
-def _suppress_durable_for_session(
+def _cancel_durable_for_session(
     *,
     session_key: str = "",
     origin_ui_session_id: str = "",
@@ -307,9 +307,9 @@ def _suppress_durable_for_session(
 ) -> set[str]:
     """Durably cancel every undelivered delegation matching one session.
 
-    This write happens before child interrupt callbacks run.  It covers both
+    This write happens before child interrupt callbacks run. It covers both
     still-running workers and the narrow race where a worker has already put
-    its completion on the shared queue but no consumer has claimed it yet.
+    its completion on the shared queue but no consumer has delivered it yet.
     """
     selectors = []
     params: List[Any] = []
@@ -328,7 +328,7 @@ def _suppress_durable_for_session(
     now = time.time()
     selector_sql = " OR ".join(selectors)
     try:
-        with _DB_LOCK, _connect() as conn:
+        with _DB_LOCK, _transaction() as conn:
             rows = conn.execute(
                 f"""SELECT delegation_id FROM async_delegations
                     WHERE delivery_state='pending' AND ({selector_sql})""",
@@ -341,7 +341,7 @@ def _suppress_durable_for_session(
                         SET state='cancelled',
                             completed_at=COALESCE(completed_at, ?),
                             updated_at=?,
-                            delivery_state='suppressed',
+                            delivery_state='dropped',
                             delivery_claim=NULL,
                             delivery_claimed_at=NULL
                         WHERE delivery_state='pending' AND ({selector_sql})""",
@@ -349,11 +349,11 @@ def _suppress_durable_for_session(
                 )
             return delegation_ids
     except Exception as exc:
-        # /stop must remain available even when durable state is degraded.
-        # The in-memory cancel_requested guard below still prevents a same-
-        # process worker from publishing its result.
+        # Session control must remain available even when durable state is
+        # degraded. The in-memory cancel_requested guard still prevents a
+        # same-process worker from publishing its result.
         logger.warning(
-            "Could not durably suppress async delegations for session (%s): %s",
+            "Could not durably cancel async delegations for session (%s): %s",
             reason,
             exc,
         )
@@ -485,10 +485,10 @@ def is_completion_delivery_claim_active(
     """Revalidate a claim immediately before injecting its synthetic turn.
 
     Session cancellation clears the claim and changes ``delivery_state`` to
-    ``suppressed``. A missing row is a legacy non-durable event and remains
+    ``dropped``. A missing row is a legacy non-durable event and remains
     deliverable.
     """
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT delivery_state, delivery_claim
                FROM async_delegations WHERE delegation_id=?""",
@@ -942,6 +942,7 @@ def _begin_finalization(
             record["status"] = "cancelled"
             record["completed_at"] = record.get("completed_at") or time.time()
             record["interrupt_fn"] = None
+            record["progress_fn"] = None
             _prune_completed_locked()
             return
         # Stay active until durable persistence and queue publication finish;
@@ -1027,7 +1028,7 @@ def _push_completion_event(
             evt[_k] = result[_k]
     if not _persist_completion(evt, result):
         logger.info(
-            "Suppressed completion for cancelled async delegation %s",
+            "Dropped completion for cancelled async delegation %s",
             record.get("delegation_id"),
         )
         return
@@ -1245,7 +1246,7 @@ def _push_batch_completion_event(
             process_registry.completion_queue.put(evt)
         else:
             logger.info(
-                "Suppressed completion for cancelled async delegation batch %s",
+                "Dropped completion for cancelled async delegation batch %s",
                 event_record.get("delegation_id"),
             )
     except Exception as exc:  # pragma: no cover
@@ -1541,6 +1542,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
         targets = [
             r for r in _records.values()
             if r.get("status") in ("running", "stalling")
+            and not r.get("cancel_requested")
         ]
     for r in targets:
         fn = r.get("interrupt_fn")
@@ -1585,54 +1587,38 @@ def interrupt_for_session(
     its delivery claim, and a worker that finishes later cannot overwrite the
     cancelled state or publish a new event.
 
-    Returns how many delegations were newly cancelled or suppressed.
+    Returns how many delegations were newly cancelled or dropped.
     """
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return 0
 
-    def _matches(r: Dict[str, Any]) -> bool:
-        return bool(
-            (
-                origin_ui_session_id
-                and str(r.get("origin_ui_session_id") or "")
-                == origin_ui_session_id
-            )
-            or (
-                session_key
-                and str(r.get("session_key") or "") == session_key
-            )
-            or (
-                parent_session_id
-                and str(r.get("parent_session_id") or "")
-                == parent_session_id
-            )
-        )
-
     now = time.time()
     with _records_lock:
         targets = [
-            r for r in _records.values()
-            if r.get("status") in ("running", "stalling")
+            record
+            for record in _records.values()
+            if record.get("status") in {"running", "stalling", "finalizing"}
+            and not record.get("cancel_requested")
             and _matches_session_selectors(
-                r,
+                record,
                 session_key=session_key,
                 origin_ui_session_id=origin_ui_session_id,
                 parent_session_id=parent_session_id,
             )
         ]
         memory_ids = {
-            str(r.get("delegation_id") or "")
-            for r in targets
-            if r.get("delegation_id")
+            str(record.get("delegation_id") or "")
+            for record in targets
+            if record.get("delegation_id")
         }
-        for r in targets:
+        for record in targets:
             # Set this before releasing the lock so a racing finalize path
-            # cannot publish while the durable cancellation is being written.
-            r["cancel_requested"] = True
-            r["cancel_reason"] = reason
-            r["cancel_requested_at"] = now
+            # cannot publish while durable cancellation is being written.
+            record["cancel_requested"] = True
+            record["cancel_reason"] = reason
+            record["cancel_requested_at"] = now
 
-    durable_ids = _suppress_durable_for_session(
+    durable_ids = _cancel_durable_for_session(
         session_key=session_key,
         origin_ui_session_id=origin_ui_session_id,
         parent_session_id=parent_session_id,
@@ -1640,8 +1626,8 @@ def interrupt_for_session(
     )
 
     # A worker may already be terminal in memory while its queued completion
-    # is still pending durably. Reflect the suppression in status listings and
-    # make repeated /stop calls idempotent.
+    # is still pending durably. Reflect the drop in status listings and make
+    # repeated session-control calls idempotent.
     with _records_lock:
         for delegation_id in durable_ids:
             record = _records.get(delegation_id)
@@ -1650,10 +1636,11 @@ def interrupt_for_session(
             record["cancel_requested"] = True
             record["cancel_reason"] = reason
             record["cancel_requested_at"] = now
-            if record.get("status") not in {"running", "finalizing"}:
+            if record.get("status") not in {"running", "stalling", "finalizing"}:
                 record["status"] = "cancelled"
                 record["completed_at"] = record.get("completed_at") or now
                 record["interrupt_fn"] = None
+                record["progress_fn"] = None
         _prune_completed_locked()
 
     for r in targets:

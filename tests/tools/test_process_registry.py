@@ -1004,6 +1004,48 @@ class TestCheckpoint:
             data = json.loads(checkpoint.read_text())
             assert data == []
 
+    def test_recovery_preserves_stop_suppression_without_replaying_watcher(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_stopped_recovery",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": 123,
+            "task_id": "t1",
+            "session_key": "session-a",
+            "watcher_interval": 5,
+            "notify_on_complete": True,
+            "watch_patterns": ["READY"],
+            "completion_suppressed": True,
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch.object(registry, "_host_pid_is_ours", return_value=True):
+            recovered = registry.recover_from_checkpoint()
+
+            assert recovered == 1
+            session = registry.get("proc_stopped_recovery")
+            assert session is not None
+            assert session.completion_suppressed is True
+            assert session.notify_on_complete is False
+            assert session.watcher_interval == 0
+            assert session.watch_patterns == []
+            assert registry.pending_watchers == []
+
+            persisted = json.loads(checkpoint.read_text())
+            assert persisted[0]["completion_suppressed"] is True
+            assert persisted[0]["notify_on_complete"] is False
+            assert persisted[0]["watcher_interval"] == 0
+            assert persisted[0]["watch_patterns"] == []
+
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
+
 # =========================================================================
 # Kill process
 # =========================================================================
@@ -1658,4 +1700,3 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-

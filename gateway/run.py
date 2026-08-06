@@ -9219,20 +9219,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
-        if getattr(event, "internal", False):
-            return False
-
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
 
@@ -23884,8 +23870,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return the cancellation epoch used by durable completion admission."""
         if not session_key:
             return 0
-        epochs = self.__dict__.get("_completion_admission_epochs") or {}
-        return int(epochs.get(session_key, 0))
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return 0
+        return int(state.persistent.completion_cancellation_epoch)
 
     def _capture_completion_admission(
         self,
@@ -23908,12 +23896,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Invalidate synthetic completions not yet admitted for a session."""
         if not session_key:
             return 0
-        epochs = self.__dict__.get("_completion_admission_epochs")
-        if epochs is None:
-            epochs = {}
-            self._completion_admission_epochs = epochs
-        epoch = int(epochs.get(session_key, 0)) + 1
-        epochs[session_key] = epoch
+        persistent = self._session_state(session_key).persistent
+        persistent.completion_cancellation_epoch = (
+            int(persistent.completion_cancellation_epoch) + 1
+        )
+        epoch = persistent.completion_cancellation_epoch
         if reason:
             logger.info(
                 "Invalidated completion admission epoch for %s → %d (%s)",
@@ -24015,10 +24002,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc,
             )
 
-        # An explicit /stop or /new is a terminal session decision, not a
-        # restart interruption. Leaving this marker set would synthesize an
-        # empty auto-resume event on the next gateway boot and restart work
-        # the user explicitly ended.
+        # An explicit /stop or /new is a terminal user decision, not a restart
+        # interruption. Leaving this marker set would synthesize an empty
+        # auto-resume event on the next gateway boot and restart work the user
+        # explicitly ended.
         try:
             await self.async_session_store.clear_resume_pending(session_key)
         except Exception as exc:

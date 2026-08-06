@@ -3032,13 +3032,21 @@ def delegate_task(
 
                 pending = set(futures.keys())
                 while pending:
-                    if (
+                    parent_interrupted = (
                         honor_parent_interrupt
                         and getattr(parent_agent, "_interrupt_requested", False) is True
-                    ):
-                        # Parent interrupted — collect whatever finished and
-                        # abandon the rest.  Children already received the
-                        # interrupt signal; we just can't wait forever.
+                    )
+                    registry_cancelled = _batch_cancel_requested.is_set()
+                    if parent_interrupted or registry_cancelled:
+                        # Parent/session interrupted — collect whatever
+                        # finished and abandon the rest. Children already
+                        # received the interrupt signal; we cannot join an
+                        # uncooperative provider indefinitely.
+                        interruption_error = (
+                            "Async delegation cancelled — child did not finish in time"
+                            if registry_cancelled
+                            else "Parent agent interrupted — child did not finish in time"
+                        )
                         for f in pending:
                             idx = futures[f]
                             if f.done():

@@ -1,9 +1,9 @@
 """Regression coverage for /stop and background async delegations.
 
-The gateway owns two independent execution lanes for one Discord session:
-the foreground AIAgent and detached ``delegate_task`` workers.  /stop must
-cancel both lanes, suppress an already-queued completion, and clear any
-restart auto-resume marker without affecting another thread.
+The gateway owns two independent execution lanes for one messaging session:
+the foreground AIAgent and detached ``delegate_task`` workers. ``/stop`` must
+cancel both lanes, drop an already-queued completion, and clear any restart
+auto-resume marker without affecting another thread.
 """
 
 import asyncio
@@ -86,10 +86,15 @@ class _AdmissionAdapter(BasePlatformAdapter):
         return {}
 
 
-def _source(thread_id):
+def _source(
+    thread_id,
+    *,
+    platform=Platform.DISCORD,
+    chat_type="forum",
+):
     return SessionSource(
-        platform=Platform.DISCORD,
-        chat_type="forum",
+        platform=platform,
+        chat_type=chat_type,
         chat_id="channel",
         thread_id=thread_id,
         user_id="user",
@@ -126,10 +131,10 @@ def _delivery_runner(*, mock_injection=True):
     return runner
 
 
-def _admission_adapter(runner):
+def _admission_adapter(runner, *, platform=Platform.DISCORD):
     adapter = _AdmissionAdapter(
         PlatformConfig(enabled=True, token="test-token"),
-        Platform.DISCORD,
+        platform,
     )
     handler = AsyncMock(return_value=None)
     adapter.set_message_handler(handler)
@@ -137,22 +142,6 @@ def _admission_adapter(runner):
         runner._validate_completion_admission
     )
     return adapter, handler
-
-
-def _install_admission_barrier(
-    adapter: _AdmissionAdapter,
-    entered: threading.Event,
-    release: threading.Event,
-) -> None:
-    """Pause a synthetic event after delivery handoff but before admission."""
-    original_handle_message = adapter.handle_message
-
-    async def blocked_handle_message(event):
-        entered.set()
-        await asyncio.to_thread(release.wait, 5)
-        await original_handle_message(event)
-
-    adapter.handle_message = blocked_handle_message
 
 
 def _tokenized_completion(runner, source):
@@ -229,7 +218,7 @@ async def test_interrupt_and_clear_session_cancels_foreground_and_background(
     assert ad.active_count() == 0
     durable = ad.get_durable_delegation(dispatched["delegation_id"])
     assert durable["state"] == "cancelled"
-    assert durable["delivery_state"] == "suppressed"
+    assert durable["delivery_state"] == "dropped"
 
 
 @pytest.mark.asyncio
@@ -293,19 +282,19 @@ async def test_stop_with_only_background_work_is_scoped_and_idempotent(
     )
     try:
         first = await runner._handle_stop_command(event)
-        assert "no active" not in str(getattr(first, "text", first)).lower()
+        assert "no active" not in str(first).lower()
         interrupted_a.assert_called_once()
         interrupted_b.assert_not_called()
         assert entry.resume_pending is False
 
         second = await runner._handle_stop_command(event)
-        assert "no active" in str(getattr(second, "text", second)).lower()
+        assert "no active" in str(second).lower()
         interrupted_a.assert_called_once()
 
         mine_row = ad.get_durable_delegation(mine["delegation_id"])
         other_row = ad.get_durable_delegation(other["delegation_id"])
         assert mine_row["state"] == "cancelled"
-        assert mine_row["delivery_state"] == "suppressed"
+        assert mine_row["delivery_state"] == "dropped"
         assert other_row["state"] == "running"
         assert other_row["delivery_state"] == "pending"
     finally:
@@ -452,7 +441,7 @@ async def test_stop_drops_already_finished_terminal_completion(
 
 
 @pytest.mark.asyncio
-async def test_gateway_drops_completion_suppressed_by_stop(tmp_path, monkeypatch):
+async def test_gateway_drops_completion_cancelled_by_stop(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     dispatched = ad.dispatch_async_delegation(
         goal="race",
@@ -476,7 +465,6 @@ async def test_gateway_drops_completion_suppressed_by_stop(tmp_path, monkeypatch
     assert evt is not None
 
     runner = _delivery_runner()
-
     assert await runner._deliver_completion_notification("synthetic", evt) is None
     runner._inject_watch_notification.assert_not_awaited()
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
@@ -518,21 +506,24 @@ async def test_gateway_revalidates_claim_when_stop_wins_delivery_race(
     monkeypatch.setattr(ad, "claim_completion_delivery", claim_then_stop)
 
     runner = _delivery_runner()
-
     assert await runner._deliver_completion_notification("synthetic", evt) is None
     runner._inject_watch_notification.assert_not_awaited()
     durable = ad.get_durable_delegation(dispatched["delegation_id"])
     assert durable["state"] == "cancelled"
-    assert durable["delivery_state"] == "suppressed"
+    assert durable["delivery_state"] == "dropped"
 
 
 @pytest.mark.asyncio
 async def test_stop_after_claim_revalidation_blocks_adapter_admission(
     tmp_path, monkeypatch
 ):
-    """A stop during adapter handoff wins after the final durable-claim read."""
+    """A stop during Telegram topic recovery wins after the final claim read."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    source = _source("thread-a")
+    source = _source(
+        "thread-a",
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
     session_key = build_session_key(source)
     dispatched = ad.dispatch_async_delegation(
         goal="post-claim race",
@@ -549,8 +540,8 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
     assert evt is not None
 
     runner = _delivery_runner(mock_injection=False)
-    adapter, handler = _admission_adapter(runner)
-    runner.adapters = {Platform.DISCORD: adapter}
+    adapter, handler = _admission_adapter(runner, platform=Platform.TELEGRAM)
+    runner.adapters = {Platform.TELEGRAM: adapter}
     runner.session_store = SimpleNamespace(
         _ensure_loaded=lambda: None,
         _entries={session_key: SimpleNamespace(origin=source)},
@@ -560,15 +551,21 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
         clear_resume_pending=AsyncMock(return_value=False),
     )
 
-    admission_entered = threading.Event()
-    release_admission = threading.Event()
-    _install_admission_barrier(adapter, admission_entered, release_admission)
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+
+    def blocking_topic_recovery(_source):
+        recovery_entered.set()
+        release_recovery.wait(timeout=5)
+        return None
+
+    adapter.set_topic_recovery_fn(blocking_topic_recovery)
     delivery_task = asyncio.create_task(
         runner._deliver_completion_notification("synthetic", evt)
     )
 
     entered = await asyncio.wait_for(
-        asyncio.to_thread(admission_entered.wait, 3),
+        asyncio.to_thread(recovery_entered.wait, 3),
         timeout=4,
     )
     cancelled = -1
@@ -580,9 +577,9 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
                 reason="stop_command",
             )
         finally:
-            release_admission.set()
+            release_recovery.set()
     else:
-        release_admission.set()
+        release_recovery.set()
 
     result = await asyncio.wait_for(delivery_task, timeout=5)
     await adapter.cancel_background_tasks()
@@ -594,16 +591,20 @@ async def test_stop_after_claim_revalidation_blocks_adapter_admission(
     assert session_key not in adapter._active_sessions
     durable = ad.get_durable_delegation(dispatched["delegation_id"])
     assert durable["state"] == "cancelled"
-    assert durable["delivery_state"] == "suppressed"
+    assert durable["delivery_state"] == "dropped"
 
 
 @pytest.mark.asyncio
 async def test_terminal_completion_stop_race_blocks_adapter_admission(
     tmp_path, monkeypatch
 ):
-    """A terminal completion already handed to the adapter loses to /stop."""
+    """A terminal completion in Telegram topic recovery loses to /stop."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    source = _source("thread-a")
+    source = _source(
+        "thread-a",
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
     session_key = build_session_key(source)
     finished = ProcessSession(
         id="proc_admission_race",
@@ -620,7 +621,7 @@ async def test_terminal_completion_stop_race_blocks_adapter_admission(
         "type": "completion",
         "session_id": finished.id,
         "session_key": session_key,
-        "platform": Platform.DISCORD.value,
+        "platform": source.platform.value,
         "chat_type": source.chat_type,
         "chat_id": source.chat_id,
         "thread_id": source.thread_id,
@@ -632,8 +633,8 @@ async def test_terminal_completion_stop_race_blocks_adapter_admission(
     }
 
     runner = _delivery_runner(mock_injection=False)
-    adapter, handler = _admission_adapter(runner)
-    runner.adapters = {Platform.DISCORD: adapter}
+    adapter, handler = _admission_adapter(runner, platform=Platform.TELEGRAM)
+    runner.adapters = {Platform.TELEGRAM: adapter}
     runner.session_store = SimpleNamespace(
         _ensure_loaded=lambda: None,
         _entries={session_key: SimpleNamespace(origin=source)},
@@ -643,15 +644,21 @@ async def test_terminal_completion_stop_race_blocks_adapter_admission(
         clear_resume_pending=AsyncMock(return_value=False),
     )
 
-    admission_entered = threading.Event()
-    release_admission = threading.Event()
-    _install_admission_barrier(adapter, admission_entered, release_admission)
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+
+    def blocking_topic_recovery(_source):
+        recovery_entered.set()
+        release_recovery.wait(timeout=5)
+        return None
+
+    adapter.set_topic_recovery_fn(blocking_topic_recovery)
     delivery_task = asyncio.create_task(
         runner._deliver_completion_notification("synthetic", evt)
     )
 
     entered = await asyncio.wait_for(
-        asyncio.to_thread(admission_entered.wait, 3),
+        asyncio.to_thread(recovery_entered.wait, 3),
         timeout=4,
     )
     if entered:
@@ -662,9 +669,9 @@ async def test_terminal_completion_stop_race_blocks_adapter_admission(
                 reason="stop_command",
             )
         finally:
-            release_admission.set()
+            release_recovery.set()
     else:
-        release_admission.set()
+        release_recovery.set()
 
     result = await asyncio.wait_for(delivery_task, timeout=5)
     await adapter.cancel_background_tasks()

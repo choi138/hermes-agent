@@ -497,4 +497,3 @@ class TestFeishuPortBindingConditional:
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
 
-
