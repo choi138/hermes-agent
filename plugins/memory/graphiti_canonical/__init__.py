@@ -16,10 +16,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from tools.threat_patterns import first_threat_message
 
-# Not ``__name__``: hermes_logging routes handlers by COMPONENT_PREFIXES, and
-# ``plugins.memory.*`` matches no component, so records under the module name
-# are written nowhere. Memory recall is an agent component — log it as one.
-logger = logging.getLogger("agent.memory.graphiti_canonical")
+logger = logging.getLogger(__name__)
 
 _READ_ONLY_MCP_TOOLS = frozenset({
     "get_status",
