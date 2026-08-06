@@ -8,6 +8,7 @@ import json
 import pytest
 
 from plugins.mention_inbox.advisory import (
+    split_advisory,
     AdvisoryContext,
     AdvisoryFinding,
     HostProposalAdvisor,
@@ -236,3 +237,37 @@ def test_wall_timeout_bounds_a_hanging_model() -> None:
 
     with pytest.raises(asyncio.TimeoutError):
         asyncio.run(advisor.advise(context=context))
+
+
+def test_split_advisory_separates_the_request_summary_from_the_verdict() -> None:
+    summary, verdict = split_advisory(
+        "요청: 탭 바의 키보드 조작이 회귀했다는 지적이에요.\n"
+        "판정: 정보 부족\n"
+        "근거: \u201c.gesture(dragGesture(for: tab))\u201d는 보이지만 선언부가 잘려 있어요.\n"
+        "다음: 탭 항목의 선언부를 확인해요."
+    )
+
+    assert summary == "탭 바의 키보드 조작이 회귀했다는 지적이에요."
+    assert verdict.startswith("판정: 정보 부족")
+    assert "근거:" in verdict
+    assert "다음:" in verdict
+    assert "요청:" not in verdict
+
+
+def test_split_advisory_rejects_an_unlabelled_answer() -> None:
+    """An unparsed blob must not reach the deduped proposal body."""
+
+    assert split_advisory("그냥 산문으로 설명해버린 답변입니다.") == ("", "")
+    assert split_advisory("판정: 수용 권장") == ("", "")
+    assert split_advisory("요청: 요약만 있고 판정이 없어요") == ("", "")
+    assert split_advisory(None) == ("", "")
+    assert split_advisory(12345) == ("", "")
+
+
+def test_split_advisory_bounds_each_half() -> None:
+    summary, verdict = split_advisory(
+        "요청: " + "요" * 900 + "\n판정: 수용 권장\n근거: " + "근" * 900
+    )
+
+    assert 0 < len(summary) <= 300
+    assert 0 < len(verdict) <= 600

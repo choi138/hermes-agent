@@ -33,7 +33,7 @@ from plugins.mention_inbox.proposals import (
 
 Clock = Callable[[], datetime]
 DEFAULT_DESTINATION = "discord:1531851208858275860"
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _DISCORD_MAX_SNOWFLAKE = (1 << 64) - 1
 
 
@@ -448,6 +448,19 @@ def _content_hash(event: MentionEvent) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(frozen=True)
+class ProposalNarrative:
+    """The model-written parts of one proposal revision, as stored.
+
+    Empty strings are a real, meaningful value: they record that generation was
+    attempted and failed, so the renderer falls back deterministically instead of
+    trying again and producing different text.
+    """
+
+    summary: str
+    verdict: str
+
+
 class MentionInboxStore:
     """Durable canonical events, revisions, cursors, and collector status."""
 
@@ -806,6 +819,16 @@ class MentionInboxStore:
                     connection.execute(
                         f"ALTER TABLE work_executions ADD COLUMN {column} TEXT"
                     )
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS work_proposal_narratives (
+                    proposal_id TEXT NOT NULL,
+                    proposal_revision INTEGER NOT NULL,
+                    summary TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (proposal_id, proposal_revision)
+                )
+            """)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         finally:
@@ -1439,6 +1462,84 @@ class MentionInboxStore:
                 return proposal
         finally:
             connection.close()
+
+    def get_proposal_narrative(
+        self, proposal_id: str, revision: int
+    ) -> ProposalNarrative | None:
+        """Return the stored narrative for one revision, or None if unwritten.
+
+        A plain None for "missing", unlike get_proposal_message_binding's
+        KeyError: the caller has not yet decided whether a narrative should
+        exist, so absence is an ordinary answer rather than an error.
+        """
+
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError("revision must be a positive integer")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT summary, verdict FROM work_proposal_narratives
+                WHERE proposal_id = ? AND proposal_revision = ?
+                """,
+                (proposal_key, revision),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return ProposalNarrative(
+            summary=str(row["summary"]),
+            verdict=str(row["verdict"]),
+        )
+
+    def put_proposal_narrative(
+        self, proposal_id: str, revision: int, *, summary: str, verdict: str
+    ) -> ProposalNarrative:
+        """Persist a narrative once, and return whatever is stored afterwards.
+
+        Write-once on purpose.  A proposal message that was sent but not yet
+        bound is recovered by searching the thread for a message whose text
+        equals a fresh render, so the render has to be reproducible — and model
+        output is not.  Keeping the first result and always returning the stored
+        row makes every later render byte-identical, including for a racing
+        second writer whose INSERT is ignored and who then reads the winner's
+        text rather than its own.
+        """
+
+        proposal_key = _require_stable_text(proposal_id, "proposal_id", limit=80)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError("revision must be a positive integer")
+        if not isinstance(summary, str) or not isinstance(verdict, str):
+            raise ValueError("narrative summary and verdict must be strings")
+        now = _iso_datetime(self._clock())
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO work_proposal_narratives (
+                        proposal_id, proposal_revision, summary, verdict, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (proposal_key, revision, summary, verdict, now),
+                )
+                row = connection.execute(
+                    """
+                    SELECT summary, verdict FROM work_proposal_narratives
+                    WHERE proposal_id = ? AND proposal_revision = ?
+                    """,
+                    (proposal_key, revision),
+                ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise RuntimeError("proposal narrative disappeared after insert")
+        return ProposalNarrative(
+            summary=str(row["summary"]),
+            verdict=str(row["verdict"]),
+        )
 
     def record_proposal_message(
         self,

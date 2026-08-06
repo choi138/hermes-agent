@@ -1146,7 +1146,15 @@ async def test_legacy_pending_is_reconciled_once_from_new_hydration(
 class _StubAdvisor:
     """Records calls and returns a fixed advisory."""
 
-    def __init__(self, text: str = "상황: 명세와 import가 불일치합니다.\n- 범위를 맞춘다") -> None:
+    _LABELLED = (
+        "요청: 명세와 import가 불일치한다는 지적이에요.\n"
+        "판정: 수용 권장\n"
+        "근거: \u201cimport spec\u201d이 명세와 다른 이름을 가리켜요.\n"
+        "다음: import 경로를 명세에 맞춰요."
+    )
+
+    def __init__(self, text: str | None = None) -> None:
+        text = self._LABELLED if text is None else text
         self.text = text
         self.calls: list[tuple[str, int]] = []
 
@@ -1166,7 +1174,9 @@ class _FailingAdvisor:
 
 
 @pytest.mark.asyncio
-async def test_advisory_posts_once_beside_the_proposal(tmp_path: Path) -> None:
+async def test_narrative_is_generated_once_and_rendered_in_the_proposal(
+    tmp_path: Path,
+) -> None:
     discord = _Discord()
     advisor = _StubAdvisor()
     coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=advisor)
@@ -1177,7 +1187,7 @@ async def test_advisory_posts_once_beside_the_proposal(tmp_path: Path) -> None:
         parent_message_id="parent-1",
         source_revision="2026-07-29T10:01:00Z",
     )
-    # A second identical delivery must not re-post either message.
+    # A second identical delivery must neither re-post nor regenerate.
     await coordinator.ensure_thread(
         event,
         parent_message_id="parent-1",
@@ -1185,15 +1195,26 @@ async def test_advisory_posts_once_beside_the_proposal(tmp_path: Path) -> None:
     )
 
     messages = discord.messages["thread-1"]
-    assert len(messages) == 2
+    # One message now: the narrative lives inside the proposal instead of beside it.
+    assert len(messages) == 1
     assert len(advisor.calls) == 1
-    proposal_text, advisory_text = messages[0][1], messages[1][1]
+    proposal_text = messages[0][1]
+    assert "현재 요청" in proposal_text
+    assert "명세와 import가 불일치한다는 지적이에요." in proposal_text
     assert "제 추천" in proposal_text
-    # The advisory is a separate message and never contaminates the proposal.
+    assert "판정: 수용 권장" in proposal_text
+    assert "근거:" in proposal_text
+    # The deterministic boilerplate it replaced is gone.
+    assert "먼저 읽기 전용으로" not in proposal_text
     assert "참고 분석" not in proposal_text
-    assert "참고 분석 (모델 작성, 권한 없음)" in advisory_text
-    assert "명세와 import가 불일치" in advisory_text
-    assert "허용 범위를 바꾸지 않아요" in advisory_text
+
+    stored = MentionInboxStore(tmp_path / "inbox.db")
+    proposal = stored.get_latest_proposal("github:R_repo:PR_7")
+    assert proposal is not None
+    narrative = stored.get_proposal_narrative(proposal.proposal_id, proposal.revision)
+    assert narrative is not None
+    assert narrative.summary == "명세와 import가 불일치한다는 지적이에요."
+    assert narrative.verdict.startswith("판정: 수용 권장")
 
 
 @pytest.mark.asyncio
@@ -1213,6 +1234,27 @@ async def test_proposal_is_delivered_when_the_advisory_fails(tmp_path: Path) -> 
     # Exactly the deterministic proposal, and the binding was still recorded.
     assert len(discord.messages["thread-1"]) == 1
     assert "제 추천" in discord.messages["thread-1"][0][1]
+    # The failure itself is persisted as an empty narrative, so a retry renders
+    # the same deterministic body instead of generating fresh text and
+    # double-sending the proposal.
+    failed_store = MentionInboxStore(tmp_path / "inbox.db")
+    latest = failed_store.get_latest_proposal("github:R_repo:PR_7")
+    assert latest is not None
+    narrative = failed_store.get_proposal_narrative(
+        latest.proposal_id, latest.revision
+    )
+    assert narrative is not None
+    assert narrative.summary == ""
+    assert narrative.verdict == ""
+    body = discord.messages["thread-1"][0][1]
+    await coordinator.ensure_thread(
+        _event(),
+        parent_message_id="parent-1",
+        source_revision="2026-07-29T10:01:00Z",
+    )
+    assert advisor.calls == 1
+    assert len(discord.messages["thread-1"]) == 1
+    assert discord.messages["thread-1"][0][1] == body
     stored = MentionInboxStore(tmp_path / "inbox.db").get_latest_proposal(
         "github:R_repo:PR_7"
     )
@@ -1226,9 +1268,17 @@ async def test_proposal_is_delivered_when_the_advisory_fails(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_advisory_does_not_change_proposal_revisions(tmp_path: Path) -> None:
-    # Non-deterministic advisory text must not churn revisions: the proposal
-    # object and its rendered message stay byte-identical across deliveries.
+async def test_narrative_is_persisted_so_a_varying_model_cannot_repost(
+    tmp_path: Path,
+) -> None:
+    """The narrative is now inside the deduped proposal body.
+
+    A model that answers differently every time would otherwise render a
+    different body on each delivery, miss the find_message_content recovery
+    lookup, and post the proposal again. Persisting the first answer and
+    rendering only from storage is what prevents that.
+    """
+
     discord = _Discord()
 
     class _VaryingAdvisor:
@@ -1237,11 +1287,15 @@ async def test_advisory_does_not_change_proposal_revisions(tmp_path: Path) -> No
 
         async def advise(self, *, context: object) -> str:
             self.count += 1
-            return f"매번 다른 문장 {self.count}"
+            return (
+                f"요청: 매번 다른 요약 {self.count}\n"
+                f"판정: 부분 수용\n"
+                f"근거: 매번 다른 근거 {self.count}\n"
+                f"다음: 매번 다른 다음 {self.count}"
+            )
 
-    coordinator = _coordinator(
-        tmp_path / "inbox.db", discord, advisor=_VaryingAdvisor()
-    )
+    advisor = _VaryingAdvisor()
+    coordinator = _coordinator(tmp_path / "inbox.db", discord, advisor=advisor)
     event = _event()
     for _ in range(3):
         await coordinator.ensure_thread(
@@ -1254,8 +1308,11 @@ async def test_advisory_does_not_change_proposal_revisions(tmp_path: Path) -> No
     proposal = store.get_latest_proposal("github:R_repo:PR_7")
     assert proposal is not None
     assert proposal.revision == 1
-    # One proposal message plus exactly one advisory message.
-    assert len(discord.messages["thread-1"]) == 2
+    assert len(discord.messages["thread-1"]) == 1
+    # Generated exactly once, then read back from storage.
+    assert advisor.count == 1
+    assert "매번 다른 요약 1" in discord.messages["thread-1"][0][1]
+    assert "매번 다른 요약 2" not in discord.messages["thread-1"][0][1]
 
 
 @pytest.mark.asyncio

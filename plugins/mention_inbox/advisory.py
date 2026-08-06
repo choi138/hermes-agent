@@ -44,6 +44,10 @@ _MAX_SUMMARY_CHARS = 900
 _MAX_FINDING_CHARS = 400
 _MAX_FINDINGS = 6
 _MAX_LOCATION_CHARS = 140
+# The two halves the proposal body renders. Bounded separately so a long
+# verdict can never crowd out the request summary above it.
+_MAX_NARRATIVE_SUMMARY_CHARS = 300
+_MAX_NARRATIVE_VERDICT_CHARS = 600
 # preflight already bounds the hunk; this is a second, independent cap so a
 # stored brief can never dominate the prompt.
 _MAX_DIFF_HUNK_CHARS = 1800
@@ -241,6 +245,45 @@ def normalize_advisory(value: object) -> str:
     return text
 
 
+def split_advisory(text: object) -> tuple[str, str]:
+    """Split the model's four labelled lines into (summary, verdict).
+
+    Returns ``("", "")`` when the shape is not recognisable.  The caller must
+    treat that as a generation failure: rendering an unparsed blob would put
+    non-reproducible text into the proposal body, which is recovered after a
+    crash by matching a fresh render against the thread.
+    """
+
+    if not isinstance(text, str):
+        return "", ""
+    summary_parts: list[str] = []
+    verdict_parts: list[str] = []
+    target: list[str] | None = None
+    for raw in text.split("\n"):
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        if line.startswith("요청:"):
+            target = summary_parts
+            line = line[len("요청:"):].strip()
+            if not line:
+                continue
+        elif line.startswith(("판정:", "근거:", "다음:")):
+            target = verdict_parts
+        if target is None:
+            continue
+        target.append(line)
+    summary = _bounded_text(
+        " ".join(summary_parts), _MAX_NARRATIVE_SUMMARY_CHARS
+    )
+    verdict = "\n".join(verdict_parts).strip()
+    if len(verdict) > _MAX_NARRATIVE_VERDICT_CHARS:
+        verdict = verdict[: _MAX_NARRATIVE_VERDICT_CHARS - 1].rstrip() + "\u2026"
+    if not summary or not verdict:
+        return "", ""
+    return summary, verdict
+
+
 _SYSTEM_MESSAGE = (
     "당신은 GitHub 리뷰 요청을 사람이 이해하도록 설명하고, 그 요청이 코드에 비추어 "
     "타당한지 판정하는 한국어 보조 분석가입니다.\n"
@@ -257,12 +300,15 @@ _SYSTEM_MESSAGE = (
     "코드가 어떻게 생겼는지 추측하지 마세요.\n"
     "- diff_hunk의 마지막 줄이 리뷰 코멘트가 달린 줄이고, 앞부분은 잘려 있을 수 "
     "있습니다.\n"
-    "- 다음 세 줄만 쓰세요. 첫째 줄은 '판정: '으로 시작하고 다음 네 가지 중 하나만 "
-    "적으세요. 수용 권장 / 부분 수용 / 반박 (오탐·코드상 불가) / 정보 부족.\n"
-    "- 둘째 줄은 '근거: '으로 시작해서, 그 판정을 뒷받침하는 diff_hunk의 특정 줄이나 "
+    "- 다음 네 줄만 쓰세요. 첫째 줄은 '요청: '으로 시작해서 이 리뷰가 무엇을 문제 삼는지 "
+    "1~2문장으로 요약하세요. 원문을 그대로 옮기지 말고, 배지나 태그 같은 장식은 "
+    "버리세요.\n"
+    "- 둘째 줄은 '판정: '으로 시작하고 다음 네 가지 중 하나만 적으세요. "
+    "수용 권장 / 부분 수용 / 반박 (오탐·코드상 불가) / 정보 부족.\n"
+    "- 셋째 줄은 '근거: '으로 시작해서, 그 판정을 뒷받침하는 diff_hunk의 특정 줄이나 "
     "심볼 이름을 짧게 따옴표 안에 옮기고, 그것이 왜 그 판정으로 이어지는지 1~2문장으로 "
     "쓰세요.\n"
-    "- 셋째 줄은 '다음: '으로 시작해서 손댈 순서를 1~2개만 짧게 쓰세요. 반박이나 정보 "
+    "- 넷째 줄은 '다음: '으로 시작해서 손댈 순서를 1~2개만 짧게 쓰세요. 반박이나 정보 "
     "부족이면 무엇을 더 봐야 하는지 쓰세요.\n"
     "- diff_hunk가 없거나, 있어도 판정에 필요한 부분이 잘려 있으면 반드시 '정보 부족'을 "
     "고르고 어떤 코드가 더 필요한지 밝히세요. 추측으로 수용이나 반박을 고르지 마세요.\n"
@@ -272,8 +318,8 @@ _SYSTEM_MESSAGE = (
     "'입니다' 같은 격식체를 쓰지 마세요.\n"
     "- 마크다운 heading, 코드 블록, 링크, 사용자 멘션을 쓰지 마세요. 세 줄은 줄바꿈으로만 "
     "구분하고 각 줄은 한 줄로 유지하세요.\n"
-    "- 전체 600자 이내로, 원문을 그대로 옮기지 말고 요약해서 쓰세요. 판정을 맨 앞에 "
-    "두어 뒤가 잘려도 결론이 남게 하세요."
+    "- 전체 600자 이내로, 원문을 그대로 옮기지 말고 요약해서 쓰세요. 요청과 판정을 "
+    "앞에 두어 뒤가 잘려도 핵심이 남게 하세요."
 )
 
 

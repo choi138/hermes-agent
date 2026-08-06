@@ -395,7 +395,18 @@ def render_proposal(
     approval_offered: bool = False,
     approval_unavailable_reason: str | None = None,
     event: MentionEvent | None = None,
+    summary: str = "",
+    verdict: str = "",
 ) -> str:
+    """Render one proposal revision.
+
+    ``summary`` and ``verdict`` are the model-written halves, already persisted
+    per revision by the caller.  Empty means generation was attempted and did not
+    produce a usable answer, in which case the deterministic proposal fields are
+    rendered instead — the text has to be reproducible, because a proposal that
+    was sent but not yet bound is recovered by matching a fresh render against
+    the thread.
+    """
     if _BOT_MENTION_RE.fullmatch(bot_mention) is None:
         raise ValueError("bot_mention must be a trusted Discord user mention")
     if not isinstance(approval_offered, bool):
@@ -431,12 +442,18 @@ def render_proposal(
     if not scopes:
         scopes.append("PR diff와 관련 테스트")
 
+    if not isinstance(summary, str) or not isinstance(verdict, str):
+        raise ValueError("summary and verdict must be strings")
+    request_text = summary.strip() or _compact_untrusted(proposal.goal, 500)
+    verdict_lines = [line for line in verdict.split("\n") if line.strip()]
+    recommendation = verdict_lines or _proposal_lines(proposal.steps)
+
     lines = [
         "현재 요청",
-        _compact_untrusted(proposal.goal, 500),
+        request_text,
         "",
         "제 추천",
-        *_proposal_lines(proposal.steps),
+        *recommendation,
         "",
         "영향 범위",
         *[f"- {scope}" for scope in scopes],

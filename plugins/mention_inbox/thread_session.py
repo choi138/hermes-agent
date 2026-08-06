@@ -8,7 +8,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
 
-from plugins.mention_inbox.advisory import ProposalAdvisor, build_advisory_context
+from plugins.mention_inbox.advisory import (
+    ProposalAdvisor,
+    build_advisory_context,
+    split_advisory,
+)
 from plugins.mention_inbox.contract import MentionEvent
 from plugins.mention_inbox.preflight import (
     PreApprovalBrief,
@@ -23,7 +27,6 @@ from plugins.mention_inbox.proposals import (
 )
 from plugins.mention_inbox.store import MentionInboxStore, WorkItemSession
 from plugins.mention_inbox.voice import (
-    render_advisory,
     render_execution_enabled_reproposal,
     render_needs_reapproval,
     render_proposal,
@@ -376,26 +379,25 @@ class MentionInboxThreadCoordinator:
         self._advisor = advisor
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def _post_advisory(
+    async def _generate_narrative(
         self,
         event: MentionEvent,
         *,
-        thread_id: str,
         proposal: WorkProposal,
         source_revision: str,
-    ) -> None:
-        """Post the model-written advisory beside a just-sent proposal.
+    ) -> tuple[str, str]:
+        """Ask the model to summarise the request and judge it.
 
-        Best effort by design. A slow or unreachable model, or a reply that
-        sanitizes down to nothing, must leave the delivered proposal and its
-        recorded binding untouched — the advisory is explanatory only. Callers
-        reach this exactly once per revision, right after the proposal message
-        binding is stored, so a failure here cannot cause a duplicate send.
+        Returns ``("", "")`` for every failure — no advisor, no usable context, a
+        slow or unreachable model, or an answer that does not parse.  The caller
+        persists whatever comes back, including the empty pair, so a retry after
+        a crash renders exactly the same text instead of generating fresh prose
+        and defeating the duplicate-send guard.
         """
 
         advisor = self._advisor
         if advisor is None:
-            return
+            return "", ""
         try:
             context = build_advisory_context(
                 proposal=proposal,
@@ -407,17 +409,15 @@ class MentionInboxThreadCoordinator:
                 ),
             )
             if context is None:
-                return
-            advisory = render_advisory(await advisor.advise(context=context))
-            if not advisory:
-                return
-            await self._discord.send_to_thread(thread_id, advisory)
+                return "", ""
+            return split_advisory(await advisor.advise(context=context))
         except Exception:
             logger.warning(
-                "Mention-inbox proposal advisory unavailable; "
-                "delivered the deterministic proposal only",
+                "Mention-inbox proposal narrative unavailable; "
+                "delivering the deterministic proposal instead",
                 exc_info=True,
             )
+            return "", ""
 
     def _lock(self, subject_key: str) -> asyncio.Lock:
         lock = self._locks.get(subject_key)
@@ -641,6 +641,28 @@ class MentionInboxThreadCoordinator:
                 proposal.proposal_id, proposal.revision
             )
             if message_id is None:
+                # Generate once, persist, then render only from storage. The
+                # narrative row is committed before `content` exists below, so a
+                # crash between persisting and sending re-enters here, reads the
+                # same row, and rebuilds a byte-identical body for the
+                # find_message_content recovery lookup.
+                narrative = self._store.get_proposal_narrative(
+                    proposal.proposal_id, proposal.revision
+                )
+                if narrative is None:
+                    generated_summary, generated_verdict = (
+                        await self._generate_narrative(
+                            event,
+                            proposal=proposal,
+                            source_revision=source_revision,
+                        )
+                    )
+                    narrative = self._store.put_proposal_narrative(
+                        proposal.proposal_id,
+                        proposal.revision,
+                        summary=generated_summary,
+                        verdict=generated_verdict,
+                    )
                 parts: list[str] = []
                 if proposal.revision == 1:
                     parts.append(render_thread_opened(event))
@@ -655,6 +677,8 @@ class MentionInboxThreadCoordinator:
                         approval_offered=approval_offered,
                         approval_unavailable_reason=unavailable_reason,
                         event=event,
+                        summary=narrative.summary,
+                        verdict=narrative.verdict,
                     )
                 )
                 content = "\n\n".join(parts)
@@ -706,12 +730,6 @@ class MentionInboxThreadCoordinator:
                     proposal.revision,
                     message_id,
                     approval_offered=approval_offered,
-                )
-                await self._post_advisory(
-                    event,
-                    thread_id=thread_id,
-                    proposal=proposal,
-                    source_revision=source_revision,
                 )
 
             restored = self._store.get_active_work_item_session(subject)
