@@ -197,3 +197,54 @@ def test_brief_is_bounded_and_round_trips_through_strict_metadata() -> None:
 def test_invalid_metadata_is_not_restored_as_approvable() -> None:
     assert brief_from_metadata({"disposition": "action_required", "approvable": True}) is None
     assert brief_from_metadata("not-a-mapping") is None
+
+
+_HUNK_HEADER = "@@ -40,120 +40,130 @@ struct PanelTabBarView: View {"
+_COMMENTED_LINE = "+    .gesture(dragGesture(for: tab))"
+
+
+def test_diff_hunk_keeps_the_commented_line_and_the_enclosing_header() -> None:
+    """GitHub puts the commented line LAST, so the front is what gets dropped.
+
+    Truncating the tail instead would throw away the one line the review comment
+    is actually about, which is the whole point of carrying the hunk.
+    """
+
+    hunk = "\n".join(
+        [_HUNK_HEADER]
+        + [f" context line {index}" for index in range(1, 120)]
+        + [_COMMENTED_LINE]
+    )
+
+    brief = _build(review=_review(), comments=({**_comment(), "diff_hunk": hunk},))
+
+    assert brief.findings
+    finding = brief.findings[0]
+    assert finding.diff_hunk is not None
+    kept = finding.diff_hunk.splitlines()
+    assert kept[0] == _HUNK_HEADER
+    assert kept[-1] == _COMMENTED_LINE
+    assert "earlier lines elided" in kept[1]
+    assert len(kept) <= 14
+    assert len(finding.diff_hunk) <= 900
+    assert brief_from_metadata(brief_to_metadata(brief)) == brief
+
+
+def test_short_diff_hunk_survives_whole_with_its_line_structure() -> None:
+    hunk = "@@ -1,3 +1,3 @@ def render():\n-    return None\n+    return view"
+
+    brief = _build(review=_review(), comments=({**_comment(), "diff_hunk": hunk},))
+
+    assert brief.findings
+    assert brief.findings[0].diff_hunk == hunk
+    assert brief_from_metadata(brief_to_metadata(brief)) == brief
+
+
+def test_missing_or_unusable_diff_hunk_is_simply_absent() -> None:
+    for value in (None, "", "   ", 12345, ["not", "a", "string"]):
+        brief = _build(
+            review=_review(), comments=({**_comment(), "diff_hunk": value},)
+        )
+        assert brief.findings
+        assert brief.findings[0].diff_hunk is None
+        assert brief_from_metadata(brief_to_metadata(brief)) == brief

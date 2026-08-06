@@ -409,6 +409,7 @@ def test_runtime_hydrates_allowlisted_ai_review_activity_on_owned_pr(
                     "line": None,
                     "review_id": None,
                     "commit_id": None,
+                    "diff_hunk": None,
                 }
             ]
             if event_type == "review_comment"
@@ -569,6 +570,7 @@ def test_runtime_keeps_codex_review_when_later_label_event_exists(
             "line": 92,
             "review_id": "4817597705",
             "commit_id": None,
+            "diff_hunk": None,
         }
     ]
 

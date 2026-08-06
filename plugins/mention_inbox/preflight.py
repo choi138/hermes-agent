@@ -24,6 +24,11 @@ _MAX_URL_CHARS = 500
 _MAX_ID_CHARS = 160
 _MAX_REVISION_CHARS = 80
 _MAX_SHA_CHARS = 128
+# A hunk is kept tail-anchored, so these bound the window that survives,
+# not the hunk GitHub sent.  See :func:`_diff_hunk`.
+_MAX_DIFF_HUNK_CHARS = 900
+_MAX_DIFF_HUNK_LINES = 14
+_ELIDED_HUNK_MARKER = "[... {count} earlier lines elided ...]"
 
 
 class PreApprovalDisposition(str, Enum):
@@ -43,6 +48,7 @@ class ReviewFinding:
     line: int | None
     review_id: str | None
     commit_id: str | None
+    diff_hunk: str | None = None
 
     def __post_init__(self) -> None:
         if not _valid_text(self.source_event_id, _MAX_ID_CHARS):
@@ -65,6 +71,8 @@ class ReviewFinding:
             self.commit_id, _MAX_SHA_CHARS
         ):
             raise ValueError("finding commit_id is invalid")
+        if self.diff_hunk is not None and not _valid_hunk(self.diff_hunk):
+            raise ValueError("finding diff_hunk is invalid")
 
 
 @dataclass(frozen=True)
@@ -85,6 +93,11 @@ class PreApprovalBrief:
             raise ValueError("brief findings are invalid")
         if any(not isinstance(item, ReviewFinding) for item in self.findings):
             raise ValueError("brief finding is invalid")
+        # diff_hunk is deliberately outside this budget.  Finding bodies alone
+        # already run to a p90 of ~2000 chars against a 1600 total, so charging
+        # hunks here would make build_preapproval_brief raise for ordinary review
+        # comments and stop event collection.  Hunks are bounded per finding by
+        # _MAX_DIFF_HUNK_CHARS instead, and again at the advisory layer.
         if len(self.summary) + sum(len(item.body) for item in self.findings) > _MAX_TEXT_BUDGET:
             raise ValueError("brief text budget exceeded")
         if not _valid_text(self.source_revision, _MAX_REVISION_CHARS):
@@ -106,6 +119,70 @@ def _valid_text(value: object, limit: int) -> bool:
         and value == value.strip()
         and len(value) <= limit
     )
+
+
+def _valid_hunk(value: object) -> bool:
+    """Like :func:`_valid_text`, but for text that is meant to span lines."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= _MAX_DIFF_HUNK_CHARS
+        and len(value.splitlines()) <= _MAX_DIFF_HUNK_LINES
+    )
+
+
+def _diff_hunk(value: object) -> str | None:
+    """Bound a GitHub diff hunk while keeping the commented line in view.
+
+    GitHub builds ``diff_hunk`` so that its LAST line is the line the comment
+    was left on, so this trims from the front and keeps the tail.  The ``@@``
+    header is kept when present because it usually names the enclosing
+    function, which is free structural context.
+
+    :func:`_compact` cannot be reused here: it collapses every newline, which
+    is exactly the structure that makes a hunk legible.
+    """
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [
+        "".join(
+            character
+            for character in line.replace("\t", "    ")
+            if not unicodedata.category(character).startswith("C")
+        ).rstrip()
+        for line in normalized.split("\n")
+    ]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return None
+    header = lines[0] if lines[0].startswith("@@") and len(lines) > 1 else ""
+    tail = lines[1:] if header else lines
+    for keep in range(min(len(tail), _MAX_DIFF_HUNK_LINES), 0, -1):
+        kept = list(tail[-keep:])
+        elided = len(tail) - keep
+        if elided > 0:
+            kept.insert(0, _ELIDED_HUNK_MARKER.format(count=elided))
+        if header:
+            kept.insert(0, header)
+        text = "\n".join(kept).strip()
+        if (
+            text
+            and len(kept) <= _MAX_DIFF_HUNK_LINES
+            and len(text) <= _MAX_DIFF_HUNK_CHARS
+        ):
+            return text
+    last = tail[-1].strip()
+    if not last:
+        return None
+    if len(last) > _MAX_DIFF_HUNK_CHARS:
+        last = last[: _MAX_DIFF_HUNK_CHARS - 1].rstrip() + "\u2026"
+    return last or None
 
 
 def _compact(value: object, limit: int) -> str:
@@ -206,6 +283,7 @@ def _finding_from_comment(
     line = _positive_line(payload.get("line"))
     review_id = _identifier(payload.get("pull_request_review_id"))
     commit_id = _commit(payload)
+    diff_hunk = _diff_hunk(payload.get("diff_hunk"))
     if source_event_id is None or not body:
         return None
     if payload.get("path") is not None and path is None:
@@ -221,6 +299,7 @@ def _finding_from_comment(
         line=line,
         review_id=review_id,
         commit_id=commit_id,
+        diff_hunk=diff_hunk,
     )
 
 
@@ -365,6 +444,7 @@ def brief_to_metadata(brief: PreApprovalBrief) -> dict[str, Any]:
                 "line": finding.line,
                 "review_id": finding.review_id,
                 "commit_id": finding.commit_id,
+                "diff_hunk": finding.diff_hunk,
             }
             for finding in brief.findings
         ],
@@ -400,6 +480,7 @@ def brief_from_metadata(value: object) -> PreApprovalBrief | None:
                     line=item.get("line"),
                     review_id=item.get("review_id"),
                     commit_id=item.get("commit_id"),
+                    diff_hunk=item.get("diff_hunk"),
                 )
             )
         approvable = payload.get("approvable")

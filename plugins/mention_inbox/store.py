@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -403,9 +404,40 @@ def _work_execution(row: sqlite3.Row) -> WorkExecution:
     )
 
 
+_DERIVED_BRIEF_FIELDS = ("diff_hunk",)
+
+
+def _strip_derived_brief_fields(payload: Any) -> None:
+    """Drop brief fields that only re-render inputs the hash already covers.
+
+    ``diff_hunk`` is GitHub's rendering of code that ``metadata.subject_head_sha``
+    and each finding's ``commit_id`` already pin, and GitHub re-renders it on
+    every force-push.  Hashing it would report a content change — and so post a
+    new proposal revision into every open work thread — for a review request
+    that did not actually change.
+
+    Only these named fields are exempt.  The rest of the brief stays hashed: a
+    sibling finding appearing or its body changing must still count as a change.
+    """
+
+    if not isinstance(payload, dict):
+        return
+    untrusted = payload.get("untrusted")
+    metadata = untrusted.get("metadata") if isinstance(untrusted, dict) else None
+    brief = metadata.get("preapproval_brief") if isinstance(metadata, dict) else None
+    findings = brief.get("findings") if isinstance(brief, dict) else None
+    if not isinstance(findings, list):
+        return
+    for finding in findings:
+        if isinstance(finding, dict):
+            for name in _DERIVED_BRIEF_FIELDS:
+                finding.pop(name, None)
+
+
 def _content_hash(event: MentionEvent) -> str:
-    payload = event_to_dict(event)
+    payload = copy.deepcopy(event_to_dict(event))
     payload["approval_state"] = "pending"
+    _strip_derived_brief_fields(payload)
     encoded = json.dumps(
         payload,
         ensure_ascii=False,

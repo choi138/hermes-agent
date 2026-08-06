@@ -11,7 +11,8 @@ from plugins.mention_inbox import (
     MentionEvent,
     ingest_event,
 )
-from plugins.mention_inbox.store import MentionInboxStore
+from plugins.mention_inbox.contract import event_to_dict, restore_event
+from plugins.mention_inbox.store import MentionInboxStore, _content_hash
 
 
 def _event(*, body: str = "Please review this pull request.") -> MentionEvent:
@@ -238,3 +239,62 @@ def test_collector_status_persists_failures_and_resets_on_success(
     assert success.last_success_at == first_retry
     assert success.next_poll_at == next_poll
     assert reloaded.get_collector_status("github.notifications") == success
+
+
+def _briefed_event(
+    *, diff_hunk: str | None, body: str = "Guard the disabled capability."
+) -> MentionEvent:
+    payload = event_to_dict(_event())
+    payload["untrusted"]["metadata"]["preapproval_brief"] = {
+        "schema_version": 1,
+        "disposition": "review_needed",
+        "summary": "Guard the disabled capability.",
+        "findings": [
+            {
+                "source_event_id": "PRRC_1",
+                "body": body,
+                "source_url": (
+                    "https://github.com/org/repo/pull/7#discussion_r1"
+                ),
+                "path": "app/view.py",
+                "line": 12,
+                "review_id": "991",
+                "commit_id": None,
+                "diff_hunk": diff_hunk,
+            }
+        ],
+        "source_revision": "2026-07-29T10:00:00Z",
+        "head_sha": "head-1",
+        "approvable": True,
+    }
+    return restore_event(payload)
+
+
+def test_content_hash_ignores_the_rerendered_diff_hunk() -> None:
+    """The hunk is GitHub's rendering of code the hash already pins.
+
+    GitHub re-renders diff_hunk on every force-push, so hashing it would report a
+    content change for a review request that did not change — and that change
+    posts a fresh proposal revision into every open work thread.
+    """
+
+    absent = _content_hash(_briefed_event(diff_hunk=None))
+    present = _content_hash(
+        _briefed_event(diff_hunk="@@ -1,2 +1,2 @@\n-old()\n+new()")
+    )
+    rerendered = _content_hash(
+        _briefed_event(diff_hunk="@@ -9,2 +9,2 @@ def f():\n-x()\n+y()")
+    )
+
+    assert absent == present == rerendered
+
+
+def test_content_hash_still_sees_a_changed_review_request() -> None:
+    baseline = _content_hash(_briefed_event(diff_hunk=None))
+
+    assert (
+        _content_hash(
+            _briefed_event(diff_hunk=None, body="A completely different request.")
+        )
+        != baseline
+    )
