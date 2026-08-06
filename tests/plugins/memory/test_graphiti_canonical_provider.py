@@ -675,9 +675,12 @@ def test_english_correction_matching_does_not_suppress_benign_without_phrase(
         "continue the previous P1 task, but don't use Kanban"
     )
 
+    # The second search carries the first turn's subject as a recent-topic hint;
+    # what this test pins is which turns dispatch at all, not the hint shape.
     assert [call[1]["query"] for call in calls] == [
         "continue the previous P1 task without delay",
-        "continue the previous P1 task without regressions",
+        "continue the previous P1 task without regressions\n"
+        "Recent topics: continue the previous P1 task without delay",
     ]
     assert correction_result == ""
     assert dont_use_result == ""
@@ -1422,7 +1425,16 @@ def test_preference_dependent_request_triggers_selective_recall(monkeypatch, tmp
     assert "preference-edge" in result
 
 
-def test_unrelated_temporal_question_does_not_trigger_recall(monkeypatch, tmp_path):
+def test_unrelated_temporal_question_yields_no_recall_context(monkeypatch, tmp_path):
+    """An off-topic question costs one search but injects nothing.
+
+    The gate used to require a work-context term alongside the temporal one,
+    which skipped the dispatch entirely. That allowlist also blocked 92% of
+    real requests, so the gate is now a denylist and off-topic turns pay one
+    bounded search. Correctness is unchanged — the relevance filter still
+    drops every fact — but the round-trip is no longer avoided. Revisit via
+    queue_prefetch if the measured per-turn cost matters.
+    """
     calls = []
     monkeypatch.setattr(
         graphiti_module,
@@ -1435,7 +1447,80 @@ def test_unrelated_temporal_question_does_not_trigger_recall(monkeypatch, tmp_pa
     result = provider.prefetch("지난밤 서울 날씨는 어땠어?")
 
     assert result == ""
-    assert calls == []
+    assert [call[1]["query"] for call in calls] == ["지난밤 서울 날씨는 어땠어?"]
+
+
+def test_gate_admits_subject_bearing_requests_and_drops_unusable_turns():
+    """Positive controls sit in the same batch as the negatives."""
+    admitted = (
+        "P1 어디까지 진행됐어?",
+        "내가 어제 뭐했지?",
+        "hermes에 graphiti 연결하는거 어디까지 했지?",
+        "우리가 저번에 정한 방식이 뭐였지",
+        "이어서 진행해",
+    )
+    dropped = (
+        "안녕",
+        "고마워",
+        "너 모델 뭐야?",
+        "what model are you",
+        "[ASYNC DELEGATION BATCH COMPLETE - deleg_95ffab52] a background fan-out",
+        "[IMPORTANT: Background process proc_0d18fbbd5db1 completed normally]",
+        "그거 말고 다른걸로 해줘",
+    )
+
+    assert [q for q in admitted if not graphiti_module._should_recall(q)] == []
+    assert [q for q in dropped if graphiti_module._should_recall(q)] == []
+
+
+def test_contentless_followup_carries_session_scope_and_recent_topics(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize(
+        "session-1",
+        hermes_home=str(tmp_path),
+        session_title="Graphiti 기억 주입 작업 재개",
+    )
+
+    provider.prefetch("neo4j 백업 유닛 컨테이너 이름을 고쳐야 해")
+    provider.prefetch("이어서 진행해")
+
+    followup = calls[1][1]["query"]
+    assert followup.startswith("이어서 진행해\n")
+    assert "Session scope: Graphiti 기억 주입 작업 재개" in followup
+    assert "Recent topics: neo4j 백업 유닛 컨테이너 이름을 고쳐야 해" in followup
+
+
+def test_recent_topics_are_bounded_and_reset_on_new_session(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+
+    [provider.prefetch(f"작업 주제 번호 {index} 를 처리해줘") for index in range(5)]
+
+    assert len(provider._recent_topics) == graphiti_module._RECENT_TOPIC_COUNT
+
+    provider.on_session_switch("session-2", reset=True)
+    assert provider._recent_topics == []
+
+    provider.prefetch("이어서 진행해")
+    assert "Recent topics" not in calls[-1][1]["query"]
 
 
 def test_recall_excludes_operational_status_facts(monkeypatch, tmp_path):
