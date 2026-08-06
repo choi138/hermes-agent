@@ -40,10 +40,12 @@ async def test_proposal_controls_render_and_route_exact_revision() -> None:
     assert result.success is True
     view = channel.send.await_args.kwargs["view"]
     labels = [child.label for child in view.children]
-    assert labels == ["수정 시작", "저장된 근거 보기", "나중에"]
+    # No one-click execution control, even when approval is offered: approving
+    # is text-only so a stray click cannot commit and push.
+    assert labels == ["저장된 근거 보기", "나중에"]
+    assert "수정 시작" not in labels
     assert view.timeout is None
     assert [child.custom_id for child in view.children] == [
-        "mention-inbox:start:wp_478607ef97c9b4875e53aecf:3",
         "mention-inbox:inspect:wp_478607ef97c9b4875e53aecf:3",
         "mention-inbox:later:wp_478607ef97c9b4875e53aecf:3",
     ]
@@ -64,7 +66,7 @@ async def test_proposal_controls_render_and_route_exact_revision() -> None:
         proposal_message_id="555",
         user_id="42",
         interaction_id="777",
-        action="start",
+        action="inspect",
     )
     assert all(child.disabled for child in view.children)
     message.edit.assert_awaited_once_with(view=view)
