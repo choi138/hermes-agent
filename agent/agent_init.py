@@ -1433,6 +1433,9 @@ def init_agent(
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
+    # Historical attribute name retained for compatibility. The counter now
+    # commits model-work units only when a top-level turn completes normally;
+    # delegated and failed turns never contribute to automatic review cadence.
     agent._iters_since_skill = 0
     if not skip_memory:
         try:

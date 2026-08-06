@@ -31,20 +31,18 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
 ] = {
     "delegate_task": {
         (): (
-            "Delegate one or more reasoning-heavy tasks to isolated subagents. "
-            "Provide goal for one task or tasks for parallel work; each child has "
-            "independent context, terminal state, and tools, and returns an array "
-            "entry asynchronously as a new message. Continue working—do not wait or "
-            "poll. Put all paths, errors, constraints, and requested language/tone in "
-            "context because children cannot see this conversation or ask via clarify. "
-            "Use execute_code for mechanical workflows and direct tools for one call. "
-            "Delegations are not durable: /new or process exit discards unfinished work, "
-            "and /stop cancels it. Treat summaries as unverified self-reports; for "
-            "external side effects require a URL, ID, absolute path, or status and verify "
-            "it before claiming success. Leaf children cannot call delegate_task, "
-            "clarify, memory, send_message, or execute_code; orchestrators may delegate "
-            "only within the limits stated in role and retain the other restrictions. "
-            "Children inherit the parent model/fallback unless globally pinned."
+            "Delegate reasoning-heavy work to isolated subagents with independent "
+            "context, terminal state, and tools. Use goal for one task or tasks for "
+            "parallel work. Results arrive asynchronously as new messages: continue "
+            "working and never wait/poll. Context must include paths, errors, constraints, "
+            "and requested language because children cannot see this chat or clarify. "
+            "Batch independent direct tool calls in one response; use execute_code only "
+            "for filtering, branching, loops, or data-dependent sequencing. Work is not "
+            "durable across /new or process exit; /stop cancels it. Treat summaries as "
+            "unverified and verify external side effects from a URL, ID, path, or status. "
+            "Leaf children cannot delegate, clarify, use memory/send_message, or "
+            "execute_code; orchestrators may delegate only within role limits. Children "
+            "inherit the parent model/fallback unless globally pinned."
         ),
         ("parameters", "properties", "background"): (
             "Deprecated and ignored. Delegations already run in the background and "
@@ -90,6 +88,21 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
         ),
         ("parameters", "properties", "capture_after"): (
             "Capture after the action to verify its effect in the same response."
+        ),
+        ("parameters", "properties", "delivery_mode"): (
+            "Input delivery: background (default) avoids focus changes; foreground "
+            "briefly fronts the app and requires approval. Escalate only after a result "
+            "reports suspected_noop, background_unavailable, or recommends foreground."
+        ),
+        ("parameters", "properties", "bring_to_front"): (
+            "With foreground delivery, keep the app frontmost after acting instead of "
+            "restoring the prior app; default false."
+        ),
+        ("parameters", "properties", "pid"): (
+            "Optional exact process target for capture; pair with window_id when needed."
+        ),
+        ("parameters", "properties", "window_id"): (
+            "Optional exact native window target for capture; pair with pid when needed."
         ),
     },
     "browser_navigate": {
@@ -156,6 +169,49 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
             "is JSON-serialized."
         ),
     },
+    "browser_cdp": {
+        (): (
+            "Send a raw Chrome DevTools Protocol command when a CDP endpoint is "
+            "attached; prefer dedicated browser tools when they cover the operation. "
+            "Omit target_id/frame_id for browser-level methods, use target_id for a "
+            "tab, and use frame_id from browser_snapshot for cross-origin OOPIF work. "
+            "Calls without frame_id are stateless. Look up method parameters in the "
+            "official CDP reference when uncertain."
+        ),
+        ("parameters", "properties", "method"): (
+            "CDP method, for example Target.getTargets or Runtime.evaluate."
+        ),
+        ("parameters", "properties", "params"): (
+            "Method-specific JSON object; omit or use {} when there are no parameters."
+        ),
+        ("parameters", "properties", "target_id"): (
+            "Optional tab targetId for page-level methods; mutually exclusive with frame_id."
+        ),
+        ("parameters", "properties", "frame_id"): (
+            "Optional cross-origin OOPIF frame_id from browser_snapshot; use target_id "
+            "for top-level tabs and normal DOM access for same-origin frames."
+        ),
+        ("parameters", "properties", "timeout"): (
+            "Seconds to wait (default 30, maximum 300)."
+        ),
+    },
+    "browser_dialog": {
+        (): (
+            "Accept or dismiss a native JavaScript dialog reported in "
+            "browser_snapshot.pending_dialogs. Supply prompt_text for prompt(); when "
+            "several dialogs are queued, select one with dialog_id. Available only "
+            "with a CDP-capable browser."
+        ),
+        ("parameters", "properties", "action"): (
+            "accept confirms (and permits beforeunload navigation); dismiss cancels."
+        ),
+        ("parameters", "properties", "prompt_text"): (
+            "prompt() response; ignored by other dialog types."
+        ),
+        ("parameters", "properties", "dialog_id"): (
+            "ID from browser_snapshot; needed only when multiple dialogs are queued."
+        ),
+    },
     "clarify": {
         (): (
             "Ask for clarification, feedback, or a meaningful decision. For selectable "
@@ -175,15 +231,13 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
     },
     "memory": {
         (): (
-            "Save compact, stable facts across sessions. Prefer one atomic operations "
-            "batch for multiple add/replace/remove changes; only its final result is "
-            "checked against the character limit, so it can free space and add in one "
-            "call. Use single fields only for one change. target=user stores identity, "
-            "preferences, and style; target=memory stores environment, conventions, and "
-            "lessons. Save durable preferences, corrections, and stable workflow facts; "
-            "skip task progress, raw dumps, rediscoverable facts, and procedures (use "
-            "skills). If full, batch removals or shortening with the new entry. Do not "
-            "repeat a successful batch."
+            "Save compact stable facts across sessions. target=user is identity, "
+            "preferences, and style; target=memory is environment, conventions, and "
+            "lessons. Store durable preferences, corrections, and workflow facts—not "
+            "task progress, raw dumps, rediscoverable facts, or procedures (use skills). "
+            "For multiple changes or a full store, use one atomic operations batch to "
+            "remove/shorten and add within the final character limit. Do not repeat a "
+            "successful batch."
         ),
         ("parameters", "properties", "operations"): (
             "Atomic list of {action, content?, old_text?}; prefer for multiple changes "
@@ -191,6 +245,15 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
         ),
         ("parameters", "properties", "old_text"): (
             "For replace/remove, a short unique substring identifying the entry."
+        ),
+    },
+    "execute_code": {
+        (): (
+            "Run Python with enabled Hermes wrappers imported from hermes_tools. Use "
+            "only for filtering large results, branching, loops, or calls whose inputs "
+            "depend on earlier outputs. For independent calls, request normal tools "
+            "together in one response so they run concurrently. Wrappers return dicts; "
+            "print the final result. Limit: 5 minutes, 50 calls, 50KB stdout."
         ),
     },
     "read_file": {
@@ -212,23 +275,29 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
     },
     "write_file": {
         (): (
-            "Write content to a file, creating parent directories. OVERWRITES the "
-            "entire file; use patch for targeted edits. Runs syntax checks and reports "
-            "only errors introduced by this write."
+            "Write a complete file, creating parent directories. OVERWRITES the entire "
+            "file; use patch for targeted edits or append. Suspicious large shrinks are "
+            "blocked unless confirmed with the returned SHA-256. Runs syntax checks."
         ),
         ("parameters", "properties", "path"): (
             "File path to create or overwrite."
         ),
         ("parameters", "properties", "content"): "Complete replacement content.",
+        ("parameters", "properties", "expected_sha256"): (
+            "Current SHA-256 returned by a destructive-shrink refusal."
+        ),
+        ("parameters", "properties", "allow_destructive_overwrite"): (
+            "Confirm an intentional shrink only with matching expected_sha256."
+        ),
     },
     "patch": {
         (): (
-            "Edit files with fuzzy unique-string replacement or a V4A multi-file patch; "
-            "returns a diff and runs syntax checks. replace mode needs "
-            "mode/path/old_string/new_string; patch mode needs mode/patch."
+            "Edit files with targeted replacement, atomic EOF append, or a V4A "
+            "multi-file patch; returns a diff and runs syntax checks. replace needs "
+            "path/old_string/new_string; append needs path/content; patch needs patch."
         ),
         ("parameters", "properties", "mode"): (
-            "replace for targeted text; patch for V4A content."
+            "replace for targeted text, append for EOF additions, or patch for V4A."
         ),
         ("parameters", "properties", "path"): "File path for replace mode.",
         ("parameters", "properties", "old_string"): (
@@ -239,6 +308,10 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
         ),
         ("parameters", "properties", "replace_all"): (
             "Replace all matches; otherwise old_string must be unique."
+        ),
+        ("parameters", "properties", "content"): "Exact EOF content for append mode.",
+        ("parameters", "properties", "expected_sha256"): (
+            "Optional current SHA-256 guard for append."
         ),
         ("parameters", "properties", "patch"): "V4A content for patch mode.",
     },
@@ -332,15 +405,14 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
     },
     "terminal": {
         (): (
-            "Run shell commands in a persistent session environment. Use dedicated "
-            "file operations for reading, searching, editing, and creating files; use "
-            "the shell for builds, installs, git, processes, scripts, packages, and "
-            "network work. Foreground returns as soon as the command exits, even with "
-            "a high timeout. For bounded work beyond the foreground limit, use "
-            "background=true with notify_on_complete=true; silent background is only "
-            "for long-lived servers/watchers. Do not wrap background work with &, "
-            "nohup, disown, or setsid. Verify server readiness separately. Set workdir "
-            "for cwd and pty=true for interactive CLIs."
+            "Run shell commands in a persistent environment; use file tools for reading, "
+            "searching, and editing. The shell is for builds, git, processes, scripts, "
+            "packages, and network work. Prefer foreground with a generous timeout for "
+            "bounded jobs—it returns early on exit and avoids polling turns. Beyond the "
+            "foreground limit, use background+notify_on_complete, then continue work or "
+            "end the turn; never loop poll/wait. Silent background is only for servers/"
+            "watchers. Do not use &, nohup, disown, or setsid. Verify readiness separately; "
+            "use workdir for cwd and pty for interactive CLIs."
         ),
         ("parameters", "properties", "background"): (
             "Run asynchronously. Bounded jobs must also set notify_on_complete=true; "
@@ -353,68 +425,186 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
             "wins if both are supplied."
         ),
         ("parameters", "properties", "watch_patterns"): (
-            "Rare strings that trigger mid-process notifications for a long-lived "
-            "process. At most one notice per 15 seconds; after three consecutive "
-            "windows with dropped matches, watching stops and only exit is reported. "
-            "Do not use for end markers, repeated errors, or bounded jobs—use "
-            "notify_on_complete instead. Mutually exclusive with notify_on_complete."
+            "Rare mid-process signals for long-lived jobs only. Rate limit: one notice/"
+            "15s; after three dropped windows, watching stops and exit notification "
+            "takes over. For bounded jobs/end markers use notify_on_complete. Mutually "
+            "exclusive with it."
+        ),
+        ("parameters", "properties", "timeout"): (
+            "Maximum seconds (default 180; foreground max 600). Returns immediately on exit."
+        ),
+    },
+    "process": {
+        (): (
+            "Manage terminal(background=true) processes. For bounded jobs, prefer "
+            "notify_on_complete and continue work or end the turn; do not create short "
+            "poll/wait loops. If the next step depends on the result, call wait once "
+            "with timeout omitted; it uses the configured timeout, returns early on "
+            "exit, and remains interruptible. Other actions inspect or control a process."
+        ),
+        ("parameters", "properties", "action"): (
+            "Action. Avoid repeated short poll/wait calls for bounded jobs."
+        ),
+        ("parameters", "properties", "timeout"): (
+            "wait only. Omit for the configured terminal timeout (180s by default); "
+            "the call still returns immediately when the process exits."
+        ),
+    },
+    "web_search": {
+        (): (
+            "Search the web and return titles, URLs, and snippets (five by default). "
+            "Backend-supported operators such as site:, filetype:, intitle:, -term, "
+            "and quoted phrases may be used."
+        ),
+        ("parameters", "properties", "query"): (
+            "Search query, optionally with backend-supported operators."
+        ),
+        ("parameters", "properties", "limit"): (
+            "Maximum results (default 5)."
+        ),
+    },
+    "web_extract": {
+        (): (
+            "Extract up to five webpages or PDFs to markdown/text without LLM "
+            "summarization. Content within char_limit is returned whole; longer content "
+            "returns head+tail plus a saved path for read_file pagination. Images remain "
+            "as placeholders/links. Use browser tools if extraction fails."
+        ),
+        ("parameters", "properties", "urls"): "URLs to extract (maximum five).",
+        ("parameters", "properties", "char_limit"): (
+            "Per-page inline character budget (default 15000); full text is saved when truncated."
+        ),
+    },
+    "image_generate": {
+        # Keep the root description: it is rebuilt for the configured backend and
+        # is the authoritative statement of edit/reference-image capabilities.
+        ("parameters", "properties", "prompt"): (
+            "Detailed generation prompt or edit instruction."
+        ),
+        ("parameters", "properties", "aspect_ratio"): (
+            "Output aspect ratio; landscape=16:9, portrait=9:16, square=1:1."
+        ),
+        ("parameters", "properties", "image_url"): (
+            "Optional public URL or absolute conversation file path to edit; only "
+            "available when the active model supports image editing."
+        ),
+        ("parameters", "properties", "reference_image_urls"): (
+            "Optional style/character/composition references; support and count limit "
+            "depend on the active model."
+        ),
+    },
+    "read_terminal": {
+        (): (
+            "Read the Hermes desktop app's embedded terminal. With no arguments, return "
+            "the visible screen and total_lines; use zero-based start_line and count to "
+            "page through scrollback."
+        ),
+        ("parameters", "properties", "start_line"): (
+            "Zero-based first line; omit for the visible screen."
+        ),
+        ("parameters", "properties", "count"): (
+            "Lines to read; defaults to visible rows."
+        ),
+    },
+    "close_terminal": {
+        (): (
+            "Close a Hermes desktop background-process terminal tab without stopping "
+            "the process; output keeps buffering and the tab can be reopened. Use "
+            "process(action='kill') to terminate instead."
+        ),
+        ("parameters", "properties", "process_id"): (
+            "Background session ID returned by terminal or process(list)."
+        ),
+    },
+    "todo": {
+        (): (
+            "Read or update this session's task list for multi-step work. Omit todos to "
+            "read. Each item needs id, content, and pending/in_progress/completed/cancelled "
+            "status; order is priority and only one may be in_progress. merge=false "
+            "replaces the list, merge=true updates by id/adds items. Mark completed work "
+            "promptly; cancel failures and add revised work. Returns the full list."
+        ),
+        ("parameters", "properties", "merge"): (
+            "true updates/adds by id; false (default) replaces the list."
+        ),
+    },
+    "skill_view": {
+        (): (
+            "Load a skill's SKILL.md and linked-file index, or pass file_path to read one "
+            "of its references, templates, scripts, or assets. Use skills_list to find names."
+        ),
+        ("parameters", "properties", "name"): (
+            "Skill name; plugin skills use qualified plugin:skill form."
+        ),
+        ("parameters", "properties", "file_path"): (
+            "Optional linked path; omit for SKILL.md and its linked-file index."
+        ),
+    },
+    "vision_analyze": {
+        (): (
+            "Load an image URL, local path, or data URL for analysis. Native-vision "
+            "models receive the pixels next turn; otherwise an auxiliary vision model "
+            "returns text. Use whenever the user or tool output references an image."
+        ),
+        ("parameters", "properties", "image_url"): (
+            "HTTP(S) URL, local file path, or data URL."
+        ),
+        ("parameters", "properties", "question"): (
+            "Specific question or requested analysis."
+        ),
+    },
+    "stock_market_snapshot": {
+        (): (
+            "Fetch a current read-only daily snapshot for one explicit US/Korean ticker "
+            "or supported index. This is informational market data, not trade execution."
+        ),
+        ("parameters", "properties", "symbol"): (
+            "Ticker such as AAPL, BRK-B, 005930.KS, 035720.KQ, ^GSPC, or ^KS11."
         ),
     },
     "session_search": {
         (): (
-            "Search or read Hermes conversation history from the session database. "
-            "This is historical context, never current evidence about a URL, file, "
-            "account, app/thread, contact, website, or live system; inspect a supplied "
-            "source first when accessible, or state why it is inaccessible. Four "
-            "shapes: query=FTS discovery; session_id+around_message_id=scroll; "
-            "session_id alone=read; no args=browse recent sessions. Discovery returns "
-            "deduplicated sessions with kickoff/resolution bookends and a +/-5 match "
-            "window. Scroll by reusing the first/last message ID and increase window "
-            "when needed. Resolve @session:<profile>/<id> with profile plus session_id. "
-            "FTS requires all words by default; use OR, quoted phrases, NOT, or prefix*."
+            "Search/read historical Hermes sessions; never substitute history for an "
+            "accessible live URL, file, account, app, or system. query does FTS discovery; "
+            "session_id reads; add around_message_id to scroll; no args browses recent "
+            "sessions. Discovery deduplicates sessions and includes kickoff/resolution "
+            "plus a match window. Scroll with the first/last returned message ID. Resolve "
+            "@session:<profile>/<id> with profile+session_id. FTS is AND by default and "
+            "supports OR, quoted phrases, NOT, and prefix*."
         ),
         ("parameters", "properties", "query"): (
-            "FTS discovery query. Omit to browse recent sessions; ignored for scroll."
+            "FTS query; omit to browse, ignored when scrolling."
         ),
         ("parameters", "properties", "limit"): (
-            "Discovery result limit (default 3, max 10). Use 5-10 for topics spanning "
-            "several sessions."
+            "Discovery limit (default 3, max 10)."
         ),
         ("parameters", "properties", "sort"): (
-            "Discovery ordering: omit for relevance, newest for recency questions, or "
-            "oldest for origin questions. Ignored by read, scroll, and browse."
+            "Discovery order: relevance (omit), newest, or oldest."
         ),
         ("parameters", "properties", "session_id"): (
-            "Session returned by discovery. Alone reads it; pair with "
-            "around_message_id to scroll."
+            "Discovered session; alone reads, with around_message_id scrolls."
         ),
         ("parameters", "properties", "around_message_id"): (
-            "Scroll anchor. Use match_message_id, the last window ID to move forward, "
-            "or the first to move backward."
+            "Scroll anchor; reuse the last ID forward or first ID backward."
         ),
         ("parameters", "properties", "window"): (
             "Messages on each side of the scroll anchor, clamped to 1-20 (default 5)."
         ),
         ("parameters", "properties", "role_filter"): (
-            "Comma-separated roles. Discovery defaults to user,assistant; include tool "
-            "only when tool output is relevant."
+            "Comma-separated roles; default user,assistant. Add tool only when needed."
         ),
         ("parameters", "properties", "profile"): (
-            "Read another Hermes profile's session database (read-only), especially "
-            "for @session:<profile>/<id>. Omit for the current profile."
+            "Read-only profile for @session:<profile>/<id>; omit for current."
         ),
     },
     "skill_manage": {
         (): (
-            "Create, patch, rewrite, delete, or add/remove supporting files in "
-            "procedural skills. Prefer patch for focused fixes and full edit only for "
-            "major rewrites. Create after a reusable non-trivial workflow succeeds or "
-            "when the user asks; update stale instructions and newly found pitfalls. "
-            "Confirm before create/delete. Good skills state triggers, exact steps, "
-            "pitfalls, and verification. For delete, absorbed_into names an existing "
-            "umbrella after content was merged, while an empty string means pruning; "
-            "this preserves downstream references. Pinned skills cannot be deleted but "
-            "can still be patched or edited."
+            "Manage procedural skills and supporting files. Prefer patch for focused "
+            "fixes and full edit for major rewrites. Create only for a proven reusable "
+            "workflow or user request; keep triggers, exact steps, pitfalls, and checks. "
+            "Confirm before create/delete. On delete, absorbed_into names the existing "
+            "skill that received the content, or empty means pruning. Pinned skills may "
+            "be patched/edited but not deleted."
         ),
         ("parameters", "properties", "name"): (
             "Skill name (lowercase, hyphens/underscores, max 64 chars); must exist for "
@@ -438,14 +628,11 @@ _DISCORD_CORE_COMPACT_DESCRIPTIONS: dict[
             "Optional create-only category subdirectory, such as devops or mlops."
         ),
         ("parameters", "properties", "file_path"): (
-            "Supporting path inside the skill. Required for write_file/remove_file and "
-            "restricted to references, templates, scripts, or assets; optional for "
-            "patch, which defaults to SKILL.md."
+            "Supporting references/templates/scripts/assets path; required for file "
+            "write/remove, optional for patch (defaults to SKILL.md)."
         ),
         ("parameters", "properties", "absorbed_into"): (
-            "Delete intent: existing umbrella skill name after consolidation, or empty "
-            "string for pruning without a target. Omission is backward-compatible but "
-            "forces downstream reference handling to guess."
+            "Delete destination after consolidation, or empty for pruning."
         ),
     },
 }

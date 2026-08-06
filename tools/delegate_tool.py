@@ -39,6 +39,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import propagate_context_to_thread
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -2008,7 +2009,9 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        _child_future = _timeout_executor.submit(
+            propagate_context_to_thread(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2659,8 +2662,12 @@ def delegate_task(
             try:
                 futures = {}
                 for i, t, child in children:
+                    # Capture a fresh Context for every worker. Context
+                    # objects cannot be entered concurrently, and profile
+                    # secret/session scopes must follow each delegated task.
+                    child_runner = propagate_context_to_thread(_run_single_child)
                     future = executor.submit(
-                        _run_single_child,
+                        child_runner,
                         task_index=i,
                         goal=t["goal"],
                         child=child,

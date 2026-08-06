@@ -24,6 +24,7 @@ def ssh_mock_env(monkeypatch):
     monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
     monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/testuser")
     monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_create_sync_baseline", lambda self: None)
     monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
     monkeypatch.setattr(
         ssh_env, "FileSyncManager",
@@ -117,16 +118,31 @@ class TestSSHBulkDownload:
         cmd_str = " ".join(cmd)
         assert "tar cf -" in cmd_str
         assert "-C /" in cmd_str
-        assert cmd[-1] == (
-            "tar cf - -C / -- "
-            "home/testuser/.hermes/skills "
-            "home/testuser/.hermes/external_skills "
-            "home/testuser/.hermes/cache"
-        )
+        assert "--exclude=home/testuser/.hermes/cache/delegation/live" in cmd[-1]
+        assert "home/testuser/.hermes/skills" in cmd[-1]
+        assert "home/testuser/.hermes/external_skills" in cmd[-1]
+        assert "home/testuser/.hermes/cache" in cmd[-1]
         assert "home/testuser/.hermes/logs" not in cmd_str
         assert "home/testuser/.hermes/hermes-agent" not in cmd_str
         assert "ssh" in cmd_str
         assert "testuser@example.com" in cmd_str
+
+    def test_ssh_bulk_download_uses_incremental_marker(self, ssh_mock_env, tmp_path):
+        dest = tmp_path / "incremental.tar"
+        ssh_mock_env._sync_baseline_path = "/tmp/hermes-sync-baseline-test"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as mock_run:
+            ssh_mock_env._ssh_bulk_download(dest)
+
+        remote_command = mock_run.call_args.args[0][-1]
+        assert "find home/testuser/.hermes/skills" in remote_command
+        assert "-cnewer /tmp/hermes-sync-baseline-test" in remote_command
+        assert "cache/delegation/live" in remote_command
+        assert "-print0 | tar --null -T - -cf -" in remote_command
 
     def test_ssh_bulk_download_writes_to_dest(self, ssh_mock_env, tmp_path):
         """subprocess.run should receive stdout=open(dest, 'wb')."""
@@ -185,6 +201,7 @@ class TestSSHCleanup:
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/u")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_create_sync_baseline", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
 
         call_order = []
@@ -214,6 +231,7 @@ class TestSSHCleanup:
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/u")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_create_sync_baseline", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
 
         calls = []
@@ -253,12 +271,41 @@ class TestSSHCleanup:
         timeout = ssh_mock_env._ssh_bulk_download.call_args.kwargs["timeout"]
         assert 0 < timeout <= 10.0
 
+    def test_bounded_clean_shutdown_publishes_reusable_sync_state(
+        self, monkeypatch, ssh_mock_env
+    ):
+        sync_manager = MagicMock()
+        sync_manager.sync_back.return_value = True
+        sync_manager.sync.return_value = True
+        sync_manager.shared_state = MagicMock()
+        ssh_mock_env._sync_manager = sync_manager
+        persist = MagicMock(return_value=True)
+        monkeypatch.setattr(ssh_mock_env, "_persist_sync_state", persist)
+
+        def _release(*, finalize=None):
+            if finalize is not None:
+                finalize()
+            return True
+
+        monkeypatch.setattr(
+            ssh_mock_env,
+            "_release_persistent_sync_lease",
+            _release,
+        )
+
+        ssh_mock_env.cleanup(shutdown_timeout_seconds=10.0)
+
+        sync_manager.sync.assert_called_once_with(force=True)
+        persist.assert_called_once()
+        assert 0 < persist.call_args.kwargs["timeout"] <= 10.0
+
     def test_ssh_cleanup_calls_sync_back_before_control_exit(self, monkeypatch):
         """sync_back() must run before the ControlMaster exit command."""
         monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/u")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_create_sync_baseline", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
 
         call_order = []
@@ -528,6 +575,7 @@ class TestBulkDownloadWiring:
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/root")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_create_sync_baseline", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
 
         captured_kwargs = {}

@@ -2238,7 +2238,11 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "For bounded jobs, prefer notify_on_complete and continue useful work or end the "
+        "turn instead of repeatedly polling. If a dependent next step must wait now, call "
+        "'wait' once with timeout omitted; it uses the configured terminal timeout, returns "
+        "early on exit, and remains interruptible."
     ),
     "parameters": {
         "type": "object",
@@ -2246,7 +2250,9 @@ PROCESS_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
-                "description": "Action to perform on background processes"
+                "description": (
+                    "Action to perform. Avoid repeated short poll/wait loops for bounded jobs."
+                )
             },
             "session_id": {
                 "type": "string",
@@ -2258,7 +2264,10 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": (
+                    "Max seconds for 'wait'. Omit to use the configured terminal timeout "
+                    "(180s by default); returns immediately on exit or partial output on timeout."
+                ),
                 "minimum": 1
             },
             "offset": {

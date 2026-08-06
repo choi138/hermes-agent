@@ -7,6 +7,8 @@ or a temp file (local).
 """
 
 import codecs
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -19,7 +21,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Protocol
+from typing import IO, Callable, Iterator, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -43,6 +45,24 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+
+# A compound operation such as remote execute_code can issue many commands
+# against one already-prepared filesystem snapshot. ContextVar keeps the
+# suppression scoped to that operation and lets the existing thread-context
+# bridge carry it into RPC workers without mutating shared environment state.
+_PRE_EXECUTE_HOOKS_SUPPRESSED: ContextVar[bool] = ContextVar(
+    "hermes_pre_execute_hooks_suppressed", default=False
+)
+
+
+@contextmanager
+def suppress_pre_execute_hooks() -> Iterator[None]:
+    """Skip per-command preparation inside one already-prepared operation."""
+    token = _PRE_EXECUTE_HOOKS_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _PRE_EXECUTE_HOOKS_SUPPRESSED.reset(token)
 
 
 # Sentinel capacity for full-fidelity capture (internal consumers). Large
@@ -1063,7 +1083,8 @@ class BaseEnvironment(ABC):
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
         """
-        self._before_execute()
+        if not _PRE_EXECUTE_HOOKS_SUPPRESSED.get():
+            self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default.

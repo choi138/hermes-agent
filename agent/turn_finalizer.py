@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.background_review_policy import is_successful_review_outcome
 from agent.message_content import flatten_message_text
 
 
@@ -605,13 +606,35 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # Check skill trigger NOW — based on how many tool iterations THIS turn used.
+    # Automatic self-improvement reviews are learned only from a successfully
+    # completed top-level turn.  Accumulate this turn's work now rather than in
+    # the model loop so failed and delegated work cannot trip the cadence.
+    _review_eligible = is_successful_review_outcome(
+        agent,
+        final_response=final_response,
+        completed=completed,
+        failed=failed,
+        interrupted=interrupted,
+        exit_reason=_turn_exit_reason,
+        cleanup_failed=bool(_cleanup_errors),
+    )
+    if (
+        _review_eligible
+        and agent._skill_nudge_interval > 0
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        # Keep the historical cadence for healthy foreground work: one unit
+        # per completed API/model iteration, committed atomically at turn end.
+        agent._iters_since_skill += max(int(api_call_count or 0), 1)
+
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (_review_eligible
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
-        agent._iters_since_skill = 0
+
+    _should_review_memory = bool(_should_review_memory and _review_eligible)
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -623,13 +646,21 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if _review_eligible and (_should_review_memory or _should_review_skills):
         try:
-            agent._spawn_background_review(
+            _accepted = agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
             )
+            # ``None`` is accepted for compatibility with patched/legacy
+            # implementations.  The coordinator returns False only when it
+            # could not retain the request (for example, a full queue).
+            if _accepted is not False:
+                if _should_review_memory:
+                    agent._turns_since_memory = 0
+                if _should_review_skills:
+                    agent._iters_since_skill = 0
         except Exception:
             pass  # Background review is best-effort
 

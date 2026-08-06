@@ -55,6 +55,12 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
+# Cumulative row targets for adaptive discovery. Most queries find enough
+# distinct interactive lineages in the first 25 rows. Cron-heavy or highly
+# duplicated result sets keep expanding, preserving the historical 300-row
+# recall ceiling without paying that cost on every query.
+_DISCOVER_SCAN_TARGETS = (25, 50, 100, 200, _DISCOVER_SCAN_LIMIT)
+
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
@@ -81,14 +87,26 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _resolve_to_parent(db, session_id: str) -> str:
-    """Walk parent_session_id chain to the lineage root. Falls back to input on errors."""
+def _resolve_to_parent(
+    db,
+    session_id: str,
+    cache: Optional[Dict[str, str]] = None,
+) -> str:
+    """Walk to the lineage root, memoizing every visited node when requested."""
     if not session_id:
         return session_id
-    visited = set()
+    if cache is not None and session_id in cache:
+        return cache[session_id]
+
+    visited = []
+    seen = set()
     cur = session_id
-    while cur and cur not in visited:
-        visited.add(cur)
+    while cur and cur not in seen:
+        if cache is not None and cur in cache:
+            cur = cache[cur]
+            break
+        seen.add(cur)
+        visited.append(cur)
         try:
             s = db.get_session(cur)
             if not s:
@@ -100,6 +118,9 @@ def _resolve_to_parent(db, session_id: str) -> str:
         except Exception as e:
             logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
             break
+    if cache is not None:
+        for visited_id in visited:
+            cache[visited_id] = cur
     return cur
 
 
@@ -118,6 +139,71 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         raw_results,
         key=lambda r: 1 if (r.get("source") or "") in _DEMOTED_SESSION_SOURCES else 0,
     )
+
+
+def _search_discovery_rows(
+    db,
+    query: str,
+    role_list: List[str],
+    limit: int,
+    sort: Optional[str],
+    current_session_id: Optional[str],
+    current_lineage_root: Optional[str],
+    lineage_cache: Dict[str, str],
+    title_result: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Page through FTS rows until recall is safe or the 300-row cap is hit.
+
+    A page containing only cron hits is not enough to stop: an interactive
+    match may still be buried behind the automation corpus. We stop early only
+    after collecting ``limit`` distinct, non-demoted lineages after applying
+    the current-session filter. The final ranking/dedup pass still operates on
+    the accumulated rows in their original FTS order.
+    """
+    interactive_lineages = set()
+    if title_result and title_result.get("source") not in _DEMOTED_SESSION_SOURCES:
+        title_lineage = title_result.get("_lineage_root")
+        if title_lineage:
+            interactive_lineages.add(title_lineage)
+
+    raw_results: List[Dict[str, Any]] = []
+    offset = 0
+    for target in _DISCOVER_SCAN_TARGETS:
+        target = min(target, _DISCOVER_SCAN_LIMIT)
+        if target <= offset:
+            continue
+        page_limit = target - offset
+        page = db.search_messages(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=page_limit,
+            offset=offset,
+            sort=sort,
+            include_context=False,
+        )
+        raw_results.extend(page)
+        offset += len(page)
+
+        for row in page:
+            raw_sid = row.get("session_id")
+            if not raw_sid:
+                continue
+            lineage_root = _resolve_to_parent(db, raw_sid, cache=lineage_cache)
+            if current_lineage_root and lineage_root == current_lineage_root:
+                continue
+            if current_session_id and raw_sid == current_session_id:
+                continue
+            if (row.get("source") or "") in _DEMOTED_SESSION_SOURCES:
+                continue
+            interactive_lineages.add(lineage_root)
+
+        if len(interactive_lineages) >= limit:
+            break
+        if len(page) < page_limit:
+            break
+
+    return raw_results
 
 
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
@@ -433,6 +519,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    lineage_cache: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -447,7 +534,7 @@ def _title_match_result(
     if not session_id:
         return None
 
-    lineage_root = _resolve_to_parent(db, session_id)
+    lineage_root = _resolve_to_parent(db, session_id, cache=lineage_cache)
     if current_lineage_root and lineage_root == current_lineage_root:
         return None
 
@@ -460,7 +547,9 @@ def _title_match_result(
         return None
 
     try:
-        messages = db.get_messages(session_id)
+        # Only the first message id is needed as the anchor. The anchored view
+        # below fetches the bounded window and bookends directly in SQL.
+        messages = db.get_messages(session_id, limit=1)
     except Exception:
         logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
         messages = []
@@ -506,19 +595,29 @@ def _discover(
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    lineage_cache: Dict[str, str] = {}
+    current_lineage_root = (
+        _resolve_to_parent(db, current_session_id, cache=lineage_cache)
+        if current_session_id else None
+    )
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        lineage_cache=lineage_cache,
+    )
 
     try:
-        raw_results = db.search_messages(
+        raw_results = _search_discovery_rows(
+            db=db,
             query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
-            offset=0,
+            role_list=role_list,
+            limit=limit,
             sort=sort,
+            current_session_id=current_session_id,
+            current_lineage_root=current_lineage_root,
+            lineage_cache=lineage_cache,
+            title_result=title_result,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -556,7 +655,7 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid = _resolve_to_parent(db, raw_sid)
+        resolved_sid = _resolve_to_parent(db, raw_sid, cache=lineage_cache)
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
             continue
