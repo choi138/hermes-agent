@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import logging
 import re
 import threading
 import time
@@ -14,6 +15,8 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from tools.threat_patterns import first_threat_message
+
+logger = logging.getLogger(__name__)
 
 _READ_ONLY_MCP_TOOLS = frozenset({
     "get_status",
@@ -124,6 +127,41 @@ _ENGLISH_CORRECTION_PATTERN = re.compile(
     r"|\b(?:use|do|choose|switch\s+to).{0,40}\binstead\b",
     re.IGNORECASE,
 )
+# Messages that never benefit from historical recall. The gate is a denylist:
+# anything not matched here is recalled, because a request whose wording carries
+# no topical anchor ("이어서 진행해") is exactly the case that needs prior context.
+_SYSTEM_NOTICE_PREFIXES = (
+    "[async delegation",
+    "[background",
+    "[important:",
+    "[kanban]",
+    "[system",
+)
+_SMALLTALK_TERMS = (
+    "안녕",
+    "고마워",
+    "감사",
+    "수고",
+    "hello",
+    "hi ",
+    "thanks",
+    "thank you",
+)
+_IDENTITY_QUESTION_PATTERN = re.compile(
+    r"(?:너|당신|you)\s*(?:는|은)?\s*(?:어떤\s*)?(?:모델|model)"
+    r"|what\s+model\b"
+    r"|which\s+model\b",
+    re.IGNORECASE,
+)
+# Below this length a message carries no anchor of its own; only the session
+# scope and recent-topic hints would drive the search, which is too thin.
+_MIN_RECALL_CHARS = 2
+_SMALLTALK_MAX_CHARS = 20
+# Contentless turns ("이어서 진행해") search better when the recent subjects of the
+# same session ride along, so the relevance filter has anchors to match against.
+_RECENT_TOPIC_COUNT = 3
+_MAX_RECENT_TOPIC_CHARS = 120
+_MIN_TOPIC_CHARS = 6
 _NOISE_RELATIONS = frozenset({
     "ABOUT",
     "HAS_RECIPIENT",
@@ -476,22 +514,44 @@ def _dispatch_tool(
     return result
 
 
+def _topic_snippet(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) < _MIN_TOPIC_CHARS:
+        return ""
+    return text[:_MAX_RECENT_TOPIC_CHARS]
+
+
+def _is_smalltalk(text: str) -> bool:
+    if len(text.replace(" ", "")) > _SMALLTALK_MAX_CHARS:
+        return False
+    return any(term in text for term in _SMALLTALK_TERMS)
+
+
 def _should_recall(query: str) -> bool:
+    """Decide whether a turn benefits from historical recall.
+
+    This is a denylist on purpose. An allowlist of continuity keywords
+    ("하던", "계속", "이어") starves recall exactly when it is most needed:
+    the requests that depend on prior context are the ones whose wording
+    carries no topical anchor, while requests that do name their subject
+    rarely contain those keywords. Only turns that provably cannot use
+    history are dropped — system notices, smalltalk, identity questions,
+    credential requests, and corrections. Corrections stay blocked so a
+    stale historical fact cannot reassert what the user just overrode.
+    """
     text = " ".join(str(query or "").lower().split())
     if (
         not text
+        or len(text) < _MIN_RECALL_CHARS
+        or text.startswith(_SYSTEM_NOTICE_PREFIXES)
+        or _is_smalltalk(text)
+        or _IDENTITY_QUESTION_PATTERN.search(text)
         or _query_requests_credentials(query)
         or any(term in text for term in _CORRECTION_TERMS)
         or _ENGLISH_CORRECTION_PATTERN.search(text)
     ):
         return False
-    if any(term in text for term in _PREFERENCE_AND_DECISION_TERMS):
-        return True
-    if any(term in text for term in _STRONG_CONTINUITY_TERMS):
-        return True
-    return any(term in text for term in _WEAK_CONTINUITY_TERMS) and any(
-        term in text for term in _WORK_CONTEXT_TERMS
-    )
+    return True
 
 
 def _extract_facts(raw: Any) -> List[Dict[str, Any]]:
@@ -1003,6 +1063,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
         self._scope_blocked_by_credentials = False
         self._session_id = ""
         self._prefetch_gate = threading.Lock()
+        self._recent_topics: List[str] = []
 
     @property
     def name(self) -> str:
@@ -1026,6 +1087,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        self._recent_topics = []
         raw_scope = kwargs.get("session_title") or kwargs.get("chat_name")
         self._scope_blocked_by_credentials = bool(raw_scope) and (
             _fact_contains_credential_signature(str(raw_scope))
@@ -1061,6 +1123,8 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             or reason in {"compression", "context_compression"}
         )
         self._session_id = new_session_id
+        if not continuation:
+            self._recent_topics = []
         if raw_scope:
             self._scope_hint = new_scope
             self._scope_blocked_by_credentials = new_scope_blocked
@@ -1088,23 +1152,56 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                 hermes_home=self._hermes_home,
             )
             return _extract_facts(raw)
-        except Exception:
+        except Exception as exc:
+            # Recall is best-effort, but a silent empty result is indistinguishable
+            # from "the graph had nothing", which hid a 100% failure rate before.
+            logger.warning(
+                "Graphiti recall search failed (%s): %s", type(exc).__name__, exc
+            )
             return []
+
+    def _record_topic(self, query_text: str) -> None:
+        snippet = _topic_snippet(query_text)
+        if not snippet:
+            return
+        kept = [topic for topic in self._recent_topics if topic != snippet]
+        self._recent_topics = [*kept, snippet][-_RECENT_TOPIC_COUNT:]
+
+    def _build_search_query(self, query_text: str) -> str:
+        hints = []
+        if self._scope_hint:
+            hints.append(f"Session scope: {self._scope_hint}")
+        if self._recent_topics:
+            hints.append("Recent topics: " + " | ".join(self._recent_topics))
+        if not hints:
+            return query_text
+        return query_text + "\n" + "\n".join(hints)
 
     def _prefetch_before_deadline(
         self, query_text: str, *, session_id: str, deadline: float
     ) -> str:
+        started = time.monotonic()
         if len(query_text) > _MAX_QUERY_CHARS:
+            logger.info(
+                "Graphiti recall skipped: query is %d chars (limit %d)",
+                len(query_text), _MAX_QUERY_CHARS,
+            )
             return ""
         if session_id and session_id != self._session_id:
             self.on_session_switch(session_id)
-        if self._scope_blocked_by_credentials or not _should_recall(query_text):
+        if self._scope_blocked_by_credentials:
+            logger.info("Graphiti recall skipped: session scope blocked by credentials")
+            return ""
+        if not _should_recall(query_text):
+            logger.info("Graphiti recall skipped: gate rejected this turn")
             return ""
         self._refresh_builtin_memory()
-        search_query = query_text
-        if self._scope_hint:
-            search_query = f"{query_text}\nSession scope: {self._scope_hint}"
+        search_query = self._build_search_query(query_text)
         if len(search_query) > _MAX_QUERY_CHARS:
+            logger.info(
+                "Graphiti recall skipped: final query is %d chars (limit %d)",
+                len(search_query), _MAX_QUERY_CHARS,
+            )
             return ""
         facts = self._bounded_search(search_query, deadline=deadline)
         context = _format_facts(
@@ -1113,7 +1210,18 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             builtin_memory=self._builtin_memory,
             identity_terms=self._identity_terms,
         )
-        return context if time.monotonic() < deadline else ""
+        self._record_topic(query_text)
+        expired = time.monotonic() >= deadline
+        logger.info(
+            "Graphiti recall: facts=%d kept_chars=%d elapsed=%.2fs scope=%s topics=%d%s",
+            len(facts),
+            len(context),
+            time.monotonic() - started,
+            "yes" if self._scope_hint else "no",
+            len(self._recent_topics),
+            " dropped=past_deadline" if expired else "",
+        )
+        return "" if expired else context
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         deadline = time.monotonic() + _PREFETCH_TIMEOUT_SECONDS
