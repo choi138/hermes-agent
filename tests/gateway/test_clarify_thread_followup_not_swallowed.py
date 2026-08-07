@@ -7,12 +7,12 @@ consume ANY non-command message in the session as the clarify answer —
 arbitrary prose vanished into clarify resolution and the agent appeared to
 ignore the user's thread messages.
 
-After the fix (``tools/clarify_gateway._coerce_text_response`` rejects
+After the fix (``tools.clarify_gateway._coerce_text_response`` rejects
 arbitrary prose for native multi-choice prompts):
 
   * numeric selections ("2") and exact choice labels still resolve, and
-  * arbitrary prose falls through the intercept and continues as a normal
-    message-handling turn.
+  * arbitrary prose is preserved for the next turn while the current clarify
+    stays pending and the user receives immediate choice guidance.
 
 Open-ended clarifies, explicit "Other" text-capture mode, and the base
 adapter's numbered-text fallback (which flips ``awaiting_text`` at send time)
@@ -110,7 +110,7 @@ async def _dispatch(runner, event):
 
 @pytest.mark.asyncio
 async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
-    """Arbitrary prose during a pending button-clarify continues as a normal turn."""
+    """Arbitrary prose is saved once and gets non-empty choice guidance."""
     _clear_clarify_state()
     from tools import clarify_gateway as cm
 
@@ -120,14 +120,20 @@ async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
     entry = cm.register("cl-native", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
     assert entry.awaiting_text is False
 
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(runner, _event("just checking the visual UI, no need to pass any data"))
+    event = _event("just checking the visual UI, no need to pass any data")
+    result = await _dispatch(runner, event)
 
     # The clarify entry must still be pending and unresolved.
     with cm._lock:
         entry = cm._entries.get("cl-native")
     assert entry is not None
     assert not entry.event.is_set()
+    assert result
+    assert "saved" in result.lower()
+    assert "1. buttons" in result
+    assert "2. dropdown" in result
+    assert "Other" in result
+    assert adapter._pending_messages == {SESSION_KEY: event}
     _clear_clarify_state()
 
 

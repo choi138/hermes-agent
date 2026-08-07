@@ -5171,13 +5171,6 @@ class TurnRunner:
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 verbose_logging=False,
-                skip_context_files=bool(
-                    getattr(
-                        getattr(self._runner, "config", None),
-                        "skip_context_files",
-                        False,
-                    )
-                ),
                 enabled_toolsets=ctx.enabled_toolsets,
                 disabled_toolsets=ctx.disabled_toolsets,
                 ephemeral_system_prompt=combined_ephemeral or None,
@@ -15468,6 +15461,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # itself will produce the next user-facing message.
                     return ""
 
+                # Native choice prompt + unrelated prose: preserve the prose
+                # as the next turn, but do not let the normal busy path steer
+                # or interrupt the agent that is blocked on this clarify.  The
+                # adapter's active-session bypass sends this non-empty guidance
+                # immediately; after a valid choice unblocks the current turn,
+                # its normal pending-message drain processes the saved event.
+                if (
+                    _pending_clarify.choices
+                    and not _pending_clarify.awaiting_text
+                ):
+                    _clarify_adapter = self._adapter_for_source(source)
+                    if _clarify_adapter is not None:
+                        self._queue_or_replace_pending_event(_quick_key, event)
+                        _choice_lines = "\n".join(
+                            f"{index}. {choice}"
+                            for index, choice in enumerate(
+                                _pending_clarify.choices,
+                                start=1,
+                            )
+                        )
+                        logger.info(
+                            "Gateway preserved non-choice clarify reply for the next turn "
+                            "(session=%s, id=%s)",
+                            _quick_key,
+                            _pending_clarify.clarify_id,
+                        )
+                        return (
+                            "I saved that message for the next turn. "
+                            "Please answer the current question first:\n"
+                            f"{_choice_lines}\n"
+                            "Reply with a number or the exact option text, or choose "
+                            "Other to enter a custom answer."
+                        )
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else
@@ -18556,6 +18583,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _turn_started_monotonic = time.monotonic()
             try:
                 agent_result = await self._run_agent(
                     message=message_text,
@@ -18606,22 +18634,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 if isinstance(agent_result, dict):
                     agent_result["final_response"] = "NO_REPLY"
-            _turn_started_monotonic = time.monotonic()
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=event.message_type,
-            )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
