@@ -35,6 +35,11 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
+        # Maximum time an alias routing key waits for the active turn holding
+        # the same resolved session lease. On expiry the inbound message is
+        # rejected with a resend notice rather than run without serialization.
+        # Non-positive values fall back to 1800 seconds.
+        "gateway_turn_lease_timeout": 1800,
         # Force-interrupt budget once gateway stop()/drain has begun
         # (seconds). Applies to SIGTERM/external stop and to the final
         # phase of in-band restart after any after-turn wait. 0 = interrupt
@@ -1630,6 +1635,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "surface": "auto",            # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
         "input_device": None,          # PortAudio input device index/name; null uses the process default
+        "capture": "auto",            # auto | local | client — where PCM is captured (client = desktop streams mic via wake.feed)
         "provider": "openwakeword",   # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
         "phrase": "hey hermes",       # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
         "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
@@ -2423,7 +2429,7 @@ DEFAULT_CONFIG = {
             "listing": "auto",
             # Absolute cap on the embedded listing in tokens (chars/4
             # estimate), regardless of context size. Range 200..60000.
-            "listing_max_tokens": 20000,
+            "listing_max_tokens": 4000,
         },
     },
 
@@ -3391,6 +3397,22 @@ OPTIONAL_ENV_VARS = {
     "GMI_BASE_URL": {
         "description": "GMI Cloud base URL override",
         "prompt": "GMI Cloud base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ACTUAL_API_KEY": {
+        "description": "Actual Computer inference key (ac_...)",
+        "prompt": "Actual Computer inference key",
+        "url": "https://actual.inc/user/keys",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ACTUAL_BASE_URL": {
+        "description": "Actual Computer base URL override (set to http://127.0.0.1:8080 for the local offline daemon)",
+        "prompt": "Actual Computer base URL (leave empty for hosted relay)",
         "url": None,
         "password": False,
         "category": "provider",

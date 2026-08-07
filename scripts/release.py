@@ -109,6 +109,9 @@ LEGACY_AUTHOR_MAP = {
     "xwolf.live@gmail.com": "vizi0uz",  # PR #59795 adopted in #62290
     "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
     "humphreysun98@gmail.com": "HumphreySun98",  # PR #61142 salvage (web: null web/backend config value guards)
+    "merlin@threewizards.agency": "light-merlin-dark",  # PR #7821 salvage (zai: parallel endpoint detection probes)
+    "4850809+frizikk@users.noreply.github.com": "frizikk",  # PR #63389 salvage (session-search: fields projection skips unused context enrichment)
+    "endeavorisforever@gmail.com": "EndeavorYen",  # PR #33971 salvage (image: parallel image_generate batches + FileSyncManager transaction lock)
     "sonxi@nous.local": "17324393074",  # PR #53196 salvage (tools_config: known_plugin_toolsets null guard; commit under unlinked local identity)
     "lemonwan@users.noreply.github.com": "lemonwan",  # PR #59430 sibling salvage (adapter reconnect contract guard)
     "luxuguangno1@163.com": "luxuguang-leo",  # PR #52966 + #52908 salvage (QQBot reconnect + Feishu Channel signaling)
@@ -722,6 +725,7 @@ LEGACY_AUTHOR_MAP = {
     "mike@grossmann.at": "ReqX",
     "axmaiqiu@gmail.com": "qWaitCrypto",
     "44045911+kidonng@users.noreply.github.com": "kidonng",
+    "ayushere@users.noreply.github.com": "ayushere",
     "daniellsmarta@gmail.com": "DanielLSM",
     "264291321+v1b3coder@users.noreply.github.com": "v1b3coder",
     "silverchris@foxmail.com": "ming1523",
@@ -1441,6 +1445,7 @@ LEGACY_AUTHOR_MAP = {
     "xiayh17@gmail.com": "xiayh0107",
     "zhujianxyz@gmail.com": "opriz",
     "tuancanhnguyen706@gmail.com": "xxxigm",
+    "j.brownemoore@gmail.com": "ElSnacko",
     "timchris.roth@pm.me": "x9x9x9x9x9x91",
     "larcombe.n@gmail.com": "NickLarcombe",
     "54813621+xxxigm@users.noreply.github.com": "xxxigm",
@@ -1572,6 +1577,7 @@ LEGACY_AUTHOR_MAP = {
     "17683456+wanazhar@users.noreply.github.com": "wanazhar",
     "26782336+cixuuz@users.noreply.github.com": "cixuuz",
     "aleksandr.pasevin@openzeppelin.com": "pasevin",
+    "pasevin@gmail.com": "pasevin",
     "ubuntu@localhost.localdomain": "holynn-q",
     "holynn@placeholder.local": "holynn-q",
     "agent@hermes.local": "jacdevos",
@@ -2055,6 +2061,7 @@ LEGACY_AUTHOR_MAP = {
     "rodisoft1@gmail.com": "0disoft",  # PR #53511 salvage (gateway PID probe TTL cache)
     "craigs.seller.sixx@gmail.com": "0-CYBERDYNE-SYSTEMS-0",  # PR #53966 salvage (session DB reads off event loop)
     "sebastianlutycz@users.noreply.github.com": "sebastianlutycz",  # PR #39140 salvage (descendant CTE); bare noreply (no NNN+ prefix) needs explicit mapping
+    "bobclawblaw@users.noreply.github.com": "BobClawblaw",  # PR #77870 salvage (output-cap compression on retry path; #55546)
     "wafy.081107@gmail.com": "mahdiwafy",  # PR #60347 salvage (session messages pagination)
     "codeforgenet@icloud.com": "CodeForgeNet",  # PR #47437 salvage (compact_rows blob skip)
     "i@dex.moe": "dexhunter",  # PR #60339 salvage (skills snapshot manifest speedup)

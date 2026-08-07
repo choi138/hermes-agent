@@ -227,6 +227,7 @@ class FileSyncManager:
         self._bulk_download_fn = bulk_download_fn
         self._delete_fn = delete_fn
         self._shared_state = shared_state or FileSyncState()
+        self._transaction_lock = threading.Lock()
         self._sync_interval = sync_interval
         # Equivalent managers share this lock and snapshot across task-scoped
         # SSH environments. Only preparation is serialized; commands remain
@@ -283,6 +284,11 @@ class FileSyncManager:
         Transactional: state only committed if ALL operations succeed.
         On failure, state rolls back so the next cycle retries everything.
         """
+        with self._transaction_lock:
+            return self._sync_transaction(force=force)
+
+    def _sync_transaction(self, *, force: bool = False) -> None:
+        """Execute one sync cycle while holding the per-manager lock."""
         if not force and not os.environ.get(_FORCE_SYNC_ENV):
             now = _monotonic()
             if now - self._last_sync_time < self._sync_interval:
@@ -401,6 +407,23 @@ class FileSyncManager:
         transport callback with a shorter timeout, and bound lock acquisition
         with an absolute monotonic *deadline*.
         """
+        with self._transaction_lock:
+            return self._sync_back_transaction(
+                hermes_home,
+                max_attempts=max_attempts,
+                bulk_download_fn=bulk_download_fn,
+                deadline=deadline,
+            )
+
+    def _sync_back_transaction(
+        self,
+        hermes_home: Path | None = None,
+        *,
+        max_attempts: int | None = None,
+        bulk_download_fn: BulkDownloadFn | None = None,
+        deadline: float | None = None,
+    ) -> bool:
+        """Execute sync-back against a stable snapshot of manager state."""
         download_fn = (
             self._bulk_download_fn
             if bulk_download_fn is None

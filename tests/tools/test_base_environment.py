@@ -240,8 +240,9 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         # must then NOT run (&&) and not clobber snap.
         bad_tmp = _q("/nonexistent-dir/snap.tmp")
         script = (
-            f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
+            f"__hermes_snap_tmp=$(mktemp {bad_tmp}) && "
+            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
+            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true"
         )
         self._run(script)
         out = self._run(f"cat {_q(snap)}")

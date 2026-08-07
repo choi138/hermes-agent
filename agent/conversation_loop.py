@@ -61,6 +61,11 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
 )
+# Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
+# to avoid importing hermes_state at module load time (its module-level
+# DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
+# monkeypatch get_hermes_home to return a str).
+_STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
@@ -796,6 +801,50 @@ def _canonicalize_tool_call_arguments(arg_str: str) -> str:
     return canonical
 
 
+def _clone_message_for_send(msg):
+    """Structural clone of a history message for the per-call API copy.
+
+    The send path builds ``api_messages`` from the persisted history and
+    then rewrites the copies in place (canonicalization/repair of tool-call
+    arguments, surrogate and non-ASCII sanitization, content strips, cache
+    decoration). A shallow ``msg.copy()`` only decouples TOP-LEVEL fields:
+    nested containers — ``tool_calls`` entries and their ``function`` dicts,
+    multimodal ``content`` part lists, ``reasoning_details`` — remain the
+    SAME objects the persisted history holds, so any in-place write there
+    silently rewrites the stored transcript (#80498: an unrepairable
+    ``write_file`` argument string was replaced with ``{}`` in the persisted
+    turn, destroying the streamed file content).
+
+    Cloning every container (dict/list) recursively while SHARING immutable
+    leaves (strings, numbers, None) makes every downstream in-place
+    transform safe by construction — current and future — at container-count
+    cost, not string-byte cost: big argument strings and base64 image
+    payloads are shared, never copied. Measured: ~1-5ms per 2000-message
+    pathological build (20% multimodal, 30% tool calls) vs ~0.4ms for the
+    shallow copy; compression keeps real request histories far smaller, and
+    the build runs once per API call — noise next to the call itself.
+    copy.deepcopy would be equally correct (CPython deepcopy also shares
+    immutable str) but ~4x slower again and needs its memo machinery;
+    history messages are JSON-shaped and acyclic (depth < 10 in practice;
+    a >~1000-deep pathological nest would hit the recursion limit, exactly
+    as deepcopy would), so cycle handling isn't needed here. Tuples are
+    shared as leaves: JSON-derived message content never contains tuples,
+    so a mutable container smuggled inside one is not a reachable shape on
+    this path.
+    """
+    if isinstance(msg, dict):
+        return {
+            k: _clone_message_for_send(v) if isinstance(v, (dict, list)) else v
+            for k, v in msg.items()
+        }
+    if isinstance(msg, list):
+        return [
+            _clone_message_for_send(v) if isinstance(v, (dict, list)) else v
+            for v in msg
+        ]
+    return msg
+
+
 def _canonicalize_api_tool_calls(api_messages) -> None:
     """Canonicalize tool-call argument JSON on the send-path message copy.
 
@@ -822,10 +871,25 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
                         ),
                     }}
                 except Exception:
-                    tc["function"]["arguments"] = _repair_tool_call_arguments(
-                        tc["function"]["arguments"],
-                        tc["function"].get("name", "?"),
-                    )
+                    # Copy-on-write here too. The send-path build now hands
+                    # this pass structurally-cloned messages (see
+                    # _clone_message_for_send), but this branch keeps its own
+                    # copy as defense in depth: some callers (tests, future
+                    # call sites) pass shallow copies, and assigning into a
+                    # shared ``tc["function"]`` would rewrite the stored
+                    # turn. On the unrepairable path the repair returns "{}",
+                    # so a write-through here replaced the model's real
+                    # arguments with an empty object in the transcript: a
+                    # stream that died mid ``write_file`` lost the file
+                    # content it had already streamed, with only a WARNING
+                    # to show for it (#80498).
+                    tc = {**tc, "function": {
+                        **tc["function"],
+                        "arguments": _repair_tool_call_arguments(
+                            tc["function"]["arguments"],
+                            tc["function"].get("name", "?"),
+                        ),
+                    }}
             new_tcs.append(tc)
         am["tool_calls"] = new_tcs
 
@@ -1145,10 +1209,13 @@ def _apply_context_engine_selection(
     # and it may be replaced wholesale via the return value — never mutated in
     # place either. ``conversation_messages`` / ``incoming_message`` are
     # read-only context; copying enforces the request-only contract rather than
-    # merely documenting it.
-    _conv_copy = [dict(m) if isinstance(m, dict) else m for m in conversation_messages] \
+    # merely documenting it. Structural clones, not dict(m): a shallow copy
+    # would leave nested containers (tool_calls, content parts) aliased to
+    # the persisted history, so an engine writing into them would rewrite
+    # the transcript (#80498 aliasing class).
+    _conv_copy = [_clone_message_for_send(m) for m in conversation_messages] \
         if conversation_messages is not None else None
-    _incoming_copy = dict(incoming_message) if isinstance(incoming_message, dict) else incoming_message
+    _incoming_copy = _clone_message_for_send(incoming_message) if isinstance(incoming_message, dict) else incoming_message
     try:
         selected = engine.select_context(
             api_messages,
@@ -1219,7 +1286,10 @@ def _notify_context_engine_turn_complete(
 
     try:
         hook(
-            [dict(m) if isinstance(m, dict) else m for m in messages],
+            # Structural clones: on_turn_complete receives the PERSISTED
+            # history; a shallow dict(m) would let a hook write through
+            # nested containers into the transcript (#80498 aliasing class).
+            [_clone_message_for_send(m) for m in messages],
             usage=usage,
             **meta,
         )
@@ -1291,6 +1361,14 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+
+    # Adopt any ~/.hermes/.env credential/base-url edits made since the last
+    # turn — a Settings save updates .env but not this worker's client, which
+    # was built at agent init (#67821). No-op when .env is unchanged.
+    try:
+        agent._try_refresh_env_client_credentials()
+    except Exception:
+        logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -1574,7 +1652,12 @@ def run_conversation(
 
         api_messages = []
         for idx, msg in enumerate(messages):
-            api_msg = msg.copy()
+            # Structural clone, NOT msg.copy(): every in-place transform
+            # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
+            # cache decoration) must be unable to reach the persisted
+            # history through shared nested containers. See
+            # _clone_message_for_send.
+            api_msg = _clone_message_for_send(msg)
 
             # api_content is the persistence sidecar carrying the exact bytes
             # sent to the API for this message when they differ from the clean
@@ -1756,7 +1839,11 @@ def run_conversation(
         if agent.prefill_messages:
             sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
             for idx, pfm in enumerate(agent.prefill_messages):
-                api_messages.insert(sys_offset + idx, pfm.copy())
+                # Structural clone: the sanitizers below run over
+                # api_messages in place, and a shallow copy would let them
+                # write through into agent.prefill_messages' nested
+                # containers (same aliasing class as the history build).
+                api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
 
         # Per-turn context selection hook (additive, no-op by default).
         # Lets a context engine select/replace which context enters the
@@ -4359,6 +4446,28 @@ def run_conversation(
                         f"      Check which providers support tools: https://openrouter.ai/models/{_model}"
                     )
 
+                # Actionable hint for a bare 404 on a provider whose catalogue
+                # uses ``vendor/model`` ids.  A model id that lost its prefix
+                # (e.g. ``nemotron-…`` instead of ``nvidia/nemotron-…``) gets
+                # a content-free "404 page not found" from the provider that
+                # never names the model, so it reads like an outage or an auth
+                # failure.  Name the real cause and the exact id to use (#78796).
+                if getattr(api_error, "status_code", None) == 404:
+                    try:
+                        from hermes_cli.model_normalize import suggest_prefixed_model_id
+
+                        _suggestion = suggest_prefixed_model_id(_provider, _model)
+                    except Exception:
+                        _suggestion = None
+                    if _suggestion:
+                        agent._buffer_vprint(
+                            f"   💡 Model '{_model}' is not a valid id for provider {_provider} — "
+                            f"it is missing its vendor prefix."
+                        )
+                        agent._buffer_vprint(
+                            f"      Did you mean '{_suggestion}'?  Re-pick it with `hermes model`."
+                        )
+
                 # Check for interrupt before deciding to retry
                 if agent._interrupt_requested:
                     # Preserve a pending redirect (mid-stream correction): the
@@ -4889,6 +4998,41 @@ def run_conversation(
                                 "failed": True,
                                 "compression_exhausted": True,
                             }
+                        # Also compress the message history so the output-cap
+                        # retry does not just spin on max_tokens alone.  The
+                        # compressor drops the middle window, freeing enough
+                        # tokens for the total to fit inside context_length.
+                        # (#55546)
+                        try:
+                            original_len = len(messages)
+                            original_tokens = estimate_messages_tokens_rough(messages)
+                            _overflow_input = messages
+                            messages, active_system_prompt = agent._compress_context(
+                                messages, system_message,
+                                approx_tokens=request_input_estimate,
+                                task_id=effective_task_id,
+                            )
+                            if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                                compression_attempts -= 1
+                                agent._persist_session(messages, conversation_history)
+                                return _compression_deferred_result(
+                                    agent, messages, api_call_count
+                                )
+                            conversation_history = conversation_history_after_compression(
+                                agent, messages, conversation_history
+                            )
+                            new_tokens = estimate_messages_tokens_rough(messages)
+                            if len(messages) < original_len:
+                                agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                            elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
+                                agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        except Exception:
+                            # Compression must never turn an output-cap error
+                            # fatal — fall through and retry on max_tokens alone.
+                            logger.warning(
+                                "%sOutput-cap compression hit an error; retrying on max_tokens only.",
+                                agent.log_prefix,
+                            )
                         _retry.restart_with_compressed_messages = True
                         break
 
@@ -6248,8 +6392,24 @@ def run_conversation(
                     ]
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                
+
                 turn_content = assistant_message.content or ""
+
+                # Some local tool-call templates emit a bare bracketed token
+                # (for example ``[memory]``) as assistant content alongside a
+                # function call. It is protocol scaffolding, not an answer.
+                # Persisting or caching it as visible content lets the empty
+                # post-tool fallback replay that token forever after compaction (#78148).
+                if (
+                    assistant_message.tool_calls
+                    and _STALE_MARKER_RE.fullmatch(turn_content.strip())
+                ):
+                    logger.warning(
+                        "Discarding bare tool-call marker from assistant content: %s",
+                        turn_content,
+                    )
+                    turn_content = ""
+                    assistant_msg["content"] = ""
 
                 # Classify tools in this turn to determine if they are all housekeeping.
                 # This classification is needed regardless of whether the turn has visible content,
@@ -6585,14 +6745,12 @@ def run_conversation(
                         # Standard no-op caller contract: only commit when the
                         # engine returned a NEW list object with a non-zero count.
                         if _pruned_n and _pruned_msgs is not messages:
-                            # Do NOT rebuild conversation_history here. Unlike the
-                            # compression branch, the prune neither rotates the session
-                            # nor calls archive_and_compact(), so there is no new
-                            # persistence baseline to establish. _prune_old_tool_results
-                            # returns per-message copies that preserve the
+                            # Do NOT rebuild conversation_history here. The compressor
+                            # atomically rewrites the active transcript with the durable
+                            # rearm threshold, then stamps every returned row with
                             # _DB_PERSISTED_MARKER, so the marker-based flush dedup (see
-                            # _flush_messages_to_session_db) already prevents both
-                            # duplicate writes and dropped rows. Calling
+                            # _flush_messages_to_session_db) prevents duplicate writes.
+                            # Calling
                             # conversation_history_after_compression (a compaction-only
                             # helper keyed on the _last_compaction_in_place flag) would be
                             # a no-op at best, and on a stale in-place flag could seed
@@ -6807,15 +6965,47 @@ def run_conversation(
                     )
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
                         agent._empty_content_retries += 1
+                        wait_time = jittered_backoff(
+                            agent._empty_content_retries,
+                            base_delay=5.0,
+                            max_delay=60.0,
+                        )
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 (model=%s)",
-                            agent._empty_content_retries, agent.model,
+                            "retry %d/3 in %.1fs (model=%s)",
+                            agent._empty_content_retries, wait_time, agent.model,
                         )
                         agent._buffer_status(
                             f"⚠️ Empty response from model — retrying "
-                            f"({agent._empty_content_retries}/3)"
+                            f"({agent._empty_content_retries}/3) in {wait_time:.0f}s"
                         )
+                        # Sleep in small increments to stay responsive to interrupts
+                        sleep_end = time.time() + wait_time
+                        _backoff_touch_counter = 0
+                        while time.time() < sleep_end:
+                            if agent._interrupt_requested:
+                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during empty-response retry wait, aborting.", force=True)
+                                _interrupt_text = (
+                                    f"Operation interrupted: retrying empty response from model "
+                                    f"(retry {agent._empty_content_retries}/3)."
+                                )
+                                close_interrupted_tool_sequence(messages, _interrupt_text)
+                                agent._persist_session(messages, conversation_history)
+                                agent.clear_interrupt()
+                                return {
+                                    "final_response": _interrupt_text,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                }
+                            time.sleep(0.2)
+                            _backoff_touch_counter += 1
+                            if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
+                                agent._touch_activity(
+                                    f"empty response retry backoff ({agent._empty_content_retries}/3), "
+                                    f"{int(sleep_end - time.time())}s remaining"
+                                )
                         continue
 
                     # ── Exhausted retries — try fallback provider ──

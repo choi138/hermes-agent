@@ -60,6 +60,17 @@ _DISCOVER_SCAN_LIMIT = 300
 # duplicated result sets keep expanding, preserving the historical 300-row
 # recall ceiling without paying that cost on every query.
 _DISCOVER_SCAN_TARGETS = (25, 50, 100, 200, _DISCOVER_SCAN_LIMIT)
+# Raw FTS rows are only a discovery-plan input. The final response hydrates
+# its own anchored message window and bookends after lineage deduplication.
+_DISCOVER_SEARCH_FIELDS = (
+    "id",
+    "session_id",
+    "role",
+    "snippet",
+    "source",
+    "model",
+    "session_started",
+)
 
 # Prefixes that identify generated context-compaction handoff summaries.
 # These are inserted by agent/context_compressor.py as normal user/assistant
@@ -349,6 +360,7 @@ def _search_discovery_rows(
             offset=offset,
             sort=sort,
             include_context=False,
+            fields=_DISCOVER_SEARCH_FIELDS,
         )
         raw_results.extend(page)
         offset += len(page)
@@ -387,6 +399,12 @@ def _shape_message(
     is added so callers know the payload was bounded.
     """
     raw_content = m.get("content")
+    if isinstance(raw_content, str) and "\x1b" in raw_content:
+        # Recalled messages can carry ANSI escape sequences (e.g. archived
+        # terminal output). Strip them before returning content to the model.
+        from tools.ansi_strip import strip_ansi
+
+        raw_content = strip_ansi(raw_content)
     if max_content_len and raw_content and len(raw_content) > max_content_len:
         content = raw_content[:max_content_len] + "…"
         truncated = True

@@ -4736,6 +4736,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_tts_done.set()
         self._voice_tts_stop = None  # active streaming pipeline's stop event
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
+        self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
+        self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -10262,6 +10264,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_rollback_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
+        elif canonical == "export":
+            self._handle_export_command(cmd_original)
+        elif canonical == "import":
+            self._handle_import_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
         elif canonical == "agents":
@@ -10309,6 +10315,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+        elif canonical == "heartbeat":
+            self._handle_heartbeat_command(cmd_original)
+        elif canonical == "refine":
+            self._handle_refine_command(cmd_original)
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a
@@ -10586,6 +10596,72 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         self._goal_manager = mgr
         return mgr
+
+    def _get_heartbeat_manager(self):
+        """Return the HeartbeatManager bound to the current session_id.
+
+        Cached on ``self._heartbeat_manager`` and rebound lazily when
+        ``session_id`` changes (mirrors ``_get_goal_manager``).
+        """
+        try:
+            from hermes_cli.heartbeat import HeartbeatManager
+        except Exception as exc:
+            logging.debug("heartbeat manager unavailable: %s", exc)
+            return None
+
+        sid = getattr(self, "session_id", None) or ""
+        if not sid:
+            return None
+
+        existing = getattr(self, "_heartbeat_manager", None)
+        if existing is not None and getattr(existing, "session_id", None) == sid:
+            return existing
+
+        mgr = HeartbeatManager(session_id=sid)
+        self._heartbeat_manager = mgr
+        return mgr
+
+    def _start_heartbeat_watchdog(self):
+        """Start the idle-poll thread that fires due heartbeats.
+
+        Same pattern as the wake-word watchdog: a daemon thread polls a few
+        times a minute; when the session is idle (no agent running, empty
+        input queue) and the heartbeat is due, its prompt is injected into
+        ``_pending_input`` as a normal user turn. Missed ticks coalesce —
+        the anchor resets on fire, so a busy hour yields ONE heartbeat turn,
+        not a backlog. Idempotent; safe to call on every /heartbeat set.
+        """
+        if getattr(self, "_heartbeat_watchdog_started", False):
+            return
+        self._heartbeat_watchdog_started = True
+
+        from hermes_cli.heartbeat import POLL_SECONDS
+
+        def _loop():
+            try:
+                while not getattr(self, "_should_exit", False):
+                    time.sleep(POLL_SECONDS)
+                    try:
+                        mgr = self._get_heartbeat_manager()
+                        if mgr is None or not mgr.is_active():
+                            continue
+                        busy = (
+                            self._agent_running
+                            or getattr(self, "_voice_recording", False)
+                            or getattr(self, "_voice_processing", False)
+                            or not self._pending_input.empty()
+                        )
+                        if busy:
+                            continue
+                        prompt = mgr.due_prompt()
+                        if prompt:
+                            self._pending_input.put(prompt)
+                    except Exception as exc:
+                        logging.debug("heartbeat watchdog tick failed: %s", exc)
+            finally:
+                self._heartbeat_watchdog_started = False
+
+        threading.Thread(target=_loop, daemon=True, name="heartbeat-watchdog").start()
 
 
 
@@ -12505,6 +12581,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 tts_text = tts_text.strip()
             if not tts_text:
                 return
+            self._voice_last_tts_text = tts_text
 
             # Use MP3 output for CLI playback (afplay doesn't handle OGG well).
             # The TTS tool may auto-convert MP3->OGG, but the original MP3 remains.
@@ -12615,6 +12692,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Latch BEFORE cutting anything: suppresses process_loop's
                 # auto-restart until the capture is submitted.
                 self._voice_barge_capture.set()
+                self._voice_barge_phase = phase
                 if phase == "playback":
                     logger.debug(
                         "TTS CUT: full-duplex listener tripped during playback"
@@ -12672,6 +12750,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"\n{_DIM}Stop phrase detected — ending voice chat.{_RST}")
                     self._disable_voice_mode()
                     return
+                # Fail-closed echo guard (#75780): a playback-phase capture
+                # has no acoustic echo cancellation, so speaker bleed alone
+                # can trip the barge trigger. If the transcript is a close
+                # match for what Hermes just spoke, treat it as self-capture
+                # instead of queuing it as a user turn.
+                if getattr(self, "_voice_barge_phase", None) == "playback":
+                    from tools.voice_mode import is_tts_echo
+                    if is_tts_echo(transcript, getattr(self, "_voice_last_tts_text", "")):
+                        logger.debug(
+                            "Dropping playback-phase barge transcript as TTS echo: %r",
+                            transcript,
+                        )
+                        _cprint(f"\n{_DIM}Ignored likely TTS echo (not queued).{_RST}")
+                        return
                 self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
             elif not result.get("success"):
@@ -12685,6 +12777,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except OSError:
                 pass
             self._voice_barge_capture.clear()
+            self._voice_barge_phase = None
             # No usable transcript: hand the mic back to the normal loop.
             if not submitted and self._voice_mode and self._voice_continuous and not self._voice_recording:
                 self._voice_restart_recording_async()
@@ -13855,6 +13948,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # playback (speech cuts TTS), and disarms itself when the turn
             # is fully done. See _voice_full_duplex_listener.
             if self._voice_mode and self._voice_continuous:
+                self._voice_last_tts_text = ""
                 threading.Thread(
                     target=self._voice_full_duplex_listener, daemon=True
                 ).start()
@@ -13926,6 +14020,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 def stream_callback(delta: str):
                     if text_queue is not None:
                         text_queue.put(delta)
+                    # Track what's actually being spoken so a playback-phase
+                    # barge capture can be checked against it (echo guard,
+                    # #75780).
+                    self._voice_last_tts_text = (self._voice_last_tts_text or "") + delta
 
             # When voice mode is active, prepend a brief instruction so the
             # model responds concisely. The prefix is API-call-local only —
@@ -15193,6 +15291,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
         self._voice_tts_stop = None  # active streaming pipeline's stop event
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
+        self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
+        self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()

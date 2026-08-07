@@ -150,6 +150,7 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # rolling summary, so dropping or rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
+PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -1365,6 +1366,7 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        self._proactive_prune_rearm_tokens = 0
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -1669,6 +1671,7 @@ class ContextCompressor(ContextEngine):
                 _r5_drift_clear(session_id)
             except Exception:  # pragma: no cover - probe cleanup is best-effort
                 pass
+        self._proactive_prune_rearm_tokens = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -1682,9 +1685,11 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._proactive_prune_rearm_tokens = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
+        self._load_proactive_prune_rearm_tokens()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -1758,6 +1763,41 @@ class ContextCompressor(ContextEngine):
             logger.debug("compression fallback streak lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
+
+    def _load_proactive_prune_rearm_tokens(self) -> None:
+        """Restore the cache-boundary runway for a resumed durable session."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            value = getter(session_id, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
+            self._proactive_prune_rearm_tokens = max(
+                0,
+                int(value) if isinstance(value, (int, float, str)) else 0,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            logger.debug("proactive prune runway lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
+
+    def _clear_durable_proactive_prune_rearm(self) -> None:
+        """Remove the persisted runway key without touching the transcript.
+
+        Best-effort companion to zeroing the in-memory mirror at sites that
+        void the runway (model switch): without it a restart would reload a
+        runway computed under thresholds that no longer apply.
+        """
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patcher):
+            return
+        try:
+            patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+        except Exception as exc:
+            logger.debug("proactive prune runway clear failed: %s", exc)
 
     def _persist_fallback_compression_streak(self) -> None:
         session_db = getattr(self, "_session_db", None)
@@ -2118,6 +2158,12 @@ class ContextCompressor(ContextEngine):
             self._clear_compression_failure_cooldown()
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
+        # The prune runway was computed against the PREVIOUS model's trigger
+        # sizes. Same durable-sync discipline as the strike reset above: clear
+        # the model_config copy too, so a restart doesn't resurrect a runway
+        # this recalibration just voided.
+        self._proactive_prune_rearm_tokens = 0
+        self._clear_durable_proactive_prune_rearm()
 
     # When the MINIMUM_CONTEXT_LENGTH floor meets/exceeds a small context
     # window, compacting at the percentage (50% → 32K of a 64K window) wastes
@@ -2312,9 +2358,9 @@ class ContextCompressor(ContextEngine):
         # message forward. Without this gate a busy tool loop would re-fire
         # the prune nearly every iteration (each new tool pair ages an old one
         # out of the protected tail), breaking the cache per turn. Requiring a
-        # meaningful batch of reclaimable tokens makes fires episodic and
-        # amortized — the same way full compression is the one sanctioned
-        # cache break. 0 disables the gate (commit any non-zero prune).
+        # meaningful batch of reclaimable tokens, then requiring a full
+        # trigger-sized growth interval before rearming, makes fires episodic
+        # and amortized. 0 disables only the minimum-savings gate.
         self.proactive_prune_min_reclaim_tokens = max(
             0, int(proactive_prune_min_reclaim_tokens or 0)
         )
@@ -2338,6 +2384,9 @@ class ContextCompressor(ContextEngine):
         self.preflight_defer_growth_ratio = min(
             1.0, max(0.0, float(preflight_defer_growth_ratio or 0.0))
         )
+        # A committed prune is a prompt-cache boundary. Do not permit the next
+        # one until the prompt has regrown the tokens just reclaimed.
+        self._proactive_prune_rearm_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -3159,12 +3208,11 @@ class ContextCompressor(ContextEngine):
         PROMPT-CACHE CONTRACT: a committed prune rewrites message bodies the
         provider has already seen, invalidating the cached prefix from the
         earliest rewritten message forward — exactly like a compression
-        boundary. To keep that break episodic rather than per-turn, the prune
-        only COMMITS when the estimated reclaim meets
-        ``proactive_prune_min_reclaim_tokens`` (measured on the actual pruned
-        output, not guessed up front). Below the gate the INPUT list object is
-        returned unchanged — the standard no-op caller contract (callers gate
-        bookkeeping on ``result is not input``).
+        boundary. A prune therefore commits only when it reclaims
+        ``proactive_prune_min_reclaim_tokens`` and disarms until message history
+        has regrown a full trigger-sized runway. Below either gate the INPUT list
+        object is returned unchanged — the standard no-op caller contract
+        (callers gate bookkeeping on ``result is not input``).
 
         Returns ``(messages, 0)`` — the input object — when disabled, below
         the trigger, or when the reclaim gate rejects the commit.
@@ -3175,6 +3223,21 @@ class ContextCompressor(ContextEngine):
             return messages, 0
         # Nothing to reclaim until there are messages outside the protected tail.
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+            return messages, 0
+        before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+        if before < self._proactive_prune_rearm_tokens:
+            return messages, 0
+        # Capability gate BEFORE the expensive 3-pass scan: a bound store that
+        # can't persist the prune atomically (duck-typed/plugin session store
+        # without archive_and_compact) makes every prune a permanent no-op, so
+        # don't pay the scan for it on every eligible iteration.
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if (
+            session_db
+            and session_id
+            and not callable(getattr(session_db, "archive_and_compact", None))
+        ):
             return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages,
@@ -3189,11 +3252,41 @@ class ContextCompressor(ContextEngine):
         # Measured-savings gate (prompt-cache hysteresis): only commit when
         # the prune reclaims a meaningful batch of tokens. Estimated on the
         # real before/after messages so dedup + arg truncation count too.
-        if self.proactive_prune_min_reclaim_tokens > 0:
-            before = sum(_estimate_msg_budget_tokens(m) for m in messages)
-            after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
-            if (before - after) < self.proactive_prune_min_reclaim_tokens:
+        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+        reclaimed = max(0, before - after)
+        if reclaimed < self.proactive_prune_min_reclaim_tokens:
+            return messages, 0
+        # ``after`` includes the tool batch appended since the provider's last
+        # usage reading, so both the low-water mark and future gate use the
+        # same message-token estimate. Require a full trigger-sized growth
+        # interval before another cache-breaking rewrite.
+        runway = max(
+            reclaimed,
+            self.proactive_prune_tokens,
+            self.proactive_prune_min_reclaim_tokens,
+        )
+        next_rearm_tokens = after + runway
+        if session_db and session_id:
+            # The capability gate above guarantees archive_and_compact exists.
+            try:
+                session_db.archive_and_compact(
+                    session_id,
+                    pruned_msgs,
+                    model_config_patch={
+                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Proactive tool-result prune DB commit failed; keeping the "
+                    "original transcript: %s",
+                    exc,
+                )
                 return messages, 0
+            for msg in pruned_msgs:
+                if isinstance(msg, dict):
+                    msg[_DB_PERSISTED_MARKER] = True
+        self._proactive_prune_rearm_tokens = next_rearm_tokens
         return pruned_msgs, pruned_count
 
     # ------------------------------------------------------------------
@@ -4747,8 +4840,46 @@ This compaction should PRIORITISE preserving all information related to the focu
         #    when call_id != id (Codex Responses API format), re-exposing orphans.
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
+            # --- In-flight tool chain protection (issue #79278) -------------
+            # A strip here must distinguish a *pending* tool_call (the model's
+            # live request whose result the executor has not yet appended) from
+            # an *orphaned* call (one whose result was summarized/truncated away
+            # and can never come back).  Compression can fire mid-chain: the
+            # model emits `assistant(tool_calls)`, and tool_executor.py only
+            # appends the matching `role="tool"` result AFTER it runs the call.
+            # In that window `messages[-1]` is an assistant tool_call whose id
+            # is (not yet) in result_call_ids.  Any tool result would be
+            # appended *after* this message (tool_executor.py), so if it is the
+            # last non-tool message its calls are presumed still pending.
+            # Stripping it as an orphan would delete the live request; when the
+            # executor later appends the real result, repair_message_sequence
+            # would drop it as an unmatched orphan and the completed side
+            # effect — and the model's final synthesis built on it — would be
+            # lost.  We therefore preserve the trailing in-flight call verbatim;
+            # only genuinely orphaned calls in the *discarded* region are
+            # stripped.
+            trailing_inflight: Optional[Dict[str, Any]] = None
+            # Walk back over any trailing tool results first: with a
+            # multi-call batch the executor appends results one at a time, so
+            # a snapshot taken between appends looks like
+            # ``[..., assistant(c1,c2,c3), tool(c1)]`` — the chain is still
+            # in flight even though the last message is a tool result. The
+            # last NON-tool message is presumed the live request in both
+            # shapes; a genuinely unanswered call preserved here is stubbed
+            # pre-API by sanitize_api_messages step 2, so preserving is safe
+            # while stripping a live call silently loses its late result.
+            idx = len(messages) - 1
+            while idx >= 0 and messages[idx].get("role") == "tool":
+                idx -= 1
+            if idx >= 0 and messages[idx].get("role") == "assistant":
+                trailing_inflight = messages[idx]
+            # -----------------------------------------------------------------
             for msg in messages:
                 if msg.get("role") != "assistant":
+                    continue
+                if msg is trailing_inflight:
+                    # Live request, not an orphan — the executor appends its
+                    # result(s) after compress() returns.
                     continue
                 tcs = msg.get("tool_calls")
                 if not tcs:
@@ -6962,6 +7093,26 @@ This compaction should PRIORITISE preserving all information related to the focu
         _strip_persistence_markers(compressed)
         self._last_compression_made_progress = True
 
+        # A successful compaction just freed the largest allocation a long
+        # session ever drops (the compressed-away message dicts), which makes
+        # this the natural point to hand allocator pages back to the OS.
+        # #76905's trim lifecycle covers the gateway/TUI housekeeping loops but
+        # not the CLI compression path, so RSS keeps the pre-compaction
+        # high-water mark until exit. The helper is glibc-gated, config-gated
+        # and rate-limited, so this is a safe no-op elsewhere. (#70782)
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(reason="post-compression")
+        except Exception as exc:
+            # debug, not warning: sibling trim sites all log failures at
+            # debug, and compression must never fail because of a trim.
+            logger.debug(
+                "post-compression memory trim failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
         # Batch compaction invalidates micro-compaction state: the batch
         # marker now holds MORE history than the in-memory rolling summary
         # (it summarized everything in the window, including exchanges micro
@@ -6974,6 +7125,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._micro_compact_cursor = 0
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
+        self._proactive_prune_rearm_tokens = 0
 
         return compressed
 
