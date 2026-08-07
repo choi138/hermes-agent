@@ -1050,12 +1050,28 @@ def _fact_is_relevant(
         return _contains_identity(normalized_fact, identity_terms)
     if not query_anchors or not query_anchors & fact_anchors:
         return False
-    if not identity_terms:
-        return relation in _NON_PERSONAL_RELATIONS
     normalized_fact = _normalize_text(fact)
-    if _contains_identity(normalized_fact, identity_terms):
+    if identity_terms and _contains_identity(normalized_fact, identity_terms):
         return True
-    return relation in _NON_PERSONAL_RELATIONS
+    if relation in _NON_PERSONAL_RELATIONS:
+        return True
+    # Graphiti mints relation names with an LLM, so the vocabulary is open:
+    # SPECIFIES_POLICY_FOR, IDENTIFIED_RISK_OF, HAS_INTEGRATION_WITH. Gating on
+    # a 14-name allowlist rejected 96 of 97 facts across the real request
+    # corpus, including on-topic ones. Admit an unlisted relation when the fact
+    # is not personal information about someone else — that is the property the
+    # allowlist was standing in for, and it holds for any relation name.
+    #
+    # Known limitation: this catches personal predicates, not personal subjects.
+    # Over the request corpus it admits 26 work facts and 2 third-party ones
+    # ("pm도 같이 지각했다"), whose predicates match no personal pattern.
+    # _has_scoped_leading_subject does not close the gap — it derives the
+    # subject by splitting on English copulas, so for a Korean fact the whole
+    # sentence becomes the subject and the check degenerates into the anchor
+    # test above. Classifying third-party facts out of a graph that mixes
+    # personal and work ingestion is not reliably solvable here; the fix is a
+    # curated Hermes-authored slice to read from.
+    return _personal_predicates_have_trusted_subject(fact, identity_terms)
 
 
 def _fact_is_current(item: Dict[str, Any]) -> bool:
