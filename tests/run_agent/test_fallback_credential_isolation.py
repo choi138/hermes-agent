@@ -291,6 +291,7 @@ class TestFallbackActivationObservation:
         ]
         agent._credential_pool = _make_pool("ollama-cloud")
         agent._unavailable_fallback_keys = set()
+        agent._rate_limit_backoff_count = 0
         agent._buffer_status = MagicMock()
         agent._is_azure_openai_url.return_value = False
         agent._is_direct_openai_url.return_value = False

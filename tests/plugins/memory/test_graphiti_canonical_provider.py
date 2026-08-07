@@ -13,6 +13,34 @@ from plugins.memory import graphiti_canonical as graphiti_module
 from plugins.memory.graphiti_canonical import GraphitiCanonicalMemoryProvider
 
 
+_RUNTIME_UNRESTRICTED_RECALL = graphiti_module._UNRESTRICTED_RECALL
+
+
+@pytest.fixture(autouse=True)
+def _restricted_recall_for_legacy_filter_contract(monkeypatch):
+    """Keep the legacy filter matrix explicit while rollout defaults unrestricted."""
+    monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", False)
+
+
+def test_runtime_rollout_defaults_to_unrestricted_mnemos_recall(monkeypatch):
+    assert _RUNTIME_UNRESTRICTED_RECALL is True
+    assert graphiti_module._RECALL_GROUP_IDS == ["mnemos"]
+
+    monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", True)
+    result = graphiti_module._format_facts(
+        [
+            {
+                "uuid": "third-party",
+                "name": "RELATED_TO",
+                "fact": "P1 reviewer Ditto prefers dark mode.",
+            }
+        ],
+        query="continue P1 reviewer project",
+        identity_terms={"choegeun-won"},
+    )
+    assert "edge=third-party" in result
+
+
 def test_graphiti_canonical_provider_exposes_only_bounded_read_only_search():
     provider = load_memory_provider("graphiti_canonical")
 
@@ -115,6 +143,7 @@ def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
     assert args == {
         "query": "What answer style does Alice prefer?",
         "max_facts": 12,
+        "group_ids": ["mnemos"],
     }
     assert deadline > time.monotonic()
     assert hermes_home == str(tmp_path.resolve())
@@ -186,19 +215,19 @@ def test_model_search_tool_distinguishes_empty_results_from_failures(
     assert reported_error == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert reported_string_error == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert failed == {
         "status": "timeout",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search timed out",
     }
     assert "synthetic" not in json.dumps(reported_error)
@@ -206,7 +235,7 @@ def test_model_search_tool_distinguishes_empty_results_from_failures(
     assert "synthetic" not in json.dumps(failed)
 
 
-def test_model_search_tool_reports_filtered_candidates_without_allowing_fallback(
+def test_model_search_tool_reports_filtered_candidates_and_allows_fallback(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
@@ -240,12 +269,12 @@ def test_model_search_tool_reports_filtered_candidates_without_allowing_fallback
         "reached_fetch_limit": False,
         "has_more": True,
         "total_unknown": False,
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "recall": "",
     }
 
 
-def test_prefetch_allows_fallback_only_for_confirmed_empty_graphiti_result(
+def test_prefetch_allows_fallback_for_any_non_ok_graphiti_result(
     monkeypatch, tmp_path
 ):
     provider = GraphitiCanonicalMemoryProvider()
@@ -281,11 +310,11 @@ def test_prefetch_allows_fallback_only_for_confirmed_empty_graphiti_result(
     assert "candidate_count: 0" in empty
     assert "status: filtered" in filtered
     assert "routing_policy: graphiti_first" in filtered
-    assert "fallback_allowed: false" in filtered
+    assert "fallback_allowed: true" in filtered
     assert "candidate_count: 1" in filtered
 
 
-def test_prefetch_does_not_treat_application_error_as_missing_information(
+def test_prefetch_reports_application_error_and_allows_fallback(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(
@@ -302,11 +331,11 @@ def test_prefetch_does_not_treat_application_error_as_missing_information(
 
     assert "status: error" in result
     assert "routing_policy: graphiti_first" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
     assert "synthetic" not in result
 
 
-def test_prefetch_timeout_blocks_fallback_instead_of_looking_empty(monkeypatch, tmp_path):
+def test_prefetch_timeout_allows_fallback(monkeypatch, tmp_path):
     provider = GraphitiCanonicalMemoryProvider()
     provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
     monkeypatch.setattr(graphiti_module, "_PREFETCH_TIMEOUT_SECONDS", 0.02)
@@ -324,7 +353,7 @@ def test_prefetch_timeout_blocks_fallback_instead_of_looking_empty(monkeypatch, 
 
     assert "status: timeout" in result
     assert "routing_policy: graphiti_first" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
 
 
 def test_model_search_tool_marks_fetch_limit_as_unknown_total(monkeypatch, tmp_path):
@@ -392,7 +421,7 @@ def test_model_search_tool_treats_structured_application_error_as_failure(
     assert result == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert "synthetic" not in json.dumps(result)
@@ -420,7 +449,7 @@ def test_model_search_tool_treats_malformed_payload_as_failure(monkeypatch, tmp_
     assert result == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert "synthetic" not in json.dumps(result)
@@ -468,13 +497,13 @@ def test_model_search_tool_bounds_post_dispatch_processing(monkeypatch, tmp_path
     assert result == {
         "status": "timeout",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search timed out",
     }
     assert overlapping_result == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert len(dispatch_calls) == 1
@@ -904,9 +933,9 @@ def test_dispatch_uses_exact_bound_readonly_mcp_capability_not_registry(
         "server_name": "graphiti_canonical",
         "tool_name": "search_memory_facts",
         "allowed_tools": graphiti_module._READ_ONLY_MCP_TOOLS,
-        "allowed_argument_keys": frozenset({"query", "max_facts"}),
+        "allowed_argument_keys": frozenset({"query", "max_facts", "group_ids"}),
         "profile_home": str(tmp_path),
-        "max_timeout": 2.5,
+        "max_timeout": 15.0,
         "max_response_chars": 262_144,
     }
     assert calls[1] == (
@@ -977,7 +1006,7 @@ def test_prefetch_enforces_one_end_to_end_deadline(monkeypatch, tmp_path):
     result = provider.prefetch("이전 P1 Graphiti 작업 기억해")
 
     assert "status: timeout" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
     assert len(calls) == 1
     assert started < calls[0][0] <= started + 0.02
     assert calls[0][1] == str(tmp_path)
@@ -1003,7 +1032,7 @@ def test_prefetch_deadline_bounds_synchronous_safety_checks(monkeypatch, tmp_pat
     elapsed = time.monotonic() - started
 
     assert "status: timeout" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
     assert elapsed < 0.08
     assert finished.wait(0.3)
 
@@ -1027,11 +1056,11 @@ def test_prefetch_timeout_keeps_only_one_lingering_worker(monkeypatch, tmp_path)
     try:
         timed_out = provider.prefetch("이전 P1 Graphiti 작업 기억해")
         assert "status: timeout" in timed_out
-        assert "fallback_allowed: false" in timed_out
+        assert "fallback_allowed: true" in timed_out
         assert started.wait(0.1)
         overlapping = provider.prefetch("이전 P1 Graphiti 작업 기억해")
         assert "status: error" in overlapping
-        assert "fallback_allowed: false" in overlapping
+        assert "fallback_allowed: true" in overlapping
         assert calls == [1]
     finally:
         release.set()
@@ -1071,7 +1100,11 @@ def test_continuity_request_recalls_fact_through_read_only_search(
     assert calls == [
         (
             "mcp__graphiti_canonical__search_memory_facts",
-            {"query": "하던 작업 계속 진행해줘", "max_facts": 12},
+            {
+                "query": "하던 작업 계속 진행해줘",
+                "max_facts": 12,
+                "group_ids": ["mnemos"],
+            },
         )
     ]
     assert "real verification before completion" in result
@@ -1873,7 +1906,7 @@ def test_recall_rejects_overlong_final_query_after_scope_append(monkeypatch, tmp
     assert calls == []
 
 
-def test_recall_reports_timeout_without_allowing_fallback(monkeypatch, tmp_path):
+def test_recall_reports_timeout_and_allows_fallback(monkeypatch, tmp_path):
     def timeout(_tool, _args, **_kwargs):
         raise TimeoutError("synthetic Graphiti timeout")
 
@@ -1883,7 +1916,7 @@ def test_recall_reports_timeout_without_allowing_fallback(monkeypatch, tmp_path)
 
     result = provider.prefetch("이전 프로젝트 작업 계속")
     assert "status: timeout" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
 
 
 def test_recall_uses_daemon_worker_around_bounded_mcp_handler(monkeypatch, tmp_path):
@@ -1905,7 +1938,7 @@ def test_recall_uses_daemon_worker_around_bounded_mcp_handler(monkeypatch, tmp_p
 
     result = provider.prefetch("이전 프로젝트 작업 계속")
     assert "status: error" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
     assert len(created) == 1
     assert created[0]["daemon"] is True
     assert created[0]["name"] == "graphiti-canonical-prefetch"
@@ -1939,7 +1972,11 @@ def test_preference_dependent_request_triggers_selective_recall(monkeypatch, tmp
     assert calls == [
         (
             "mcp__graphiti_canonical__search_memory_facts",
-            {"query": "내 선호에 맞는 방식으로 보고해줘", "max_facts": 12},
+            {
+                "query": "내 선호에 맞는 방식으로 보고해줘",
+                "max_facts": 12,
+                "group_ids": ["mnemos"],
+            },
         )
     ]
     assert "preference-edge" in result
@@ -3191,7 +3228,7 @@ def test_prefetch_and_model_search_share_one_inflight_gate(monkeypatch, tmp_path
         prefetch_thread.join(timeout=1)
 
     assert result["status"] == "error"
-    assert result["fallback_allowed"] is False
+    assert result["fallback_allowed"] is True
     assert calls == [1]
 
 

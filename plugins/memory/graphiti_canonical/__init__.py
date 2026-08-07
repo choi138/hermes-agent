@@ -56,7 +56,14 @@ _MAX_RESPONSE_FACTS = 64
 _MAX_INPUT_FACT_CHARS = 10_000
 _MAX_QUERY_CHARS = 4_000
 _MIN_RECALL_CHARS = 2
-_PREFETCH_TIMEOUT_SECONDS = 2.5
+_PREFETCH_TIMEOUT_SECONDS = 15.0
+# unrestricted recall (user directive 2026-08-07): single-user Discord bot.
+# Personal-scope filters disabled. Credential/threat guards remain active.
+_UNRESTRICTED_RECALL = True
+# recall이 조회할 group 목록. 서버 기본 group 외에 큐레이션 그룹을 추가할 수 있다.
+# 주의: 존재하지 않는 group을 목록에 넣으면 검색 결과가 전면 0이 된다(합집합 아님).
+# 새 그룹은 실제로 데이터가 쌓인 뒤에만 추가할 것.
+_RECALL_GROUP_IDS = ["mnemos"]
 _MODEL_SEARCH_SCHEMA = {
     "name": _MODEL_SEARCH_TOOL,
     "description": (
@@ -606,7 +613,7 @@ def _dispatch_tool(
         server_name=_SERVER_NAME,
         tool_name=_REQUIRED_SEARCH_TOOL,
         allowed_tools=_READ_ONLY_MCP_TOOLS,
-        allowed_argument_keys=frozenset({"query", "max_facts"}),
+        allowed_argument_keys=frozenset({"query", "max_facts", "group_ids"}),
         profile_home=hermes_home,
         max_timeout=_PREFETCH_TIMEOUT_SECONDS,
         max_response_chars=_MAX_RAW_RESPONSE_CHARS,
@@ -764,7 +771,7 @@ def _dispatch_search_with_anchor_fallback(
 ) -> str | dict:
     raw = _dispatch_tool(
         _SEARCH_TOOL,
-        {"query": query, "max_facts": _FETCH_LIMIT},
+        {"query": query, "max_facts": _FETCH_LIMIT, "group_ids": list(_RECALL_GROUP_IDS)},
         deadline=deadline,
         hermes_home=hermes_home,
     )
@@ -778,7 +785,7 @@ def _dispatch_search_with_anchor_fallback(
         return raw
     return _dispatch_tool(
         _SEARCH_TOOL,
-        {"query": anchor, "max_facts": _FETCH_LIMIT},
+        {"query": anchor, "max_facts": _FETCH_LIMIT, "group_ids": list(_RECALL_GROUP_IDS)},
         deadline=deadline,
         hermes_home=hermes_home,
     )
@@ -822,7 +829,7 @@ def _lookup_status_block(
         f"routing_policy: {safe_routing_policy}\n"
         f"status: {safe_status}\n"
         f"candidate_count: {max(0, candidate_count)}\n"
-        f"fallback_allowed: {'true' if safe_status == 'empty' else 'false'}"
+        f"fallback_allowed: {'false' if safe_status == 'ok' else 'true'}"
     )
 
 
@@ -909,6 +916,8 @@ def _canonical_relation(value: Any) -> str:
 
 
 def _relation_is_noise(relation: str) -> bool:
+    if _UNRESTRICTED_RECALL:
+        return False
     return relation in _NOISE_RELATIONS or bool(
         set(relation.split("_")) & _NOISE_RELATION_PARTS
     )
@@ -921,6 +930,8 @@ def _relation_is_secret(relation: str) -> bool:
 
 
 def _relation_is_ephemeral(relation: str) -> bool:
+    if _UNRESTRICTED_RECALL:
+        return False
     return relation in _EPHEMERAL_RELATIONS or bool(
         set(relation.split("_")) & _EPHEMERAL_RELATION_PARTS
     )
@@ -952,6 +963,8 @@ def _contains_identity(normalized_fact: str, identity_terms: set[str]) -> bool:
 
 
 def _has_trusted_leading_subject(fact: str, identity_terms: set[str]) -> bool:
+    if _UNRESTRICTED_RECALL:
+        return True
     if not identity_terms:
         return False
     normalized_fact = _normalize_text(fact)
@@ -996,6 +1009,8 @@ def _generic_project_subject_is_structured(normalized: str) -> bool:
 def _has_scoped_leading_subject(
     fact: str, identity_terms: set[str], query_anchors: set[str]
 ) -> bool:
+    if _UNRESTRICTED_RECALL:
+        return True
     if _has_trusted_leading_subject(fact, identity_terms):
         return True
     normalized = _normalize_text(fact)
@@ -1021,6 +1036,8 @@ def _has_scoped_leading_subject(
 def _personal_predicates_have_trusted_subject(
     fact: str, identity_terms: set[str]
 ) -> bool:
+    if _UNRESTRICTED_RECALL:
+        return True
     normalized_fact = _normalize_text(fact)
     has_personal_semantics = bool(
         _ENGLISH_PERSONAL_PREDICATE_PATTERN.search(normalized_fact)
@@ -1042,6 +1059,8 @@ def _fact_is_relevant(
     query_anchors: set[str],
     identity_terms: set[str],
 ) -> bool:
+    if _UNRESTRICTED_RECALL:
+        return True
     fact_anchors = _anchor_tokens(fact)
     if relation in _HIGH_SIGNAL_RELATIONS:
         if not identity_terms:
@@ -1128,15 +1147,17 @@ def _format_facts_with_count(
             or _relation_is_noise(relation)
             or _relation_is_ephemeral(relation)
             or _relation_is_secret(relation)
-            or relation not in _ALLOWED_RELATIONS
+            or (not _UNRESTRICTED_RECALL and relation not in _ALLOWED_RELATIONS)
         ):
             continue
-        if any(marker in fact.lower() for marker in _NOISE_TEXT_MARKERS):
+        if not _UNRESTRICTED_RECALL and any(
+            marker in fact.lower() for marker in _NOISE_TEXT_MARKERS
+        ):
             continue
-        if _EPHEMERAL_TEXT_PATTERN.search(fact):
+        if not _UNRESTRICTED_RECALL and _EPHEMERAL_TEXT_PATTERN.search(fact):
             continue
         if (
-            _ROLE_LABEL_PATTERN.search(fact)
+            (not _UNRESTRICTED_RECALL and _ROLE_LABEL_PATTERN.search(fact))
             or _CONTEXT_DELIMITER_PATTERN.search(fact)
             or _KOREAN_INSTRUCTION_PATTERN.search(fact)
             or first_threat_message(fact, scope="strict")
@@ -1576,7 +1597,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             raise ValueError("Graphiti memory refuses a non-search model tool")
         if not isinstance(args, dict):
             raise TypeError("Graphiti search arguments must be an object")
-        unknown = set(args) - {"query", "max_facts"}
+        unknown = set(args) - {"query", "max_facts", "group_ids"}
         if unknown:
             raise ValueError("Graphiti search received unsupported arguments")
 
@@ -1602,13 +1623,13 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
         error_result = json.dumps({
             "status": "error",
             "source": _MODEL_SEARCH_SOURCE,
-            "fallback_allowed": False,
+            "fallback_allowed": True,
             "error": "Graphiti search failed",
         })
         timeout_result = json.dumps({
             "status": "timeout",
             "source": _MODEL_SEARCH_SOURCE,
-            "fallback_allowed": False,
+            "fallback_allowed": True,
             "error": "Graphiti search timed out",
         })
         if not self._search_gate.acquire(blocking=False):
@@ -1670,7 +1691,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                     result[0] = json.dumps({
                         "status": status,
                         **metadata,
-                        "fallback_allowed": status == "empty",
+                        "fallback_allowed": status != "ok",
                         "recall": "",
                     })
                     return

@@ -318,7 +318,7 @@ class ToolCallGuardrailController:
             tool_name in _GRAPHITI_FALLBACK_TOOL_NAMES
             or tool_name.startswith("browser_")
         )
-        if is_fallback_tool and graphiti_status not in {None, "empty"}:
+        if is_fallback_tool and graphiti_status == "ok":
             return ToolGuardrailDecision(
                 action="deny",
                 code="graphiti_fallback_not_allowed",
