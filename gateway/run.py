@@ -8067,6 +8067,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return str(getattr(decision, "label", "") or "").strip()
         outcome = str(getattr(decision, "outcome", "") or "")
         label = str(getattr(decision, "label", "") or "")
+        record = getattr(decision, "record", None) or {}
+        if record.get("refusal_applied"):
+            refusal = getattr(router, "refusal", None)
+            if label in {"SYSTEM_DEV", "FRONTEND_DEV"}:
+                return str(getattr(refusal, "dev_route", "") or "").strip()
+            if label == "DOCUMENT_WORK":
+                return str(
+                    getattr(refusal, "document_route", "")
+                    or getattr(refusal, "chat_route", "")
+                    or ""
+                ).strip()
+            return str(getattr(refusal, "chat_route", "") or "").strip()
         if label == "NORMAL" and (
             outcome in {"noop_already_chat", "repromote_held"}
             or outcome.startswith("noop_satisfied_repromote_")
@@ -8245,6 +8257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "switch",
                 "downgrade_to_chat",
                 "repromote_to_primary",
+                "refusal_switch",
             }
         ):
             reasoning_effort = str(directive.get("reasoning_effort") or "")
@@ -8265,6 +8278,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             decision.record["applied"] = bool(applied)
             if reasoning_effort:
                 decision.record["reasoning_applied"] = bool(reasoning_applied)
+            if applied:
+                logger.info(
+                    "model router: %s session=%s -> route=%s model=%s (%s)",
+                    decision.outcome,
+                    session_key,
+                    directive.get("route"),
+                    directive.get("model"),
+                    decision.label,
+                )
+                if (
+                    decision.outcome == "refusal_switch"
+                    and bool(
+                        getattr(
+                            getattr(catalog.router, "refusal", None),
+                            "notify",
+                            True,
+                        )
+                    )
+                ):
+                    try:
+                        confidence = float(
+                            decision.record.get("refusal_confidence")
+                        )
+                        evidence = str(
+                            decision.record.get("evidence") or ""
+                        )[:80]
+                        notice = (
+                            f"⚠️ refusal-risk 감지 → {directive.get('route')} "
+                            f"({directive.get('model')}) 라우팅 "
+                            f"(conf {confidence:.2f}, {evidence})"
+                        )
+                        await self._deliver_platform_notice(source, notice)
+                    except Exception:
+                        logger.debug(
+                            "model router: refusal-risk notice send failed",
+                            exc_info=True,
+                        )
         elif mode == "enforce" and state_committed and (
             decision.outcome in {
                 "noop_satisfied",

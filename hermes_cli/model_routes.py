@@ -85,7 +85,10 @@ _HEALTH_NUMERIC_KEYS = ("ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_sec
 _RULE_KEYS = {"name", "route", "when", "reason"}
 _ROUTER_KEYS = {
     "mode", "provider", "model", "timeout_ms", "classify_timeout_s", "recent_turns", "normal_downgrade_streak",
-    "repromote_after_turns", "chat_route", "label_routes", "decision_log",
+    "repromote_after_turns", "chat_route", "label_routes", "decision_log", "refusal",
+}
+_REFUSAL_KEYS = {
+    "enabled", "min_confidence", "dev_route", "chat_route", "document_route", "notify",
 }
 _ROUTER_MODES = ("off", "shadow", "enforce")
 # Classifier labels that may map to a route. NORMAL is not mappable — its
@@ -163,6 +166,18 @@ class HealthConfig:
 
 
 @dataclass(frozen=True)
+class RefusalConfig:
+    """Orthogonal refusal-risk routing under ``model_routes.router.refusal``."""
+
+    enabled: bool = False
+    min_confidence: float = 0.85
+    dev_route: str = "PERMISSIVE_DEV"
+    chat_route: str = "PERMISSIVE_CHAT"
+    document_route: str = ""  # empty → follow chat_route
+    notify: bool = True
+
+
+@dataclass(frozen=True)
 class RouterConfig:
     """``model_routes.router`` — the gateway pre-dispatch dynamic router."""
 
@@ -177,6 +192,7 @@ class RouterConfig:
     chat_route: str = ""  # NORMAL downgrade target; "" = downgrades disabled
     label_routes: Tuple[Tuple[str, str], ...] = ()  # (label, route-name) pairs
     decision_log: str = ""  # "" → get_hermes_home()/logs/model_router_decisions.jsonl
+    refusal: RefusalConfig = field(default_factory=RefusalConfig)
 
     def label_route_map(self) -> Dict[str, str]:
         return dict(self.label_routes)
@@ -758,6 +774,74 @@ def _parse_static_rules(
     return rules
 
 
+def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
+    if raw is None:
+        return RefusalConfig()
+    if not isinstance(raw, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"model_routes: router.refusal must be a mapping "
+            f"(got {type(raw).__name__}) — refusal routing stays disabled",
+            f"Supported refusal keys: {', '.join(sorted(_REFUSAL_KEYS))}",
+        ))
+        return RefusalConfig()
+
+    for key in sorted(set(raw) - _REFUSAL_KEYS):
+        issues.append(ConfigIssue(
+            "warning",
+            f"model_routes: unknown key '{key}' under router.refusal ignored",
+            f"Supported refusal keys: {', '.join(sorted(_REFUSAL_KEYS))}",
+        ))
+
+    kwargs: Dict[str, Any] = {}
+    for key in ("enabled", "notify"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool):
+            kwargs[key] = value
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.refusal.{key} must be a boolean "
+                f"(got {value!r}) — default used",
+                f"Use an unquoted YAML boolean: {key}: "
+                f"{'true' if getattr(RefusalConfig(), key) else 'false'}",
+            ))
+
+    if "min_confidence" in raw:
+        value = raw["min_confidence"]
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and 0 <= float(value) <= 1
+        ):
+            kwargs["min_confidence"] = float(value)
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.refusal.min_confidence must be a number "
+                f"from 0 to 1 ({value!r}) — default used",
+                f"Example: min_confidence: {RefusalConfig().min_confidence}",
+            ))
+
+    for key in ("dev_route", "chat_route", "document_route"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, str):
+            kwargs[key] = value.strip()
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.refusal.{key} must be a string "
+                f"(got {type(value).__name__}) — default used",
+                f"Example: {key}: {getattr(RefusalConfig(), key)!r}",
+            ))
+
+    return RefusalConfig(**kwargs)
+
+
 def _parse_router(
     raw: Any,
     routes: Dict[str, RouteSpec],
@@ -944,6 +1028,9 @@ def _parse_router(
                 f"(got {type(decision_log).__name__}) — default used",
                 'Use "" for the default <hermes home>/logs/model_router_decisions.jsonl',
             ))
+
+    if "refusal" in raw:
+        kwargs["refusal"] = _parse_refusal(raw["refusal"], issues)
 
     router = _with_effective_router_mode(RouterConfig(**kwargs))
     if router.mode != "off" and not routes:

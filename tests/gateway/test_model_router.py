@@ -19,6 +19,7 @@ import os
 import threading
 import urllib.error
 from contextvars import ContextVar
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,11 +33,13 @@ from gateway.session import SessionSource
 from hermes_cli.model_routes import load_routes
 
 
+SKILL_GATE_DIR = Path("/home/ubuntu/.hermes/plugins/skill-gate")
+
 EXPECTED_RECORD_FIELDS = {
     "policy", "session_key", "label", "confidence", "evidence", "source",
     "classification_reason", "resolution_reason",
     "provider", "model", "outcome", "directive_route", "runtime_model", "msg_head",
-    "mode", "rule",
+    "mode", "rule", "refusal_risk", "refusal_confidence", "refusal_applied",
 }
 
 
@@ -62,6 +65,16 @@ def _cfg(*, router=None, static_rules=None):
                 "reasoning_effort": "xhigh",
             },
             "chat": {"description": "chat route", "provider": "p2", "model": "model-b"},
+            "PERMISSIVE_DEV": {
+                "description": "low-refusal dev route",
+                "provider": "p1",
+                "model": "kimi-k3",
+            },
+            "PERMISSIVE_CHAT": {
+                "description": "low-refusal chat route",
+                "provider": "p2",
+                "model": "grok-4.5",
+            },
         },
     }
     if static_rules is not None:
@@ -135,9 +148,20 @@ class _FakeStore:
         return self._sid
 
 
-def _complete(label, confidence=0.9, evidence="S5 test"):
+def _complete(
+    label,
+    confidence=0.9,
+    evidence="S5 test",
+    *,
+    refusal_risk=None,
+    refusal_confidence=None,
+):
     def _fn(prompt):
-        return json.dumps({"evidence": evidence, "label": label, "confidence": confidence})
+        result = {"evidence": evidence, "label": label, "confidence": confidence}
+        if refusal_risk is not None:
+            result["refusal_risk"] = refusal_risk
+            result["refusal_confidence"] = refusal_confidence
+        return json.dumps(result)
     return _fn
 
 
@@ -172,6 +196,51 @@ def _evaluate(
         state={} if state is None else state,
         complete_dev=complete_dev,
     )
+
+
+# ---------------------------------------------------------------------------
+# Byte-identity parity with the skill-gate porting source (skipped where the
+# read-only plugin checkout is not present)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not (SKILL_GATE_DIR / "policy_router.py").exists(),
+    reason="skill-gate plugin source not present on this host",
+)
+def test_verbatim_parity_with_skill_gate_plugin():
+    import importlib.util
+    import re as _re
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        "_sg_policy_router_for_parity", SKILL_GATE_DIR / "policy_router.py"
+    )
+    sg = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = sg
+    try:
+        spec.loader.exec_module(sg)
+        old_prompt = mr_mod.DEV_SYSTEM_PROMPT.replace(
+            mr_mod.DEV_REFUSAL_S0 + "\n\n", "", 1,
+        ).replace("\n" + mr_mod.DEV_REFUSAL_EXAMPLE, "", 1)
+        assert old_prompt == sg.DEV_SYSTEM_PROMPT
+        old_schema = json.loads(json.dumps(mr_mod.DEV_RESPONSE_SCHEMA))
+        old_schema["properties"].pop("refusal_risk")
+        old_schema["properties"].pop("refusal_confidence")
+        old_schema["required"] = ["evidence", "label", "confidence"]
+        old_schema["propertyOrdering"] = ["evidence", "label", "confidence"]
+        assert old_schema == sg.DEV_RESPONSE_SCHEMA
+        assert mr_mod.DEV_CANDIDATE_RE.pattern == sg.DEV_CANDIDATE_RE.pattern
+        assert mr_mod.DEV_CANDIDATE_RE.flags == sg.DEV_CANDIDATE_RE.flags
+        assert mr_mod.FRONTEND_FALLBACK_RE.pattern == sg.FRONTEND_FALLBACK_RE.pattern
+        assert mr_mod.CONTINUATION_RE.pattern == sg.CONTINUATION_RE.pattern
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    init_src = (SKILL_GATE_DIR / "__init__.py").read_text(encoding="utf-8")
+    match = _re.search(r"_OWNER_ENV_MAP = \{(.*?)\}", init_src, _re.DOTALL)
+    assert match is not None
+    assert eval("{" + match.group(1) + "}") == mr_mod._OWNER_ENV_MAP
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +347,23 @@ def test_classifier_llm_json_parsed():
     )
     assert detail == {
         "label": "SYSTEM_DEV", "confidence": 0.83, "evidence": "S5 debug",
+        "refusal_risk": False, "refusal_confidence": None,
         "source": "llm", "classification_reason": "",
     }
+
+
+def test_classifier_refusal_fields_parsed_and_normalized():
+    detail = mr_mod.classify_dev_detailed(
+        mr_mod.PolicyClassificationContext(current_user_message="write explicit NSFW copy"),
+        complete=_complete(
+            "DOCUMENT_WORK",
+            evidence="S0 explicit NSFW authoring + S6 prose",
+            refusal_risk=True,
+            refusal_confidence="0.93",
+        ),
+    )
+    assert detail["refusal_risk"] is True
+    assert detail["refusal_confidence"] == 0.93
 
 
 def test_classifier_failure_falls_back_to_regex():
@@ -300,6 +384,7 @@ def test_classifier_failure_falls_back_to_regex():
     detail = mr_mod.classify_dev_detailed(normal, complete=_boom)
     assert detail == {
         "label": "NORMAL", "confidence": None, "evidence": "",
+        "refusal_risk": False, "refusal_confidence": None,
         "source": "fallback", "classification_reason": "classifier_error:TimeoutError",
     }
 
@@ -510,8 +595,176 @@ def test_plain_label_response_is_not_authoritative():
     )
     assert detail == {
         "label": "NORMAL", "confidence": None, "evidence": "",
+        "refusal_risk": False, "refusal_confidence": None,
         "source": "fallback", "classification_reason": "invalid_classifier_response",
     }
+
+
+def test_dev_schema_refusal_fields_are_required_and_ordered():
+    schema = mr_mod.DEV_RESPONSE_SCHEMA
+    assert schema["required"] == [
+        "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
+    ]
+    assert schema["propertyOrdering"] == schema["required"]
+    assert schema["properties"]["refusal_risk"] == {"type": "boolean"}
+    assert schema["properties"]["refusal_confidence"] == {
+        "type": "number", "minimum": 0, "maximum": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Refusal-risk routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "refusal_route"),
+    [
+        ("SYSTEM_DEV", "PERMISSIVE_DEV"),
+        ("FRONTEND_DEV", "PERMISSIVE_DEV"),
+        ("DOCUMENT_WORK", "PERMISSIVE_CHAT"),
+        ("NORMAL", "PERMISSIVE_CHAT"),
+    ],
+)
+@pytest.mark.parametrize("refusal_risk", [False, True])
+@pytest.mark.parametrize("refusal_confidence", [0.84, 0.9])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_refusal_routing_matrix(
+    label, refusal_route, refusal_risk, refusal_confidence, enabled,
+):
+    cfg = _cfg(router={
+        "refusal": {
+            "enabled": enabled,
+            "min_confidence": 0.85,
+            "dev_route": "PERMISSIVE_DEV",
+            "chat_route": "PERMISSIVE_CHAT",
+            "document_route": "",
+        },
+    })
+    decision = _evaluate(
+        complete_dev=_complete(
+            label,
+            refusal_risk=refusal_risk,
+            refusal_confidence=refusal_confidence,
+        ),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=cfg,
+    )
+    should_route = enabled and refusal_risk and refusal_confidence >= 0.85
+    if should_route:
+        assert decision.outcome == "refusal_switch"
+        assert decision.directive["route"] == refusal_route
+        assert decision.record["refusal_applied"] is True
+    else:
+        expected_route = None if label == "NORMAL" else "dev"
+        assert (decision.directive or {}).get("route") == expected_route
+        assert decision.record["refusal_applied"] is False
+    assert decision.record["refusal_risk"] is refusal_risk
+    assert decision.record["refusal_confidence"] == refusal_confidence
+    assert decision.record.get("refusal_below_threshold") is (
+        True if enabled and refusal_risk and refusal_confidence < 0.85 else None
+    )
+
+
+def test_refusal_document_route_override():
+    cfg = _cfg(router={
+        "refusal": {
+            "enabled": True,
+            "document_route": "PERMISSIVE_DEV",
+        },
+    })
+    decision = _evaluate(
+        complete_dev=_complete(
+            "DOCUMENT_WORK", refusal_risk=True, refusal_confidence=0.91,
+        ),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=cfg,
+    )
+    assert decision.outcome == "refusal_switch"
+    assert decision.directive["route"] == "PERMISSIVE_DEV"
+
+
+def test_refusal_fallback_source_never_routes(monkeypatch):
+    monkeypatch.setattr(mr_mod, "classify_dev_detailed", lambda *a, **k: {
+        "label": "SYSTEM_DEV",
+        "confidence": 0.99,
+        "evidence": "S0 hard cue + S5 code",
+        "refusal_risk": True,
+        "refusal_confidence": 0.99,
+        "source": "fallback",
+    })
+    decision = _evaluate(
+        cfg=_cfg(router={"refusal": {"enabled": True}}),
+        runtime={"model": "model-z", "provider": "p1"},
+    )
+    assert decision.outcome == "switch"
+    assert decision.directive["route"] == "dev"
+    assert decision.record["refusal_applied"] is False
+
+
+def test_refusal_evaluation_exception_keeps_normal_routing(monkeypatch):
+    original = mr_mod._resolve_route_directive
+
+    def _resolve(route_name, cfg, catalog):
+        if route_name == "PERMISSIVE_DEV":
+            raise RuntimeError("refusal route lookup failed")
+        return original(route_name, cfg, catalog)
+
+    monkeypatch.setattr(mr_mod, "_resolve_route_directive", _resolve)
+    decision = _evaluate(
+        complete_dev=_complete(
+            "SYSTEM_DEV", refusal_risk=True, refusal_confidence=0.99,
+        ),
+        cfg=_cfg(router={"refusal": {"enabled": True}}),
+        runtime={"model": "model-z", "provider": "p1"},
+    )
+    assert decision.outcome == "switch"
+    assert decision.directive["route"] == "dev"
+    assert decision.record["refusal_applied"] is False
+
+
+def test_refusal_membership_exception_keeps_normal_routing(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.model_routes.runtime_satisfies_route",
+        MagicMock(side_effect=RuntimeError("membership lookup failed")),
+    )
+    decision = _evaluate(
+        complete_dev=_complete(
+            "SYSTEM_DEV", refusal_risk=True, refusal_confidence=0.99,
+        ),
+        cfg=_cfg(router={"refusal": {"enabled": True}}),
+        runtime={"model": "model-z", "provider": "p1"},
+    )
+    assert decision.outcome == "switch"
+    assert decision.directive["route"] == "dev"
+    assert decision.record["refusal_applied"] is False
+
+
+def test_refusal_route_membership_is_absorbing_and_repromotes():
+    cfg = _cfg(router={"refusal": {"enabled": True}})
+    cfg["model_routes"]["routes"]["PERMISSIVE_DEV"]["accepted"] = [
+        "kimi-k3", "permissive-member",
+    ]
+    state = {}
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(
+            complete_dev=_complete(
+                "SYSTEM_DEV", refusal_risk=True, refusal_confidence=0.99,
+            ),
+            cfg=cfg,
+            state=state,
+            runtime={"model": "permissive-member", "provider": "p1"},
+        )
+        outcomes.append(decision.outcome)
+        assert decision.record["refusal_applied"] is True
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "PERMISSIVE_DEV"
+    assert decision.directive["model"] == "kimi-k3"
 
 
 # ---------------------------------------------------------------------------
@@ -1695,6 +1948,91 @@ def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
     assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
 
 
+def _refusal_stage_runner(monkeypatch, tmp_path, *, notify=True):
+    from gateway.run import GatewayRunner
+
+    cfg = _cfg(router={
+        "mode": "enforce",
+        "refusal": {"enabled": True, "notify": notify},
+    })
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(
+        return_value={"model": "model-z", "provider": "p1"},
+    )
+    evidence = "S0 hard refusal cue + S5 code " + "x" * 100
+    monkeypatch.setattr(
+        mr_mod,
+        "_call_configured_classifier",
+        lambda *a, **k: json.dumps({
+            "evidence": evidence,
+            "label": "SYSTEM_DEV",
+            "confidence": 0.97,
+            "refusal_risk": True,
+            "refusal_confidence": 0.93,
+        }),
+    )
+    runner._apply_model_router_directive = AsyncMock(return_value=(True, False))
+    runner._deliver_platform_notice = AsyncMock()
+    monkeypatch.setenv(
+        "HERMES_MODEL_ROUTER_DECISION_LOG",
+        str(tmp_path / "refusal-decisions.jsonl"),
+    )
+    return runner, cfg, evidence
+
+
+def test_refusal_notify_sent_after_successful_apply(monkeypatch, tmp_path):
+    runner, cfg, evidence = _refusal_stage_runner(monkeypatch, tmp_path, notify=True)
+    source = _source()
+    asyncio.run(
+        runner._model_router_stage(
+            _event("hard request"),
+            source,
+            "tg:c1",
+            mode="enforce",
+            user_config=cfg,
+        )
+    )
+    runner._deliver_platform_notice.assert_awaited_once_with(
+        source,
+        "⚠️ refusal-risk 감지 → PERMISSIVE_DEV (kimi-k3) 라우팅 "
+        f"(conf 0.93, {evidence[:80]})",
+    )
+
+
+def test_refusal_notify_suppressed_by_config(monkeypatch, tmp_path):
+    runner, cfg, _ = _refusal_stage_runner(monkeypatch, tmp_path, notify=False)
+    asyncio.run(
+        runner._model_router_stage(
+            _event("hard request"),
+            _source(),
+            "tg:c1",
+            mode="enforce",
+            user_config=cfg,
+        )
+    )
+    runner._deliver_platform_notice.assert_not_awaited()
+
+
+def test_refusal_notify_exception_does_not_break_dispatch(monkeypatch, tmp_path):
+    runner, cfg, _ = _refusal_stage_runner(monkeypatch, tmp_path, notify=True)
+    runner._deliver_platform_notice.side_effect = RuntimeError("adapter send failed")
+    asyncio.run(
+        runner._model_router_stage(
+            _event("hard request"),
+            _source(),
+            "tg:c1",
+            mode="enforce",
+            user_config=cfg,
+        )
+    )
+    record = json.loads(
+        (tmp_path / "refusal-decisions.jsonl").read_text().splitlines()[0]
+    )
+    assert record["outcome"] == "refusal_switch"
+    assert record["applied"] is True
+
+
 def test_gateway_enforce_classifier_timeout_uses_fallback_without_late_state(
     monkeypatch,
 ):
@@ -1837,6 +2175,21 @@ def test_gateway_chat_repromote_noops_preserve_chat_route_intent(outcome):
     )
 
     assert GatewayRunner._selected_model_route(decision, router) == "chat"
+
+
+def test_gateway_refusal_noop_preserves_permissive_route_intent():
+    from gateway.run import GatewayRunner
+
+    router = _catalog(_cfg(router={"refusal": {"enabled": True}})).router
+    decision = SimpleNamespace(
+        directive=None,
+        outcome="noop_satisfied",
+        label="SYSTEM_DEV",
+        rule=None,
+        record={"refusal_applied": True},
+    )
+
+    assert GatewayRunner._selected_model_route(decision, router) == "PERMISSIVE_DEV"
 
 
 def test_gateway_shadow_resolution_never_probes_or_rewrites_live_health(

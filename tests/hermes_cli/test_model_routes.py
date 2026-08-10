@@ -94,11 +94,16 @@ def _seed_verdict(health, provider, healthy, ts, reason="seeded"):
     probes on a stale *unhealthy* verdict, so probe-path tests seed one."""
     path = health.resolved_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous_mtime_ns = path.stat().st_mtime_ns if path.exists() else None
     cache = {}
     if path.exists():
         cache = json.loads(path.read_text(encoding="utf-8"))
     cache[str(provider)] = {"healthy": bool(healthy), "reason": reason, "ts": float(ts)}
     path.write_text(json.dumps(cache), encoding="utf-8")
+    # The memo contract keys on mtime; keep fixture writes distinct even on
+    # filesystems that coalesce immediate timestamp updates.
+    if previous_mtime_ns is not None and path.stat().st_mtime_ns <= previous_mtime_ns:
+        os.utime(path, ns=(path.stat().st_atime_ns, previous_mtime_ns + 1))
 
 
 def _seed_stale_unhealthy(monkeypatch, health, provider="p1"):
@@ -1513,6 +1518,13 @@ def test_router_absent_defaults_off():
     assert catalog.router.chat_route == ""
     assert catalog.router.label_routes == ()
     assert catalog.router.decision_log == ""
+    assert catalog.router.refusal == mr.RefusalConfig()
+    assert catalog.router.refusal.enabled is False
+    assert catalog.router.refusal.min_confidence == 0.85
+    assert catalog.router.refusal.dev_route == "PERMISSIVE_DEV"
+    assert catalog.router.refusal.chat_route == "PERMISSIVE_CHAT"
+    assert catalog.router.refusal.document_route == ""
+    assert catalog.router.refusal.notify is True
 
 
 def test_router_full_valid_block():
@@ -1541,6 +1553,44 @@ def test_router_full_valid_block():
     # empty-string DOCUMENT_WORK means "never switches" — not an error
     assert rc.label_route_map() == {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev"}
     assert rc.decision_log == "/tmp/decisions.jsonl"
+
+
+def test_router_refusal_partial_config_inherits_defaults():
+    catalog = mr.load_routes(_cfg(
+        routes=_router_routes(),
+        router={"refusal": {"enabled": True, "min_confidence": 0.9, "notify": False}},
+    ))
+    assert catalog.issues == []
+    refusal = catalog.router.refusal
+    assert refusal.enabled is True
+    assert refusal.min_confidence == 0.9
+    assert refusal.dev_route == "PERMISSIVE_DEV"
+    assert refusal.chat_route == "PERMISSIVE_CHAT"
+    assert refusal.document_route == ""
+    assert refusal.notify is False
+
+
+def test_router_refusal_explicit_disabled_config_parsed():
+    catalog = mr.load_routes(_cfg(
+        routes=_router_routes(),
+        router={"refusal": {
+            "enabled": False,
+            "min_confidence": 0.72,
+            "dev_route": "dev",
+            "chat_route": "chat",
+            "document_route": "chat",
+            "notify": True,
+        }},
+    ))
+    assert catalog.issues == []
+    assert catalog.router.refusal == mr.RefusalConfig(
+        enabled=False,
+        min_confidence=0.72,
+        dev_route="dev",
+        chat_route="chat",
+        document_route="chat",
+        notify=True,
+    )
 
 
 def test_router_not_a_mapping_is_error_and_off():
