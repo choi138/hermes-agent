@@ -112,6 +112,9 @@ class ConversationState:
     sidecar_notes: List[str] = field(default_factory=list)
     # Pinned session-context bytes: (change_key, text).
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
+    # One-shot recall quarantine armed by a refusal clean-fork.  Consumed when
+    # the next agent turn is bound.
+    refusal_recall_quarantine: bool = False
     # Last voice-channel context delivered (None = never delivered).
     vc_last: Optional[str] = None
 
@@ -131,6 +134,7 @@ class ConversationState:
         self.queued_events = []
         self.sidecar_notes = []
         self.ephemeral_pin = None
+        self.refusal_recall_quarantine = False
         self.vc_last = None
 
 

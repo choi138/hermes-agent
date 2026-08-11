@@ -1417,6 +1417,9 @@ def init_agent(
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     agent._fallback_reason = getattr(agent, "_fallback_reason", None)
+    agent._refusal_clean_fork_active = False
+    agent._refusal_recall_quarantine = False
+    agent._refusal_recall_quarantine_pending = False
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:

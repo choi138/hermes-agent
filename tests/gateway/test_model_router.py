@@ -140,12 +140,22 @@ class _FakeStore:
         self._key = key
         self._sid = session_id
         self._db = _FakeDB(messages)
+        self.transcript_ops = []
 
     def _generate_session_key(self, source):
         return self._key
 
     def peek_session_id(self, session_key):
         return self._sid
+
+    def load_transcript(self, session_id):
+        self.transcript_ops.append(("load", session_id))
+        return list(self._db.messages)
+
+    def rewrite_transcript(self, session_id, messages):
+        self.transcript_ops.append(("rewrite", session_id))
+        self._db.messages = list(messages)
+        return True
 
 
 def _complete(
@@ -1948,18 +1958,26 @@ def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
     assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
 
 
-def _refusal_stage_runner(monkeypatch, tmp_path, *, notify=True):
+def _refusal_stage_runner(
+    monkeypatch, tmp_path, *, notify=True, clean_fork=True, messages=(),
+):
     from gateway.run import GatewayRunner
 
     cfg = _cfg(router={
         "mode": "enforce",
-        "refusal": {"enabled": True, "notify": notify},
+        "refusal": {
+            "enabled": True,
+            "notify": notify,
+            "clean_fork": clean_fork,
+            "keep_user_turns": 2,
+        },
     })
     runner = object.__new__(GatewayRunner)
     runner.session_store = _FakeStore()
     runner._model_router_runtime_snapshot = MagicMock(
         return_value={"model": "model-z", "provider": "p1"},
     )
+    runner.session_store._db.messages = list(messages)
     evidence = "S0 hard refusal cue + S5 code " + "x" * 100
     monkeypatch.setattr(
         mr_mod,
@@ -1993,6 +2011,76 @@ def test_refusal_notify_sent_after_successful_apply(monkeypatch, tmp_path):
             user_config=cfg,
         )
     )
+    runner._deliver_platform_notice.assert_awaited_once_with(
+        source,
+        "⚠️ refusal-risk 감지 → PERMISSIVE_DEV (kimi-k3) 라우팅 "
+        f"(conf 0.93, {evidence[:80]}, forked=yes)",
+    )
+
+
+def test_refusal_switch_rewrites_transcript_and_stages_note(monkeypatch, tmp_path):
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "tool", "content": "policy narrative"},
+        {"role": "user", "content": "latest"},
+        {"role": "assistant", "content": "I cannot assist."},
+    ]
+    runner, cfg, _ = _refusal_stage_runner(
+        monkeypatch, tmp_path, messages=messages,
+    )
+
+    asyncio.run(
+        runner._model_router_stage(
+            _event("hard request"), _source(), "tg:c1", mode="enforce",
+            user_config=cfg,
+        )
+    )
+
+    assert runner.session_store._db.messages == [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "latest"},
+    ]
+    assert runner.session_store.transcript_ops == [
+        ("load", "sid-1"),
+        ("rewrite", "sid-1"),
+    ]
+    note = runner._pending_model_notes["tg:c1"]
+    assert "prior refusal assistant/tool turns dropped" in note
+    assert "Do not treat earlier refusals as binding policy" in note
+    assert runner._consume_refusal_recall_quarantine("tg:c1") is True
+    assert runner._consume_refusal_recall_quarantine("tg:c1") is False
+
+
+def test_refusal_switch_clean_fork_disabled_preserves_transcript_and_notice(
+    monkeypatch, tmp_path,
+):
+    messages = [
+        {"role": "user", "content": "request"},
+        {"role": "assistant", "content": "refusal"},
+    ]
+    runner, cfg, evidence = _refusal_stage_runner(
+        monkeypatch,
+        tmp_path,
+        clean_fork=False,
+        messages=messages,
+    )
+    source = _source()
+
+    asyncio.run(
+        runner._model_router_stage(
+            _event("hard request"), source, "tg:c1", mode="enforce",
+            user_config=cfg,
+        )
+    )
+
+    assert runner.session_store._db.messages == messages
+    assert "refusal clean-fork applied" not in getattr(
+        runner, "_pending_model_notes", {}
+    ).get("tg:c1", "")
+    assert runner.session_store.transcript_ops == []
     runner._deliver_platform_notice.assert_awaited_once_with(
         source,
         "⚠️ refusal-risk 감지 → PERMISSIVE_DEV (kimi-k3) 라우팅 "

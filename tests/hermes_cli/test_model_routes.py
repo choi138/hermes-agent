@@ -1521,6 +1521,8 @@ def test_router_absent_defaults_off():
     assert catalog.router.refusal == mr.RefusalConfig()
     assert catalog.router.refusal.enabled is False
     assert catalog.router.refusal.api_fallback is False
+    assert catalog.router.refusal.clean_fork is True
+    assert catalog.router.refusal.keep_user_turns == 5
     assert catalog.router.refusal.min_confidence == 0.85
     assert catalog.router.refusal.dev_route == "PERMISSIVE_DEV"
     assert catalog.router.refusal.chat_route == "PERMISSIVE_CHAT"
@@ -1565,6 +1567,8 @@ def test_router_refusal_partial_config_inherits_defaults():
     refusal = catalog.router.refusal
     assert refusal.enabled is True
     assert refusal.api_fallback is False
+    assert refusal.clean_fork is True
+    assert refusal.keep_user_turns == 5
     assert refusal.min_confidence == 0.9
     assert refusal.dev_route == "PERMISSIVE_DEV"
     assert refusal.chat_route == "PERMISSIVE_CHAT"
@@ -1578,6 +1582,8 @@ def test_router_refusal_explicit_disabled_config_parsed():
         router={"refusal": {
             "enabled": False,
             "api_fallback": True,
+            "clean_fork": False,
+            "keep_user_turns": 3,
             "min_confidence": 0.72,
             "dev_route": "dev",
             "chat_route": "chat",
@@ -1589,12 +1595,24 @@ def test_router_refusal_explicit_disabled_config_parsed():
     assert catalog.router.refusal == mr.RefusalConfig(
         enabled=False,
         api_fallback=True,
+        clean_fork=False,
+        keep_user_turns=3,
         min_confidence=0.72,
         dev_route="dev",
         chat_route="chat",
         document_route="chat",
         notify=True,
     )
+
+
+@pytest.mark.parametrize("value", [0, -1, 2.5, "3", True, None])
+def test_router_refusal_invalid_keep_user_turns_warns_and_defaults(value):
+    catalog = mr.load_routes(_cfg(
+        routes=_router_routes(),
+        router={"refusal": {"keep_user_turns": value}},
+    ))
+    assert catalog.router.refusal.keep_user_turns == 5
+    assert any("keep_user_turns" in issue.message for issue in _warnings(catalog))
 
 
 def test_router_not_a_mapping_is_error_and_off():

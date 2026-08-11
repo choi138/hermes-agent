@@ -56,7 +56,9 @@ def _mock_client(base_url="https://api.example.com/v1", api_key="fb-key"):
 _FB = {"provider": "openai", "model": "gpt-4o"}
 
 
-def _refusal_routes_config(*, enabled=True, api_fallback=True):
+def _refusal_routes_config(
+    *, enabled=True, api_fallback=True, clean_fork=True, keep_user_turns=5,
+):
     return {
         "providers": {
             "openai": {"base_url": "https://api.openai.com/v1"},
@@ -80,6 +82,8 @@ def _refusal_routes_config(*, enabled=True, api_fallback=True):
                 "refusal": {
                     "enabled": enabled,
                     "api_fallback": api_fallback,
+                    "clean_fork": clean_fork,
+                    "keep_user_turns": keep_user_turns,
                     "dev_route": "PERMISSIVE_DEV",
                     "chat_route": "PERMISSIVE_CHAT",
                 }
@@ -520,15 +524,17 @@ class TestOtherResetPaths:
         primary-transport recovery and assert the reset clears
         _fallback_reason alongside _fallback_activated.  The cleared reason
         is stale pre-recovery bookkeeping — _try_recover_primary_transport
-        refuses while a fallback is actually live — so seed the stale shape:
-        a burned chain index with a recorded reason but no activation."""
+        refuses while a fallback is actually live — so seed a recorded reason
+        with no activation and no fallback chain."""
 
         class ReadTimeout(Exception):
             pass
 
-        agent = _make_agent(fallback_model=[_FB])
+        # No fallback chain: this test exercises primary transport recovery,
+        # and must not become order-sensitive if another setup path reopens a
+        # previously exhausted chain index.
+        agent = _make_agent(fallback_model=None)
         agent._api_max_retries = 2
-        agent._fallback_index = len(agent._fallback_chain)
         agent._fallback_reason = "content_policy_blocked"
 
         responses = [
@@ -612,6 +618,102 @@ class TestLoopCallSitesForwardReason:
         assert spy.call_count == 1
         assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
         assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_http200_refusal_hop_cleans_retry_request_history(self):
+        agent = _make_agent(fallback_model=[_FB])
+        requests = []
+        responses = iter([
+            _loop_response(content="I cannot help.", finish_reason="content_filter"),
+            _loop_response("Recovered without refusal framing."),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            return next(responses)
+
+        history = [
+            {"role": "user", "content": "earlier request"},
+            {"role": "assistant", "content": "I can't help with that."},
+        ]
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch.object(agent, "_buffer_status") as buffer_status,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("hermes_cli.config.load_config",
+                  return_value=_refusal_routes_config(keep_user_turns=2)),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+        ):
+            result = agent.run_conversation(
+                "latest request",
+                conversation_history=history,
+            )
+
+        assert result["final_response"] == "Recovered without refusal framing."
+        assert len(requests) == 2
+        assert any(
+            message.get("content") == "I can't help with that."
+            for message in requests[0]
+        )
+        assert all(message.get("role") != "assistant" for message in requests[1])
+        assert all(message.get("role") != "tool" for message in requests[1])
+        assert all(
+            message.get("content") != "I can't help with that."
+            for message in result["messages"]
+        )
+        assert agent._refusal_clean_fork_active is True
+        assert agent._refusal_recall_quarantine is True
+        assert any(
+            "clean_fork=yes dropped=1" in str(status_call.args[0])
+            for status_call in buffer_status.call_args_list
+        )
+
+    def test_http200_refusal_hop_respects_clean_fork_disabled(self):
+        agent = _make_agent(fallback_model=[_FB])
+        requests = []
+        responses = iter([
+            _loop_response(content="", finish_reason="content_filter"),
+            _loop_response(),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            return next(responses)
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("hermes_cli.config.load_config",
+                  return_value=_refusal_routes_config(clean_fork=False)),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+        ):
+            result = agent.run_conversation(
+                "latest request",
+                conversation_history=[
+                    {"role": "user", "content": "earlier request"},
+                    {"role": "assistant", "content": "refusal text"},
+                ],
+            )
+
+        assert result["final_response"] == "Recovered on fallback."
+        assert any(
+            message.get("content") == "refusal text"
+            for message in requests[1]
+        )
+        assert agent._refusal_clean_fork_active is False
 
     def test_midstream_content_filter_stub_forwards_reason(self):
         """A content-filter-terminated partial-stream stub (#32421) must

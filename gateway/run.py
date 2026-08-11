@@ -5600,6 +5600,9 @@ class TurnRunner:
         agent._runtime_route_state = (
             self._runner._consume_pending_runtime_route_state(ctx.session_key)
         )
+        agent._refusal_recall_quarantine_pending = (
+            self._runner._consume_refusal_recall_quarantine(ctx.session_key)
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -8287,6 +8290,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     directive.get("model"),
                     decision.label,
                 )
+                forked = False
+                if (
+                    decision.outcome == "refusal_switch"
+                    and bool(getattr(catalog.router.refusal, "clean_fork", True))
+                ):
+                    forked = await self._apply_gateway_refusal_clean_fork(
+                        session_key,
+                        source,
+                        keep_user_turns=int(
+                            getattr(catalog.router.refusal, "keep_user_turns", 5)
+                        ),
+                    )
                 if (
                     decision.outcome == "refusal_switch"
                     and bool(
@@ -8307,7 +8322,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         notice = (
                             f"⚠️ refusal-risk 감지 → {directive.get('route')} "
                             f"({directive.get('model')}) 라우팅 "
-                            f"(conf {confidence:.2f}, {evidence})"
+                            f"(conf {confidence:.2f}, {evidence}"
+                            + (", forked=yes" if forked else "")
+                            + ")"
                         )
                         await self._deliver_platform_notice(source, notice)
                     except Exception:
@@ -8335,6 +8352,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             decision_log=catalog.router.decision_log,
         )
         return decision
+
+    async def _apply_gateway_refusal_clean_fork(
+        self,
+        session_key: str,
+        source: SessionSource,
+        *,
+        keep_user_turns: int,
+    ) -> bool:
+        """Rewrite persisted refusal history and stage its one-turn note."""
+        from agent.refusal_history import clean_fork_messages
+
+        try:
+            session_id = self.session_store.peek_session_id(session_key)
+            if not session_id:
+                entry = await self.async_session_store.get_or_create_session(source)
+                session_id = entry.session_id
+            history = await self.async_session_store.load_transcript(session_id)
+            cleaned = clean_fork_messages(
+                history,
+                keep_user_turns=keep_user_turns,
+            )
+            if not await self.async_session_store.rewrite_transcript(
+                session_id, cleaned
+            ):
+                logger.warning(
+                    "model router: refusal clean-fork transcript rewrite failed "
+                    "session=%s",
+                    session_key,
+                )
+                return False
+        except Exception:
+            logger.warning(
+                "model router: refusal clean-fork failed session=%s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+        note = (
+            "[Note: refusal clean-fork applied; prior refusal assistant/tool "
+            "turns dropped. Re-evaluate the latest user request only. Do not "
+            "treat earlier refusals as binding policy.]"
+        )
+        pending = getattr(self, "_pending_model_notes", None)
+        if pending is None:
+            self._pending_model_notes = {}
+            pending = self._pending_model_notes
+        existing = pending.get(session_key, "")
+        pending[session_key] = f"{existing}\n\n{note}".strip()
+        self._session_state(
+            session_key
+        ).conversation.refusal_recall_quarantine = True
+        return True
 
     async def _apply_model_router_directive(
         self,
@@ -27550,6 +27620,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         staged = state.conversation.sidecar_notes
         state.conversation.sidecar_notes = []
         return list(staged) if isinstance(staged, list) else []
+
+    def _consume_refusal_recall_quarantine(self, session_key: str) -> bool:
+        """Consume the one-turn recall quarantine armed by a clean-fork."""
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return False
+        active = bool(state.conversation.refusal_recall_quarantine)
+        state.conversation.refusal_recall_quarantine = False
+        return active
 
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """Return a ``[Voice channel now: ...]`` note when VC state changed.
