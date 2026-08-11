@@ -2314,6 +2314,12 @@ def _build_refusal_fallback_chain(agent: Any) -> list[dict]:
         catalog = load_routes(cfg)
         refusal = catalog.router.refusal
         if not (refusal.enabled and refusal.api_fallback):
+            logger.warning(
+                "Refusal fallback chain empty: refusal routing is disabled "
+                "(enabled=%s api_fallback=%s)",
+                refusal.enabled,
+                refusal.api_fallback,
+            )
             return []
 
         if _current_runtime_is_dev_route(agent, cfg, catalog):
@@ -2352,11 +2358,28 @@ def _build_refusal_fallback_chain(agent: Any) -> list[dict]:
                 )
                 continue
             chain.append(entry)
+        if not chain:
+            logger.warning(
+                "Refusal fallback chain empty: no usable PERMISSIVE routes "
+                "resolved from %s",
+                [name for name in route_names if str(name or "").strip()],
+            )
+        else:
+            logger.info(
+                "Refusal fallback chain built: %s",
+                " -> ".join(
+                    f"{entry.get('provider')}/{entry.get('model')}"
+                    for entry in chain
+                ),
+            )
         return chain
     except Exception:
         # Refusal routing is an optional preference. Config or route-resolution
         # failures must leave the established fallback chain available.
-        logger.debug("Refusal fallback route resolution failed", exc_info=True)
+        logger.warning(
+            "Refusal fallback chain empty: route resolution failed",
+            exc_info=True,
+        )
         return []
 
 

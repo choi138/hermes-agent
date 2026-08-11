@@ -2340,7 +2340,7 @@ def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path)
         {"role": "user", "content": "current request"},
         {"role": "assistant", "content": response},
     ]
-    runner, _ = _refusal_stage_runner(
+    runner, _cfg, _ = _refusal_stage_runner(
         monkeypatch, tmp_path, messages=messages,
     )
     probe = MagicMock(return_value={
@@ -2369,7 +2369,7 @@ def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path)
 
 def test_soft_refusal_below_threshold_does_not_mask_or_stage(monkeypatch, tmp_path):
     response = "A long response that the probe rates below the configured threshold."
-    runner, _ = _refusal_stage_runner(
+    runner, _cfg, _ = _refusal_stage_runner(
         monkeypatch,
         tmp_path,
         messages=[
@@ -2395,7 +2395,7 @@ def test_soft_refusal_below_threshold_does_not_mask_or_stage(monkeypatch, tmp_pa
 
 
 def test_soft_refusal_skips_content_policy_hard_error(monkeypatch, tmp_path):
-    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    runner, _cfg, _ = _refusal_stage_runner(monkeypatch, tmp_path)
     probe = MagicMock(side_effect=AssertionError("hard refusal must own this turn"))
     monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
 
@@ -2413,7 +2413,7 @@ def test_soft_refusal_skips_content_policy_hard_error(monkeypatch, tmp_path):
 
 
 def test_soft_refusal_disabled_never_calls_probe(monkeypatch, tmp_path):
-    runner, _ = _refusal_stage_runner(
+    runner, _cfg, _ = _refusal_stage_runner(
         monkeypatch, tmp_path, soft_detect=False,
     )
     probe = MagicMock(side_effect=AssertionError("soft probe is disabled"))
@@ -2430,7 +2430,7 @@ def test_soft_refusal_disabled_never_calls_probe(monkeypatch, tmp_path):
 
 
 def test_short_response_never_calls_soft_refusal_probe(monkeypatch, tmp_path):
-    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    runner, _cfg, _ = _refusal_stage_runner(monkeypatch, tmp_path)
     probe = MagicMock(side_effect=AssertionError("short response must be skipped"))
     monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
 
@@ -2444,7 +2444,7 @@ def test_refusal_recovery_guard_stops_third_hop_and_notifies_once(
     monkeypatch, tmp_path,
 ):
     response = "A repeated refusal response that is sufficiently long for probing."
-    runner, _ = _refusal_stage_runner(
+    runner, _cfg, _ = _refusal_stage_runner(
         monkeypatch,
         tmp_path,
         max_recovery_hops=2,
@@ -2489,7 +2489,7 @@ def test_refusal_recovery_guard_stops_third_hop_and_notifies_once(
 
 def test_refusal_recovery_guard_resets_after_clean_turn(monkeypatch, tmp_path):
     response = "A response long enough to exercise the refusal probe and recovery guard."
-    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    runner, _cfg, _ = _refusal_stage_runner(monkeypatch, tmp_path)
     probe = MagicMock(side_effect=[
         {"prior_refusal": True, "prior_refusal_confidence": 0.95},
         {"prior_refusal": False, "prior_refusal_confidence": 0.99},
@@ -2519,7 +2519,7 @@ def test_refusal_recovery_guard_resets_after_clean_turn(monkeypatch, tmp_path):
 def test_interrupted_or_failed_turn_never_calls_soft_probe(
     monkeypatch, tmp_path, terminal_flag,
 ):
-    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    runner, _cfg, _ = _refusal_stage_runner(monkeypatch, tmp_path)
     probe = MagicMock(side_effect=AssertionError("terminal turn must skip probe"))
     monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
 

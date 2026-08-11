@@ -17,10 +17,12 @@ Covers:
    ``_try_activate_fallback()`` (the wiring skill-gate depends on)
 """
 
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.chat_completion_helpers import _build_refusal_fallback_chain
 from agent.error_classifier import FailoverReason
 from agent.runtime_control import get_runtime_state
 from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
@@ -329,6 +331,35 @@ class TestApiRefusalRouteFallback:
         ]
         assert agent.provider == "openai"
         assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_built_refusal_chain_logs_provider_model_pairs(self, caplog):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            caplog.at_level(logging.INFO, logger="agent.chat_completion_helpers"),
+        ):
+            chain = _build_refusal_fallback_chain(agent)
+
+        assert chain
+        assert "Refusal fallback chain built:" in caplog.text
+        for entry in chain:
+            assert f"{entry['provider']}/{entry['model']}" in caplog.text
+
+    def test_empty_refusal_chain_logs_warning(self, caplog):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(api_fallback=False),
+            ),
+            caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"),
+        ):
+            assert _build_refusal_fallback_chain(agent) == []
+
+        assert "Refusal fallback chain empty:" in caplog.text
 
     def test_disabled_api_fallback_uses_generic_chain_only(self):
         agent = self._dev_agent()
