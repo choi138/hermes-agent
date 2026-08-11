@@ -56,6 +56,38 @@ def _mock_client(base_url="https://api.example.com/v1", api_key="fb-key"):
 _FB = {"provider": "openai", "model": "gpt-4o"}
 
 
+def _refusal_routes_config(*, enabled=True, api_fallback=True):
+    return {
+        "providers": {
+            "openai": {"base_url": "https://api.openai.com/v1"},
+        },
+        "model_routes": {
+            "health": {"enabled": False},
+            "routes": {
+                "PERMISSIVE_DEV": {
+                    "description": "permissive development runtime",
+                    "provider": "openai",
+                    "model": "gpt-5.6",
+                    "reasoning_effort": "high",
+                },
+                "PERMISSIVE_CHAT": {
+                    "description": "permissive chat runtime",
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                },
+            },
+            "router": {
+                "refusal": {
+                    "enabled": enabled,
+                    "api_fallback": api_fallback,
+                    "dev_route": "PERMISSIVE_DEV",
+                    "chat_route": "PERMISSIVE_CHAT",
+                }
+            },
+        }
+    }
+
+
 def _loop_response(content="Recovered on fallback.", finish_reason="stop"):
     """Minimal OpenAI-style response for driving run_conversation()."""
     msg = SimpleNamespace(content=content, tool_calls=None)
@@ -124,6 +156,200 @@ class TestFallbackReasonRecording:
             agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
             agent._try_activate_fallback(reason=FailoverReason.auth)
         assert agent._fallback_reason == "auth"
+
+
+# ── API-level refusal route preference ───────────────────────────────────
+
+
+class TestApiRefusalRouteFallback:
+    def _dev_agent(self):
+        agent = _make_agent(fallback_model=[
+            {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+        ])
+        agent.provider = "claude-lb"
+        agent.model = "claude-fable"
+        agent.base_url = "https://claude-lb.example/v1"
+        return agent
+
+    def test_content_policy_prefers_permissive_dev_before_generic(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=SimpleNamespace(value="content_policy_blocked")
+            ) is True
+
+        assert calls == [("openai", "gpt-5.6")]
+        assert agent.provider == "openai"
+        assert agent.model == "gpt-5.6"
+        assert agent._fallback_index == 0
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_repeated_refusals_advance_permissive_then_generic(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            for expected_provider in ("openai", "zai", "openrouter"):
+                assert agent._try_activate_fallback(
+                    reason=FailoverReason.content_policy_blocked
+                ) is True
+                assert agent.provider == expected_provider
+
+        assert calls == [
+            ("openai", "gpt-5.6"),
+            ("zai", "glm-4.7"),
+            ("openrouter", "anthropic/claude-opus-4.8"),
+        ]
+        assert agent._fallback_index == 1
+
+    def test_chat_primary_prefers_permissive_chat(self):
+        agent = self._dev_agent()
+        agent.provider = "openrouter"
+        agent.model = "google/gemini-3-flash-preview"
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "glm-4.7"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert resolve.call_args.args == ("zai",)
+        assert agent.provider == "zai"
+
+    def test_route_identity_uses_configured_base_url_for_alias_skip(self):
+        agent = self._dev_agent()
+        agent.provider = "alias-a"
+        agent.model = "shared-model"
+        agent.base_url = "https://shared.example/v1"
+        cfg = _refusal_routes_config()
+        cfg["providers"]["alias-b"] = {
+            "base_url": "https://shared.example/v1",
+        }
+        cfg["model_routes"]["routes"]["PERMISSIVE_CHAT"].update({
+            "provider": "alias-b",
+            "model": "shared-model",
+        })
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=cfg),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-5.6"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert resolve.call_args.args == ("openai",)
+        assert agent.provider == "openai"
+
+    def test_exhausted_permissive_routes_continue_generic_chain(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            if provider in {"openai", "zai"}:
+                return None, None
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert calls == [
+            ("openai", "gpt-5.6"),
+            ("zai", "glm-4.7"),
+            ("openrouter", "anthropic/claude-opus-4.8"),
+        ]
+        assert agent.provider == "openrouter"
+        assert agent._fallback_index == 1
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_disabled_api_fallback_uses_generic_chain_only(self):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(api_fallback=False),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "anthropic/claude-opus-4.8"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert resolve.call_args.args == ("openrouter",)
+        assert resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
+
+    def test_non_refusal_reason_ignores_permissive_routes(self):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ) as load_config,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "anthropic/claude-opus-4.8"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.auth) is True
+
+        # The generic activation path may load config for reasoning/api-mode,
+        # but it must not resolve either PERMISSIVE provider.
+        assert load_config.called
+        assert resolve.call_args.args == ("openrouter",)
+        assert resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
 
 
 # ── restore_primary_runtime lifecycle ─────────────────────────────────────

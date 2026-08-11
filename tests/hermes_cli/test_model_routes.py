@@ -1520,6 +1520,7 @@ def test_router_absent_defaults_off():
     assert catalog.router.decision_log == ""
     assert catalog.router.refusal == mr.RefusalConfig()
     assert catalog.router.refusal.enabled is False
+    assert catalog.router.refusal.api_fallback is False
     assert catalog.router.refusal.min_confidence == 0.85
     assert catalog.router.refusal.dev_route == "PERMISSIVE_DEV"
     assert catalog.router.refusal.chat_route == "PERMISSIVE_CHAT"
@@ -1563,6 +1564,7 @@ def test_router_refusal_partial_config_inherits_defaults():
     assert catalog.issues == []
     refusal = catalog.router.refusal
     assert refusal.enabled is True
+    assert refusal.api_fallback is False
     assert refusal.min_confidence == 0.9
     assert refusal.dev_route == "PERMISSIVE_DEV"
     assert refusal.chat_route == "PERMISSIVE_CHAT"
@@ -1575,6 +1577,7 @@ def test_router_refusal_explicit_disabled_config_parsed():
         routes=_router_routes(),
         router={"refusal": {
             "enabled": False,
+            "api_fallback": True,
             "min_confidence": 0.72,
             "dev_route": "dev",
             "chat_route": "chat",
@@ -1585,6 +1588,7 @@ def test_router_refusal_explicit_disabled_config_parsed():
     assert catalog.issues == []
     assert catalog.router.refusal == mr.RefusalConfig(
         enabled=False,
+        api_fallback=True,
         min_confidence=0.72,
         dev_route="dev",
         chat_route="chat",

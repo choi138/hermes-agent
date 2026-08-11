@@ -88,7 +88,8 @@ _ROUTER_KEYS = {
     "repromote_after_turns", "chat_route", "label_routes", "decision_log", "refusal",
 }
 _REFUSAL_KEYS = {
-    "enabled", "min_confidence", "dev_route", "chat_route", "document_route", "notify",
+    "enabled", "api_fallback", "min_confidence", "dev_route", "chat_route",
+    "document_route", "notify",
 }
 _ROUTER_MODES = ("off", "shadow", "enforce")
 # Classifier labels that may map to a route. NORMAL is not mappable — its
@@ -170,6 +171,7 @@ class RefusalConfig:
     """Orthogonal refusal-risk routing under ``model_routes.router.refusal``."""
 
     enabled: bool = False
+    api_fallback: bool = False
     min_confidence: float = 0.85
     dev_route: str = "PERMISSIVE_DEV"
     chat_route: str = "PERMISSIVE_CHAT"
@@ -794,7 +796,7 @@ def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
         ))
 
     kwargs: Dict[str, Any] = {}
-    for key in ("enabled", "notify"):
+    for key in ("enabled", "api_fallback", "notify"):
         if key not in raw:
             continue
         value = raw[key]
