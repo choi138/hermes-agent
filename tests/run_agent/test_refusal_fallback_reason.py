@@ -17,10 +17,12 @@ Covers:
    ``_try_activate_fallback()`` (the wiring skill-gate depends on)
 """
 
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.chat_completion_helpers import _build_refusal_fallback_chain
 from agent.error_classifier import FailoverReason
 from agent.runtime_control import get_runtime_state
 from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
@@ -329,6 +331,92 @@ class TestApiRefusalRouteFallback:
         ]
         assert agent.provider == "openai"
         assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_overloaded_generic_hop_continues_refusal_permissive_tail(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+            assert agent.provider == "openrouter"
+
+            # The generic opus hop failed for availability, not policy. The
+            # original refusal context still owns the exhausted-chain tail.
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.overloaded
+            ) is True
+
+        assert calls == [
+            ("openrouter", "anthropic/claude-opus-4.8"),
+            ("openai", "gpt-5.6"),
+        ]
+        assert agent.provider == "openai"
+        assert agent.model == "gpt-5.6"
+        assert agent._refusal_fallback_index == 1
+
+    def test_prebuilt_refusal_chain_survives_non_policy_exhaustion(self):
+        agent = self._dev_agent()
+        agent._fallback_index = len(agent._fallback_chain)
+        agent._fallback_reason = "server_error"
+        agent._refusal_fallback_chain = [{
+            "provider": "zai",
+            "model": "glm-4.7",
+        }]
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "glm-4.7"),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.overloaded
+            ) is True
+
+        assert agent.provider == "zai"
+        assert agent.model == "glm-4.7"
+
+    def test_built_refusal_chain_logs_provider_model_pairs(self, caplog):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            caplog.at_level(logging.INFO, logger="agent.chat_completion_helpers"),
+        ):
+            chain = _build_refusal_fallback_chain(agent)
+
+        assert chain
+        assert "Refusal fallback chain built:" in caplog.text
+        for entry in chain:
+            assert f"{entry['provider']}/{entry['model']}" in caplog.text
+
+    def test_empty_refusal_chain_logs_warning(self, caplog):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(api_fallback=False),
+            ),
+            caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"),
+        ):
+            assert _build_refusal_fallback_chain(agent) == []
+
+        assert "Refusal fallback chain empty:" in caplog.text
 
     def test_disabled_api_fallback_uses_generic_chain_only(self):
         agent = self._dev_agent()

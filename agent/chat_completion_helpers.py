@@ -2314,6 +2314,12 @@ def _build_refusal_fallback_chain(agent: Any) -> list[dict]:
         catalog = load_routes(cfg)
         refusal = catalog.router.refusal
         if not (refusal.enabled and refusal.api_fallback):
+            logger.warning(
+                "Refusal fallback chain empty: refusal routing is disabled "
+                "(enabled=%s api_fallback=%s)",
+                refusal.enabled,
+                refusal.api_fallback,
+            )
             return []
 
         if _current_runtime_is_dev_route(agent, cfg, catalog):
@@ -2352,11 +2358,28 @@ def _build_refusal_fallback_chain(agent: Any) -> list[dict]:
                 )
                 continue
             chain.append(entry)
+        if not chain:
+            logger.warning(
+                "Refusal fallback chain empty: no usable PERMISSIVE routes "
+                "resolved from %s",
+                [name for name in route_names if str(name or "").strip()],
+            )
+        else:
+            logger.info(
+                "Refusal fallback chain built: %s",
+                " -> ".join(
+                    f"{entry.get('provider')}/{entry.get('model')}"
+                    for entry in chain
+                ),
+            )
         return chain
     except Exception:
         # Refusal routing is an optional preference. Config or route-resolution
         # failures must leave the established fallback chain available.
-        logger.debug("Refusal fallback route resolution failed", exc_info=True)
+        logger.warning(
+            "Refusal fallback chain empty: route resolution failed",
+            exc_info=True,
+        )
         return []
 
 
@@ -2579,22 +2602,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if reason in _OUTAGE_ROUTE_FALLBACK_REASONS:
         fb = _next_outage_route_fallback(agent)
     if fb is None and agent._fallback_index >= len(agent._fallback_chain):
-        # Generic chain exhausted. For content-policy refusals only, walk the
-        # configured PERMISSIVE routes AFTER the normal fallback_providers
-        # (typically opus). Owner intent: keep fable→opus as the first hop so
-        # intelligence is preserved; PERMISSIVE (k3/grok) is the last resort
-        # when frontier models refuse the same prompt.
+        # Generic chain exhausted. Once a content-policy refusal starts a
+        # recovery walk, later outage-shaped failures on the generic hop must
+        # still reach the configured PERMISSIVE tail. Agents that never had a
+        # refusal retain the established content-policy-only behavior.
+        refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
+        refusal_recovery_active = bool(refusal_chain) or (
+            getattr(agent, "_fallback_reason", None)
+            == FailoverReason.content_policy_blocked.value
+        )
         if (
-            reason == FailoverReason.content_policy_blocked
+            (
+                reason == FailoverReason.content_policy_blocked
+                or refusal_recovery_active
+            )
             and not getattr(agent, "_refusal_fallback_walk_active", False)
         ):
-            continuing_refusal = (
-                bool(getattr(agent, "_fallback_activated", False))
-                and getattr(agent, "_fallback_reason", None)
-                == FailoverReason.content_policy_blocked.value
-            )
-            if continuing_refusal:
-                refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
+            if refusal_recovery_active:
                 refusal_index = int(
                     getattr(agent, "_refusal_fallback_index", 0) or 0
                 )
