@@ -2260,8 +2260,16 @@ def _is_content_policy_blocked(reason: Any) -> bool:
 
 def _current_runtime_is_dev_route(agent: Any, cfg: dict, catalog: Any) -> bool:
     """Whether refusal recovery should prefer the configured dev route."""
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
-    model = str(getattr(agent, "model", "") or "").strip().lower()
+    # Prefer the pre-fallback primary identity so order stays stable across
+    # generic→PERMISSIVE hops (after opus activates, current provider is no
+    # longer claude-lb but the turn was still a dev refusal).
+    primary = getattr(agent, "_primary_runtime", None) or {}
+    provider = str(
+        primary.get("provider") or getattr(agent, "provider", "") or ""
+    ).strip().lower()
+    model = str(
+        primary.get("model") or getattr(agent, "model", "") or ""
+    ).strip().lower()
     if provider == "claude-lb" and (
         "claude-fable" in model or "claude-opus" in model
     ):
@@ -2274,7 +2282,9 @@ def _current_runtime_is_dev_route(agent: Any, cfg: dict, catalog: Any) -> bool:
         runtime = {
             "provider": provider,
             "model": model,
-            "base_url": str(getattr(agent, "base_url", "") or ""),
+            "base_url": str(
+                primary.get("base_url") or getattr(agent, "base_url", "") or ""
+            ),
         }
         for label in ("SYSTEM_DEV", "FRONTEND_DEV"):
             route_name = str(label_routes.get(label) or "")
@@ -2535,47 +2545,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # activation path stores ``reason.value``.
         reason = FailoverReason.content_policy_blocked
 
-        # Re-enter this exact activator with a temporary route-derived chain.
-        # Its index survives successful hops within the active refusal
-        # sequence, so repeated refusals progress DEV -> CHAT -> generic
-        # instead of rebuilding and cycling between PERMISSIVE routes.
-        if not getattr(agent, "_refusal_fallback_walk_active", False):
-            continuing_refusal = (
-                bool(getattr(agent, "_fallback_activated", False))
-                and getattr(agent, "_fallback_reason", None)
-                == FailoverReason.content_policy_blocked.value
-            )
-            if continuing_refusal:
-                refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
-                refusal_index = int(
-                    getattr(agent, "_refusal_fallback_index", 0) or 0
-                )
-            else:
-                refusal_chain = _build_refusal_fallback_chain(agent)
-                refusal_index = 0
-                agent._refusal_fallback_chain = refusal_chain
-                agent._refusal_fallback_index = 0
-
-            if refusal_index < len(refusal_chain):
-                normal_chain = agent._fallback_chain
-                normal_index = agent._fallback_index
-                cooldown_before = getattr(agent, "_rate_limited_until", 0)
-                agent._fallback_chain = refusal_chain
-                agent._fallback_index = refusal_index
-                agent._refusal_fallback_walk_active = True
-                try:
-                    if agent._try_activate_fallback(reason):
-                        return True
-                    # Exhausting only the temporary preference chain is not a
-                    # full fallback exhaustion; let the generic walk own any
-                    # cross-turn cooldown side effect.
-                    agent._rate_limited_until = cooldown_before
-                finally:
-                    agent._refusal_fallback_index = agent._fallback_index
-                    agent._fallback_chain = normal_chain
-                    agent._fallback_index = normal_index
-                    agent._refusal_fallback_walk_active = False
-
     if reason in _PASSIVE_UNHEALTHY_REASONS:
         _record_passive_provider_outcome(
             agent,
@@ -2610,6 +2579,55 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if reason in _OUTAGE_ROUTE_FALLBACK_REASONS:
         fb = _next_outage_route_fallback(agent)
     if fb is None and agent._fallback_index >= len(agent._fallback_chain):
+        # Generic chain exhausted. For content-policy refusals only, walk the
+        # configured PERMISSIVE routes AFTER the normal fallback_providers
+        # (typically opus). Owner intent: keep fable→opus as the first hop so
+        # intelligence is preserved; PERMISSIVE (k3/grok) is the last resort
+        # when frontier models refuse the same prompt.
+        if (
+            reason == FailoverReason.content_policy_blocked
+            and not getattr(agent, "_refusal_fallback_walk_active", False)
+        ):
+            continuing_refusal = (
+                bool(getattr(agent, "_fallback_activated", False))
+                and getattr(agent, "_fallback_reason", None)
+                == FailoverReason.content_policy_blocked.value
+            )
+            if continuing_refusal:
+                refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
+                refusal_index = int(
+                    getattr(agent, "_refusal_fallback_index", 0) or 0
+                )
+                # First successful hop may have been generic only — build the
+                # PERMISSIVE tail lazily when we first exhaust fallback_providers.
+                if not refusal_chain:
+                    refusal_chain = _build_refusal_fallback_chain(agent)
+                    refusal_index = 0
+                    agent._refusal_fallback_chain = refusal_chain
+                    agent._refusal_fallback_index = 0
+            else:
+                refusal_chain = _build_refusal_fallback_chain(agent)
+                refusal_index = 0
+                agent._refusal_fallback_chain = refusal_chain
+                agent._refusal_fallback_index = 0
+
+            if refusal_index < len(refusal_chain):
+                normal_chain = agent._fallback_chain
+                normal_index = agent._fallback_index
+                cooldown_before = getattr(agent, "_rate_limited_until", 0)
+                agent._fallback_chain = refusal_chain
+                agent._fallback_index = refusal_index
+                agent._refusal_fallback_walk_active = True
+                try:
+                    if agent._try_activate_fallback(reason):
+                        return True
+                    agent._rate_limited_until = cooldown_before
+                finally:
+                    agent._refusal_fallback_index = agent._fallback_index
+                    agent._fallback_chain = normal_chain
+                    agent._fallback_index = normal_index
+                    agent._refusal_fallback_walk_active = False
+
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next

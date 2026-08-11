@@ -169,9 +169,15 @@ class TestApiRefusalRouteFallback:
         agent.provider = "claude-lb"
         agent.model = "claude-fable"
         agent.base_url = "https://claude-lb.example/v1"
+        # Keep primary identity for PERMISSIVE ordering after generic hop.
+        agent._primary_runtime = {
+            "provider": "claude-lb",
+            "model": "claude-fable",
+            "base_url": "https://claude-lb.example/v1",
+        }
         return agent
 
-    def test_content_policy_prefers_permissive_dev_before_generic(self):
+    def test_content_policy_uses_generic_before_permissive(self):
         agent = self._dev_agent()
         calls = []
 
@@ -193,13 +199,14 @@ class TestApiRefusalRouteFallback:
                 reason=SimpleNamespace(value="content_policy_blocked")
             ) is True
 
-        assert calls == [("openai", "gpt-5.6")]
-        assert agent.provider == "openai"
-        assert agent.model == "gpt-5.6"
-        assert agent._fallback_index == 0
+        # First hop is still generic fallback_providers (opus), not PERMISSIVE.
+        assert calls == [("openrouter", "anthropic/claude-opus-4.8")]
+        assert agent.provider == "openrouter"
+        assert agent.model == "anthropic/claude-opus-4.8"
+        assert agent._fallback_index == 1
         assert agent._fallback_reason == "content_policy_blocked"
 
-    def test_repeated_refusals_advance_permissive_then_generic(self):
+    def test_repeated_refusals_advance_generic_then_permissive(self):
         agent = self._dev_agent()
         calls = []
 
@@ -217,23 +224,31 @@ class TestApiRefusalRouteFallback:
                 side_effect=resolve,
             ),
         ):
-            for expected_provider in ("openai", "zai", "openrouter"):
+            for expected_provider in ("openrouter", "openai", "zai"):
                 assert agent._try_activate_fallback(
                     reason=FailoverReason.content_policy_blocked
                 ) is True
                 assert agent.provider == expected_provider
 
         assert calls == [
+            ("openrouter", "anthropic/claude-opus-4.8"),
             ("openai", "gpt-5.6"),
             ("zai", "glm-4.7"),
-            ("openrouter", "anthropic/claude-opus-4.8"),
         ]
+        # Generic chain exhausted; PERMISSIVE walk advanced past first entry.
         assert agent._fallback_index == 1
 
-    def test_chat_primary_prefers_permissive_chat(self):
+    def test_chat_primary_prefers_permissive_chat_after_generic(self):
         agent = self._dev_agent()
         agent.provider = "openrouter"
         agent.model = "google/gemini-3-flash-preview"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._primary_runtime = {
+            "provider": "openrouter",
+            "model": "google/gemini-3-flash-preview",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        agent._fallback_chain = []  # no generic hop available
         with (
             patch(
                 "hermes_cli.config.load_config",
@@ -256,6 +271,7 @@ class TestApiRefusalRouteFallback:
         agent.provider = "alias-a"
         agent.model = "shared-model"
         agent.base_url = "https://shared.example/v1"
+        agent._fallback_chain = []
         cfg = _refusal_routes_config()
         cfg["providers"]["alias-b"] = {
             "base_url": "https://shared.example/v1",
@@ -279,13 +295,13 @@ class TestApiRefusalRouteFallback:
         assert resolve.call_args.args == ("openai",)
         assert agent.provider == "openai"
 
-    def test_exhausted_permissive_routes_continue_generic_chain(self):
+    def test_exhausted_generic_continues_to_permissive(self):
         agent = self._dev_agent()
         calls = []
 
         def resolve(provider, model=None, **kwargs):
             calls.append((provider, model))
-            if provider in {"openai", "zai"}:
+            if provider == "openrouter":
                 return None, None
             return _mock_client(), model
 
@@ -304,12 +320,10 @@ class TestApiRefusalRouteFallback:
             ) is True
 
         assert calls == [
-            ("openai", "gpt-5.6"),
-            ("zai", "glm-4.7"),
             ("openrouter", "anthropic/claude-opus-4.8"),
+            ("openai", "gpt-5.6"),
         ]
-        assert agent.provider == "openrouter"
-        assert agent._fallback_index == 1
+        assert agent.provider == "openai"
         assert agent._fallback_reason == "content_policy_blocked"
 
     def test_disabled_api_fallback_uses_generic_chain_only(self):
