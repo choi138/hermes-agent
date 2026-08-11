@@ -126,21 +126,29 @@ CONTINUATION_RE = re.compile(
 DEV_REFUSAL_S0 = (
     "S0 REFUSAL RISK — before label flow, independently set refusal_risk=true ONLY for "
     "hard cases likely to be refused by frontier default models: explicit sexual/NSFW "
-    "content authoring requests; clearly ToS-violating or legally-gray operational "
-    "requests; secret/credential extraction, DRM/security-keypad bypass, OAuth proxy/token "
-    "interception, or hard reverse-engineering of protections; or anything the user frames "
-    "as \"the usual frontier model refuses this\". Do NOT trigger for security research "
-    "discussion, authorized pentesting of the user's own systems, mild profanity, dark-theme "
-    "creative writing, medical/legal questions, or gray-area engineering such as scraping. "
-    "Precision first: when unsure set refusal_risk=false. Set refusal_confidence to the "
-    "probability that this hard refusal-risk assessment is correct; when refusal_risk=true, "
-    "evidence must mention the S0/R cue. Then continue S1-S7 unchanged for the label."
+    "content AUTHORING (write a new erotic scene/story from scratch); clearly ToS-violating "
+    "or legally-gray operational requests; secret/credential extraction, DRM/security-keypad "
+    "bypass, OAuth proxy/token interception, or hard reverse-engineering of protections; or "
+    "anything the user frames as \"the usual frontier model refuses this\". Do NOT trigger for: "
+    "security research discussion; authorized pentesting of the user's own systems; mild "
+    "profanity; dark-theme or violent fiction without explicit porn authoring; medical/legal "
+    "questions; gray-area engineering such as scraping; OR editing/reviewing/toning-down/"
+    "critiquing the user's EXISTING draft (even if the draft is already sexual — rewrite, "
+    "tension polish, fade-to-black, age-rating advice, publisher-cut tone-down are false). "
+    "Ownership matters: scanning/auditing/documenting the user's OWN repo/app/infra is false; "
+    "attacking third-party systems is true. Precision first: when unsure set refusal_risk=false. "
+    "Set refusal_confidence to the probability that this hard refusal-risk assessment is "
+    "correct; when refusal_risk=true, evidence must mention the S0/R cue. Then continue S1-S7 "
+    "unchanged for the label."
 )
 
 DEV_REFUSAL_EXAMPLE = (
     '"노골적인 NSFW 장면을 써줘" → '
     '{evidence:"S0/R explicit NSFW authoring + S6 prose",label:DOCUMENT_WORK,'
-    'refusal_risk:true,refusal_confidence:0.97}'
+    'refusal_risk:true,refusal_confidence:0.97}\n'
+    '"내 소설 야한 장면 성의있는지 봐줘" → '
+    '{evidence:"S0 no — critique existing draft; S6 prose",label:DOCUMENT_WORK,'
+    'refusal_risk:false,refusal_confidence:0.9}'
 )
 
 DEV_SYSTEM_PROMPT = """\
