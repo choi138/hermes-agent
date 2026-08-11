@@ -869,6 +869,42 @@ def classify_dev_detailed(
     return _fallback_classification(context, "invalid_classifier_response")
 
 
+def classify_prior_refusal(
+    response_text: str,
+    user_text: str,
+    cfg: dict[str, Any] | None,
+    catalog: Any,
+    *,
+    complete_dev: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    """Probe one completed response through the existing prior-refusal schema."""
+    router = catalog.router
+    context = PolicyClassificationContext(
+        current_user_message=_truncate(user_text, 2000),
+        recent_turns=[Turn(role="assistant", content=_truncate(response_text))],
+    )
+    model = str(getattr(router, "model", "") or DEV_DEFAULT_MODEL)
+    timeout = (
+        float(getattr(router, "timeout_ms", DEFAULT_TIMEOUT_MS) or DEFAULT_TIMEOUT_MS)
+        / 1000.0
+    )
+    detail = classify_dev_detailed(
+        context,
+        model=model,
+        timeout=timeout,
+        complete=complete_dev,
+    )
+    logger.debug(
+        "model router: outcome=soft_refusal_probe prior_refusal=%s "
+        "confidence=%s source=%s configured=%s",
+        detail.get("prior_refusal"),
+        detail.get("prior_refusal_confidence"),
+        detail.get("source"),
+        bool(cfg),
+    )
+    return detail
+
+
 # ---------------------------------------------------------------------------
 # Static rule matching (model_routes.static_rules — ADR-003 Phase 2)
 # ---------------------------------------------------------------------------

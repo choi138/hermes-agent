@@ -1524,6 +1524,8 @@ def test_router_absent_defaults_off():
     assert catalog.router.refusal.clean_fork is True
     assert catalog.router.refusal.keep_user_turns == 5
     assert catalog.router.refusal.mask_on_refusal is True
+    assert catalog.router.refusal.soft_detect is True
+    assert catalog.router.refusal.max_recovery_hops == 2
     assert catalog.router.refusal.min_confidence == 0.85
     assert catalog.router.refusal.dev_route == "PERMISSIVE_DEV"
     assert catalog.router.refusal.chat_route == "PERMISSIVE_CHAT"
@@ -1571,6 +1573,8 @@ def test_router_refusal_partial_config_inherits_defaults():
     assert refusal.clean_fork is True
     assert refusal.keep_user_turns == 5
     assert refusal.mask_on_refusal is True
+    assert refusal.soft_detect is True
+    assert refusal.max_recovery_hops == 2
     assert refusal.min_confidence == 0.9
     assert refusal.dev_route == "PERMISSIVE_DEV"
     assert refusal.chat_route == "PERMISSIVE_CHAT"
@@ -1587,6 +1591,8 @@ def test_router_refusal_explicit_disabled_config_parsed():
             "clean_fork": False,
             "keep_user_turns": 3,
             "mask_on_refusal": False,
+            "soft_detect": False,
+            "max_recovery_hops": 4,
             "min_confidence": 0.72,
             "dev_route": "dev",
             "chat_route": "chat",
@@ -1601,6 +1607,8 @@ def test_router_refusal_explicit_disabled_config_parsed():
         clean_fork=False,
         keep_user_turns=3,
         mask_on_refusal=False,
+        soft_detect=False,
+        max_recovery_hops=4,
         min_confidence=0.72,
         dev_route="dev",
         chat_route="chat",

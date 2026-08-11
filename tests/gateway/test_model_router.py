@@ -2168,7 +2168,15 @@ def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
 
 
 def _refusal_stage_runner(
-    monkeypatch, tmp_path, *, notify=True, clean_fork=True, messages=(),
+    monkeypatch,
+    tmp_path,
+    *,
+    notify=True,
+    clean_fork=True,
+    messages=(),
+    soft_detect=True,
+    max_recovery_hops=2,
+    min_confidence=0.85,
 ):
     from gateway.run import GatewayRunner
 
@@ -2179,6 +2187,9 @@ def _refusal_stage_runner(
             "notify": notify,
             "clean_fork": clean_fork,
             "keep_user_turns": 2,
+            "soft_detect": soft_detect,
+            "max_recovery_hops": max_recovery_hops,
+            "min_confidence": min_confidence,
         },
     })
     runner = object.__new__(GatewayRunner)
@@ -2318,6 +2329,211 @@ def test_hard_refusal_masks_only_current_turn_and_stages_force(
     entry = runner._model_router_state["tg:c1"]
     assert entry["force_refusal_route"] is True
     assert entry["force_refusal_reason"] == "prior_turn_refused"
+    assert entry["refusal_recovery_count"] == 1
+
+
+def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path):
+    response = "A completed refusal explanation from the assistant. " * 2
+    messages = [
+        {"role": "user", "content": "earlier request"},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": response},
+    ]
+    runner, _ = _refusal_stage_runner(
+        monkeypatch, tmp_path, messages=messages,
+    )
+    probe = MagicMock(return_value={
+        "prior_refusal": True,
+        "prior_refusal_confidence": 0.94,
+        "source": "llm",
+    })
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
+
+    masked = asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1",
+        "sid-1",
+        _source(),
+        {"final_response": response},
+        "current request",
+    ))
+
+    assert masked == 1
+    assert runner.session_store._db.inactive_ids == {4}
+    entry = runner._model_router_state["tg:c1"]
+    assert entry["force_refusal_route"] is True
+    assert entry["force_refusal_reason"] == "prior_turn_refused"
+    assert entry["refusal_recovery_count"] == 1
+    probe.assert_called_once()
+
+
+def test_soft_refusal_below_threshold_does_not_mask_or_stage(monkeypatch, tmp_path):
+    response = "A long response that the probe rates below the configured threshold."
+    runner, _ = _refusal_stage_runner(
+        monkeypatch,
+        tmp_path,
+        messages=[
+            {"role": "user", "content": "request"},
+            {"role": "assistant", "content": response},
+        ],
+    )
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", MagicMock(return_value={
+        "prior_refusal": True,
+        "prior_refusal_confidence": 0.84,
+        "source": "llm",
+    }))
+
+    masked = asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+    ))
+
+    assert masked == 0
+    assert runner.session_store._db.inactive_ids == set()
+    entry = runner._model_router_state["tg:c1"]
+    assert "force_refusal_route" not in entry
+    assert entry["refusal_recovery_count"] == 0
+
+
+def test_soft_refusal_skips_content_policy_hard_error(monkeypatch, tmp_path):
+    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    probe = MagicMock(side_effect=AssertionError("hard refusal must own this turn"))
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
+
+    assert asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1",
+        "sid-1",
+        _source(),
+        {
+            "final_response": "A provider-generated refusal response. " * 2,
+            "error": "content_policy_blocked: provider rejected request",
+        },
+        "request",
+    )) == 0
+    probe.assert_not_called()
+
+
+def test_soft_refusal_disabled_never_calls_probe(monkeypatch, tmp_path):
+    runner, _ = _refusal_stage_runner(
+        monkeypatch, tmp_path, soft_detect=False,
+    )
+    probe = MagicMock(side_effect=AssertionError("soft probe is disabled"))
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
+
+    assert asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1",
+        "sid-1",
+        _source(),
+        {"final_response": "A response long enough to otherwise be classified. " * 2},
+        "request",
+    )) == 0
+    probe.assert_not_called()
+
+
+def test_short_response_never_calls_soft_refusal_probe(monkeypatch, tmp_path):
+    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    probe = MagicMock(side_effect=AssertionError("short response must be skipped"))
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
+
+    assert asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": "No, sorry."}, "request",
+    )) == 0
+    probe.assert_not_called()
+
+
+def test_refusal_recovery_guard_stops_third_hop_and_notifies_once(
+    monkeypatch, tmp_path,
+):
+    response = "A repeated refusal response that is sufficiently long for probing."
+    runner, _ = _refusal_stage_runner(
+        monkeypatch,
+        tmp_path,
+        max_recovery_hops=2,
+        messages=[
+            {"role": "user", "content": "request"},
+            {"role": "assistant", "content": response},
+        ],
+    )
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", MagicMock(return_value={
+        "prior_refusal": True,
+        "prior_refusal_confidence": 0.95,
+        "source": "llm",
+    }))
+
+    for _ in range(2):
+        asyncio.run(runner._handle_gateway_soft_refusal(
+            "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+        ))
+        runner._model_router_state["tg:c1"].pop("force_refusal_route", None)
+        runner._model_router_state["tg:c1"].pop("force_refusal_reason", None)
+
+    mask_ops_before = list(runner.session_store.transcript_ops)
+    asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+    ))
+    entry = runner._model_router_state["tg:c1"]
+    assert entry["refusal_recovery_count"] == 2
+    assert entry["refusal_recovery_exhausted"] is True
+    assert "force_refusal_route" not in entry
+    assert runner.session_store.transcript_ops == mask_ops_before
+    exhaustion_notice = (
+        "⚠️ 거절이 반복 — 라우팅으로 해결되는 케이스가 아님. 자동 전환을 멈춤"
+    )
+    assert runner._deliver_platform_notice.await_args_list[-1].args[1] == exhaustion_notice
+
+    notice_count = runner._deliver_platform_notice.await_count
+    asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+    ))
+    assert runner._deliver_platform_notice.await_count == notice_count
+
+
+def test_refusal_recovery_guard_resets_after_clean_turn(monkeypatch, tmp_path):
+    response = "A response long enough to exercise the refusal probe and recovery guard."
+    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    probe = MagicMock(side_effect=[
+        {"prior_refusal": True, "prior_refusal_confidence": 0.95},
+        {"prior_refusal": False, "prior_refusal_confidence": 0.99},
+        {"prior_refusal": True, "prior_refusal_confidence": 0.95},
+    ])
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
+
+    asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+    ))
+    entry = runner._model_router_state["tg:c1"]
+    assert entry["refusal_recovery_count"] == 1
+
+    asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+    ))
+    assert entry["refusal_recovery_count"] == 0
+    assert entry["refusal_recovery_exhausted"] is False
+
+    asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "request",
+    ))
+    assert entry["refusal_recovery_count"] == 1
+
+
+@pytest.mark.parametrize("terminal_flag", ["interrupted", "failed"])
+def test_interrupted_or_failed_turn_never_calls_soft_probe(
+    monkeypatch, tmp_path, terminal_flag,
+):
+    runner, _ = _refusal_stage_runner(monkeypatch, tmp_path)
+    probe = MagicMock(side_effect=AssertionError("terminal turn must skip probe"))
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
+
+    assert asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1",
+        "sid-1",
+        _source(),
+        {
+            "final_response": "A response long enough to otherwise be classified. " * 2,
+            terminal_flag: True,
+        },
+        "request",
+    )) == 0
+    probe.assert_not_called()
 
 
 def test_refusal_notify_suppressed_by_config(monkeypatch, tmp_path):
