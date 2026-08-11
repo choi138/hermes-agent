@@ -6251,37 +6251,93 @@ class DiscordAdapter(BasePlatformAdapter):
         is_startup_replay = bool(
             getattr(event, "_hermes_startup_restore_replay", False)
         )
-        is_external_discord_thread = bool(
+        is_external_discord_message = bool(
             source is not None
             and getattr(source, "platform", None) == Platform.DISCORD
-            and getattr(source, "chat_type", None) == "thread"
             and not getattr(event, "internal", False)
         )
-        if is_startup_replay and is_external_discord_thread:
-            thread_id = str(
-                getattr(source, "thread_id", None)
+        is_external_discord_thread = bool(
+            is_external_discord_message
+            and getattr(source, "chat_type", None) == "thread"
+        )
+        if is_startup_replay and is_external_discord_message:
+            route_channel_id = str(
+                (
+                    getattr(source, "thread_id", None)
+                    if is_external_discord_thread
+                    else None
+                )
                 or getattr(source, "chat_id", "")
                 or ""
             )
+            route_parent_id = getattr(source, "parent_chat_id", None)
             raw_message = getattr(event, "raw_message", None)
             metadata = getattr(event, "metadata", {})
-            original_content = (
-                metadata.get("discord_original_content")
-                if isinstance(metadata, dict)
-                else None
-            )
-            if not isinstance(original_content, str):
-                original_content = str(
-                    getattr(raw_message, "content", None)
-                    or getattr(event, "text", "")
-                    or ""
-                )
             route_result = None
-            if thread_id and raw_message is not None:
+            if route_channel_id and raw_message is None:
+                router = getattr(self, "_mention_inbox_router", None)
+                if router is not None:
+                    try:
+                        surface_checker = getattr(router, "is_agent_surface", None)
+                        agent_surface = bool(
+                            surface_checker(route_channel_id, route_parent_id)
+                            if callable(surface_checker)
+                            else False
+                        )
+                        registered_thread = bool(
+                            is_external_discord_thread
+                            and not agent_surface
+                            and router.is_work_thread(route_channel_id)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Startup replay work-surface validation failed closed",
+                            self.name,
+                            exc_info=True,
+                        )
+                        return True
+                    if registered_thread or agent_surface:
+                        logger.warning(
+                            "[%s] Dropping startup-replayed Work Inbox message "
+                            "without raw Discord human-admission evidence",
+                            self.name,
+                        )
+                        return True
+            if route_channel_id and raw_message is not None:
+                raw_channel = getattr(raw_message, "channel", None)
+                raw_parent_id = getattr(raw_channel, "parent_id", None)
+                if raw_parent_id is None:
+                    raw_parent_id = getattr(
+                        getattr(raw_channel, "parent", None),
+                        "id",
+                        None,
+                    )
+                if raw_parent_id is not None:
+                    route_parent_id = str(raw_parent_id)
+                replay_content = str(getattr(raw_message, "content", "") or "")
+                stored_content = (
+                    metadata.get("discord_original_content")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if isinstance(stored_content, str):
+                    comparable_content = stored_content
+                    bot_id = getattr(getattr(self, "_client", None), "user", None)
+                    bot_id = getattr(bot_id, "id", None)
+                    if bot_id is not None:
+                        comparable_content = comparable_content.replace(
+                            f"<@{bot_id}>", ""
+                        ).replace(f"<@!{bot_id}>", "")
+                    if comparable_content.strip() == replay_content.strip():
+                        replay_content = stored_content
                 route_result = await self._route_mention_inbox_message_result(
                     raw_message,
-                    thread_id=thread_id,
-                    raw_content=original_content,
+                    thread_id=route_channel_id,
+                    parent_channel_id=(
+                        None if route_parent_id is None else str(route_parent_id)
+                    ),
+                    raw_content=replay_content,
+                    check_registered_thread=is_external_discord_thread,
                 )
             if route_result is not None and bool(route_result.handled):
                 return True
@@ -6292,6 +6348,19 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if isinstance(agent_text, str) and agent_text.strip():
                 event.text = agent_text
+                event.message_type = MessageType.TEXT
+                event.channel_context = None
+                event.media_urls = []
+                event.media_types = []
+                event.reply_to_message_id = None
+                event.reply_to_text = None
+                event.reply_to_author_id = None
+                event.reply_to_author_name = None
+                event.reply_to_is_own_message = False
+                if isinstance(metadata, dict):
+                    metadata["discord_original_content"] = replay_content
+                if event.source is not None:
+                    event.source.chat_name = "Work Inbox"
 
         # Internal approved-execution events and ordinary Discord events stay
         # on the shared adapter rail. Returning True records successful
@@ -6430,15 +6499,52 @@ class DiscordAdapter(BasePlatformAdapter):
         return dispatch_id
 
     async def _route_mention_inbox_message_result(
-        self, message: Any, *, thread_id: str, raw_content: str
+        self,
+        message: Any,
+        *,
+        thread_id: str,
+        raw_content: str,
+        parent_channel_id: str | None = None,
+        check_registered_thread: bool = True,
     ) -> Any | None:
         router = getattr(self, "_mention_inbox_router", None)
-        if router is None or not router.is_work_thread(thread_id):
+        if router is None:
             return None
         from plugins.mention_inbox.router import (
             InboxDiscordMessage,
             InboxRouteResult,
         )
+
+        try:
+            surface_checker = getattr(router, "is_agent_surface", None)
+            agent_surface = bool(
+                surface_checker(thread_id, parent_channel_id)
+                if callable(surface_checker)
+                else False
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Mention-inbox work-surface validation failed closed",
+                self.name,
+                exc_info=True,
+            )
+            return InboxRouteResult(True, "agent_surface_validation_failed")
+        if agent_surface:
+            registered_thread = False
+        elif not check_registered_thread:
+            return None
+        else:
+            try:
+                registered_thread = bool(router.is_work_thread(thread_id))
+            except Exception:
+                logger.warning(
+                    "[%s] Mention-inbox registered-thread validation failed closed",
+                    self.name,
+                    exc_info=True,
+                )
+                return InboxRouteResult(True, "registered_thread_validation_failed")
+        if not registered_thread and not agent_surface:
+            return None
 
         reference = getattr(message, "reference", None)
         reply_to = getattr(reference, "message_id", None)
@@ -6446,6 +6552,12 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to = getattr(getattr(reference, "resolved", None), "id", None)
         user_id = str(getattr(getattr(message, "author", None), "id", ""))
         message_id = str(getattr(message, "id", ""))
+        author = getattr(message, "author", None)
+        admitted_human = (
+            author is not None
+            and getattr(author, "bot", None) is False
+            and getattr(message, "webhook_id", None) is None
+        )
         content = raw_content
         bot_id = getattr(getattr(self, "_client", None), "user", None)
         bot_id = getattr(bot_id, "id", None)
@@ -6459,6 +6571,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     user_id=user_id,
                     text=content,
                     reply_to_message_id=(None if reply_to is None else str(reply_to)),
+                    parent_channel_id=parent_channel_id,
+                    admitted_human=admitted_human,
                 )
             )
         except Exception:
@@ -8188,7 +8302,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
-        raw_content = message.content.strip()
+        direct_content = message.content.strip()
+        raw_content = direct_content
         normalized_content = raw_content
         mention_prefix = False
 
@@ -8255,11 +8370,18 @@ class DiscordAdapter(BasePlatformAdapter):
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
-        if is_thread and thread_id is not None:
+        mention_inbox_agent_passthrough = False
+        route_channel_id = str(getattr(message.channel, "id", ""))
+        route_parent_id = parent_channel_id
+        if route_channel_id:
             route_result = await self._route_mention_inbox_message_result(
                 message,
-                thread_id=thread_id,
-                raw_content=raw_content,
+                thread_id=route_channel_id,
+                parent_channel_id=(
+                    None if route_parent_id is None else str(route_parent_id)
+                ),
+                raw_content=direct_content,
+                check_registered_thread=is_thread,
             )
             if route_result is not None and bool(route_result.handled):
                 return True
@@ -8270,6 +8392,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if isinstance(agent_text, str) and agent_text.strip():
                 normalized_content = agent_text
+                mention_inbox_agent_passthrough = True
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -8322,10 +8445,15 @@ class DiscordAdapter(BasePlatformAdapter):
         referenced_attachments = []
         reference = getattr(message, "reference", None)
         resolved_reference = getattr(reference, "resolved", None) if reference else None
-        if resolved_reference is not None:
+        if resolved_reference is not None and not mention_inbox_agent_passthrough:
             referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
 
-        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
+        inherited_attachments = (
+            []
+            if mention_inbox_agent_passthrough
+            else snapshot_attachments + referenced_attachments
+        )
+        all_attachments = list(message.attachments) + inherited_attachments
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -8371,6 +8499,8 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"
+        if mention_inbox_agent_passthrough:
+            chat_name = "Work Inbox"
 
         # Get channel topic (if available - TextChannels have topics, DMs/threads don't).
         # For threads whose parent is a forum channel, inherit the parent's topic
@@ -8548,7 +8678,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # to keep the partition rule clean.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
+        if (
+            not _is_dm
+            and not mention_inbox_agent_passthrough
+            and self._discord_history_backfill()
+        ):
             # Run backfill when there's a real gap to fill:
             #   - mention-gated channels with no free-response override
             #     (messages between bot turns aren't in the transcript)
@@ -8625,7 +8759,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         reply_to_id = None
         reply_to_text = None
-        if message.reference:
+        if message.reference and not mention_inbox_agent_passthrough:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None

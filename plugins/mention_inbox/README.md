@@ -401,6 +401,7 @@ mention_inbox:
   action_sessions:
     enabled: false
     execution_enabled: false
+    user_message_mode: proposal_router
     authorized_approver_ids: []
     bot_mention: null
     execution_mode: direct
@@ -420,6 +421,28 @@ destination, create public threads, send messages in threads, and add guild
 members to those threads. Configured Discord IDs must be positive uint64
 snowflakes; impossible out-of-range values fail configuration before any API
 write.
+
+`action_sessions.user_message_mode` is an independent, opt-in routing gate.
+The default `proposal_router` keeps the deterministic proposal, approval, and
+read-only conversation behavior described below. `standard_agent` promotes a
+direct request in the configured destination channel, one of its child threads,
+or a registered work-item thread to the normal Hermes agent only when the
+Discord adapter has admitted the message and positively identified a non-bot,
+non-webhook author. A bot, webhook, missing author classification, or direct
+router call without that platform marker fails closed before any agent or tool
+dispatch. Registered work items carry only bounded store-derived context;
+unregistered destination messages use `work_item: null`. The complete
+`work_item` value is labelled as untrusted, non-executing data, and stored
+capability and approval fields are omitted because they cannot grant authority
+to the standard agent. Generic Discord history, reply text, reply/forward
+attachments, forwarded snapshot text, and external thread names are excluded.
+Only text and attachments supplied directly on the admitted human's current
+message can accompany the store-derived payload. Startup replay revalidates both
+the configured parent channel and child threads, and fails closed for a Work
+Inbox event when its raw Discord human-admission evidence is missing. If an
+admitted startup-replayed message is promoted, any pre-router history, reply,
+forward, and media context is discarded rather than guessing which attachment
+was direct; the user must resend a needed attachment after startup.
 
 On gateway startup, the runtime reconciles at most 1,000 active work-item
 sessions whose Discord parent matches the currently configured destination. It
@@ -441,10 +464,13 @@ reclaimed the attempt, the stale worker is cancelled before it can post
 proposal controls and cannot overwrite the current attempt's error state.
 Proposal sends also use a deterministic revision-specific Discord nonce so an
 uncertain concurrent accept converges on one visible message.
-Read-only external proposals (`inspect_only`) never route write-like requests
-to the full tool-capable agent, even when the requester is an authorized
-approver. Membership is additive: removing an ID from configuration or rolling
-back this code does not remove members already added to Discord threads.
+With the default `user_message_mode=proposal_router`, read-only external
+proposals (`inspect_only`) never route write-like requests to the full
+tool-capable agent, even when the requester is an authorized approver. Opting
+into `standard_agent` changes only admitted human messages; collected external
+notifications remain non-executing untrusted data. Membership is additive:
+removing an ID from configuration or rolling back this code does not remove
+members already added to Discord threads.
 
 Read replay is limited to at most seven days and ten pages even when configured
 explicitly. It is GET-only and never changes GitHub notification read state.
@@ -522,6 +548,11 @@ but `action_sessions.execution_enabled=false` is review-only mode. Review-only
 messages contain no approval CTA and are stored with `approval_offered=false`.
 Even when execution is enabled, stale, informational, or insufficient evidence
 cannot offer approval.
+
+That review-only statement applies to the deterministic proposal execution
+rail. When `user_message_mode=standard_agent`, a newly admitted human message
+uses the normal Hermes agent and its ordinary channel tool and approval policy;
+it does not inherit execution authority from the stored external proposal.
 
 There are two deterministic ways for an authorized user to request execution:
 

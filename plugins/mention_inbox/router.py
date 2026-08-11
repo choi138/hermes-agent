@@ -132,6 +132,8 @@ class InboxDiscordMessage:
     user_id: str
     text: str
     reply_to_message_id: str | None = None
+    parent_channel_id: str | None = None
+    admitted_human: bool = False
 
 
 @dataclass(frozen=True)
@@ -174,17 +176,43 @@ class InboxProposalRouter:
         authorized_approver_ids: frozenset[str],
         approval_handler: object | None = None,
         conversation_responder: ReadOnlyConversationResponder | None = None,
+        user_message_mode: str = "proposal_router",
+        destination_channel_id: str | None = None,
         thread_destination_validator: (
             Callable[[str], Awaitable[bool]] | None
         ) = None,
     ) -> None:
+        if (
+            not isinstance(user_message_mode, str)
+            or user_message_mode not in {"proposal_router", "standard_agent"}
+        ):
+            raise ValueError("user_message_mode is invalid")
+        if destination_channel_id is not None and (
+            not isinstance(destination_channel_id, str)
+            or not destination_channel_id
+        ):
+            raise ValueError("destination_channel_id is invalid")
         self._store = store
         self._discord = discord
         self._bot_mention = bot_mention
         self._authorized_approver_ids = authorized_approver_ids
         self._approval_handler = approval_handler
         self._conversation_responder = conversation_responder
+        self._user_message_mode = user_message_mode
+        self._destination_channel_id = destination_channel_id
         self._thread_destination_validator = thread_destination_validator
+
+    def is_agent_surface(
+        self,
+        channel_id: str,
+        parent_channel_id: str | None,
+    ) -> bool:
+        destination = self._destination_channel_id
+        return (
+            self._user_message_mode == "standard_agent"
+            and destination is not None
+            and (channel_id == destination or parent_channel_id == destination)
+        )
 
     async def _is_current_destination(self, thread_id: str) -> bool:
         validator = self._thread_destination_validator
@@ -589,9 +617,13 @@ class InboxProposalRouter:
         if not isinstance(message, InboxDiscordMessage):
             raise ValueError("message must be an InboxDiscordMessage")
         session = self._store.get_work_item_session_by_thread(message.thread_id)
-        if session is None:
+        agent_surface = self.is_agent_surface(
+            message.thread_id,
+            message.parent_channel_id,
+        )
+        if session is None and not agent_surface:
             return InboxRouteResult(False, "not_work_thread")
-        if not await self._is_current_destination(message.thread_id):
+        if session is not None and not await self._is_current_destination(message.thread_id):
             return InboxRouteResult(
                 True,
                 "work_thread_wrong_destination",
@@ -600,12 +632,51 @@ class InboxProposalRouter:
         if not feedback:
             return InboxRouteResult(True, "empty_message")
 
-        latest = self._store.get_latest_proposal(session.subject_key)
+        latest = (
+            None
+            if session is None
+            else self._store.get_latest_proposal(session.subject_key)
+        )
+        if self._user_message_mode == "standard_agent" and not message.admitted_human:
+            return InboxRouteResult(
+                True,
+                "agent_passthrough_non_human",
+                latest,
+            )
         if latest is None:
+            if self._user_message_mode == "standard_agent":
+                return InboxRouteResult(
+                    False,
+                    "agent_passthrough",
+                    agent_text=build_agent_passthrough_message(
+                        message=message.text,
+                        context=None,
+                    ),
+                )
             return InboxRouteResult(True, "proposal_missing")
         binding = self._store.get_proposal_message_binding(
             latest.proposal_id, latest.revision
         )
+
+        if self._user_message_mode == "standard_agent":
+            stored = self._store.get(latest.source_dedupe_key)
+            context = build_conversation_context(
+                stored=stored,
+                proposal=latest,
+                approval_offered=bool(
+                    binding is not None and binding.approval_offered
+                ),
+                execution_available=self._approval_handler is not None,
+            )
+            return InboxRouteResult(
+                False,
+                "agent_passthrough",
+                latest,
+                agent_text=build_agent_passthrough_message(
+                    message=message.text,
+                    context=context,
+                ),
+            )
 
         if self._is_exact_approval(message):
             return await self._route_approval(message, latest, binding)

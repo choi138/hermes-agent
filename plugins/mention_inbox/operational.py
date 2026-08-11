@@ -74,6 +74,7 @@ class MentionInboxConfig:
     team_mentions: bool = False
     team_review_requests: bool = False
     action_sessions_enabled: bool = False
+    user_message_mode: str = "proposal_router"
     proposal_bot_mention: str | None = None
     authorized_approver_ids: tuple[str, ...] = ()
     thread_auto_archive_minutes: int = 1440
@@ -157,6 +158,12 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
     execution_enabled = action_sessions.get("execution_enabled", False)
     if not isinstance(action_sessions_enabled, bool) or not isinstance(execution_enabled, bool):
         raise ValueError("mention_inbox action-session switches must be booleans")
+    user_message_mode = action_sessions.get("user_message_mode", "proposal_router")
+    if (
+        not isinstance(user_message_mode, str)
+        or user_message_mode not in {"proposal_router", "standard_agent"}
+    ):
+        raise ValueError("mention_inbox action-session user_message_mode is invalid")
     advisory_summary = raw.get("advisory_summary", False)
     if not isinstance(advisory_summary, bool):
         raise ValueError("mention_inbox.advisory_summary must be a boolean")
@@ -247,6 +254,7 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         team_mentions=team_mentions,
         team_review_requests=team_review_requests,
         action_sessions_enabled=action_sessions_enabled,
+        user_message_mode=user_message_mode,
         proposal_bot_mention=bot_mention,
         authorized_approver_ids=tuple(approver_ids),
         thread_auto_archive_minutes=archive_minutes,
@@ -1238,6 +1246,8 @@ class MentionInboxGatewayService:
                     ),
                     approval_handler=approval_handler,
                     conversation_responder=HostReadOnlyConversationResponder(),
+                    user_message_mode=self.config.user_message_mode,
+                    destination_channel_id=destination_channel_id,
                     thread_destination_validator=lambda thread_id: (
                         discord_transport.thread_has_parent(
                             thread_id,

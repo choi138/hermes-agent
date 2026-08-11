@@ -11,6 +11,7 @@ import pytest
 from plugins.mention_inbox import ingest_event
 from plugins.mention_inbox.conversation import (
     HostReadOnlyConversationResponder,
+    build_agent_passthrough_message,
     build_conversation_context,
     normalize_conversation_response,
 )
@@ -132,6 +133,40 @@ def test_context_includes_only_head_bound_preapproval_evidence() -> None:
     assert mismatched.disposition is None
     assert mismatched.brief_summary is None
     assert mismatched.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("request_length", "expected_length", "expected_ellipsis"),
+    (
+        (599, 599, False),
+        (600, 600, False),
+        (601, 600, True),
+    ),
+)
+def test_agent_passthrough_request_has_exact_600_character_boundary(
+    request_length: int,
+    expected_length: int,
+    expected_ellipsis: bool,
+) -> None:
+    prompt = build_agent_passthrough_message(
+        message="가" * request_length,
+        context=None,
+    )
+    payload = json.loads(prompt.split("\n\n", 1)[1])
+    user_request = payload["user_request"]
+
+    assert len(user_request) == expected_length
+    assert user_request.endswith("…") is expected_ellipsis
+
+
+def test_agent_passthrough_request_removes_controls_and_normalizes_whitespace() -> None:
+    prompt = build_agent_passthrough_message(
+        message="  alpha\t beta\n \x00gamma\u200b  ",
+        context=None,
+    )
+    payload = json.loads(prompt.split("\n\n", 1)[1])
+
+    assert payload["user_request"] == "alpha beta gamma"
 
 
 @pytest.mark.asyncio

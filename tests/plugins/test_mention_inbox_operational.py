@@ -73,6 +73,7 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     assert disabled.read_replay_max_pages == 2
     assert disabled.include_public_actionable_activity is False
     assert disabled.external_repository_actions == "disabled"
+    assert disabled.user_message_mode == "proposal_router"
     config = parse_mention_inbox_config({"mention_inbox": {
         "enabled": True,
         "credential_env": "GITHUB_PAT_TOKEN",
@@ -87,6 +88,10 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     }})
     assert public_config.include_public_actionable_activity is True
     assert public_config.external_repository_actions == "inspect_only"
+    standard_agent_config = parse_mention_inbox_config({"mention_inbox": {
+        "action_sessions": {"user_message_mode": "standard_agent"},
+    }})
+    assert standard_agent_config.user_message_mode == "standard_agent"
     for invalid in (
         {"enabled": "true"},
         {"enabled": True, "credential_env": "TOKEN"},
@@ -97,6 +102,8 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
         {"enabled": True, "read_replay_max_pages": 11},
         {"include_public_actionable_activity": "true"},
         {"external_repository_actions": "write"},
+        {"action_sessions": {"user_message_mode": "unrestricted"}},
+        {"action_sessions": {"user_message_mode": ["standard_agent"]}},
     ):
         with pytest.raises(ValueError):
             parse_mention_inbox_config({"mention_inbox": invalid})
@@ -1076,6 +1083,7 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
         repositories=("silviahealth/content",),
         destination=DESTINATION,
         action_sessions_enabled=True,
+        user_message_mode="standard_agent",
         proposal_bot_mention="<@1525050677381279865>",
         authorized_approver_ids=("396159160201658368",),
         execution_enabled=execution_enabled,
@@ -1094,6 +1102,7 @@ async def test_execution_handler_is_wired_only_when_explicitly_enabled(
 
     assert adapter.router is not None
     assert adapter.router._conversation_responder is not None
+    assert adapter.router._user_message_mode == "standard_agent"
     assert (adapter.router._approval_handler is not None) is expected_handler
     assert (adapter.execution_observer is not None) is execution_enabled
     assert service._runtime is not None
