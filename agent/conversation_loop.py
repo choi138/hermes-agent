@@ -90,7 +90,7 @@ from agent.retry_utils import (
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
 )
-from agent.refusal_history import clean_fork_messages
+from agent.refusal_history import current_user_ordinal_from_tail, user_anchor_from_tail
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1149,13 +1149,15 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def _apply_refusal_clean_fork(agent, messages, api_messages) -> int:
+def _apply_refusal_clean_fork(
+    agent, messages, api_messages, current_turn_user_idx: int,
+) -> int:
     """Clean both durable and in-flight history after a refusal fallback.
 
     ``api_messages`` is a provider-shaped copy built before the retry loop, so
     cleaning only ``messages`` would still resend the refusal-contaminated
-    request on an in-block ``continue``.  Keep the request's leading system
-    message and the provider-shaped copies of the same surviving user turns.
+    request on an in-block ``continue``. Keep every completed earlier turn and
+    truncate only rows generated after this turn's real user anchor.
 
     Returns the number of durable messages dropped, or zero when disabled.
     """
@@ -1174,29 +1176,29 @@ def _apply_refusal_clean_fork(agent, messages, api_messages) -> int:
     if not clean_fork:
         return 0
 
-    original_count = len(messages)
-    cleaned_messages = clean_fork_messages(
+    user_from_tail = current_user_ordinal_from_tail(
         messages,
+        current_turn_user_idx,
         keep_user_turns=keep_user_turns,
     )
-    messages[:] = cleaned_messages
-
-    # Prefill messages may also use the user role and sit immediately after
-    # the system prompt.  Count surviving durable users, then take that many
-    # provider-shaped users from the tail so prefills cannot displace the live
-    # request while api_content/context-engine transformations are preserved.
-    surviving_users = sum(
-        1 for message in cleaned_messages if message.get("role") == "user"
-    )
-    api_messages[:] = clean_fork_messages(
+    if user_from_tail is None:
+        return 0
+    api_anchor = user_anchor_from_tail(
         api_messages,
-        keep_user_turns=surviving_users,
+        user_from_tail,
+        keep_user_turns=keep_user_turns,
     )
+    if api_anchor is None:
+        return 0
+
+    original_count = len(messages)
+    messages[:] = messages[: current_turn_user_idx + 1]
+    api_messages[:] = api_messages[: api_anchor + 1]
 
     agent._session_messages = messages
     agent._refusal_clean_fork_active = True
     agent._refusal_recall_quarantine = True
-    dropped = original_count - len(cleaned_messages)
+    dropped = original_count - len(messages)
     agent._buffer_status(f"⚠️ Refusal fallback clean_fork=yes dropped={dropped}")
     return dropped
 
@@ -3307,7 +3309,9 @@ def _run_conversation_impl(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
                     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
-                        _apply_refusal_clean_fork(agent, messages, api_messages)
+                        _apply_refusal_clean_fork(
+                            agent, messages, api_messages, current_turn_user_idx,
+                        )
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3483,7 +3487,10 @@ def _run_conversation_impl(
                                 # gets a coherent continuation point.
                                 if truncated_response_parts:
                                     messages = agent._get_messages_up_to_last_assistant(messages)
-                                _apply_refusal_clean_fork(agent, messages, api_messages)
+                                _apply_refusal_clean_fork(
+                                    agent, messages, api_messages,
+                                    current_turn_user_idx,
+                                )
                                 agent._session_messages = messages
                                 length_continue_retries = 0
                                 truncated_response_parts = []
@@ -5121,7 +5128,10 @@ def _run_conversation_impl(
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
                         if classified.reason == FailoverReason.content_policy_blocked:
-                            _apply_refusal_clean_fork(agent, messages, api_messages)
+                            _apply_refusal_clean_fork(
+                                agent, messages, api_messages,
+                                current_turn_user_idx,
+                            )
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0

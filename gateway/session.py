@@ -3594,6 +3594,26 @@ class SessionStore:
             logger.debug("Failed to rewrite transcript in DB: %s", e)
             return False
 
+    def deactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
+        """Reversibly hide explicit transcript rows in the canonical DB."""
+        if not self._db or not message_ids:
+            return 0
+        try:
+            return self._db.deactivate_messages(session_id, message_ids)
+        except Exception as e:
+            logger.debug("Failed to deactivate transcript messages: %s", e)
+            return 0
+
+    def reactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
+        """Reverse :meth:`deactivate_messages` for explicit transcript rows."""
+        if not self._db or not message_ids:
+            return 0
+        try:
+            return self._db.reactivate_messages(session_id, message_ids)
+        except Exception as e:
+            logger.debug("Failed to reactivate transcript messages: %s", e)
+            return 0
+
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript.
 

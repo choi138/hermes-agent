@@ -661,16 +661,19 @@ class TestLoopCallSitesForwardReason:
             message.get("content") == "I can't help with that."
             for message in requests[0]
         )
-        assert all(message.get("role") != "assistant" for message in requests[1])
+        assert any(
+            message.get("content") == "I can't help with that."
+            for message in requests[1]
+        )
         assert all(message.get("role") != "tool" for message in requests[1])
-        assert all(
-            message.get("content") != "I can't help with that."
+        assert any(
+            message.get("content") == "I can't help with that."
             for message in result["messages"]
         )
         assert agent._refusal_clean_fork_active is True
         assert agent._refusal_recall_quarantine is True
         assert any(
-            "clean_fork=yes dropped=1" in str(status_call.args[0])
+            "clean_fork=yes dropped=0" in str(status_call.args[0])
             for status_call in buffer_status.call_args_list
         )
 

@@ -142,6 +142,18 @@ DEV_REFUSAL_S0 = (
     "unchanged for the label."
 )
 
+DEV_PRIOR_REFUSAL_S0B = (
+    "S0b PRIOR REFUSAL — independently set prior_refusal=true ONLY when the most "
+    "recent assistant turn in the dialogue DECLINED or refused the user's request "
+    "(refused to write/build it, said it cannot or will not help, or answered only "
+    "with reasons why the request is impermissible). Do NOT set it for: normal "
+    "technical limitations (\"this API can't do that, change the schema\"), "
+    "disagreement or pushback on approach, delivered work with caveats, questions "
+    "back to the user, or discussion ABOUT refusals/filters/moderation as a topic. "
+    "Precision first: when unsure set prior_refusal=false. Set "
+    "prior_refusal_confidence accordingly."
+)
+
 DEV_REFUSAL_EXAMPLE = (
     '"노골적인 NSFW 장면을 써줘" → '
     '{evidence:"S0/R explicit NSFW authoring + S6 prose",label:DOCUMENT_WORK,'
@@ -159,7 +171,7 @@ Core law: TOPIC ≠ TASK. An engineering topic never makes a turn dev; only comm
 
 Apply steps IN ORDER; first match wins.
 
-""" + DEV_REFUSAL_S0 + """
+""" + DEV_REFUSAL_S0 + "\n\n" + DEV_PRIOR_REFUSAL_S0B + """
 
 S1 CONTINUATION — bare go-ahead ("ㄱㄱ","진행해","좋아 그렇게 해줘","continue"): inherit from recent dialogue. Prior turn proposed a code/config/schema implementation plan or dev work is ongoing → that DEV label — never downgrade it. Proposed a document draft → DOCUMENT_WORK. Proposed an ops action (restart/rerun/cleanup) or context unclear → NORMAL.
 
@@ -213,12 +225,22 @@ DEV_RESPONSE_SCHEMA: dict[str, Any] = {
             "minimum": 0,
             "maximum": 1,
         },
+        "prior_refusal": {
+            "type": "boolean",
+        },
+        "prior_refusal_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
     },
     "required": [
         "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
+        "prior_refusal", "prior_refusal_confidence",
     ],
     "propertyOrdering": [
         "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
+        "prior_refusal", "prior_refusal_confidence",
     ],
 }
 
@@ -746,12 +768,28 @@ def _parse_dev_json(raw: str) -> dict[str, Any] | None:
             refusal_confidence = None
     except (TypeError, ValueError):
         refusal_confidence = None
+    prior_refusal = obj.get("prior_refusal") is True
+    try:
+        prior_refusal_confidence = (
+            float(obj.get("prior_refusal_confidence"))
+            if obj.get("prior_refusal_confidence") is not None
+            else None
+        )
+        if (
+            prior_refusal_confidence is not None
+            and not 0 <= prior_refusal_confidence <= 1
+        ):
+            prior_refusal_confidence = None
+    except Exception:
+        prior_refusal_confidence = None
     return {
         "label": label,
         "confidence": confidence,
         "evidence": evidence,
         "refusal_risk": refusal_risk,
         "refusal_confidence": refusal_confidence,
+        "prior_refusal": prior_refusal,
+        "prior_refusal_confidence": prior_refusal_confidence,
     }
 
 
@@ -767,6 +805,8 @@ def _fallback_classification(
         "classification_reason": reason,
         "refusal_risk": False,
         "refusal_confidence": None,
+        "prior_refusal": False,
+        "prior_refusal_confidence": None,
     }
 
 
@@ -781,7 +821,7 @@ def classify_dev_detailed(
     """Classify dev routing with structured output.
 
     Returns {label, confidence, evidence, refusal_risk, refusal_confidence,
-    source, classification_reason}.
+    prior_refusal, prior_refusal_confidence, source, classification_reason}.
     ``source='llm'`` is reserved for a fully valid structured decision;
     malformed/plain responses and transport errors use the regex fallback.
     Hysteresis logic must only trust authoritative LLM NORMALs — a fail-open
@@ -1163,7 +1203,10 @@ def static_rule_decision(
         "rule": rule_name,
         "refusal_risk": False,
         "refusal_confidence": None,
+        "prior_refusal": False,
+        "prior_refusal_confidence": None,
         "refusal_applied": False,
+        "masked": 0,
     }
     return RoutingDecision(
         directive=directive, outcome=outcome, label=route_name,
@@ -1199,6 +1242,55 @@ def _classifier_request_settings(router: Any) -> tuple[str, str, float, float]:
     )
     classify_timeout = float(getattr(router, "classify_timeout_s", 2.0) or 2.0)
     return provider, model, transport_timeout, classify_timeout
+
+
+def _mask_newest_active_assistant(session_store: Any, session_id: str) -> int:
+    """Reversibly hide the newest visible assistant row for a soft refusal."""
+    if not session_store or not session_id:
+        return 0
+    db = getattr(session_store, "_db", None)
+    if db is None:
+        return 0
+    try:
+        message_id = db.latest_message_row_id(
+            session_id, role="assistant", require_text=True,
+        )
+    except (AttributeError, TypeError):
+        try:
+            message_id = next(
+                (
+                    message.get("id")
+                    for message in reversed(db.get_messages(session_id))
+                    if message.get("role") == "assistant"
+                    and str(message.get("content") or "").strip()
+                ),
+                None,
+            )
+        except Exception:
+            message_id = None
+    except Exception:
+        logger.debug("model router: newest assistant lookup failed", exc_info=True)
+        return 0
+    if message_id is None:
+        return 0
+    try:
+        return int(session_store.deactivate_messages(session_id, [int(message_id)]) or 0)
+    except Exception:
+        logger.debug("model router: prior-refusal masking failed", exc_info=True)
+        return 0
+
+
+def refusal_route_for_label(refusal: Any, label: str) -> str:
+    """Return the configured permissive route for a classifier label."""
+    if label in {"SYSTEM_DEV", "FRONTEND_DEV"}:
+        return str(getattr(refusal, "dev_route", "") or "")
+    if label == "DOCUMENT_WORK":
+        return str(
+            getattr(refusal, "document_route", "")
+            or getattr(refusal, "chat_route", "")
+            or ""
+        )
+    return str(getattr(refusal, "chat_route", "") or "")
 
 
 def classifier_decision(
@@ -1273,6 +1365,11 @@ def classifier_decision_from_detail(
     dev_label = detail["label"]
     state_key = context.session_key or context.session_id or "unknown"
     entry = state.setdefault(state_key, {"normal_streak": 0})
+    # A deterministic hard refusal from the prior turn is a one-shot signal.
+    # Pop before any routing work so disabled refusal routing, resolution
+    # failure, or a failed apply cannot replay it on later turns.
+    force_refusal_route = bool(entry.pop("force_refusal_route", False))
+    force_refusal_reason = str(entry.pop("force_refusal_reason", "") or "")
     refusal_repromote_streak = int(entry.get("repromote_streak") or 0)
     refusal_repromote_route = str(entry.get("repromote_route") or "")
     label_routes = dict(getattr(router, "label_routes", None) or {})
@@ -1360,30 +1457,63 @@ def classifier_decision_from_detail(
     }
     refusal_risk = detail.get("refusal_risk") is True
     refusal_confidence = detail.get("refusal_confidence")
+    prior_refusal = detail.get("prior_refusal") is True
+    prior_refusal_confidence = detail.get("prior_refusal_confidence")
     refusal_applied = False
     refusal_below_threshold = False
+    prior_refusal_below_threshold = False
+    masked = 0
+    refusal_signal = ""
     try:
         refusal = getattr(router, "refusal", None)
-        if (
-            bool(getattr(refusal, "enabled", False))
-            and refusal_risk
-            and detail.get("source") == "llm"
-        ):
+        refusal_enabled = bool(getattr(refusal, "enabled", False))
+        current_refusal_qualified = False
+        prior_refusal_qualified = False
+        if refusal_enabled:
             threshold = float(getattr(refusal, "min_confidence", 0.85))
-            confidence = float(refusal_confidence)
-            if confidence < threshold:
-                refusal_below_threshold = True
-            else:
-                if dev_label in {"SYSTEM_DEV", "FRONTEND_DEV"}:
-                    refusal_route = str(getattr(refusal, "dev_route", "") or "")
-                elif dev_label == "DOCUMENT_WORK":
-                    refusal_route = str(
-                        getattr(refusal, "document_route", "")
-                        or getattr(refusal, "chat_route", "")
-                        or ""
-                    )
+            if refusal_risk and detail.get("source") == "llm":
+                try:
+                    current_confidence = float(refusal_confidence)
+                except (TypeError, ValueError):
+                    current_confidence = None
+                if current_confidence is not None:
+                    current_refusal_qualified = current_confidence >= threshold
+                    refusal_below_threshold = current_confidence < threshold
+            if prior_refusal and detail.get("source") == "llm":
+                try:
+                    prior_confidence = float(prior_refusal_confidence)
+                except (TypeError, ValueError):
+                    prior_confidence = None
+                if prior_confidence is not None:
+                    prior_refusal_qualified = prior_confidence >= threshold
+                    prior_refusal_below_threshold = prior_confidence < threshold
+
+            refusal_triggered = (
+                force_refusal_route
+                or current_refusal_qualified
+                or prior_refusal_qualified
+            )
+            if refusal_triggered:
+                if force_refusal_route:
+                    refusal_signal = force_refusal_reason or "prior_turn_refused"
+                elif prior_refusal_qualified:
+                    refusal_signal = "prior_refusal"
                 else:
-                    refusal_route = str(getattr(refusal, "chat_route", "") or "")
+                    refusal_signal = "refusal_risk"
+
+                # The pre-dispatch classifier already receives recent_turns,
+                # so detecting and masking a soft refusal adds no API call and
+                # no user-visible latency. Shadow mode remains read-only.
+                if (
+                    prior_refusal_qualified
+                    and mode == "enforce"
+                    and bool(getattr(refusal, "mask_on_refusal", True))
+                ):
+                    masked = _mask_newest_active_assistant(
+                        session_store, context.session_id,
+                    )
+
+                refusal_route = refusal_route_for_label(refusal, dev_label)
 
                 refusal_directive = _resolve_route_directive(refusal_route, cfg, catalog)
                 if refusal_directive is not None:
@@ -1438,10 +1568,19 @@ def classifier_decision_from_detail(
         "rule": None,
         "refusal_risk": refusal_risk,
         "refusal_confidence": refusal_confidence,
+        "prior_refusal": prior_refusal,
+        "prior_refusal_confidence": prior_refusal_confidence,
         "refusal_applied": refusal_applied,
+        "masked": masked,
     }
     if refusal_below_threshold:
         record["refusal_below_threshold"] = True
+    if prior_refusal_below_threshold:
+        record["prior_refusal_below_threshold"] = True
+    if force_refusal_route:
+        record["forced_refusal_route"] = True
+    if refusal_signal:
+        record["refusal_signal"] = refusal_signal
     return RoutingDecision(
         directive=directive, outcome=outcome, label=dev_label, rule=None, record=record,
     )

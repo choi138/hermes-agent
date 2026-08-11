@@ -1,44 +1,61 @@
-"""History shaping for refusal-driven model hops."""
+"""History anchoring for refusal-driven model hops."""
 
 from __future__ import annotations
 
-from typing import Any
 
-
-def clean_fork_messages(
+def current_user_ordinal_from_tail(
     messages: list[dict] | None,
+    current_turn_user_idx: int,
     *,
     keep_user_turns: int = 5,
-) -> list[dict]:
-    """Return leading system messages plus the last requested user turns.
+) -> int | None:
+    """Return the current user row's 1-based user ordinal from the tail.
 
-    Assistant and tool messages are deliberately excluded so a model selected
-    after a safety refusal does not inherit the prior model's refusal framing
-    or tool-derived policy narrative.  The input list and its dictionaries are
-    never mutated.
+    Synthetic recovery/nudge users may be appended after the real turn user,
+    so "the last user" is not a safe anchor. ``keep_user_turns`` bounds this
+    reverse search; a stale or out-of-range anchor fails closed with ``None``.
     """
-    if not messages:
-        return []
-
+    if not messages or not isinstance(current_turn_user_idx, int):
+        return None
+    if not 0 <= current_turn_user_idx < len(messages):
+        return None
+    if messages[current_turn_user_idx].get("role") != "user":
+        return None
     try:
-        user_limit = max(0, int(keep_user_turns))
+        limit = int(keep_user_turns)
     except (TypeError, ValueError):
-        user_limit = 0
-
-    leading_system: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "system":
-            break
-        leading_system.append(dict(message))
-
-    users = [
-        dict(message)
-        for message in messages
+        return None
+    if limit <= 0:
+        return None
+    ordinal = 1 + sum(
+        1
+        for message in messages[current_turn_user_idx + 1 :]
         if isinstance(message, dict) and message.get("role") == "user"
-    ]
-    if user_limit == 0:
-        users = []
-    else:
-        users = users[-user_limit:]
+    )
+    return ordinal if ordinal <= limit else None
 
-    return [*leading_system, *users]
+
+def user_anchor_from_tail(
+    messages: list[dict] | None,
+    user_from_tail: int,
+    *,
+    keep_user_turns: int = 5,
+) -> int | None:
+    """Find a bounded Nth user-role anchor from the end of ``messages``."""
+    if not messages:
+        return None
+    try:
+        ordinal = int(user_from_tail)
+        limit = int(keep_user_turns)
+    except (TypeError, ValueError):
+        return None
+    if ordinal <= 0 or limit <= 0 or ordinal > limit:
+        return None
+    seen = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            seen += 1
+            if seen == ordinal:
+                return index
+    return None

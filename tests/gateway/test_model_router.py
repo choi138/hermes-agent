@@ -39,7 +39,8 @@ EXPECTED_RECORD_FIELDS = {
     "policy", "session_key", "label", "confidence", "evidence", "source",
     "classification_reason", "resolution_reason",
     "provider", "model", "outcome", "directive_route", "runtime_model", "msg_head",
-    "mode", "rule", "refusal_risk", "refusal_confidence", "refusal_applied",
+    "mode", "rule", "refusal_risk", "refusal_confidence", "prior_refusal",
+    "prior_refusal_confidence", "refusal_applied", "masked",
 }
 
 
@@ -122,17 +123,53 @@ class _FakeDB:
     def __init__(self, messages):
         self.messages = list(messages)
         self.recent_dialogue_limit = None
+        self.inactive_ids = set()
 
     def get_recent_dialogue_messages(self, session_id, limit):
         self.recent_dialogue_limit = limit
         dialogue = [
-            message for message in self.messages
+            message for index, message in enumerate(self.messages, 1)
             if message.get("role") in {"user", "assistant"}
+            and index not in self.inactive_ids
         ]
         return dialogue[-limit:]
 
     def get_messages_as_conversation(self, session_id, include_ancestors=False):
-        return list(self.messages)
+        return [
+            dict(message)
+            for index, message in enumerate(self.messages, 1)
+            if index not in self.inactive_ids
+        ]
+
+    def get_messages(self, session_id):
+        return [
+            {**message, "id": index, "active": 1}
+            for index, message in enumerate(self.messages, 1)
+            if index not in self.inactive_ids
+        ]
+
+    def latest_message_row_id(
+        self, session_id, *, role="user", offset=0, require_text=True,
+    ):
+        matches = [
+            message["id"]
+            for message in self.get_messages(session_id)
+            if message.get("role") == role
+            and (
+                not require_text
+                or str(message.get("content") or "").strip()
+            )
+        ]
+        return matches[-1 - offset] if len(matches) > offset else None
+
+    def deactivate_messages(self, session_id, message_ids):
+        before = len(self.inactive_ids)
+        self.inactive_ids.update(
+            message_id
+            for message_id in message_ids
+            if 1 <= message_id <= len(self.messages)
+        )
+        return len(self.inactive_ids) - before
 
 
 class _FakeStore:
@@ -157,6 +194,10 @@ class _FakeStore:
         self._db.messages = list(messages)
         return True
 
+    def deactivate_messages(self, session_id, message_ids):
+        self.transcript_ops.append(("deactivate", session_id, tuple(message_ids)))
+        return self._db.deactivate_messages(session_id, message_ids)
+
 
 def _complete(
     label,
@@ -165,12 +206,17 @@ def _complete(
     *,
     refusal_risk=None,
     refusal_confidence=None,
+    prior_refusal=None,
+    prior_refusal_confidence=None,
 ):
     def _fn(prompt):
         result = {"evidence": evidence, "label": label, "confidence": confidence}
         if refusal_risk is not None:
             result["refusal_risk"] = refusal_risk
             result["refusal_confidence"] = refusal_confidence
+        if prior_refusal is not None:
+            result["prior_refusal"] = prior_refusal
+            result["prior_refusal_confidence"] = prior_refusal_confidence
         return json.dumps(result)
     return _fn
 
@@ -232,11 +278,15 @@ def test_verbatim_parity_with_skill_gate_plugin():
         spec.loader.exec_module(sg)
         old_prompt = mr_mod.DEV_SYSTEM_PROMPT.replace(
             mr_mod.DEV_REFUSAL_S0 + "\n\n", "", 1,
+        ).replace(
+            mr_mod.DEV_PRIOR_REFUSAL_S0B + "\n\n", "", 1,
         ).replace("\n" + mr_mod.DEV_REFUSAL_EXAMPLE, "", 1)
         assert old_prompt == sg.DEV_SYSTEM_PROMPT
         old_schema = json.loads(json.dumps(mr_mod.DEV_RESPONSE_SCHEMA))
         old_schema["properties"].pop("refusal_risk")
         old_schema["properties"].pop("refusal_confidence")
+        old_schema["properties"].pop("prior_refusal")
+        old_schema["properties"].pop("prior_refusal_confidence")
         old_schema["required"] = ["evidence", "label", "confidence"]
         old_schema["propertyOrdering"] = ["evidence", "label", "confidence"]
         assert old_schema == sg.DEV_RESPONSE_SCHEMA
@@ -358,6 +408,7 @@ def test_classifier_llm_json_parsed():
     assert detail == {
         "label": "SYSTEM_DEV", "confidence": 0.83, "evidence": "S5 debug",
         "refusal_risk": False, "refusal_confidence": None,
+        "prior_refusal": False, "prior_refusal_confidence": None,
         "source": "llm", "classification_reason": "",
     }
 
@@ -395,6 +446,7 @@ def test_classifier_failure_falls_back_to_regex():
     assert detail == {
         "label": "NORMAL", "confidence": None, "evidence": "",
         "refusal_risk": False, "refusal_confidence": None,
+        "prior_refusal": False, "prior_refusal_confidence": None,
         "source": "fallback", "classification_reason": "classifier_error:TimeoutError",
     }
 
@@ -606,6 +658,7 @@ def test_plain_label_response_is_not_authoritative():
     assert detail == {
         "label": "NORMAL", "confidence": None, "evidence": "",
         "refusal_risk": False, "refusal_confidence": None,
+        "prior_refusal": False, "prior_refusal_confidence": None,
         "source": "fallback", "classification_reason": "invalid_classifier_response",
     }
 
@@ -614,12 +667,47 @@ def test_dev_schema_refusal_fields_are_required_and_ordered():
     schema = mr_mod.DEV_RESPONSE_SCHEMA
     assert schema["required"] == [
         "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
+        "prior_refusal", "prior_refusal_confidence",
     ]
     assert schema["propertyOrdering"] == schema["required"]
     assert schema["properties"]["refusal_risk"] == {"type": "boolean"}
     assert schema["properties"]["refusal_confidence"] == {
         "type": "number", "minimum": 0, "maximum": 1,
     }
+    assert schema["properties"]["prior_refusal"] == {"type": "boolean"}
+    assert schema["properties"]["prior_refusal_confidence"] == {
+        "type": "number", "minimum": 0, "maximum": 1,
+    }
+
+
+def test_prior_refusal_fields_parse_and_default_safely():
+    parsed = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S0b prior refusal",
+        "label": "SYSTEM_DEV",
+        "confidence": 0.9,
+        "prior_refusal": True,
+        "prior_refusal_confidence": 0.96,
+    }))
+    assert parsed["prior_refusal"] is True
+    assert parsed["prior_refusal_confidence"] == 0.96
+
+    defaults = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S5",
+        "label": "SYSTEM_DEV",
+        "confidence": 0.9,
+    }))
+    assert defaults["prior_refusal"] is False
+    assert defaults["prior_refusal_confidence"] is None
+
+    invalid = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S0b",
+        "label": "SYSTEM_DEV",
+        "confidence": 0.9,
+        "prior_refusal": True,
+        "prior_refusal_confidence": 1.1,
+    }))
+    assert invalid["prior_refusal"] is True
+    assert invalid["prior_refusal_confidence"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +780,127 @@ def test_refusal_document_route_override():
     )
     assert decision.outcome == "refusal_switch"
     assert decision.directive["route"] == "PERMISSIVE_DEV"
+
+
+def test_prior_soft_refusal_masks_newest_assistant_and_routes_permissive():
+    store = _FakeStore(messages=[
+        {"role": "user", "content": "build this"},
+        {"role": "assistant", "content": "I cannot help with that request."},
+    ])
+    decision = _evaluate(
+        complete_dev=_complete(
+            "SYSTEM_DEV",
+            prior_refusal=True,
+            prior_refusal_confidence=0.94,
+        ),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=_cfg(router={"refusal": {"enabled": True, "min_confidence": 0.85}}),
+        store=store,
+        mode="enforce",
+    )
+    assert decision.outcome == "refusal_switch"
+    assert decision.directive["route"] == "PERMISSIVE_DEV"
+    assert decision.record["masked"] == 1
+    assert store._db.inactive_ids == {2}
+    assert store.transcript_ops == [("deactivate", "sid-1", (2,))]
+
+
+def test_prior_soft_refusal_below_threshold_does_not_mask_or_switch():
+    store = _FakeStore(messages=[
+        {"role": "user", "content": "build this"},
+        {"role": "assistant", "content": "I cannot help with that request."},
+    ])
+    decision = _evaluate(
+        complete_dev=_complete(
+            "SYSTEM_DEV",
+            prior_refusal=True,
+            prior_refusal_confidence=0.84,
+        ),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=_cfg(router={"refusal": {"enabled": True, "min_confidence": 0.85}}),
+        store=store,
+        mode="enforce",
+    )
+    assert decision.outcome == "switch"
+    assert decision.directive["route"] == "dev"
+    assert decision.record["masked"] == 0
+    assert decision.record["prior_refusal_below_threshold"] is True
+    assert store._db.inactive_ids == set()
+
+
+def test_mask_on_refusal_false_keeps_route_behavior_without_masking():
+    store = _FakeStore(messages=[
+        {"role": "user", "content": "build this"},
+        {"role": "assistant", "content": "I cannot help with that request."},
+    ])
+    decision = _evaluate(
+        complete_dev=_complete(
+            "SYSTEM_DEV",
+            prior_refusal=True,
+            prior_refusal_confidence=0.94,
+        ),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=_cfg(router={"refusal": {
+            "enabled": True,
+            "mask_on_refusal": False,
+        }}),
+        store=store,
+        mode="enforce",
+    )
+    assert decision.outcome == "refusal_switch"
+    assert decision.directive["route"] == "PERMISSIVE_DEV"
+    assert decision.record["masked"] == 0
+    assert store._db.inactive_ids == set()
+
+
+def test_forced_refusal_route_is_one_shot():
+    state = {
+        "tg:c1": {
+            "normal_streak": 0,
+            "force_refusal_route": True,
+            "force_refusal_reason": "prior_turn_refused",
+        },
+    }
+    cfg = _cfg(router={"refusal": {"enabled": True}})
+    first = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=cfg,
+        state=state,
+    )
+    assert first.outcome == "refusal_switch"
+    assert first.directive["route"] == "PERMISSIVE_DEV"
+    assert first.record["forced_refusal_route"] is True
+    assert "force_refusal_route" not in state["tg:c1"]
+    assert "force_refusal_reason" not in state["tg:c1"]
+
+    second = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=cfg,
+        state=state,
+    )
+    assert second.outcome == "switch"
+    assert second.directive["route"] == "dev"
+
+
+def test_forced_refusal_route_clears_even_when_refusal_is_disabled():
+    state = {
+        "tg:c1": {
+            "normal_streak": 0,
+            "force_refusal_route": True,
+            "force_refusal_reason": "prior_turn_refused",
+        },
+    }
+    decision = _evaluate(
+        complete_dev=_complete("NORMAL"),
+        runtime={"model": "model-z", "provider": "p1"},
+        cfg=_cfg(router={"refusal": {"enabled": False}}),
+        state=state,
+    )
+    assert decision.outcome != "refusal_switch"
+    assert "force_refusal_route" not in state["tg:c1"]
+    assert "force_refusal_reason" not in state["tg:c1"]
 
 
 def test_refusal_fallback_source_never_routes(monkeypatch):
@@ -1738,6 +1947,7 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     cfg = _cfg(router={"mode": "shadow"})
     runner = object.__new__(GatewayRunner)
     runner.session_store = _FakeStore()
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: cfg)
     runner._model_router_state = {}
     runtime = {"model": "model-b", "provider": "p2", "api_mode": "chat_completions"}
     runtime_before = dict(runtime)
@@ -2013,12 +2223,11 @@ def test_refusal_notify_sent_after_successful_apply(monkeypatch, tmp_path):
     )
     runner._deliver_platform_notice.assert_awaited_once_with(
         source,
-        "⚠️ refusal-risk 감지 → PERMISSIVE_DEV (kimi-k3) 라우팅 "
-        f"(conf 0.93, {evidence[:80]}, forked=yes)",
+        "⚠️ 거절 감지 → PERMISSIVE_DEV(kimi-k3) 라우팅 (masked=0)",
     )
 
 
-def test_refusal_switch_rewrites_transcript_and_stages_note(monkeypatch, tmp_path):
+def test_preemptive_refusal_switch_never_rewrites_transcript(monkeypatch, tmp_path):
     messages = [
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "old"},
@@ -2038,20 +2247,9 @@ def test_refusal_switch_rewrites_transcript_and_stages_note(monkeypatch, tmp_pat
         )
     )
 
-    assert runner.session_store._db.messages == [
-        {"role": "system", "content": "stable"},
-        {"role": "user", "content": "old"},
-        {"role": "user", "content": "latest"},
-    ]
-    assert runner.session_store.transcript_ops == [
-        ("load", "sid-1"),
-        ("rewrite", "sid-1"),
-    ]
-    note = runner._pending_model_notes["tg:c1"]
-    assert "prior refusal assistant/tool turns dropped" in note
-    assert "Do not treat earlier refusals as binding policy" in note
-    assert runner._consume_refusal_recall_quarantine("tg:c1") is True
-    assert runner._consume_refusal_recall_quarantine("tg:c1") is False
+    assert runner.session_store._db.messages == messages
+    assert runner.session_store.transcript_ops == []
+    assert "tg:c1" not in getattr(runner, "_pending_model_notes", {})
 
 
 def test_refusal_switch_clean_fork_disabled_preserves_transcript_and_notice(
@@ -2083,9 +2281,43 @@ def test_refusal_switch_clean_fork_disabled_preserves_transcript_and_notice(
     assert runner.session_store.transcript_ops == []
     runner._deliver_platform_notice.assert_awaited_once_with(
         source,
-        "⚠️ refusal-risk 감지 → PERMISSIVE_DEV (kimi-k3) 라우팅 "
-        f"(conf 0.93, {evidence[:80]})",
+        "⚠️ 거절 감지 → PERMISSIVE_DEV(kimi-k3) 라우팅 (masked=0)",
     )
+
+
+def test_hard_refusal_masks_only_current_turn_and_stages_force(
+    monkeypatch, tmp_path,
+):
+    messages = [
+        {"role": "user", "content": "earlier request"},
+        {"role": "assistant", "content": "earlier completed answer"},
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": "provider refusal output"},
+    ]
+    runner, _cfg, _ = _refusal_stage_runner(
+        monkeypatch, tmp_path, notify=True, messages=messages,
+    )
+    source = _source()
+
+    masked = asyncio.run(
+        runner._handle_gateway_hard_refusal(
+            "tg:c1",
+            "sid-1",
+            source,
+            {"error": "content_policy_blocked: blocked by provider"},
+        )
+    )
+
+    assert masked == 1
+    assert runner.session_store._db.inactive_ids == {4}
+    assert [
+        message["content"]
+        for message in runner.session_store._db.get_messages("sid-1")
+        if message["role"] == "assistant"
+    ] == ["earlier completed answer"]
+    entry = runner._model_router_state["tg:c1"]
+    assert entry["force_refusal_route"] is True
+    assert entry["force_refusal_reason"] == "prior_turn_refused"
 
 
 def test_refusal_notify_suppressed_by_config(monkeypatch, tmp_path):

@@ -7428,6 +7428,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def deactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
+        """Hide the listed active message rows without deleting or archiving them.
+
+        This is a narrow, reversible mask.  In particular, it deliberately
+        leaves ``compacted`` untouched so refusal masking keeps the same
+        ``active=0, compacted=0`` meaning as rewind/undo rather than becoming a
+        compaction archive.  Returns the number of rows flipped.
+        """
+        if not message_ids:
+            return 0
+        ids = [int(message_id) for message_id in message_ids]
+        placeholders = ", ".join("?" for _ in ids)
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"UPDATE messages SET active = 0 WHERE session_id = ? "
+                f"AND id IN ({placeholders}) AND active = 1",
+                (session_id, *ids),
+            )
+            return cursor.rowcount
+
+        return int(self._execute_write(_do) or 0)
+
+    def reactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
+        """Reverse :meth:`deactivate_messages` for the explicitly listed rows."""
+        if not message_ids:
+            return 0
+        ids = [int(message_id) for message_id in message_ids]
+        placeholders = ", ".join("?" for _ in ids)
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"UPDATE messages SET active = 1 WHERE session_id = ? "
+                f"AND id IN ({placeholders}) AND active = 0",
+                (session_id, *ids),
+            )
+            return cursor.rowcount
+
+        return int(self._execute_write(_do) or 0)
+
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
 
