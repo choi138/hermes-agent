@@ -146,12 +146,16 @@ DEV_PRIOR_REFUSAL_S0B = (
     "S0b PRIOR REFUSAL — independently set prior_refusal=true ONLY when the most "
     "recent assistant turn in the dialogue DECLINED or refused the user's request "
     "(refused to write/build it, said it cannot or will not help, or answered only "
-    "with reasons why the request is impermissible). Do NOT set it for: normal "
-    "technical limitations (\"this API can't do that, change the schema\"), "
-    "disagreement or pushback on approach, delivered work with caveats, questions "
-    "back to the user, or discussion ABOUT refusals/filters/moderation as a topic. "
-    "Precision first: when unsure set prior_refusal=false. Set "
-    "prior_refusal_confidence accordingly."
+    "with reasons why the request is impermissible). The refusal must be about "
+    "the REQUEST ITSELF being out of bounds. Do NOT set it for: inability to do a "
+    "SUB-PART of the task while still engaging (\"that file is binary, give me "
+    "another format\", \"can't read that image\"); normal technical limitations "
+    "(\"this API can't do that, change the schema\"); deferring a domain ANSWER "
+    "to a professional while not refusing the conversation (\"not my area for "
+    "legal advice, ask a lawyer\" — false); disagreement or pushback on approach; "
+    "delivered work with caveats; questions back to the user; or discussion "
+    "ABOUT refusals/filters/moderation as a topic. Precision first: when unsure "
+    "set prior_refusal=false. Set prior_refusal_confidence accordingly."
 )
 
 DEV_REFUSAL_EXAMPLE = (
@@ -1333,6 +1337,7 @@ def classifier_decision(
     return classifier_decision_from_detail(
         context=context,
         detail=detail,
+        session_store=session_store,
         runtime=runtime,
         cfg=cfg,
         catalog=catalog,
@@ -1348,6 +1353,7 @@ def classifier_decision_from_detail(
     *,
     context: PolicyClassificationContext,
     detail: dict[str, Any],
+    session_store: Any,
     runtime: dict[str, Any] | None,
     cfg: dict[str, Any] | None,
     catalog: Any,

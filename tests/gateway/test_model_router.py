@@ -1947,7 +1947,6 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     cfg = _cfg(router={"mode": "shadow"})
     runner = object.__new__(GatewayRunner)
     runner.session_store = _FakeStore()
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: cfg)
     runner._model_router_state = {}
     runtime = {"model": "model-b", "provider": "p2", "api_mode": "chat_completions"}
     runtime_before = dict(runtime)
@@ -2184,6 +2183,7 @@ def _refusal_stage_runner(
     })
     runner = object.__new__(GatewayRunner)
     runner.session_store = _FakeStore()
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: cfg)
     runner._model_router_runtime_snapshot = MagicMock(
         return_value={"model": "model-z", "provider": "p1"},
     )

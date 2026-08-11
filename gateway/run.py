@@ -8156,6 +8156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             model_router.classifier_decision_from_detail,
             context=context,
             detail=detail,
+            session_store=self.session_store,
             runtime=runtime,
             cfg=cfg,
             catalog=catalog,
