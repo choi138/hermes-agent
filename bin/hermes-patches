@@ -1,0 +1,1521 @@
+#!/usr/bin/env python3
+"""Manifest-driven patch stack manager for the choi138 Hermes fork.
+
+Read-only commands:
+  status
+  validate
+
+Mutating commands default to dry-run and require an explicit --apply:
+  rebuild
+  sync <ref>
+  add <name>
+
+The tool never pushes and never deletes a remote branch. It also refuses to
+move a local branch that is attached to any registered Git worktree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+
+
+REPO = Path(__file__).resolve().parent.parent
+MANIFEST_PATH = REPO / "PATCHES.md"
+UPSTREAM_REMOTE = "upstream"
+PRODUCTION_BRANCH = "hermes/production"
+PATCH_PREFIX = "hermes/patches/"
+ACTIVE_STATES = frozenset({"local-only", "pending-upstream", "vendored"})
+ALLOWED_STATES = ACTIVE_STATES | {"merged-upstream"}
+TRAILER_STATES = ACTIVE_STATES
+ZERO_OID = "0" * 40
+SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+PATCH_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
+
+
+class HermesPatchesError(RuntimeError):
+    """Expected operator-facing failure."""
+
+
+class ManifestError(HermesPatchesError):
+    """PATCHES.md cannot be parsed safely."""
+
+
+class GitCommandError(HermesPatchesError):
+    """A Git command failed."""
+
+    def __init__(self, args: Iterable[str], result: subprocess.CompletedProcess[str]):
+        command = shlex.join(["git", "-C", str(REPO), *args])
+        detail = (result.stderr or result.stdout or "unknown git error").strip()
+        super().__init__(f"{command}\n{detail}")
+        self.returncode = result.returncode
+
+
+@dataclass(frozen=True)
+class Patch:
+    index: int
+    name: str
+    branch: str
+    origin: str
+    upstream_pr: str
+    state: str
+    rationale: str
+    commit_items: tuple[str, ...]
+    commits: tuple[str, ...]
+    touches: tuple[str, ...]
+    enabled: bool
+    example: bool
+
+    @property
+    def has_tbd_commits(self) -> bool:
+        return any("TBD" in item.upper() for item in self.commit_items)
+
+    @property
+    def production_active(self) -> bool:
+        return self.enabled and not self.example and self.state in ACTIVE_STATES
+
+    @property
+    def sync_active(self) -> bool:
+        return not self.example and self.state in ACTIVE_STATES
+
+
+@dataclass(frozen=True)
+class Manifest:
+    upstream: str
+    base_ref: str
+    base_commit: str
+    pinned_at: str
+    patches: tuple[Patch, ...]
+    text: str
+
+
+@dataclass(frozen=True)
+class WorktreeAttachment:
+    path: str
+    branch: str
+    prunable: bool
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+def _git_result(
+    *args: str,
+    cwd: Path = REPO,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.setdefault("LC_ALL", "C")
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        input=input_text,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def git(
+    *args: str,
+    cwd: Path = REPO,
+    input_text: Optional[str] = None,
+    check: bool = True,
+) -> str:
+    result = _git_result(*args, cwd=cwd, input_text=input_text)
+    if check and result.returncode != 0:
+        raise GitCommandError(args, result)
+    return result.stdout.strip()
+
+
+def git_ok(*args: str, cwd: Path = REPO) -> bool:
+    return _git_result(*args, cwd=cwd).returncode == 0
+
+
+def run_git(*args: str, cwd: Path = REPO, input_text: Optional[str] = None) -> str:
+    print("$", shlex.join(["git", "-C", str(cwd), *args]))
+    return git(*args, cwd=cwd, input_text=input_text)
+
+
+def _strip_code_ticks(value: str) -> str:
+    value = value.strip()
+    if value.startswith("`") and value.endswith("`") and value.count("`") == 2:
+        return value[1:-1].strip()
+    return value
+
+
+def _scalar_field(text: str, key: str, *, required: bool = True) -> str:
+    match = re.search(
+        rf"(?m)^-\s+\*\*{re.escape(key)}:\*\*\s*(?P<value>.+?)\s*$",
+        text,
+    )
+    if not match:
+        if required:
+            raise ManifestError(f"PATCHES.md field is missing: {key}")
+        return ""
+    return _strip_code_ticks(match.group("value"))
+
+
+def _list_field(text: str, key: str) -> tuple[str, ...]:
+    header = re.search(
+        rf"(?m)^-\s+\*\*{re.escape(key)}:\*\*\s*$",
+        text,
+    )
+    if not header:
+        raise ManifestError(f"PATCHES.md list field is missing: {key}")
+
+    items: list[str] = []
+    tail = text[header.end() :]
+    for line in tail.splitlines():
+        if not line.strip():
+            if items:
+                break
+            continue
+        item = re.match(r"^[ \t]+-\s+(.+?)\s*$", line)
+        if not item:
+            break
+        items.append(item.group(1).strip())
+    return tuple(items)
+
+
+def _parse_bool(raw: str, *, key: str, default: bool) -> bool:
+    if not raw:
+        return default
+    normalized = _strip_code_ticks(raw).lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ManifestError(f"{key} must be true or false, got {raw!r}")
+
+
+def _touch_path(item: str) -> str:
+    item = item.strip()
+    if item.startswith("`"):
+        closing = item.find("`", 1)
+        if closing > 1:
+            return item[1:closing]
+    return item
+
+
+def parse_manifest() -> Manifest:
+    if not MANIFEST_PATH.is_file():
+        raise ManifestError(f"manifest not found: {MANIFEST_PATH}")
+    text = MANIFEST_PATH.read_text(encoding="utf-8")
+
+    pinned_match = re.search(
+        r"(?ms)^## Pinned Base\s*$\n(?P<body>.*?)(?=^## |\Z)", text
+    )
+    if not pinned_match:
+        raise ManifestError("PATCHES.md is missing the Pinned Base section")
+    pinned = pinned_match.group("body")
+
+    upstream = _scalar_field(pinned, "upstream")
+    base_ref = _scalar_field(pinned, "base_ref")
+    base_commit = _scalar_field(pinned, "base_commit")
+    pinned_at = _scalar_field(pinned, "pinned_at")
+
+    patch_matches = list(
+        re.finditer(
+            r"(?m)^###\s+(?P<index>\d+)\.\s+(?P<name>[^\n]+?)\s*$",
+            text,
+        )
+    )
+    patches: list[Patch] = []
+    for position, match in enumerate(patch_matches):
+        end = (
+            patch_matches[position + 1].start()
+            if position + 1 < len(patch_matches)
+            else len(text)
+        )
+        section = text[match.end() : end]
+        name = match.group("name").strip()
+        commit_items = _list_field(section, "commits")
+        touches = tuple(_touch_path(item) for item in _list_field(section, "touches"))
+        commits: list[str] = []
+        for item in commit_items:
+            sha_match = SHA_RE.search(item)
+            if sha_match:
+                commits.append(sha_match.group(0).lower())
+
+        patches.append(
+            Patch(
+                index=int(match.group("index")),
+                name=name,
+                branch=_scalar_field(section, "branch"),
+                origin=_scalar_field(section, "origin"),
+                upstream_pr=_scalar_field(section, "upstream_pr"),
+                state=_scalar_field(section, "state"),
+                rationale=_scalar_field(section, "rationale"),
+                commit_items=commit_items,
+                commits=tuple(commits),
+                touches=touches,
+                enabled=_parse_bool(
+                    _scalar_field(section, "enabled", required=False),
+                    key=f"{name}.enabled",
+                    default=True,
+                ),
+                example=_parse_bool(
+                    _scalar_field(section, "example", required=False),
+                    key=f"{name}.example",
+                    default=False,
+                ),
+            )
+        )
+
+    return Manifest(
+        upstream=upstream,
+        base_ref=base_ref,
+        base_commit=base_commit,
+        pinned_at=pinned_at,
+        patches=tuple(patches),
+        text=text,
+    )
+
+
+def rev_parse(ref: str) -> str:
+    return git("rev-parse", "--verify", f"{ref}^{{commit}}")
+
+
+def rev_parse_at(repo: Path, ref: str) -> str:
+    return git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo)
+
+
+def branch_ref(branch: str) -> str:
+    return f"refs/heads/{branch}"
+
+
+def branch_exists(branch: str) -> bool:
+    return git_ok("show-ref", "--verify", "--quiet", branch_ref(branch))
+
+
+def branch_tip(branch: str) -> Optional[str]:
+    if not branch_exists(branch):
+        return None
+    return rev_parse(branch)
+
+
+def is_ancestor(ancestor: str, descendant: str) -> bool:
+    return git_ok("merge-base", "--is-ancestor", ancestor, descendant)
+
+
+def worktree_attachments() -> tuple[WorktreeAttachment, ...]:
+    raw = git("worktree", "list", "--porcelain")
+    attachments: list[WorktreeAttachment] = []
+    for record in re.split(r"\n\s*\n", raw.strip()):
+        if not record:
+            continue
+        path = ""
+        branch = ""
+        prunable = False
+        for line in record.splitlines():
+            if line.startswith("worktree "):
+                path = line.removeprefix("worktree ")
+            elif line.startswith("branch refs/heads/"):
+                branch = line.removeprefix("branch refs/heads/")
+            elif line.startswith("prunable"):
+                prunable = True
+        if path and branch:
+            attachments.append(WorktreeAttachment(path, branch, prunable))
+    return tuple(attachments)
+
+
+def attachments_by_branch() -> dict[str, tuple[WorktreeAttachment, ...]]:
+    grouped: dict[str, list[WorktreeAttachment]] = {}
+    for attachment in worktree_attachments():
+        grouped.setdefault(attachment.branch, []).append(attachment)
+    return {branch: tuple(values) for branch, values in grouped.items()}
+
+
+def _attachment_detail(attachment: WorktreeAttachment) -> str:
+    suffix = " (prunable record)" if attachment.prunable else ""
+    return f"{attachment.path}{suffix}"
+
+
+def reject_attached(branches: Iterable[str], *, operation: str) -> None:
+    attached = attachments_by_branch()
+    blocked: list[str] = []
+    for branch in branches:
+        for attachment in attached.get(branch, ()):
+            blocked.append(f"{branch}: {_attachment_detail(attachment)}")
+    if blocked:
+        details = "\n".join(f"  - {item}" for item in blocked)
+        raise HermesPatchesError(
+            f"refusing {operation}: target branch is attached to a worktree\n"
+            f"{details}\n"
+            "Finish or detach that worktree explicitly; this tool will not bypass it."
+        )
+
+
+def _github_slug(url: str) -> Optional[str]:
+    normalized = url.strip().removesuffix(".git")
+    match = re.search(r"github\.com(?::|/)([^/]+)/([^/]+)$", normalized, re.IGNORECASE)
+    if not match:
+        return None
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def actual_commits(base: str, branch: str) -> tuple[str, ...]:
+    output = git("rev-list", "--reverse", f"{base}..{branch}")
+    return tuple(line for line in output.splitlines() if line)
+
+
+def changed_files(base: str, branch: str) -> tuple[str, ...]:
+    output = git("diff", "--name-only", f"{base}..{branch}")
+    return tuple(line for line in output.splitlines() if line)
+
+
+def is_merge_commit(commit: str) -> bool:
+    return len(git("rev-list", "--parents", "-n", "1", commit).split()) > 2
+
+
+def patch_id_for_commit(commit: str) -> Optional[str]:
+    diff = git(
+        "show",
+        "--format=",
+        "--no-ext-diff",
+        "--binary",
+        commit,
+    )
+    if not diff.strip():
+        return None
+    result = _git_result("patch-id", "--stable", input_text=diff + "\n")
+    if result.returncode != 0:
+        raise GitCommandError(("patch-id", "--stable"), result)
+    lines = result.stdout.strip().splitlines()
+    return lines[0].split()[0] if lines else None
+
+
+def patch_ids_for_range(start: str, end: str) -> frozenset[str]:
+    if start == end:
+        return frozenset()
+    log_process = subprocess.Popen(
+        [
+            "git",
+            "-C",
+            str(REPO),
+            "log",
+            "--no-merges",
+            "--no-ext-diff",
+            "--pretty=format:%H",
+            "-p",
+            f"{start}..{end}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert log_process.stdout is not None
+    patch_process = subprocess.run(
+        ["git", "-C", str(REPO), "patch-id", "--stable"],
+        stdin=log_process.stdout,
+        capture_output=True,
+        text=True,
+    )
+    log_process.stdout.close()
+    log_stderr = b""
+    if log_process.stderr is not None:
+        log_stderr = log_process.stderr.read()
+    log_returncode = log_process.wait()
+    if log_returncode != 0:
+        detail = log_stderr.decode(errors="replace").strip()
+        raise HermesPatchesError(
+            f"git log failed while computing stable patch-id values: {detail}"
+        )
+    if patch_process.returncode != 0:
+        detail = patch_process.stderr.strip() or "git patch-id failed"
+        raise HermesPatchesError(detail)
+    return frozenset(
+        line.split()[0] for line in patch_process.stdout.splitlines() if line.strip()
+    )
+
+
+def patch_id_matches(
+    base: str,
+    target: str,
+    commits: Iterable[str],
+) -> dict[str, bool]:
+    upstream_ids = patch_ids_for_range(base, target)
+    matches: dict[str, bool] = {}
+    for commit in commits:
+        patch_id = patch_id_for_commit(commit)
+        if patch_id is not None:
+            matches[commit] = patch_id in upstream_ids
+    return matches
+
+
+def _expanded_manifest_commits(commits: Iterable[str]) -> tuple[str, ...]:
+    expanded: list[str] = []
+    for commit in commits:
+        try:
+            expanded.append(rev_parse(commit))
+        except GitCommandError:
+            expanded.append(f"INVALID:{commit}")
+    return tuple(expanded)
+
+
+def _trailer_errors(commit: str) -> tuple[str, ...]:
+    body = git("show", "-s", "--format=%B", commit)
+    values: dict[str, list[str]] = {}
+    for key in ("Origin", "Upstream-PR", "Patch-State"):
+        values[key] = re.findall(rf"(?m)^{re.escape(key)}:\s*(.+?)\s*$", body)
+
+    errors: list[str] = []
+    for key, found in values.items():
+        if len(found) != 1 or not found[0].strip():
+            errors.append(
+                f"{commit[:12]} must contain exactly one non-empty {key}: trailer"
+            )
+    states = values["Patch-State"]
+    if len(states) == 1 and states[0].strip() not in TRAILER_STATES:
+        errors.append(
+            f"{commit[:12]} Patch-State is {states[0].strip()!r}; "
+            f"expected one of {', '.join(sorted(TRAILER_STATES))}"
+        )
+    return tuple(errors)
+
+
+def validate_manifest(manifest: Manifest) -> ValidationReport:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not re.fullmatch(r"[0-9a-f]{40}", manifest.base_commit):
+        errors.append("base_commit must be a full 40-character lowercase SHA")
+    elif not git_ok("cat-file", "-e", f"{manifest.base_commit}^{{commit}}"):
+        errors.append(f"base_commit does not exist: {manifest.base_commit}")
+
+    try:
+        observed_base = rev_parse(manifest.base_ref)
+    except GitCommandError:
+        observed_base = ""
+        errors.append(f"base_ref cannot be resolved: {manifest.base_ref}")
+
+    if observed_base and re.fullmatch(r"[0-9a-f]{40}", manifest.base_commit):
+        if not is_ancestor(manifest.base_commit, observed_base):
+            errors.append(
+                f"pinned base {manifest.base_commit[:12]} is not an ancestor of "
+                f"{manifest.base_ref} ({observed_base[:12]})"
+            )
+        elif observed_base != manifest.base_commit:
+            ahead = git(
+                "rev-list", "--count", f"{manifest.base_commit}..{observed_base}"
+            )
+            warnings.append(
+                f"{manifest.base_ref} is {ahead} commits ahead of the pinned base "
+                "(expected until sync is approved)"
+            )
+    try:
+        datetime.fromisoformat(manifest.pinned_at)
+    except ValueError:
+        errors.append(f"pinned_at is not valid ISO-8601: {manifest.pinned_at}")
+
+    remote_result = _git_result("remote", "get-url", UPSTREAM_REMOTE)
+    if remote_result.returncode != 0:
+        errors.append(f"required remote is missing: {UPSTREAM_REMOTE}")
+    else:
+        configured_slug = _github_slug(remote_result.stdout.strip())
+        if configured_slug is None:
+            warnings.append(
+                f"could not normalize {UPSTREAM_REMOTE} URL: "
+                f"{remote_result.stdout.strip()}"
+            )
+        elif configured_slug.lower() != manifest.upstream.lower():
+            errors.append(
+                f"manifest upstream is {manifest.upstream}, but remote "
+                f"{UPSTREAM_REMOTE} points to {configured_slug}"
+            )
+
+    names: set[str] = set()
+    branches: set[str] = set()
+    seen_commits: dict[str, str] = {}
+    has_real_patches = any(not patch.example for patch in manifest.patches)
+    live_patch_ids: Optional[frozenset[str]] = None
+    if (
+        has_real_patches
+        and observed_base
+        and is_ancestor(manifest.base_commit, observed_base)
+    ):
+        live_patch_ids = patch_ids_for_range(manifest.base_commit, observed_base)
+
+    for patch in manifest.patches:
+        label = f"patch {patch.index} ({patch.name})"
+        if patch.name in names:
+            errors.append(f"duplicate patch name: {patch.name}")
+        names.add(patch.name)
+        if patch.branch in branches:
+            errors.append(f"duplicate patch branch: {patch.branch}")
+        branches.add(patch.branch)
+
+        if not PATCH_NAME_RE.fullmatch(patch.name):
+            errors.append(
+                f"{label}: name must use lowercase letters, digits, and hyphens"
+            )
+        if patch.state not in ALLOWED_STATES:
+            errors.append(
+                f"{label}: invalid state {patch.state!r}; expected one of "
+                f"{', '.join(sorted(ALLOWED_STATES))}"
+            )
+        if not patch.origin:
+            errors.append(f"{label}: origin is empty")
+        if not patch.upstream_pr:
+            errors.append(f"{label}: upstream_pr is empty; use none when absent")
+        if not patch.rationale or patch.rationale.upper() == "TBD":
+            errors.append(f"{label}: rationale must be concrete")
+        if not patch.touches:
+            errors.append(f"{label}: touches must contain at least one path")
+
+        tip = branch_tip(patch.branch)
+        if tip is None:
+            errors.append(f"{label}: branch does not exist: {patch.branch}")
+            continue
+
+        if patch.example:
+            if patch.enabled:
+                errors.append(f"{label}: example entries must set enabled: false")
+            if not patch.has_tbd_commits:
+                warnings.append(
+                    f"{label}: example no longer has TBD commits; promote or remove it"
+                )
+            warnings.append(
+                f"{label}: example entry is excluded from sync and production"
+            )
+            continue
+
+        if not patch.branch.startswith(PATCH_PREFIX):
+            errors.append(f"{label}: branch must start with {PATCH_PREFIX}")
+        if patch.state == "merged-upstream" and patch.enabled:
+            errors.append(f"{label}: merged-upstream entries must set enabled: false")
+        if patch.has_tbd_commits:
+            errors.append(
+                f"{label}: active/non-example entries cannot contain TBD commits"
+            )
+        if not is_ancestor(manifest.base_commit, tip):
+            errors.append(
+                f"{label}: pinned base {manifest.base_commit[:12]} is not an "
+                f"ancestor of {patch.branch}"
+            )
+            continue
+
+        commits = actual_commits(manifest.base_commit, patch.branch)
+        if not commits:
+            errors.append(f"{label}: topic has no commits after the pinned base")
+        for commit in commits:
+            if is_merge_commit(commit):
+                errors.append(
+                    f"{label}: merge commit is not allowed in a topic: {commit[:12]}"
+                )
+            errors.extend(f"{label}: {item}" for item in _trailer_errors(commit))
+            previous = seen_commits.get(commit)
+            if previous is not None:
+                errors.append(
+                    f"{label}: commit {commit[:12]} is also carried by {previous}"
+                )
+            seen_commits[commit] = patch.name
+
+        declared = _expanded_manifest_commits(patch.commits)
+        if declared != commits:
+            errors.append(
+                f"{label}: manifest commits do not match "
+                f"{manifest.base_commit[:12]}..{patch.branch}"
+            )
+
+        manifest_touches = set(patch.touches)
+        actual_touches = set(changed_files(manifest.base_commit, patch.branch))
+        missing_touches = sorted(actual_touches - manifest_touches)
+        if missing_touches:
+            errors.append(f"{label}: touches is missing {', '.join(missing_touches)}")
+        stale_touches = sorted(manifest_touches - actual_touches)
+        if stale_touches:
+            warnings.append(
+                f"{label}: touches lists unchanged paths: {', '.join(stale_touches)}"
+            )
+
+        content_matches: list[bool] = []
+        if live_patch_ids is not None:
+            for commit in commits:
+                patch_id = patch_id_for_commit(commit)
+                if patch_id is not None:
+                    content_matches.append(patch_id in live_patch_ids)
+        all_merged = bool(content_matches) and all(content_matches)
+        if all_merged and patch.state not in {"merged-upstream", "vendored"}:
+            errors.append(
+                f"{label}: every content commit matches {manifest.base_ref} by "
+                "stable patch-id; review and mark merged-upstream"
+            )
+        if patch.state == "merged-upstream" and content_matches and not all_merged:
+            errors.append(
+                f"{label}: state says merged-upstream but patch-id comparison disagrees"
+            )
+
+    active = [patch for patch in manifest.patches if patch.production_active]
+    production_tip = branch_tip(PRODUCTION_BRANCH)
+    if production_tip is None:
+        if active:
+            errors.append(
+                f"{PRODUCTION_BRANCH} is missing while {len(active)} patches are enabled"
+            )
+        else:
+            warnings.append(
+                f"{PRODUCTION_BRANCH} has not been created (no active patches yet)"
+            )
+    elif not active:
+        if production_tip != manifest.base_commit:
+            errors.append(
+                f"{PRODUCTION_BRANCH} should equal the pinned base when no "
+                "patches are active"
+            )
+    else:
+        expected_parents = [manifest.base_commit]
+        missing_tip = False
+        for patch in active:
+            tip = branch_tip(patch.branch)
+            if tip is None:
+                missing_tip = True
+                break
+            expected_parents.append(tip)
+        if not missing_tip:
+            actual_parents = git("show", "-s", "--format=%P", production_tip).split()
+            if actual_parents != expected_parents:
+                errors.append(
+                    f"{PRODUCTION_BRANCH} parents do not match pinned base + "
+                    "enabled topic tips"
+                )
+
+    return ValidationReport(tuple(errors), tuple(warnings))
+
+
+def _print_report(report: ValidationReport) -> None:
+    for warning in report.warnings:
+        print(f"WARN: {warning}")
+    for error in report.errors:
+        print(f"FAIL: {error}")
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    manifest = parse_manifest()
+    observed = rev_parse(manifest.base_ref)
+    print(f"BASE: {manifest.base_ref}")
+    print(f"  pinned:    {manifest.base_commit}")
+    print(f"  observed:  {observed}")
+    print(f"  pinned_at: {manifest.pinned_at}")
+    if is_ancestor(manifest.base_commit, observed):
+        ahead = git("rev-list", "--count", f"{manifest.base_commit}..{observed}")
+        print(f"  observed_ahead_by: {ahead} commit(s)")
+    else:
+        print("  relation: DIVERGED")
+
+    production = branch_tip(PRODUCTION_BRANCH)
+    if production is None:
+        print(f"PRODUCTION: {PRODUCTION_BRANCH} MISSING")
+    else:
+        print(f"PRODUCTION: {PRODUCTION_BRANCH} @ {production}")
+
+    attached = attachments_by_branch()
+    print()
+    print(f"{'PATCH':30} {'STATE':18} {'ENABLED':8} {'BRANCH':8} {'WORKTREE':10} NOTES")
+    print("-" * 100)
+    for patch in manifest.patches:
+        tip = branch_tip(patch.branch)
+        branch_status = "yes" if tip else "MISSING"
+        attachments = attached.get(patch.branch, ())
+        worktree_status = str(len(attachments)) if attachments else "no"
+        notes: list[str] = []
+        if patch.example:
+            notes.append("example; excluded from stack")
+        if patch.has_tbd_commits:
+            notes.append("commits=TBD")
+        if attachments:
+            notes.extend(_attachment_detail(item) for item in attachments)
+        if not patch.example and tip and is_ancestor(manifest.base_commit, tip):
+            commits = actual_commits(manifest.base_commit, patch.branch)
+            notes.append(f"{len(commits)} commit(s)")
+            if is_ancestor(manifest.base_commit, observed):
+                matches = patch_id_matches(manifest.base_commit, observed, commits)
+                if matches:
+                    matched = sum(1 for value in matches.values() if value)
+                    notes.append(
+                        f"patch-id {matched}/{len(matches)} in {manifest.base_ref}"
+                    )
+        print(
+            f"{patch.name:30} {patch.state:18} "
+            f"{str(patch.enabled).lower():8} {branch_status:8} "
+            f"{worktree_status:10} {'; '.join(notes)}"
+        )
+
+    report = validate_manifest(manifest)
+    print()
+    _print_report(report)
+    outcome = "DRIFT" if report.errors else "OK"
+    print(
+        f"STATUS: {outcome} "
+        f"({len(report.errors)} error(s), {len(report.warnings)} warning(s))"
+    )
+    return 1 if report.errors else 0
+
+
+def cmd_validate(_args: argparse.Namespace) -> int:
+    manifest = parse_manifest()
+    report = validate_manifest(manifest)
+    _print_report(report)
+    if report.errors:
+        print(
+            f"validate: FAIL "
+            f"({len(report.errors)} error(s), {len(report.warnings)} warning(s))"
+        )
+        return 1
+    print(f"validate: OK ({len(report.warnings)} warning(s))")
+    return 0
+
+
+def _mode_banner(apply: bool) -> None:
+    if apply:
+        print("MODE: apply")
+    else:
+        print("MODE: dry-run (no refs, worktrees, or files will be changed)")
+
+
+def _require_valid_for_apply(
+    manifest: Manifest,
+    *,
+    allow_upstream_match_drift: bool = False,
+) -> None:
+    report = validate_manifest(manifest)
+    errors = list(report.errors)
+    if allow_upstream_match_drift:
+        errors = [
+            error for error in errors if "every content commit matches" not in error
+        ]
+    if errors:
+        _print_report(ValidationReport(tuple(errors), report.warnings))
+        raise HermesPatchesError("manifest validation failed; refusing --apply")
+
+
+def _backup_ref(namespace: str, name: str, oid: str) -> str:
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_name = name.replace("/", "-")
+    ref = f"refs/hermes/backups/{namespace}/{token}/{safe_name}"
+    run_git("update-ref", ref, oid, ZERO_OID)
+    return ref
+
+
+def _remove_temp_worktree(path: Path) -> None:
+    result = _git_result("worktree", "remove", str(path))
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise HermesPatchesError(
+            f"temporary worktree cleanup failed; left for inspection at "
+            f"{path}: {detail}"
+        )
+
+
+def _make_temp_root(prefix: str) -> Path:
+    return Path(tempfile.mkdtemp(prefix=prefix))
+
+
+def _remove_empty_temp_root(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def cmd_rebuild(args: argparse.Namespace) -> int:
+    manifest = parse_manifest()
+    active = [patch for patch in manifest.patches if patch.production_active]
+    _mode_banner(args.apply)
+    print(f"BASE: {manifest.base_commit}")
+    print(f"TARGET: {PRODUCTION_BRANCH}")
+    print(f"ACTIVE PATCHES: {len(active)}")
+
+    tips: list[str] = []
+    for patch in active:
+        tip = branch_tip(patch.branch)
+        if tip is None:
+            raise HermesPatchesError(f"active patch branch is missing: {patch.branch}")
+        tips.append(tip)
+        print(f"  - {patch.name}: {patch.branch} @ {tip}")
+
+    blockers = attachments_by_branch().get(PRODUCTION_BRANCH, ())
+    for blocker in blockers:
+        print(
+            f"APPLY BLOCKED: {PRODUCTION_BRANCH} is attached at "
+            f"{_attachment_detail(blocker)}"
+        )
+
+    if not args.apply:
+        if active:
+            print("PLAN: strict octopus merge pinned base + listed topic tips")
+        else:
+            print("PLAN: point production at the exact pinned base (no active patches)")
+        print("No sequential conflict fallback will be attempted.")
+        print("Re-run with --apply only after reviewing this plan.")
+        return 0
+
+    reject_attached([PRODUCTION_BRANCH], operation="production rebuild")
+    _require_valid_for_apply(manifest)
+
+    previous = branch_tip(PRODUCTION_BRANCH)
+    if not active:
+        assembled = manifest.base_commit
+    else:
+        temp_root = _make_temp_root("hermes-patches-rebuild-")
+        worktree_path = temp_root / "assembly"
+        added = False
+        try:
+            run_git(
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(worktree_path),
+                manifest.base_commit,
+            )
+            added = True
+            merge_result = _git_result(
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                f"merge: assemble Hermes production stack ({len(active)} patches)",
+                *tips,
+                cwd=worktree_path,
+            )
+            if merge_result.returncode != 0:
+                _git_result("merge", "--abort", cwd=worktree_path)
+                detail = (merge_result.stderr or merge_result.stdout).strip()
+                raise HermesPatchesError(
+                    "strict octopus merge failed; production was not moved. "
+                    "Resolve overlap in topic branches and retry.\n"
+                    f"{detail}"
+                )
+            assembled = rev_parse_at(worktree_path, "HEAD")
+            parents = git(
+                "show",
+                "-s",
+                "--format=%P",
+                assembled,
+                cwd=worktree_path,
+            ).split()
+            expected = [manifest.base_commit, *tips]
+            if parents != expected:
+                raise HermesPatchesError(
+                    f"assembled merge parents are unexpected: {parents}; "
+                    f"expected {expected}"
+                )
+        finally:
+            if added:
+                _remove_temp_worktree(worktree_path)
+            _remove_empty_temp_root(temp_root)
+
+    backup = None
+    if previous is not None:
+        backup = _backup_ref("production", PRODUCTION_BRANCH, previous)
+        expected_production = previous
+    else:
+        expected_production = ZERO_OID
+    transaction = ["start"]
+    transaction.extend(
+        f"verify {branch_ref(patch.branch)} {tip}" for patch, tip in zip(active, tips)
+    )
+    transaction.extend([
+        f"update {branch_ref(PRODUCTION_BRANCH)} {assembled} {expected_production}",
+        "prepare",
+        "commit",
+        "",
+    ])
+    run_git("update-ref", "--stdin", input_text="\n".join(transaction))
+    print(f"REBUILT: {PRODUCTION_BRANCH} @ {assembled}")
+    if backup:
+        print(f"BACKUP: {backup} -> {previous}")
+    print("No remote ref was changed. Review and test before any separate deployment.")
+    return 0
+
+
+def _replace_scalar(text: str, key: str, value: str) -> str:
+    pattern = re.compile(rf"(?m)^(?P<prefix>-\s+\*\*{re.escape(key)}:\*\*\s*).+?$")
+    updated, count = pattern.subn(rf"\g<prefix>`{value}`", text, count=1)
+    if count != 1:
+        raise ManifestError(f"could not update manifest field: {key}")
+    return updated
+
+
+def _replace_patch_section(
+    text: str,
+    patch: Patch,
+    *,
+    state_value: str,
+    commits: Optional[tuple[str, ...]],
+) -> str:
+    pattern = re.compile(
+        rf"(?ms)^(?P<head>###\s+{patch.index}\.\s+"
+        rf"{re.escape(patch.name)}\s*$)"
+        rf"(?P<body>.*?)(?=^###\s+\d+\.|\Z)"
+    )
+    match = pattern.search(text)
+    if not match:
+        raise ManifestError(f"could not locate patch section for rewrite: {patch.name}")
+    body = _replace_scalar(match.group("body"), "state", state_value)
+    if commits is not None:
+        lines: list[str] = []
+        if commits:
+            for commit in commits:
+                subject = (
+                    git("show", "-s", "--format=%s", commit).replace("\n", " ").strip()
+                )
+                lines.append(f"  - `{commit}` {subject}")
+        else:
+            lines.append("  - `TBD`")
+        replacement = "- **commits:**\n" + "\n".join(lines) + "\n"
+        list_pattern = re.compile(
+            r"(?m)^-\s+\*\*commits:\*\*\s*$\n"
+            r"(?:^[ \t]+-\s+.*(?:\n|\Z))+"
+        )
+        body, count = list_pattern.subn(replacement, body, count=1)
+        if count != 1:
+            raise ManifestError(f"could not update commits for {patch.name}")
+    section = match.group("head") + body
+    return text[: match.start()] + section + text[match.end() :]
+
+
+def _render_synced_manifest(
+    manifest: Manifest,
+    new_ref: str,
+    new_base: str,
+    patch_updates: dict[str, tuple[str, Optional[tuple[str, ...]]]],
+) -> str:
+    text = manifest.text
+    for patch in reversed(manifest.patches):
+        update = patch_updates.get(patch.name)
+        if update is None:
+            continue
+        state_value, commits = update
+        text = _replace_patch_section(
+            text,
+            patch,
+            state_value=state_value,
+            commits=commits,
+        )
+    text = _replace_scalar(text, "base_ref", new_ref)
+    text = _replace_scalar(text, "base_commit", new_base)
+    pinned_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    text = _replace_scalar(text, "pinned_at", pinned_at)
+    return text
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _update_refs_transaction(
+    updates: Iterable[tuple[str, str, str]],
+) -> None:
+    update_list = list(updates)
+    if not update_list:
+        return
+    lines = ["start"]
+    lines.extend(f"update {ref} {new} {old}" for ref, new, old in update_list)
+    lines.extend(["prepare", "commit", ""])
+    run_git("update-ref", "--stdin", input_text="\n".join(lines))
+
+
+def _worktree_is_clean() -> bool:
+    return not git("status", "--porcelain", "--untracked-files=all").strip()
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    manifest = parse_manifest()
+    patches = [patch for patch in manifest.patches if patch.sync_active]
+    _mode_banner(args.apply)
+    print(f"CURRENT BASE: {manifest.base_ref} @ {manifest.base_commit}")
+    print(f"SYNC TARGET: {args.ref}")
+    print(f"TOPICS: {len(patches)}")
+
+    attached = attachments_by_branch()
+    blockers = [
+        (patch.branch, attachment)
+        for patch in patches
+        for attachment in attached.get(patch.branch, ())
+    ]
+    for branch, attachment in blockers:
+        print(
+            f"APPLY BLOCKED: {branch} is attached at {_attachment_detail(attachment)}"
+        )
+
+    if not args.apply:
+        print(f"PLAN: would run git fetch --prune {UPSTREAM_REMOTE}")
+        try:
+            observed = rev_parse(args.ref)
+            print(f"CACHED TARGET: {observed}")
+        except GitCommandError:
+            observed = ""
+            print("CACHED TARGET: unavailable until fetch")
+        if patches and observed and is_ancestor(manifest.base_commit, observed):
+            upstream_ids = patch_ids_for_range(manifest.base_commit, observed)
+            for patch in patches:
+                tip = branch_tip(patch.branch)
+                if tip is None or not is_ancestor(manifest.base_commit, tip):
+                    print(
+                        f"  - {patch.name}: cannot plan "
+                        "(missing or not based on pinned base)"
+                    )
+                    continue
+                commits = actual_commits(manifest.base_commit, patch.branch)
+                content_ids = [patch_id_for_commit(commit) for commit in commits]
+                content_ids = [item for item in content_ids if item is not None]
+                matched = sum(1 for item in content_ids if item in upstream_ids)
+                if (
+                    content_ids
+                    and matched == len(content_ids)
+                    and patch.state != "vendored"
+                ):
+                    print(
+                        f"  - {patch.name}: would mark merged-upstream "
+                        f"({matched}/{matched} patch-id matches)"
+                    )
+                else:
+                    print(
+                        f"  - {patch.name}: would rebase; stable patch-id "
+                        f"matches {matched}/{len(content_ids)}"
+                    )
+        print(
+            "PLAN: update base_ref/base_commit/pinned_at and rebased commit "
+            "SHAs in PATCHES.md"
+        )
+        print("No fetch, rebase, ref update, or manifest write occurred.")
+        print("Re-run with --apply only after reviewing this plan.")
+        return 0
+
+    if not _worktree_is_clean():
+        raise HermesPatchesError("policy worktree is not clean; refusing sync --apply")
+    reject_attached((patch.branch for patch in patches), operation="topic sync")
+    _require_valid_for_apply(manifest, allow_upstream_match_drift=True)
+
+    run_git("fetch", "--prune", UPSTREAM_REMOTE)
+    new_base = rev_parse(args.ref)
+    if not is_ancestor(manifest.base_commit, new_base):
+        raise HermesPatchesError(
+            f"sync target {new_base[:12]} does not descend from pinned base "
+            f"{manifest.base_commit[:12]}"
+        )
+    if new_base == manifest.base_commit and args.ref == manifest.base_ref:
+        print("Already pinned to this exact ref and commit; nothing changed.")
+        return 0
+
+    upstream_ids = (
+        patch_ids_for_range(manifest.base_commit, new_base) if patches else frozenset()
+    )
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    staged_refs: list[str] = []
+    real_updates: list[tuple[str, str, str]] = []
+    manifest_updates: dict[str, tuple[str, Optional[tuple[str, ...]]]] = {}
+
+    try:
+        for patch in patches:
+            old_tip = branch_tip(patch.branch)
+            if old_tip is None:
+                raise HermesPatchesError(
+                    f"topic disappeared during sync: {patch.branch}"
+                )
+            commits = actual_commits(manifest.base_commit, patch.branch)
+            content_ids = [patch_id_for_commit(commit) for commit in commits]
+            content_ids = [item for item in content_ids if item is not None]
+            matched = sum(1 for item in content_ids if item in upstream_ids)
+            if (
+                patch.state != "vendored"
+                and content_ids
+                and matched == len(content_ids)
+            ):
+                print(
+                    f"MERGED: {patch.name} "
+                    f"({matched}/{matched} stable patch-id matches)"
+                )
+                manifest_updates[patch.name] = (
+                    "merged-upstream",
+                    None,
+                )
+                continue
+
+            staging_branch = f"hermes/staging/{token}/{patch.name}"
+            staging_ref = branch_ref(staging_branch)
+            run_git("update-ref", staging_ref, old_tip, ZERO_OID)
+            staged_refs.append(staging_ref)
+
+            temp_root = _make_temp_root(f"hermes-patches-sync-{patch.name}-")
+            worktree_path = temp_root / "topic"
+            added = False
+            try:
+                run_git(
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    str(worktree_path),
+                    staging_branch,
+                )
+                added = True
+                rebase_args = ["rebase", "--empty=keep"]
+                if patch.state == "vendored":
+                    rebase_args.append("--reapply-cherry-picks")
+                rebase_args.extend([
+                    "--onto",
+                    new_base,
+                    manifest.base_commit,
+                ])
+                result = _git_result(*rebase_args, cwd=worktree_path)
+                if result.returncode != 0:
+                    _git_result("rebase", "--abort", cwd=worktree_path)
+                    detail = (result.stderr or result.stdout).strip()
+                    raise HermesPatchesError(
+                        f"rebase conflict in {patch.name}; real topic "
+                        f"refs were not moved.\n{detail}"
+                    )
+                new_tip = rev_parse_at(worktree_path, "HEAD")
+                new_commits = actual_commits(new_base, staging_branch)
+            finally:
+                if added:
+                    _remove_temp_worktree(worktree_path)
+                _remove_empty_temp_root(temp_root)
+
+            real_updates.append((branch_ref(patch.branch), new_tip, old_tip))
+            manifest_updates[patch.name] = (
+                patch.state,
+                new_commits,
+            )
+            print(
+                f"STAGED: {patch.name} {old_tip[:12]} -> "
+                f"{new_tip[:12]} (patch-id matches "
+                f"{matched}/{len(content_ids)})"
+            )
+
+        rendered = _render_synced_manifest(
+            manifest,
+            args.ref,
+            new_base,
+            manifest_updates,
+        )
+
+        backups: list[str] = []
+        for ref, _new, old in real_updates:
+            backups.append(
+                _backup_ref(
+                    "sync",
+                    ref.removeprefix("refs/heads/"),
+                    old,
+                )
+            )
+        _update_refs_transaction(real_updates)
+        _atomic_write(MANIFEST_PATH, rendered)
+
+        print(f"SYNCED BASE: {args.ref} @ {new_base}")
+        for backup in backups:
+            print(f"BACKUP: {backup}")
+        print("PATCHES.md was updated but not committed.")
+        print("Run validate and targeted tests, then review rebuild before --apply.")
+        return 0
+    finally:
+        for staging_ref in reversed(staged_refs):
+            staging_branch = staging_ref.removeprefix("refs/heads/")
+            attached_staging = attachments_by_branch().get(staging_branch, ())
+            if attached_staging:
+                detail = ", ".join(
+                    _attachment_detail(item) for item in attached_staging
+                )
+                print(
+                    f"WARN: keeping attached internal staging ref "
+                    f"{staging_ref}: {detail}",
+                    file=sys.stderr,
+                )
+                continue
+            current = git(
+                "show-ref",
+                "--hash",
+                staging_ref,
+                check=False,
+            )
+            if not current:
+                continue
+            result = _git_result("update-ref", "-d", staging_ref, current)
+            if result.returncode != 0:
+                print(
+                    f"WARN: could not remove internal staging ref "
+                    f"{staging_ref}; inspect it manually",
+                    file=sys.stderr,
+                )
+
+
+def _validate_add_text(value: str, *, field: str) -> None:
+    if not value.strip() or "\n" in value or "\r" in value:
+        raise HermesPatchesError(f"{field} must be one non-empty line")
+
+
+def _render_new_entry(
+    index: int,
+    name: str,
+    branch: str,
+    origin: str,
+    upstream_pr: str,
+    state_value: str,
+    rationale: str,
+    touches: tuple[str, ...],
+    commit: str,
+) -> str:
+    subject = f"chore(patch): scaffold {name}"
+    touch_lines = "\n".join(f"  - `{path}`" for path in touches)
+    return (
+        f"\n\n### {index}. {name}\n\n"
+        f"- **branch:** `{branch}`\n"
+        f"- **origin:** `{origin}`\n"
+        f"- **upstream_pr:** `{upstream_pr}`\n"
+        f"- **state:** `{state_value}`\n"
+        "- **enabled:** `true`\n"
+        "- **example:** `false`\n"
+        f"- **rationale:** {rationale}\n"
+        "- **commits:**\n"
+        f"  - `{commit}` {subject}\n"
+        "- **touches:**\n"
+        f"{touch_lines}\n"
+    )
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    manifest = parse_manifest()
+    name = args.name.strip()
+    if not PATCH_NAME_RE.fullmatch(name):
+        raise HermesPatchesError(
+            "name must contain only lowercase letters, digits, and hyphens"
+        )
+    branch = f"{PATCH_PREFIX}{name}"
+    _mode_banner(args.apply)
+    print(f"BASE: {manifest.base_commit}")
+    print(f"BRANCH: {branch}")
+    print("SCAFFOLD COMMIT TRAILERS:")
+    print(f"  Origin: {args.origin}")
+    print(f"  Upstream-PR: {args.upstream_pr}")
+    print(f"  Patch-State: {args.state}")
+
+    existing_tip = branch_tip(branch)
+    if existing_tip is not None:
+        attached = attachments_by_branch().get(branch, ())
+        if attached:
+            detail = ", ".join(_attachment_detail(item) for item in attached)
+            raise HermesPatchesError(
+                f"branch already exists and is attached: {branch}: {detail}"
+            )
+        raise HermesPatchesError(f"branch already exists: {branch} @ {existing_tip}")
+
+    if not args.apply:
+        print(
+            "PLAN: create the branch without checking it out, add a "
+            "trailer-bearing empty commit,"
+        )
+        print(
+            "      and append a manifest entry when --rationale and "
+            "--touch are supplied."
+        )
+        print("No branch, commit, worktree, hook, or manifest entry was created.")
+        return 0
+
+    if not args.rationale or not args.touch:
+        raise HermesPatchesError(
+            "add --apply requires --rationale and at least one --touch "
+            "so the manifest cannot be scaffolded with invented metadata"
+        )
+    if not _worktree_is_clean():
+        raise HermesPatchesError("policy worktree is not clean; refusing add --apply")
+    _require_valid_for_apply(manifest)
+    _validate_add_text(args.origin, field="origin")
+    _validate_add_text(args.upstream_pr, field="upstream_pr")
+    _validate_add_text(args.rationale, field="rationale")
+    touches = tuple(item.strip() for item in args.touch)
+    for touch in touches:
+        _validate_add_text(touch, field="touch")
+
+    tree = git("rev-parse", f"{manifest.base_commit}^{{tree}}")
+    message = (
+        f"chore(patch): scaffold {name}\n\n"
+        "Initialize the fork patch topic at the manifest's pinned "
+        "upstream base.\n\n"
+        f"Origin: {args.origin}\n"
+        f"Upstream-PR: {args.upstream_pr}\n"
+        f"Patch-State: {args.state}\n"
+    )
+    commit = run_git(
+        "commit-tree",
+        tree,
+        "-p",
+        manifest.base_commit,
+        input_text=message,
+    )
+    entry = _render_new_entry(
+        max(
+            (patch.index for patch in manifest.patches),
+            default=0,
+        )
+        + 1,
+        name,
+        branch,
+        args.origin,
+        args.upstream_pr,
+        args.state,
+        args.rationale,
+        touches,
+        commit,
+    )
+    new_manifest = manifest.text.rstrip() + entry
+
+    created = False
+    try:
+        run_git(
+            "update-ref",
+            branch_ref(branch),
+            commit,
+            ZERO_OID,
+        )
+        created = True
+        _atomic_write(MANIFEST_PATH, new_manifest)
+    except Exception:
+        if created:
+            _git_result(
+                "update-ref",
+                "-d",
+                branch_ref(branch),
+                commit,
+            )
+        raise
+
+    print(f"CREATED: {branch} @ {commit}")
+    print("PATCHES.md was updated but not committed.")
+    print("No branch was checked out and no remote ref was changed.")
+    return 0
+
+
+def _add_mode_flags(parser: argparse.ArgumentParser) -> None:
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the mutation (never implied)",
+    )
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the plan without changing anything (the default)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hermes-patches",
+        description=("Manage the manifest-driven choi138 Hermes fork patch stack."),
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    status = commands.add_parser(
+        "status",
+        help="show manifest state versus local Git refs",
+    )
+    status.set_defaults(func=cmd_status)
+
+    validate = commands.add_parser(
+        "validate",
+        help="fail when manifest and Git reality drift",
+    )
+    validate.set_defaults(func=cmd_validate)
+
+    rebuild = commands.add_parser(
+        "rebuild",
+        help="rebuild hermes/production from the manifest",
+    )
+    _add_mode_flags(rebuild)
+    rebuild.set_defaults(func=cmd_rebuild)
+
+    sync = commands.add_parser(
+        "sync",
+        help="fetch upstream and rebase every topic onto a new base",
+    )
+    sync.add_argument("ref", help="target ref, normally upstream/main")
+    _add_mode_flags(sync)
+    sync.set_defaults(func=cmd_sync)
+
+    add = commands.add_parser(
+        "add",
+        help="scaffold a new hermes/patches/<name> topic",
+    )
+    add.add_argument("name", help="lowercase topic name")
+    add.add_argument(
+        "--origin",
+        default="local-author",
+        help="Origin trailer value",
+    )
+    add.add_argument(
+        "--upstream-pr",
+        default="none",
+        help="Upstream-PR trailer value",
+    )
+    add.add_argument(
+        "--state",
+        default="local-only",
+        choices=sorted(TRAILER_STATES),
+        help="initial Patch-State trailer and manifest state",
+    )
+    add.add_argument(
+        "--rationale",
+        help="required with --apply; one-line manifest rationale",
+    )
+    add.add_argument(
+        "--touch",
+        action="append",
+        default=[],
+        help=(
+            "expected touched path; repeat for multiple paths; required with --apply"
+        ),
+    )
+    _add_mode_flags(add)
+    add.set_defaults(func=cmd_add)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except HermesPatchesError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
