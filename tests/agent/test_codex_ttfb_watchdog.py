@@ -17,6 +17,7 @@ stall.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -148,6 +149,136 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+def test_active_sse_survives_general_wall_clock_stale_timeout(tmp_path, monkeypatch):
+    """An active Codex stream uses event-idle liveness, not response wall time."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda *_args: 0.4
+    )
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "5")
+
+    closes: list[str] = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def active_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        time.sleep(0.9)
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", active_stream)
+
+    response = h.interruptible_api_call(
+        agent, {"model": "gpt-5.5", "input": "hi"}
+    )
+    assert response is sentinel
+    assert "stale_call_kill" not in closes
+
+
+def test_post_frame_idle_watchdog_still_terminates(tmp_path, monkeypatch):
+    """Skipping the wall-clock cutoff must not disable SSE-idle recovery."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0.4")
+    monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(h, "_ABORTED_REQUEST_WORKER_JOIN_SECONDS", 0.05)
+
+    closes: list[str] = []
+    stop = threading.Event()
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+
+    def stalled_after_frame(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        stop.wait(5)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", stalled_after_frame)
+
+    try:
+        with pytest.raises(TimeoutError, match="no SSE events"):
+            h.interruptible_api_call(
+                agent, {"model": "gpt-5.5", "input": "hi"}
+            )
+        assert "codex_stream_idle_kill" in closes
+    finally:
+        stop.set()
+
+
+def test_lingering_aborted_worker_blocks_same_endpoint_retry(tmp_path, monkeypatch):
+    """A timed-out owner still pending upstream must not overlap its retry."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(h, "_ABORTED_REQUEST_WORKER_JOIN_SECONDS", 0.05)
+    monkeypatch.setattr(h, "_ABORTED_REQUEST_WORKER_DRAIN_SECONDS", 0.05)
+
+    release_first = threading.Event()
+    first_finished = threading.Event()
+    attempts = {"count": 0}
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *_a, **_k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *_a, **_k: None)
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def request(api_kwargs, client=None, on_first_delta=None):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            release_first.wait(5)
+            first_finished.set()
+            raise RuntimeError("old request drained")
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", request)
+
+    with pytest.raises(TimeoutError, match="no bytes"):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    with pytest.raises(TimeoutError, match="still draining"):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert attempts["count"] == 1
+
+    release_first.set()
+    assert first_finished.wait(2)
+    response = h.interruptible_api_call(
+        agent, {"model": "gpt-5.5", "input": "hi"}
+    )
+    assert response is sentinel
+    assert attempts["count"] == 2
+
+
 
 
 
@@ -176,6 +307,24 @@ def test_wait_notice_omits_reconnect_when_all_deadlines_are_non_finite(
     )
 
     assert recovery == ""
+
+
+def test_wait_notice_keeps_stale_deadline_when_event_watchdogs_are_disabled():
+    from agent import chat_completion_helpers as h
+
+    recovery = h._codex_wait_notice_recovery(
+        stale_timeout=90.0,
+        ttfb_enabled=False,
+        ttfb_timeout=120.0,
+        last_event_ts=105.0,
+        call_start=100.0,
+        idle_enabled=False,
+        idle_timeout=0.0,
+        elapsed=30.0,
+        hard_timeout=None,
+    )
+
+    assert recovery == "; auto-reconnect at 90s"
 
 
 
@@ -345,7 +494,4 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
-
-
 

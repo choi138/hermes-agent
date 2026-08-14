@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Optional
+
+from hermes_cli.provider_config import get_provider_config_entry
+
 
 def _coerce_timeout(raw: object) -> float | None:
     try:
@@ -12,24 +16,19 @@ def _coerce_timeout(raw: object) -> float | None:
 
 
 def get_provider_request_timeout(
-    provider_id: str, model: str | None = None
+    provider_id: str,
+    model: str | None = None,
+    *,
+    requested_provider: Optional[str] = None,
 ) -> float | None:
     """Return a configured provider request timeout in seconds, if any."""
-    if not provider_id:
-        return None
-
-    try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly()
-    except Exception:
-        return None
-
-    providers = config.get("providers", {}) if isinstance(config, dict) else {}
-    provider_config = (
-        providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+    resolved = get_provider_config_entry(
+        provider_id,
+        requested_provider=requested_provider,
     )
-    if not isinstance(provider_config, dict):
+    if resolved is None:
         return None
+    _resolved_id, provider_config = resolved
 
     model_config = _get_model_config(provider_config, model)
     if model_config is not None:
@@ -41,24 +40,19 @@ def get_provider_request_timeout(
 
 
 def get_provider_stale_timeout(
-    provider_id: str, model: str | None = None
+    provider_id: str,
+    model: str | None = None,
+    *,
+    requested_provider: Optional[str] = None,
 ) -> float | None:
     """Return a configured non-stream stale timeout in seconds, if any."""
-    if not provider_id:
-        return None
-
-    try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly()
-    except Exception:
-        return None
-
-    providers = config.get("providers", {}) if isinstance(config, dict) else {}
-    provider_config = (
-        providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+    resolved = get_provider_config_entry(
+        provider_id,
+        requested_provider=requested_provider,
     )
-    if not isinstance(provider_config, dict):
+    if resolved is None:
         return None
+    _resolved_id, provider_config = resolved
 
     model_config = _get_model_config(provider_config, model)
     if model_config is not None:

@@ -61,7 +61,7 @@ def test_graphiti_canonical_provider_exposes_only_bounded_read_only_search():
                 "type": "integer",
                 "description": "Maximum number of filtered facts to return.",
                 "minimum": 1,
-                "maximum": 12,
+                "maximum": 24,
                 "default": 4,
             },
         },
@@ -71,8 +71,10 @@ def test_graphiti_canonical_provider_exposes_only_bounded_read_only_search():
     description = schemas[0]["description"].lower()
     assert "before browser" in description
     assert "status=empty" in description
-    assert "fallback_allowed=true" in description
-    assert "do not fall back" in description
+    assert "status=filtered" in description
+    assert "status=timeout" in description
+    assert "status=error" in description
+    assert "do not fall back only when status=ok" in description
 
 
 def test_memory_manager_registers_graphiti_model_search_tool():
@@ -125,7 +127,7 @@ def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
         "source": "graphiti_historical_memory",
         "returned_count": 1,
         "candidate_count": 2,
-        "fetch_limit": 12,
+        "fetch_limit": 24,
         "reached_fetch_limit": False,
         "has_more": True,
         "total_unknown": False,
@@ -142,7 +144,7 @@ def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
     assert tool_name == "mcp__graphiti_canonical__search_memory_facts"
     assert args == {
         "query": "What answer style does Alice prefer?",
-        "max_facts": 12,
+        "max_facts": 24,
         "group_ids": ["mnemos"],
     }
     assert deadline > time.monotonic()
@@ -205,7 +207,7 @@ def test_model_search_tool_distinguishes_empty_results_from_failures(
         "source": "graphiti_historical_memory",
         "returned_count": 0,
         "candidate_count": 0,
-        "fetch_limit": 12,
+        "fetch_limit": 24,
         "reached_fetch_limit": False,
         "has_more": False,
         "total_unknown": False,
@@ -265,7 +267,7 @@ def test_model_search_tool_reports_filtered_candidates_and_allows_fallback(
         "source": "graphiti_historical_memory",
         "returned_count": 0,
         "candidate_count": 1,
-        "fetch_limit": 12,
+        "fetch_limit": 24,
         "reached_fetch_limit": False,
         "has_more": True,
         "total_unknown": False,
@@ -384,10 +386,10 @@ def test_model_search_tool_marks_fetch_limit_as_unknown_total(monkeypatch, tmp_p
     assert result["source"] == "graphiti_historical_memory"
     assert result["returned_count"] == 12
     assert result["candidate_count"] == 12
-    assert result["fetch_limit"] == 12
-    assert result["reached_fetch_limit"] is True
-    assert result["has_more"] is None
-    assert result["total_unknown"] is True
+    assert result["fetch_limit"] == 24
+    assert result["reached_fetch_limit"] is False
+    assert result["has_more"] is False
+    assert result["total_unknown"] is False
     assert result["fallback_allowed"] is False
 
 
@@ -522,7 +524,7 @@ def test_model_search_tool_bounds_post_dispatch_processing(monkeypatch, tmp_path
         ("search_memory_facts", {"query": "x" * 4001}),
         ("search_memory_facts", {"query": "Alice projects", "max_facts": True}),
         ("search_memory_facts", {"query": "Alice projects", "max_facts": 0}),
-        ("search_memory_facts", {"query": "Alice projects", "max_facts": 13}),
+        ("search_memory_facts", {"query": "Alice projects", "max_facts": 25}),
     ],
 )
 def test_model_search_tool_rejects_other_tools_and_invalid_arguments(
@@ -1102,7 +1104,7 @@ def test_continuity_request_recalls_fact_through_read_only_search(
             "mcp__graphiti_canonical__search_memory_facts",
             {
                 "query": "하던 작업 계속 진행해줘",
-                "max_facts": 12,
+                "max_facts": 24,
                 "group_ids": ["mnemos"],
             },
         )
@@ -1974,7 +1976,7 @@ def test_preference_dependent_request_triggers_selective_recall(monkeypatch, tmp
             "mcp__graphiti_canonical__search_memory_facts",
             {
                 "query": "내 선호에 맞는 방식으로 보고해줘",
-                "max_facts": 12,
+                "max_facts": 24,
                 "group_ids": ["mnemos"],
             },
         )
@@ -2591,13 +2593,11 @@ def test_provider_prompt_declares_recall_non_authoritative_and_read_only():
     assert "live state" in block
     assert "before browser" in block
     assert "before session history" in block
-    assert "only when status=empty and fallback_allowed=true" in block
-    assert "filtered" in block
-    assert "timeout" in block
-    assert "error" in block
-    assert "do not silently fall back" in block
+    assert "denies a fallback source only after status=ok" in block
+    assert "status=empty or status=filtered" in block
+    assert "status=timeout or status=error" in block
+    assert "use session_search" in block
     assert "runtime guard" in block
-    assert "denied fallback" in block
     assert "explicitly directs a live" in block
     assert "graphiti records" in block
     assert "returned_count" in block

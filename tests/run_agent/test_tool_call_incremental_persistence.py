@@ -482,6 +482,144 @@ def test_segmented_batch_stops_before_later_segment_after_persist_failure():
     assert getattr(agent, "_incremental_persistence_failed", False) is True
 
 
+def test_successful_kanban_terminal_call_skips_later_batch_side_effects(monkeypatch):
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="kanban_complete", call_id="c1"),
+        _mock_tool_call(name="terminal", call_id="c2"),
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+    dispatched: list[str] = []
+
+    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
+        from model_tools import TrustedToolResult
+
+        dispatched.append(function_name)
+        raw = json.dumps({
+            "ok": True,
+            "task_id": "t_12345678",
+            "__hermes_kanban_terminal__": {
+                "task_id": "t_12345678",
+                "tool": "kanban_complete",
+                "status": "done",
+            },
+        })
+        return TrustedToolResult(raw, raw)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    assert dispatched == ["kanban_complete"]
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert "skipped after successful kanban_complete" in messages[1]["content"]
+    assert agent._kanban_terminal_transition["status"] == "done"
+
+
+def test_terminal_marker_survives_tool_result_externalization(monkeypatch):
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="kanban_complete", call_id="c1"),
+        _mock_tool_call(name="terminal", call_id="c2"),
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+    dispatched: list[str] = []
+
+    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
+        from model_tools import TrustedToolResult
+
+        dispatched.append(function_name)
+        raw = json.dumps({
+            "ok": True,
+            "task_id": "t_12345678",
+            "__hermes_kanban_terminal__": {
+                "task_id": "t_12345678",
+                "tool": "kanban_complete",
+                "status": "done",
+            },
+        })
+        return TrustedToolResult(raw, raw)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            return_value="[Tool result persisted externally]",
+        ),
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    assert dispatched == ["kanban_complete"]
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert messages[0]["content"] == "[Tool result persisted externally]"
+    assert "skipped after successful kanban_complete" in messages[1]["content"]
+    assert agent._kanban_terminal_transition["status"] == "done"
+
+
+def test_run_conversation_stops_before_another_model_request_after_terminal_marker(monkeypatch):
+    agent = _make_agent()
+    agent.valid_tool_names = {"kanban_complete", "terminal"}
+    tool_calls = [
+        _mock_tool_call(name="kanban_complete", call_id="c1"),
+        _mock_tool_call(name="terminal", call_id="c2"),
+    ]
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="", finish_reason="tool_calls", tool_calls=tool_calls,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+
+    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
+        from model_tools import TrustedToolResult
+
+        raw = json.dumps({
+            "ok": True,
+            "task_id": "t_12345678",
+            "__hermes_kanban_terminal__": {
+                "task_id": "t_12345678",
+                "tool": "kanban_complete",
+                "status": "done",
+            },
+        })
+        return TrustedToolResult(raw, raw)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
+        patch.object(agent, "_persist_session") as persist_session,
+        patch.object(agent, "_save_trajectory") as save_trajectory,
+        patch.object(agent, "_cleanup_task_resources") as cleanup_task_resources,
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        result = agent.run_conversation("finish the card")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["kanban_terminal"] is True
+    assert result["kanban_terminal_transition"]["status"] == "done"
+    save_trajectory.assert_called_once()
+    cleanup_task_resources.assert_called_once()
+    assert persist_session.call_count >= 1
+    for persisted in persist_session.call_args_list:
+        assert persisted.args[0][-1] == {
+            "role": "assistant",
+            "content": "Kanban task t_12345678 transitioned to done.",
+        }
+    assert result["messages"][-1] == {
+        "role": "assistant",
+        "content": "Kanban task t_12345678 transitioned to done.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Contract 3: the CONCURRENT path flushes each collected tool result in append
 # order.  Dispatch goes through agent._invoke_tool (the real concurrent

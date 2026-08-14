@@ -4113,6 +4113,15 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                # Capture attribution before fallback/recovery mutates agent state.
+                try:
+                    _retry.record_failure(
+                        provider=getattr(agent, "provider", "") or "",
+                        model=getattr(agent, "model", "") or "",
+                        reason=classified.reason,
+                    )
+                except Exception:
+                    pass
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -5760,11 +5769,27 @@ def run_conversation(
                             force=True,
                         )
 
-                    logger.error(
-                        "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
-                        agent.log_prefix, max_retries, _final_summary,
-                        _provider, _model, len(api_messages), f"{approx_tokens:,}",
-                    )
+                    _trace = ""
+                    try:
+                        _retry.record_turn_footprint(
+                            retries=max_retries,
+                            messages=len(api_messages),
+                            approx_tokens=approx_tokens,
+                        )
+                        _trace = _retry.format_failure_trace() or ""
+                    except Exception:
+                        _trace = ""
+                    if _trace:
+                        logger.error(
+                            "%sAPI call failed after %s retries. %s | %s",
+                            agent.log_prefix, max_retries, _final_summary, _trace,
+                        )
+                    else:
+                        logger.error(
+                            "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
+                            agent.log_prefix, max_retries, _final_summary,
+                            _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                        )
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
@@ -6078,27 +6103,13 @@ def run_conversation(
                 else:
                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
-            # Notify progress callback of model's thinking (used by subagent
-            # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
-                _think_text = assistant_message.content.strip()
-                # Strip reasoning XML tags that shouldn't leak to parent display
-                _think_text = re.sub(
-                    r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
-                ).strip()
-                # For subagents: relay first line to parent display (existing behaviour).
-                # For all agents with a structured callback: emit reasoning.available event.
-                first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-                if first_line and getattr(agent, '_delegate_depth', 0) > 0:
-                    try:
-                        agent.tool_progress_callback("_thinking", first_line)
-                    except Exception:
-                        pass
-                elif _think_text:
-                    try:
-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
-                    except Exception:
-                        pass
+            # Publish only real reasoning/scratch as thinking progress. Ordinary
+            # assistant content is owned by either the existing interim paths or
+            # the finalization path and must never be relayed as ``_thinking``.
+            if agent.tool_progress_callback:
+                from agent.agent_runtime_helpers import emit_reasoning_progress
+
+                emit_reasoning_progress(agent, assistant_message)
             
             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
@@ -6681,6 +6692,15 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                kanban_terminal = getattr(agent, "_kanban_terminal_transition", None)
+                if kanban_terminal is not None:
+                    _turn_exit_reason = "kanban_terminal"
+                    final_response = (
+                        f"Kanban task {kanban_terminal['task_id']} "
+                        f"transitioned to {kanban_terminal['status']}."
+                    )
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

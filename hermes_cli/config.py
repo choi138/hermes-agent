@@ -1322,7 +1322,7 @@ def _normalize_custom_provider_entry(
         # configs don't warn on every load.
         "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
-        "api_mode", "transport", "model", "default_model", "models",
+        "api_mode", "transport", "backend_family", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
@@ -1402,6 +1402,10 @@ def _normalize_custom_provider_entry(
     api_mode = entry.get("api_mode") or entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():
         normalized["api_mode"] = api_mode.strip()
+
+    backend_family = entry.get("backend_family")
+    if isinstance(backend_family, str) and backend_family.strip():
+        normalized["backend_family"] = backend_family.strip()
 
     model_name = entry.get("model") or entry.get("default_model")
     if isinstance(model_name, str) and model_name.strip():
@@ -1493,6 +1497,7 @@ def _custom_provider_entry_to_provider_config(
         "name",
         "api_key",
         "key_env",
+        "backend_family",
         "models",
         "context_length",
         "rate_limit_delay",

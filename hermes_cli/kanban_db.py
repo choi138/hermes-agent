@@ -993,8 +993,9 @@ class Task:
     # or the worker explicitly blocks/completes. ``False`` (default) =
     # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
     goal_mode: bool = False
-    # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
-    # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
+    # Goal-loop turn budget for ``goal_mode`` workers. New goal-mode tasks
+    # require an explicit positive value; ``None`` is reserved for non-goal
+    # tasks and legacy rows normalized by the additive migration.
     goal_max_turns: Optional[int] = None
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
@@ -1487,8 +1488,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
-    -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
-    -- goals-engine default.
+    -- Goal-loop turn budget for ``goal_mode`` workers. New goal-mode writes
+    -- require a positive value; NULL is retained for non-goal / legacy rows.
     goal_max_turns       INTEGER,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
@@ -3653,6 +3654,9 @@ def create_task(
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
 
+    ``goal_mode=True`` requires an explicit positive ``goal_max_turns`` so
+    open-ended work always has a durable, caller-chosen quality budget.
+
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
@@ -3664,6 +3668,14 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    goal_mode = bool(goal_mode)
+    if goal_mode:
+        if isinstance(goal_max_turns, bool) or not isinstance(goal_max_turns, int):
+            raise ValueError("goal_max_turns must be >= 1 when goal_mode is enabled")
+        if goal_max_turns < 1:
+            raise ValueError("goal_max_turns must be >= 1 when goal_mode is enabled")
+    else:
+        goal_max_turns = None
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -9190,10 +9202,14 @@ def decompose_triage_task(
                     (author or "decomposer"),
                 ),
             )
-            _append_event(
-                conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
-            )
+            created_payload: dict[str, Any] = {
+                "by": author or "decomposer",
+                "from_decompose_of": task_id,
+            }
+            role = child.get("role")
+            if isinstance(role, str) and role.strip():
+                created_payload["role"] = role.strip()
+            _append_event(conn, new_id, "created", created_payload)
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
 

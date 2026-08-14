@@ -17,8 +17,10 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
-import enum
 import contextvars
+import enum
+import hashlib
+import hmac
 import json
 import logging
 
@@ -33,6 +35,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
+from agent.failover_domain import endpoint_origin
 from agent.interrupt_compat import request_hard_interrupt
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -150,6 +153,261 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Active-delegation fingerprint reservations
+#
+# Guards against the SAME expensive delegation being launched twice while an
+# identical child is still in flight — the incident being prevented is a
+# duplicated review that doubled model/API queue contention for no new
+# information.  A reservation is claimed BEFORE the child is built, so two
+# racing delegate_task calls can never both construct/run it.
+#
+# Identity is deliberately narrow (see _delegation_fingerprint): a different
+# context, role, provider, model, workspace or parent turn is a different job
+# and still spawns.  Only a concurrent, byte-identical delegation is
+# suppressed; once the reservation is released the exact same task may run
+# again sequentially.  A reservation is scoped to ONE child, not to the batch
+# that spawned it: it is dropped as soon as that child's own run ends, so a
+# finished task stops suppressing duplicates even while its siblings run on.
+#
+# Lock discipline: ``_active_delegation_lock`` is a LEAF lock.  No other lock
+# is acquired while holding it, and it is never held across a child build or
+# run, so it cannot form a cycle with ``_active_subagents_lock`` /
+# ``_spawn_pause_lock``.
+#
+# Lifetime is process-local by design — nothing is persisted, so a restart
+# never resurrects a stale claim.
+# ---------------------------------------------------------------------------
+
+_active_delegation_lock = threading.Lock()
+# fingerprint (sha256 hex) -> {owner_id, subagent_id, task_index, started_at}.
+# Bounded, non-sensitive metadata ONLY: the goal/context text is hashed into
+# the key and never stored here (or logged).
+_active_delegations: Dict[str, Dict[str, Any]] = {}
+
+
+def _fingerprint_text(value: Any) -> str:
+    """Whitespace-normalise one fingerprint component to a stable string.
+
+    Only genuinely text-shaped values contribute: ``str`` and ``os.PathLike``
+    (``_subdirectory_hints.working_dir`` is a ``Path``).  Anything else —
+    notably the ``MagicMock`` attributes test doubles hand us — collapses to
+    ``""`` so a fingerprint can never depend on an object's repr or identity.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, os.PathLike):
+        try:
+            value = os.fspath(value)
+        except Exception:
+            return ""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+_FINGERPRINT_HMAC_KEY = os.urandom(32)
+
+
+def _credential_fingerprint(api_key: Any, base_url: Any = None) -> str:
+    """Return a process-local one-way discriminator for credential material."""
+    key_text = _fingerprint_text(api_key)
+    userinfo = ""
+    url_text = _fingerprint_text(base_url)
+    if "://" in url_text:
+        try:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url_text)
+            if parsed.username or parsed.password:
+                userinfo = f"{parsed.username or ''}:{parsed.password or ''}"
+        except (TypeError, ValueError):
+            userinfo = ""
+    if not key_text and not userinfo:
+        return ""
+    mac = hmac.new(_FINGERPRINT_HMAC_KEY, digestmod=hashlib.sha256)
+    for part in (key_text, userinfo):
+        encoded = part.encode("utf-8")
+        mac.update(len(encoded).to_bytes(8, "big"))
+        mac.update(encoded)
+    return mac.hexdigest()
+
+
+def _valid_task_index(value: Any, task_count: int) -> Optional[int]:
+    """Return an in-range integer result index, otherwise ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value >= task_count:
+        return None
+    return value
+
+
+def _result_sort_key(entry: Any, task_count: int) -> tuple:
+    """Sort valid caller indices first and malformed indices last, stably."""
+    index = None
+    if isinstance(entry, dict):
+        index = _valid_task_index(entry.get("task_index"), task_count)
+    return (1, 0) if index is None else (0, index)
+
+
+def _resolve_workspace_identity(parent_agent) -> str:
+    """Effective workspace identity for the delegation fingerprint.
+
+    Parent-specific values win over the process-wide ``TERMINAL_CWD`` env var,
+    which any terminal tool call can rewrite mid-run: two parents rooted in
+    different worktrees must never collide just because one of them last
+    exported a shared cwd.  Unlike ``_resolve_workspace_hint`` (which feeds a
+    child prompt and therefore insists the directory exists) this is pure
+    identity, so a non-existent path is still a usable discriminator.
+    """
+    for candidate in (
+        getattr(getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None),
+        getattr(parent_agent, "terminal_cwd", None),
+        getattr(parent_agent, "cwd", None),
+        os.getenv("TERMINAL_CWD"),
+    ):
+        text = _fingerprint_text(candidate)
+        if not text:
+            continue
+        try:
+            return os.path.abspath(os.path.expanduser(text))
+        except Exception:
+            return text
+    return ""
+
+
+def _delegation_fingerprint(
+    *,
+    parent_session_id: str,
+    parent_turn_id: str,
+    workspace: str,
+    goal: str,
+    context: Optional[str],
+    role: str,
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Any = None,
+    api_key: Any = None,
+    sibling_ordinal: int = 0,
+) -> str:
+    """SHA-256 digest over a deterministic JSON view of a delegation's identity.
+
+    Every component that would make two children behave differently is part of
+    the key, so intentionally different comparison/QA runs (other context,
+    role, provider, model, workspace, or a later parent turn) are never
+    collapsed into one another.  Only the returned digest is ever stored or
+    logged — the raw goal/context text does not escape this function.
+    """
+    payload = {
+        "parent_session_id": _fingerprint_text(parent_session_id),
+        "parent_turn_id": _fingerprint_text(parent_turn_id),
+        "workspace": _fingerprint_text(workspace),
+        "goal": _fingerprint_text(goal),
+        "context": _fingerprint_text(context),
+        "role": _fingerprint_text(role),
+        "provider": _fingerprint_text(provider),
+        "model": _fingerprint_text(model),
+        "endpoint": endpoint_origin(base_url),
+        "credential": _credential_fingerprint(api_key, base_url),
+        "sibling_ordinal": int(sibling_ordinal),
+    }
+    blob = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _new_reservation_owner_id() -> str:
+    """Opaque, stable id for one caller's claim on a fingerprint.
+
+    Allocated before the child is built (the subagent id does not exist yet),
+    and reported to a suppressed duplicate when no child id is available.
+    """
+    import uuid as _uuid
+
+    return f"resv-{_uuid.uuid4().hex[:12]}"
+
+
+def _reserve_active_delegation(
+    fingerprint: str, *, owner_id: str, task_index: int
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim ``fingerprint`` for ``owner_id``.
+
+    Returns ``None`` when the claim succeeded, or a snapshot of the record that
+    already holds it (the in-flight duplicate) when it did not.  Callers MUST
+    reserve before ``_build_child_agent`` so the loser of a race never
+    constructs or runs a child.
+    """
+    with _active_delegation_lock:
+        existing = _active_delegations.get(fingerprint)
+        if existing is not None:
+            return dict(existing)
+        _active_delegations[fingerprint] = {
+            "owner_id": owner_id,
+            "subagent_id": None,
+            "task_index": task_index,
+            "started_at": time.time(),
+        }
+        return None
+
+
+def _bind_reservation_subagent_id(
+    fingerprint: str, owner_id: str, subagent_id: Any
+) -> None:
+    """Upgrade a reservation's reported id to the real child's subagent id.
+
+    Owner-matched so a stale caller cannot relabel someone else's claim.  Test
+    doubles without a string id simply leave the owner id in place.
+    """
+    if not isinstance(subagent_id, str) or not subagent_id:
+        return
+    with _active_delegation_lock:
+        record = _active_delegations.get(fingerprint)
+        if record is not None and record.get("owner_id") == owner_id:
+            record["subagent_id"] = subagent_id
+
+
+def _release_active_delegation(fingerprint: str, owner_id: str) -> bool:
+    """Release a reservation, but only for the caller that owns it.
+
+    Owner matching is what stops a late release (e.g. a slow background batch
+    unwinding) from evicting a *newer* reservation another caller has since
+    taken on the same fingerprint.  Returns True when this call owned it.
+    """
+    with _active_delegation_lock:
+        record = _active_delegations.get(fingerprint)
+        if record is None or record.get("owner_id") != owner_id:
+            return False
+        del _active_delegations[fingerprint]
+        return True
+
+
+def _duplicate_result_entry(
+    task_index: int, fingerprint: str, existing: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Result entry for a task suppressed as an in-flight duplicate.
+
+    No child was built or run, so ``api_calls`` is 0 by construction.  The
+    explanation names the in-flight owner and the digest only — never the goal
+    or context text.
+    """
+    owner = existing.get("subagent_id") or existing.get("owner_id") or ""
+    return {
+        "task_index": task_index,
+        "status": "duplicate",
+        "summary": None,
+        "api_calls": 0,
+        "duration_seconds": 0,
+        "fingerprint": fingerprint,
+        "existing_subagent_id": owner,
+        "note": (
+            f"Suppressed: an identical delegation is already in flight as {owner} "
+            "(same parent session, turn, workspace, goal, context, role, provider "
+            "and model). Use that child's result instead of spawning a second "
+            "copy; the same task may be delegated again once it finishes."
+        ),
+    }
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -1656,6 +1914,9 @@ def _build_child_agent(
             **child_optional_kwargs,
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Numeric-only context size for the subagent_request_size line; the
+    # context text itself is deliberately never stashed on the child.
+    child._delegate_context_chars = len(context) if isinstance(context, str) else 0
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -1720,6 +1981,138 @@ def _build_child_agent(
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
     return child
+
+
+# ~4 characters per token — the standard rule of thumb. A real tokenizer is
+# deliberately NOT loaded: this runs immediately before the child's first API
+# call, which is precisely where extra latency is least affordable.
+_CHARS_PER_TOKEN = 4
+
+
+def _approx_tokens_from_chars(chars: Any) -> int:
+    """Approximate a token count from a character count.
+
+    Formula: ``ceil(chars / 4)``.  Deterministic, allocation-free, and safe
+    on the hot path.  Anything that is not a positive ``int`` (including
+    ``bool``) yields 0 rather than raising — this feeds best-effort
+    instrumentation, so a bad input must degrade, not break.
+    """
+    if not isinstance(chars, int) or isinstance(chars, bool) or chars <= 0:
+        return 0
+    return -(-chars // _CHARS_PER_TOKEN)  # ceiling division
+
+
+def _sized_len(value: Any) -> int:
+    """``len()`` of a str/list/tuple, else 0.
+
+    The type guard is the point: ``len(repr(mock))`` or a stringified object
+    would turn a test double (or a half-built child) into a plausible-looking
+    number, and worse, tempt callers into logging the value itself.
+    """
+    if isinstance(value, (str, list, tuple)):
+        return len(value)
+    return 0
+
+
+def _subagent_request_size_fields(
+    *,
+    child: Any,
+    task_index: int,
+    goal: str,
+) -> Dict[str, int]:
+    """Numeric-only size metadata describing a child's first request.
+
+    Every value is an ``int``, so the caller can log the mapping verbatim:
+    no goal/context/system/tool text, no credential, no URL, no path and no
+    ``repr`` can reach the log through here.
+
+    Fields (in emitted order):
+      * ``task_index``
+      * ``goal_chars`` / ``goal_tokens`` — the user message handed to the child.
+      * ``context_chars`` / ``context_tokens`` — read from the
+        ``_delegate_context_chars`` length stashed by ``_build_child_agent``;
+        the context text itself is never stored for this purpose.
+      * ``system_chars`` / ``system_tokens`` — the child's effective system
+        prompt (ephemeral first, then plain, mirroring the timeout dump).
+      * ``tool_schema_bytes`` — UTF-8 length of exactly ONE ``json.dumps`` of
+        the child's tool schemas, on the same basis as the timeout
+        diagnostic's identically-named field so the two are comparable.
+      * ``message_count`` — conversation turns already staged on the child
+        (prefill + session).  Legitimately 0 before the first API call.
+      * ``approx_tokens`` — sum of the four component estimates
+        (goal + context + system + tool schema).  Deliberately an *upper
+        bound*: the child's system prompt already embeds the goal and the
+        context, so those are counted twice.  Each component is logged
+        separately, so a tighter figure can be derived from the same line.
+    """
+    if not isinstance(task_index, int) or isinstance(task_index, bool):
+        task_index = 0
+    task_index = max(0, task_index)
+
+    goal_chars = _sized_len(goal)
+
+    context_chars = getattr(child, "_delegate_context_chars", 0)
+    if not isinstance(context_chars, int) or isinstance(context_chars, bool):
+        context_chars = 0
+    context_chars = max(0, context_chars)
+
+    system_prompt = getattr(child, "ephemeral_system_prompt", None)
+    if not isinstance(system_prompt, str):
+        system_prompt = getattr(child, "system_prompt", None)
+    system_chars = _sized_len(system_prompt)
+
+    # Single serialization: no per-field or per-tool re-dumping, and skipped
+    # entirely unless the attribute is a real, non-empty sequence.
+    tool_schema_bytes = 0
+    tools_schema = getattr(child, "tools", None)
+    if isinstance(tools_schema, (list, tuple)) and tools_schema:
+        tool_schema_bytes = len(
+            json.dumps(tools_schema, default=str).encode("utf-8")
+        )
+
+    message_count = _sized_len(getattr(child, "prefill_messages", None)) + _sized_len(
+        getattr(child, "_session_messages", None)
+    )
+
+    goal_tokens = _approx_tokens_from_chars(goal_chars)
+    context_tokens = _approx_tokens_from_chars(context_chars)
+    system_tokens = _approx_tokens_from_chars(system_chars)
+    schema_tokens = _approx_tokens_from_chars(tool_schema_bytes)
+
+    return {
+        "task_index": task_index,
+        "goal_chars": goal_chars,
+        "goal_tokens": goal_tokens,
+        "context_chars": context_chars,
+        "context_tokens": context_tokens,
+        "system_chars": system_chars,
+        "system_tokens": system_tokens,
+        "tool_schema_bytes": tool_schema_bytes,
+        "message_count": message_count,
+        "approx_tokens": goal_tokens + context_tokens + system_tokens + schema_tokens,
+    }
+
+
+def _log_subagent_request_size(*, child: Any, task_index: int, goal: str) -> None:
+    """Log one ``subagent_request_size`` line for a normal child run.
+
+    Best-effort by construction: every failure is swallowed so instrumentation
+    can never stop a subagent from running.  The failure path logs the
+    exception *type* only — an exception's message can carry the ``repr`` of
+    whatever it choked on, which is exactly what must not reach the log.
+    """
+    try:
+        fields = _subagent_request_size_fields(
+            child=child, task_index=task_index, goal=goal
+        )
+        logger.info(
+            "subagent_request_size %s",
+            " ".join(f"{key}={value}" for key, value in fields.items()),
+        )
+    except Exception as exc:
+        logger.debug(
+            "Subagent request-size instrumentation failed: %s", type(exc).__name__
+        )
 
 
 def _dump_subagent_timeout_diagnostic(
@@ -2331,6 +2724,9 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                 )
 
+        # Emitted before submit(), so one size line lands even when the child
+        # raises or never returns.
+        _log_subagent_request_size(child=child, task_index=task_index, goal=goal)
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
             _child_context.run,
@@ -2484,6 +2880,7 @@ def _run_single_child(
 
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
+        failed = bool(result.get("failed", False))
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
@@ -2496,6 +2893,10 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif failed:
+            # A failed turn may still carry a useful final_response explaining
+            # what went wrong.  That explanation is not evidence of success.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -2545,6 +2946,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif failed:
+            exit_reason = result.get("turn_exit_reason") or "failed"
         elif completed:
             exit_reason = "completed"
         else:
@@ -2591,7 +2994,11 @@ def _run_single_child(
             ),
         }
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            entry["error"] = (
+                result.get("error")
+                or summary
+                or "Subagent did not produce a response."
+            )
 
         # A steer that queued after the child's final assistant turn had no
         # tool batch left to drain into.  The finalizer hands the undelivered
@@ -3143,49 +3550,202 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
-    # Build all child agents on the main thread (thread-safe construction).
-    # _build_child_preserving_parent_tools saves/restores the parent's
-    # resolved tool names around each construction under a lock, so child
-    # toolset resolution never leaks into the parent (shared with the plugin
-    # subagent-lifecycle API).
+    # Fingerprint inputs that are constant across the batch. Resolved once so
+    # every task in this call is judged against the same parent identity.
+    _fp_session_id = _fingerprint_text(getattr(parent_agent, "session_id", ""))
+    _fp_turn_id = _fingerprint_text(getattr(parent_agent, "_current_turn_id", ""))
+    _fp_workspace = _resolve_workspace_identity(parent_agent)
+    _fp_base_url = creds["base_url"] or getattr(parent_agent, "base_url", None)
+    _fp_api_key = creds["api_key"] or getattr(parent_agent, "api_key", None)
+    if not _fp_api_key:
+        _client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+        if isinstance(_client_kwargs, dict):
+            _fp_api_key = _client_kwargs.get("api_key")
+    # Base identity -> count of equivalent entries already seen in THIS call.
+    # The ordinal preserves explicit same-text N-sample batches, while a
+    # concurrent call's first equivalent entry still uses ordinal zero and
+    # collides with the active reservation.
+    _sibling_ordinals: Dict[str, int] = {}
+
+    # Build all child agents on the main thread. The HEAD helper serializes
+    # construction and restores the parent's process-global tool names around
+    # every child, while reservations are claimed before construction.
     children = []
-    for i, t in enumerate(task_list):
-        # Per-task role beats top-level; normalise again so unknown
-        # per-task values warn and degrade to leaf uniformly.
-        effective_role = _normalize_role(t.get("role") or top_role)
-        child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=t.get("context"),
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role=effective_role,
-        )
-        # Tee the child's progress events into its live transcript log.
-        # wrap_progress_callback preserves the inner callback contract
-        # (including the _flush attribute) and never lets writer failures
-        # reach the agent loop. When no parent display exists the inner
-        # callback is None and the wrapper still records events.
-        _writer = live_writers[i] if i < len(live_writers) else None
-        if _writer is not None:
-            child.tool_progress_callback = wrap_progress_callback(
-                getattr(child, "tool_progress_callback", None), _writer
+    # task_index -> (fingerprint, owner_id) claimed by THIS call.  Keyed per
+    # task, not batch-wide, because each child must drop its OWN claim the
+    # moment its own run ends: a batch is not one in-flight request, it is N of
+    # them, and a task that has already finished must stop suppressing an
+    # identical delegation even while its siblings are still running.
+    reservations: Dict[int, tuple] = {}
+    # Claims move here atomically after the async scheduler accepts the batch.
+    # A parent-frame error after acceptance must not release runner-owned work.
+    runner_reservations: Dict[int, tuple] = {}
+    # Guards `reservations` only: worker threads pop their own entry while the
+    # parent thread may drain the rest.  Never held across
+    # _release_active_delegation(), so _active_delegation_lock stays a leaf.
+    reservations_lock = threading.Lock()
+    # Tasks skipped because an identical child is already in flight. Folded
+    # back into `results` at the end so batch ordering is preserved.
+    duplicate_entries: List[Dict[str, Any]] = []
+
+    def _release_child_reservation(task_index: int) -> None:
+        """Drop ONLY this child's claim, the moment its own run is over.
+
+        Popping under `reservations_lock` makes this exactly-once per task, so
+        the batch-wide fallback below can never re-release (and thus never
+        evict) a fingerprint a newer caller has since claimed.
+        """
+        with reservations_lock:
+            claim = reservations.pop(task_index, None)
+            if claim is None:
+                claim = runner_reservations.pop(task_index, None)
+        if claim is not None:
+            _release_active_delegation(*claim)
+
+    def _handoff_reservations_to_runner() -> None:
+        """Transfer outstanding claims to an accepted background runner."""
+        with reservations_lock:
+            runner_reservations.update(reservations)
+            reservations.clear()
+
+    def _release_parent_reservations() -> None:
+        """Release only claims not yet accepted by a background runner."""
+        with reservations_lock:
+            claims = list(reservations.values())
+            reservations.clear()
+        for _fp, _owner in claims:
+            _release_active_delegation(_fp, _owner)
+
+    def _release_active_reservations() -> None:
+        """Batch-wide fallback: drop whatever claims are still outstanding.
+
+        Children that ran already released themselves via
+        ``_release_child_reservation``, so this covers only the ones that never
+        started — a build that raised, a dispatch that raised, and futures
+        abandoned when the parent was interrupted.  Owner-matched (see
+        ``_release_active_delegation``) so a late release can never evict a
+        newer caller's reservation, and idempotent so the redundant terminal
+        paths below can all call it safely.
+        """
+        with reservations_lock:
+            claims = list(reservations.values()) + list(runner_reservations.values())
+            reservations.clear()
+            runner_reservations.clear()
+        for _fp, _owner in claims:
+            _release_active_delegation(_fp, _owner)
+
+    def _run_child_and_release(
+        task_index, goal, child, parent_agent, **run_kwargs,
+    ):
+        """Run one child, then release that child's reservation — and only it.
+
+        Wraps EVERY ``_run_single_child`` invocation (the single-child fast
+        path and each executor future alike).  The ``finally`` fires when this
+        child returns or raises, i.e. strictly before the batch-wide summary /
+        hook / cost aggregation that runs once all siblings have joined.
+        """
+        try:
+            return _run_single_child(
+                task_index,
+                goal,
+                child,
+                parent_agent,
+                **run_kwargs,
             )
-            child._live_transcript_path = str(_writer.path)
-        children.append((i, t, child))
+        finally:
+            _release_child_reservation(task_index)
+
+    try:
+        for i, t in enumerate(task_list):
+            # Per-task role beats top-level; normalise again so unknown
+            # per-task values warn and degrade to leaf uniformly.
+            effective_role = _normalize_role(t.get("role") or top_role)
+            # Claim the fingerprint BEFORE building: a concurrent caller that
+            # loses this race must not construct or run a second child.
+            identity = _delegation_fingerprint(
+                parent_session_id=_fp_session_id,
+                parent_turn_id=_fp_turn_id,
+                workspace=_fp_workspace,
+                goal=t["goal"],
+                context=t.get("context"),
+                role=effective_role,
+                provider=creds["provider"] or getattr(parent_agent, "provider", None),
+                model=creds["model"] or getattr(parent_agent, "model", None),
+                base_url=_fp_base_url,
+                api_key=_fp_api_key,
+            )
+            sibling_ordinal = _sibling_ordinals.get(identity, 0)
+            _sibling_ordinals[identity] = sibling_ordinal + 1
+            fingerprint = _delegation_fingerprint(
+                parent_session_id=_fp_session_id,
+                parent_turn_id=_fp_turn_id,
+                workspace=_fp_workspace,
+                goal=t["goal"],
+                context=t.get("context"),
+                role=effective_role,
+                provider=creds["provider"] or getattr(parent_agent, "provider", None),
+                model=creds["model"] or getattr(parent_agent, "model", None),
+                base_url=_fp_base_url,
+                api_key=_fp_api_key,
+                sibling_ordinal=sibling_ordinal,
+            )
+            owner_id = _new_reservation_owner_id()
+            in_flight = _reserve_active_delegation(
+                fingerprint, owner_id=owner_id, task_index=i
+            )
+            if in_flight is not None:
+                logger.info(
+                    "delegate_task: task %d suppressed as a duplicate — "
+                    "fingerprint %s… already in flight (owner=%s)",
+                    i,
+                    fingerprint[:12],
+                    in_flight.get("subagent_id") or in_flight.get("owner_id"),
+                )
+                duplicate_entries.append(
+                    _duplicate_result_entry(i, fingerprint, in_flight)
+                )
+                continue
+            reservations[i] = (fingerprint, owner_id)
+            child = _build_child_preserving_parent_tools(
+                task_index=i,
+                goal=t["goal"],
+                context=t.get("context"),
+                # Subagents always inherit the parent's toolsets; the model
+                # cannot choose or narrow them (no model-facing toolsets arg).
+                toolsets=None,
+                model=creds["model"],
+                max_iterations=effective_max_iter,
+                task_count=n_tasks,
+                parent_agent=parent_agent,
+                override_provider=creds["provider"],
+                override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"],
+                override_api_mode=creds["api_mode"],
+                override_request_overrides=creds.get("request_overrides"),
+                override_max_tokens=creds.get("max_output_tokens"),
+                override_acp_command=creds.get("command"),
+                override_acp_args=creds.get("args"),
+                role=effective_role,
+            )
+            # The child now exists — report its id to anyone we suppress.
+            _bind_reservation_subagent_id(
+                fingerprint, owner_id, getattr(child, "_subagent_id", None)
+            )
+            # Tee the child's progress into the HEAD live-transcript side
+            # channel without changing model-visible context.
+            _writer = live_writers[i] if i < len(live_writers) else None
+            if _writer is not None:
+                child.tool_progress_callback = wrap_progress_callback(
+                    getattr(child, "tool_progress_callback", None), _writer
+                )
+                child._live_transcript_path = str(_writer.path)
+            children.append((i, t, child))
+    except BaseException:
+        # A child build blew up: drop every claim this call holds so the exact
+        # same task can be retried immediately rather than being shadowed by a
+        # reservation whose child never existed.
+        _release_active_reservations()
+        raise
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -3197,10 +3757,15 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
-        if n_tasks == 1:
+        # Branch on how many children were actually BUILT, not how many tasks
+        # were requested: suppressed duplicates have no child to run.
+        if not children:
+            # Every task was an in-flight duplicate — nothing to execute.
+            pass
+        elif len(children) == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(
+            result = _run_child_and_release(
                 _i,
                 _t["goal"],
                 child,
@@ -3228,7 +3793,7 @@ def delegate_task(
                     child_context = contextvars.copy_context()
                     future = executor.submit(
                         child_context.run,
-                        _run_single_child,
+                        _run_child_and_release,
                         task_index=i,
                         goal=t["goal"],
                         child=child,
@@ -3316,15 +3881,14 @@ def delegate_task(
                         completed_count += 1
 
                         # Print per-task completion line above the spinner
-                        idx = entry["task_index"]
-                        label = (
-                            task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
-                        )
+                        idx = _valid_task_index(entry.get("task_index"), n_tasks)
+                        label = task_labels[idx] if idx is not None else "Task ?"
+                        position = f"{idx + 1}/{n_tasks}" if idx is not None else f"?/{n_tasks}"
                         dur = entry.get("duration_seconds", 0)
                         status = entry.get("status", "?")
                         icon = "✓" if status == "completed" else "✗"
                         remaining = n_tasks - completed_count
-                        completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                        completion_line = f"{icon} [{position}] {label}  ({dur}s)"
                         if spinner_ref:
                             try:
                                 spinner_ref.print_above(completion_line)
@@ -3348,7 +3912,7 @@ def delegate_task(
                     executor.shutdown(wait=False)
 
             # Sort by task_index so results match input order
-            results.sort(key=lambda r: r["task_index"])
+            results.sort(key=lambda r: _result_sort_key(r, n_tasks))
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's
@@ -3357,6 +3921,13 @@ def delegate_task(
         _finalize_child_results(results, task_list, children, parent_agent)
 
         total_duration = round(time.monotonic() - overall_start, 2)
+
+        # Duplicate entries have no child lifecycle to finalize. Fold them in
+        # only after summary/memory/hook/cost processing, then restore caller
+        # order before closing the per-task live transcripts.
+        if duplicate_entries:
+            results.extend(duplicate_entries)
+            results.sort(key=lambda r: _result_sort_key(r, n_tasks))
 
         # Close out the live transcripts: terminal marker per task + manifest
         # status update. The files are retained (retention pruning happens on
@@ -3386,6 +3957,27 @@ def delegate_task(
             combined["live_transcripts"] = list(live_paths)
         return combined
 
+    def _execute_and_release(*, honor_parent_interrupt: bool = True) -> dict:
+        """``_execute_and_aggregate`` plus the guaranteed reservation sweep.
+
+        Each child already released its own claim as it finished (see
+        ``_run_child_and_release``); this is the backstop for children that
+        never started — an interrupt that abandons still-pending futures, or a
+        raise before/around the run loop.  Every path that reaches the children
+        funnels through here — the synchronous run, the background batch runner
+        (completion, error, and the post-cancel unwind, since
+        ``_batch_interrupt`` only asks children to stop and the runner still
+        returns), the async-unsupported inline fallback, and the
+        pool-at-capacity inline fallback — so a fingerprint is never left
+        claimed after the work has stopped.
+        """
+        try:
+            return _execute_and_aggregate(
+                honor_parent_interrupt=honor_parent_interrupt,
+            )
+        finally:
+            _release_active_reservations()
+
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
     # When background is true, the entire fan-out runs on the daemon executor
     # via a single async delegation. _execute_and_aggregate() joins on every
@@ -3393,7 +3985,20 @@ def delegate_task(
     # conversation as a single message when ALL children finish. The chat is
     # not blocked in the meantime. This is the contract: dispatch N subagents,
     # keep chatting, get the combined summaries back together at the end.
-    if background:
+    def _dispatch_background() -> str:
+        """Hand the whole batch to the async runner, or run it inline.
+
+        Split out of the ``if background:`` branch below so its caller can
+        release the dedup reservations if anything here raises before the
+        background runner takes ownership of them.
+        """
+        nonlocal _origin_ui_session_id
+
+        # Every task was suppressed as an in-flight duplicate: there is no child
+        # to dispatch, so report on this turn instead of occupying an async slot.
+        if not children:
+            return json.dumps(_execute_and_release(), ensure_ascii=False)
+
         from tools.async_delegation import dispatch_async_delegation_batch
         from tools.approval import get_current_session_key
 
@@ -3437,7 +4042,7 @@ def delegate_task(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
             )
-            _sync_result = _execute_and_aggregate()
+            _sync_result = _execute_and_release()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
@@ -3505,8 +4110,10 @@ def delegate_task(
 
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
-            # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(honor_parent_interrupt=False)
+            # owned by the async registry and cancelled only via
+            # _batch_interrupt. The shared release wrapper keeps reservations
+            # until each detached child (or the batch backstop) unwinds.
+            return _execute_and_release(honor_parent_interrupt=False)
 
         def _batch_interrupt():
             _batch_cancel_requested.set()
@@ -3550,7 +4157,10 @@ def delegate_task(
                     parts.append(None)
             return tuple(parts), in_tool
 
-        _goals = [t["goal"] for t in task_list]
+        # Only the goals that actually got a child — tasks suppressed as
+        # in-flight duplicates must not inflate the dispatched count or the
+        # async completion block.
+        _goals = [_t["goal"] for (_i, _t, _c) in children]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3573,6 +4183,10 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            # The scheduler owns the work now. Move claims before constructing
+            # the response so a later serialization error cannot free an
+            # in-flight runner's reservations.
+            _handoff_reservations_to_runner()
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -3602,6 +4216,10 @@ def delegate_task(
                     "task). Read or `tail -f` these paths at any time to watch "
                     "a child work while it runs."
                 )
+            if duplicate_entries:
+                # Surface suppressed tasks now; they also ride along in the
+                # consolidated results block when the batch finishes.
+                payload["duplicates"] = list(duplicate_entries)
             return json.dumps(payload, ensure_ascii=False)
 
         # Pool at capacity / schedule failure — children are still attached
@@ -3612,7 +4230,7 @@ def delegate_task(
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
-        _cap_result = _execute_and_aggregate()
+        _cap_result = _execute_and_release()
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
                 "The background delegation pool was at capacity "
@@ -3623,8 +4241,17 @@ def delegate_task(
             )
         return json.dumps(_cap_result, ensure_ascii=False)
 
+    if background:
+        try:
+            return _dispatch_background()
+        except BaseException:
+            # Only pre-acceptance claims still belong to this frame. Accepted
+            # work remains reserved until the background runner releases it.
+            _release_parent_reservations()
+            raise
+
     # ----- Synchronous path -----
-    return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+    return json.dumps(_execute_and_release(), ensure_ascii=False)
 
 
 def _resolve_child_credential_pool(

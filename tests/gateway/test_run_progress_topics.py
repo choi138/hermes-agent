@@ -3,12 +3,14 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
 
 import pytest
 
+from agent.agent_runtime_helpers import emit_reasoning_progress, extract_reasoning
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -127,6 +129,34 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class FinalAckProgressAdapter(MetadataEditProgressCaptureAdapter):
+    """Expose when the stream consumer's final platform delivery succeeds."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.final_ack = threading.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        if result.success and isinstance(metadata, dict) and metadata.get("notify"):
+            self.final_ack.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if result.success and finalize:
+            self.final_ack.set()
+        return result
+
+
 class RetryableFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
     """Fail one progress edit transiently, then accept later edits."""
 
@@ -214,23 +244,94 @@ class FakeAgent:
 
 
 class ThinkingAgent:
-    """Agent that emits _thinking scratch text (no tool calls).
+    """Agent that emits structured reasoning progress (no tool calls).
 
-    Used to prove the progress callback relays _thinking bubbles when
-    thinking_progress is enabled but tool_progress is off.
+    Uses the production classifier so gateway tests exercise the same source
+    path as a real AIAgent response.
     """
 
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
+    def _extract_reasoning(self, message):
+        return extract_reasoning(self, message)
+
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        cb = self.tool_progress_callback
-        if cb is not None:
-            cb("_thinking", "weighing the options here")
+        if self.tool_progress_callback is not None:
+            emit_reasoning_progress(
+                self,
+                SimpleNamespace(
+                    content="done",
+                    reasoning="weighing the options here",
+                ),
+            )
             time.sleep(0.35)
         return {
             "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class FinalContentProgressAgent:
+    """Exercise final-content classification with gateway streaming enabled."""
+
+    FINAL = "This final answer must use the final delivery path exactly once."
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def _extract_reasoning(self, message):
+        return extract_reasoning(self, message)
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback is not None:
+            self.stream_delta_callback(self.FINAL)
+        emit_reasoning_progress(self, SimpleNamespace(content=self.FINAL))
+        return {
+            "final_response": self.FINAL,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class LateThinkingAfterFinalAgent(FinalContentProgressAgent):
+    """Attempt a progress callback only after the adapter ACKs the final."""
+
+    adapter_probe = None
+    late_thread = None
+    late_callback_fired = None
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback is not None:
+            self.stream_delta_callback(self.FINAL)
+        callback = self.tool_progress_callback
+        assert callback is not None
+        fired = threading.Event()
+        type(self).late_callback_fired = fired
+
+        def _emit_after_final_ack():
+            adapter = type(self).adapter_probe
+            if adapter is not None and adapter.final_ack.wait(timeout=2.0):
+                callback(
+                    "reasoning.available",
+                    "_thinking",
+                    "late scratch must be suppressed",
+                    None,
+                )
+                fired.set()
+
+        thread = threading.Thread(
+            target=_emit_after_final_ack,
+            name="late-thinking-after-final-test",
+        )
+        type(self).late_thread = thread
+        thread.start()
+        return {
+            "final_response": self.FINAL,
             "messages": [],
             "api_calls": 1,
         }
@@ -1533,6 +1634,133 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     # Exactly TWO terminal headers: one for the first run of three calls,
     # one for the terminal call after web_search broke the streak.
     assert final.count("terminal\n```") == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_relays_structured_reasoning_when_tool_progress_off(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ThinkingAgent,
+        session_id="sess-thinking-on",
+        config_data={
+            "display": {
+                "thinking_progress": True,
+                "tool_progress": "off",
+            },
+            "streaming": {"enabled": False},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    blob = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert "💬 weighing the options here" in blob
+
+
+@pytest.mark.asyncio
+async def test_run_agent_suppresses_reasoning_when_thinking_off(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ThinkingAgent,
+        session_id="sess-thinking-off",
+        config_data={
+            "display": {
+                "thinking_progress": False,
+                "tool_progress": "off",
+            },
+            "streaming": {"enabled": False},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    blob = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert "weighing the options here" not in blob
+
+
+@pytest.mark.asyncio
+async def test_streaming_final_content_is_not_emitted_as_thinking(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FinalContentProgressAgent,
+        session_id="sess-final-not-thinking",
+        config_data={
+            "display": {
+                "thinking_progress": True,
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="final-not-thinking",
+        chat_type="channel",
+        thread_id="thread-final-not-thinking",
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == FinalContentProgressAgent.FINAL
+    assert result.get("already_sent") is True
+    assert len(adapter.sent) == 1
+    assert FinalContentProgressAgent.FINAL in adapter.sent[0]["content"]
+    blob = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert "💬" not in blob
+
+
+@pytest.mark.asyncio
+async def test_progress_event_after_final_ack_is_suppressed(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LateThinkingAfterFinalAgent,
+        session_id="sess-late-thinking-closed",
+        config_data={
+            "display": {
+                "thinking_progress": True,
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="late-thinking-closed",
+        chat_type="channel",
+        thread_id="thread-late-thinking-closed",
+        adapter_cls=FinalAckProgressAdapter,
+    )
+
+    thread = LateThinkingAfterFinalAgent.late_thread
+    assert thread is not None
+    await asyncio.to_thread(thread.join, 2.5)
+    assert not thread.is_alive()
+    assert adapter.final_ack.is_set()
+    assert LateThinkingAfterFinalAgent.late_callback_fired.is_set()
+    assert result.get("already_sent") is True
+    blob = "\n".join(
+        [call["content"] for call in adapter.sent]
+        + [call["content"] for call in adapter.edits]
+    )
+    assert "late scratch must be suppressed" not in blob
 
 
 class TestSlackReplyInThreadProgressRouting:

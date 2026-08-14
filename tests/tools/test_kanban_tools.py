@@ -93,6 +93,31 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def test_create_goal_mode_requires_explicit_positive_turn_budget(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(kt._handle_create({
+        "title": "unbounded goal",
+        "assignee": "peer",
+        "goal_mode": True,
+    }))
+    assert rejected.get("ok") is not True
+    assert "goal_max_turns must be >= 1" in rejected["error"]
+
+    created = json.loads(kt._handle_create({
+        "title": "bounded goal",
+        "assignee": "peer",
+        "goal_mode": True,
+        "goal_max_turns": 4,
+    }))
+    assert created["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, created["task_id"])
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 4
+
+
 def _terminal_evidence(
     task,
     *,

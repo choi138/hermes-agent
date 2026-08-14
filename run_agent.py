@@ -1386,7 +1386,11 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = get_provider_request_timeout(
+            self.provider,
+            self.model,
+            requested_provider=getattr(self, "requested_provider", None),
+        )
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -1409,7 +1413,11 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = get_provider_stale_timeout(
+            self.provider,
+            self.model,
+            requested_provider=getattr(self, "requested_provider", None),
+        )
         if cfg is not None:
             return cfg, False
 
@@ -1445,13 +1453,22 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        from agent.chat_completion_helpers import estimate_request_context_tokens
+        from agent.chat_completion_helpers import (
+            apply_openai_codex_stale_timeout_floor,
+            estimate_request_context_tokens,
+        )
         est_tokens = estimate_request_context_tokens(api_payload)
         if est_tokens > 100_000:
-            return max(stale_base, 240.0)
-        if est_tokens > 50_000:
-            return max(stale_base, 150.0)
-        return stale_base
+            stale_timeout = max(stale_base, 240.0)
+        elif est_tokens > 50_000:
+            stale_timeout = max(stale_base, 150.0)
+        else:
+            stale_timeout = stale_base
+        return apply_openai_codex_stale_timeout_floor(
+            self,
+            api_payload,
+            stale_timeout,
+        )
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
         """Return an actionable hint when this request matches a known
@@ -1477,14 +1494,9 @@ class AIAgent:
         """
         if self.api_mode != "codex_responses":
             return None
-        is_codex_backend = (
-            self.provider == "openai-codex"
-            or (
-                getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-                and "/backend-api/codex" in (getattr(self, "_base_url_lower", "") or "")
-            )
-        )
-        if not is_codex_backend:
+        from agent.chat_completion_helpers import _is_openai_codex_backend
+
+        if not _is_openai_codex_backend(self):
             return None
         eff_model = (model if model is not None else self.model) or ""
         model_lower = eff_model.lower()
@@ -5288,7 +5300,11 @@ class AIAgent:
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
         logger.debug(
@@ -5878,7 +5894,11 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6019,7 +6039,11 @@ class AIAgent:
             self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -6129,7 +6153,11 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
 

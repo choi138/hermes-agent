@@ -216,7 +216,7 @@ def test_aiagent_loads_filtered_search_wrapper_but_keeps_raw_mcp_tools_hidden(
                 "search_memory_facts",
                 {
                     "query": "continue the previous P1 project",
-                    "max_facts": 12,
+                    "max_facts": 24,
                     "group_ids": ["mnemos"],
                 },
             ),
@@ -224,7 +224,7 @@ def test_aiagent_loads_filtered_search_wrapper_but_keeps_raw_mcp_tools_hidden(
                 "search_memory_facts",
                 {
                     "query": "continue the previous P1 project",
-                    "max_facts": 12,
+                    "max_facts": 24,
                     "group_ids": ["mnemos"],
                 },
             ),

@@ -166,3 +166,13 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_run_slash_goal_requires_explicit_positive_turn_budget(kanban_home):
+    rejected = kc.run_slash("create 'open ended' --goal")
+    assert "--goal requires --goal-max-turns" in rejected
+
+    created = kc.run_slash("create 'open ended' --goal --goal-max-turns 4")
+    assert "Created" in created
+    with kb.connect() as conn:
+        task = kb.list_tasks(conn)[0]
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 4

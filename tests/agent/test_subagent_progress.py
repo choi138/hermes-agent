@@ -10,9 +10,12 @@ Verifies that:
 
 import io
 import sys
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import MagicMock
 
+from agent.agent_runtime_helpers import emit_reasoning_progress, extract_reasoning
 from agent.display import KawaiiSpinner
 from tools.delegate_tool import _build_child_progress_callback
 
@@ -153,49 +156,144 @@ class TestBuildChildProgressCallback:
 # =========================================================================
 
 class TestThinkingCallback:
-    """Tests for the _thinking callback in AIAgent conversation loop."""
+    """Behavior tests for the production reasoning-progress classifier."""
 
-    def _simulate_thinking_callback(self, content, callback, delegate_depth=1):
-        """Simulate the exact code path from run_agent.py for the thinking callback.
-        
-        delegate_depth: simulates self._delegate_depth.
-            0 = main agent (should NOT fire), >=1 = subagent (should fire).
-        """
-        import re
-        if (content and callback and delegate_depth > 0):
-            _think_text = content.strip()
-            _think_text = re.sub(
-                r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
-            ).strip()
-            first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-            if first_line:
-                try:
-                    callback("_thinking", first_line)
-                except Exception:
-                    pass
-
-    def test_thinking_callback_fires_on_content(self):
-        """tool_progress_callback should receive _thinking event
-        when assistant message has content."""
-        calls = []
-        self._simulate_thinking_callback(
-            "I'll research quantum computing first, then summarize.",
-            lambda name, preview=None: calls.append((name, preview))
+    @staticmethod
+    def _agent(callback, *, delegate_depth=0):
+        return SimpleNamespace(
+            tool_progress_callback=callback,
+            _delegate_depth=delegate_depth,
+            _reasoning_progress_seen=set(),
+            _extract_reasoning=lambda message: extract_reasoning(None, message),
         )
-        assert len(calls) == 1
-        assert calls[0][0] == "_thinking"
-        assert "quantum computing" in calls[0][1]
 
-
-    def test_thinking_callback_truncates_long_content(self):
-        """Should truncate long content to 80 chars."""
+    def test_final_assistant_content_is_not_thinking(self):
         calls = []
-        self._simulate_thinking_callback(
-            "A" * 200 + "\nSecond line should be ignored",
-            lambda name, preview=None: calls.append((name, preview))
+        agent = self._agent(lambda *args: calls.append(args))
+
+        emitted = emit_reasoning_progress(
+            agent,
+            SimpleNamespace(content="The final answer belongs to final delivery."),
         )
+
+        assert emitted is False
+        assert calls == []
+
+    def test_structured_reasoning_emits_structured_event(self):
+        calls = []
+        agent = self._agent(lambda *args: calls.append(args))
+
+        emitted = emit_reasoning_progress(
+            agent,
+            SimpleNamespace(
+                content="The final answer.",
+                reasoning="Checking the relevant delivery invariant.",
+            ),
+        )
+
+        assert emitted is True
+        assert calls == [
+            (
+                "reasoning.available",
+                "_thinking",
+                "Checking the relevant delivery invariant.",
+                None,
+            )
+        ]
+
+    def test_explicit_reasoning_tags_emit_only_scratch(self):
+        calls = []
+        agent = self._agent(lambda *args: calls.append(args))
+
+        emit_reasoning_progress(
+            agent,
+            SimpleNamespace(
+                content="<think>Inspect the queue ordering.</think>\nThe final answer.",
+            ),
+        )
+
+        assert calls[0][2] == "Inspect the queue ordering."
+        assert "final answer" not in calls[0][2].lower()
+
+    def test_reasoning_progress_is_turn_deduped_and_bounded(self):
+        calls = []
+        agent = self._agent(lambda *args: calls.append(args))
+        message = SimpleNamespace(content="done", reasoning="A" * 700)
+
+        assert emit_reasoning_progress(agent, message) is True
+        assert emit_reasoning_progress(agent, message) is False
+
         assert len(calls) == 1
-        assert len(calls[0][1]) == 80
+        assert len(calls[0][2]) == 500
+
+    def test_subagent_final_summary_is_not_thinking(self):
+        calls = []
+        agent = self._agent(
+            lambda *args: calls.append(args),
+            delegate_depth=1,
+        )
+
+        emit_reasoning_progress(
+            agent,
+            SimpleNamespace(content="Completed the delegated task successfully."),
+        )
+
+        assert calls == []
+
+    def test_subagent_real_reasoning_keeps_legacy_relay_shape(self):
+        calls = []
+        agent = self._agent(
+            lambda *args: calls.append(args),
+            delegate_depth=1,
+        )
+
+        emit_reasoning_progress(
+            agent,
+            SimpleNamespace(content="done", reasoning="R" * 120 + "\nnext line"),
+        )
+
+        assert calls == [("_thinking", "R" * 80)]
+
+    def test_opaque_reasoning_replay_payload_is_not_emitted(self):
+        calls = []
+        agent = self._agent(lambda *args: calls.append(args))
+
+        emitted = emit_reasoning_progress(
+            agent,
+            SimpleNamespace(
+                content="The final answer.",
+                reasoning_details=[
+                    {
+                        "type": "reasoning",
+                        "id": "rs_opaque",
+                        "encrypted_content": "opaque-provider-blob",
+                        "signature": "opaque-signature",
+                    }
+                ],
+            ),
+        )
+
+        assert emitted is False
+        assert calls == []
+
+    def test_reasoning_progress_is_force_redacted(self, monkeypatch):
+        calls = []
+        redaction = {}
+
+        def _redact(text, *, force=False, **kwargs):
+            redaction["force"] = force
+            return text.replace("raw-secret", "[REDACTED]")
+
+        monkeypatch.setattr("agent.redact.redact_sensitive_text", _redact)
+        agent = self._agent(lambda *args: calls.append(args))
+
+        emit_reasoning_progress(
+            agent,
+            SimpleNamespace(content="done", reasoning="Inspect raw-secret safely."),
+        )
+
+        assert redaction["force"] is True
+        assert calls[0][2] == "Inspect [REDACTED] safely."
 
 
 
@@ -265,4 +363,3 @@ class TestBatchFlush:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

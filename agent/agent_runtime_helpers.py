@@ -1327,7 +1327,11 @@ def try_recover_primary_transport(
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
                 rt["anthropic_api_key"], rt["anthropic_base_url"],
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                timeout=get_provider_request_timeout(
+                    agent.provider,
+                    agent.model,
+                    requested_provider=getattr(agent, "requested_provider", None),
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1583,7 +1587,11 @@ def restore_primary_runtime(agent) -> bool:
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
                 rt["anthropic_api_key"], rt["anthropic_base_url"],
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                timeout=get_provider_request_timeout(
+                    agent.provider,
+                    agent.model,
+                    requested_provider=getattr(agent, "requested_provider", None),
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1830,6 +1838,91 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         return "\n\n".join(reasoning_parts)
     
     return None
+
+
+_REASONING_PROGRESS_LIMIT = 500
+_SUBAGENT_REASONING_PROGRESS_LIMIT = 80
+
+
+def reasoning_progress_text(
+    agent,
+    assistant_message,
+    *,
+    limit: int = _REASONING_PROGRESS_LIMIT,
+) -> Optional[str]:
+    """Return bounded, display-safe reasoning for a progress event.
+
+    Only provider reasoning fields and explicitly tagged inline reasoning are
+    eligible because ``agent._extract_reasoning`` owns that classification.
+    Ordinary assistant content -- including the final answer -- is never used
+    as a fallback here. Opaque replay state (signatures, encrypted content,
+    reasoning item ids) is likewise excluded by the extractor.
+    """
+    try:
+        reasoning_text = agent._extract_reasoning(assistant_message)
+    except Exception:
+        logger.debug("Reasoning progress extraction failed", exc_info=True)
+        return None
+
+    if not isinstance(reasoning_text, str):
+        return None
+    reasoning_text = _ORPHAN_REASONING_TAG_PATTERN.sub("", reasoning_text).strip()
+    if not reasoning_text:
+        return None
+
+    # Progress text crosses a user-visible boundary. Force redaction even when
+    # transcript redaction is disabled, and fail closed if the redactor itself
+    # is unavailable so raw reasoning never leaks credentials.
+    try:
+        from agent.redact import redact_sensitive_text
+
+        reasoning_text = redact_sensitive_text(reasoning_text, force=True).strip()
+    except Exception:
+        logger.debug("Reasoning progress redaction failed", exc_info=True)
+        return None
+    if not reasoning_text:
+        return None
+
+    return reasoning_text[: max(0, int(limit))] or None
+
+
+def emit_reasoning_progress(agent, assistant_message) -> bool:
+    """Emit one reasoning-only progress event, deduplicated within the turn.
+
+    Main agents use the structured ``reasoning.available`` callback shape.
+    Delegated agents retain the legacy ``_thinking`` shape consumed by the
+    child-progress relay, but the payload now comes from real reasoning rather
+    than from the child's final assistant summary.
+    """
+    callback = getattr(agent, "tool_progress_callback", None)
+    if callback is None:
+        return False
+
+    text = reasoning_progress_text(agent, assistant_message)
+    if not text:
+        return False
+
+    seen = getattr(agent, "_reasoning_progress_seen", None)
+    if not isinstance(seen, set):
+        seen = set()
+        agent._reasoning_progress_seen = seen
+    if text in seen:
+        return False
+
+    try:
+        if getattr(agent, "_delegate_depth", 0) > 0:
+            first_line = text.splitlines()[0][:_SUBAGENT_REASONING_PROGRESS_LIMIT]
+            if not first_line:
+                return False
+            callback("_thinking", first_line)
+        else:
+            callback("reasoning.available", "_thinking", text, None)
+    except Exception:
+        logger.debug("Reasoning progress callback failed", exc_info=True)
+        return False
+
+    seen.add(text)
+    return True
 
 
 
@@ -2574,7 +2667,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url,
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                timeout=get_provider_request_timeout(
+                    agent.provider,
+                    agent.model,
+                    requested_provider=getattr(agent, "requested_provider", None),
+                ),
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
@@ -2604,7 +2701,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 )
             except Exception:
                 logger.debug("custom-provider TLS resolution skipped on switch_model", exc_info=True)
-            _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
+            _sm_timeout = get_provider_request_timeout(
+                agent.provider,
+                agent.model,
+                requested_provider=getattr(agent, "requested_provider", None),
+            )
             if _sm_timeout is not None:
                 agent._client_kwargs["timeout"] = _sm_timeout
             # Reapply provider-specific headers (e.g. OpenRouter HTTP-Referer,
@@ -4064,6 +4165,8 @@ __all__ = [
     "drop_thinking_only_and_merge_users",
     "restore_primary_runtime",
     "extract_reasoning",
+    "reasoning_progress_text",
+    "emit_reasoning_progress",
     "dump_api_request_debug",
     "prompt_caching_disabled_from_config",
     "blank_cache_policy_stub",

@@ -337,6 +337,19 @@ def setup_logging(
         formatter=RedactingFormatter(_LOG_FORMAT),
     )
 
+    # Strict allowlist bridge into #agent-health.  The handler itself is
+    # synchronous and non-blocking: it classifies the record and performs a
+    # queue put_nowait through the active gateway sink.  Installation lives
+    # beside agent.log/errors.log and follows the same idempotent contract.
+    try:
+        from gateway.agent_health_sink import install_agent_health_log_handler
+
+        install_agent_health_log_handler(root)
+    except Exception:
+        # Logging setup must remain usable in minimal/bare installations where
+        # gateway modules are unavailable.
+        pass
+
     # --- gateway.log (INFO+, gateway component only) ------------------------
     if mode == "gateway":
         _add_rotating_handler(

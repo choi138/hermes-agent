@@ -2251,6 +2251,24 @@ if _config_path.exists():
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
                     _agent_cfg["gateway_startup_restore_drain_timeout"]
                 )
+        # Gateway health policy is top-level (not agent.*).  Process env is an
+        # explicit service-manager override, so preserve an existing
+        # HERMES_HEALTH_* value; otherwise bridge the configured value.
+        _health_cfg = _cfg.get("agent_health", {})
+        if _health_cfg and isinstance(_health_cfg, dict):
+            _health_env_map = {
+                "enabled": "HERMES_HEALTH_ENABLED",
+                "channel": "HERMES_HEALTH_CHANNEL",
+                "mention": "HERMES_HEALTH_MENTION",
+                "silence_timeout": "HERMES_HEALTH_SILENCE_TIMEOUT",
+                "turn_deadline": "HERMES_HEALTH_TURN_DEADLINE",
+                "upstream_failure_streak": "HERMES_HEALTH_UPSTREAM_FAILURE_STREAK",
+                "cooldown_seconds": "HERMES_HEALTH_COOLDOWN_SECONDS",
+                "hourly_cap": "HERMES_HEALTH_HOURLY_CAP",
+            }
+            for _health_key, _health_env in _health_env_map.items():
+                if _health_key in _health_cfg and _health_env not in os.environ:
+                    os.environ[_health_env] = str(_health_cfg[_health_key])
         # config-authoritative knobs for the session-search index; same
         # bridge semantics as the agent settings above.
         _sessions_cfg = _cfg.get("sessions", {})
@@ -2446,6 +2464,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _COMPLETION_ADMISSION_REJECTED_KEY,
     _COMPLETION_ADMISSION_TOKEN_KEY,
     _prefix_within_utf16_limit,
@@ -2564,6 +2583,11 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # Stall-watchdog "already notified" latch (#72016). Cleared on /new so a
     # fresh conversation can warn again if it later stalls with pending inbound.
     "_session_stall_notified",
+    # Agent-health A uses a wall clock from turn claim to confirmed content
+    # delivery.  These are plain-dict stores until SessionState grows an
+    # explicit output-observation scope.
+    "_turn_started_at",
+    "_last_content_sent_at",
     # Staged-but-never-consumed sidecar notes (turn aborted between staging
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
@@ -3915,6 +3939,8 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if ctx.progress_closed.is_set():
+            return
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -3995,6 +4021,9 @@ class TurnRunner:
             if not ctx._thinking_enabled:
                 return
             thinking_text = preview if tool_name == "_thinking" else tool_name
+            if not isinstance(thinking_text, str):
+                return
+            thinking_text = _redact_gateway_user_facing_secrets(thinking_text).strip()[:500]
             msg = f"💬 {thinking_text}" if thinking_text else None
             if msg:
                 ctx.progress_queue.put(msg)
@@ -4283,6 +4312,8 @@ class TurnRunner:
                 _edit_accepts_metadata = False
 
         async def _edit_progress_message(message_id: str, content: str):
+            if ctx.progress_closed.is_set():
+                return SendResult(success=False, error="progress closed")
             kwargs = {
                 "chat_id": ctx.source.chat_id,
                 "message_id": message_id,
@@ -4321,6 +4352,8 @@ class TurnRunner:
                 ctx._cleanup_msg_ids.append(str(result.message_id))
 
         async def _send_progress_text(text: str):
+            if ctx.progress_closed.is_set():
+                return SendResult(success=False, error="progress closed")
             result = await adapter.send(
                 chat_id=ctx.source.chat_id,
                 content=text,
@@ -4352,6 +4385,8 @@ class TurnRunner:
                 the normal send/edit path for this tick.
                 """
             nonlocal progress_msg_id, progress_lines, can_edit
+            if ctx.progress_closed.is_set():
+                return True
             if not progress_lines or not can_edit:
                 return False
             groups = _split_progress_groups(progress_lines)
@@ -4397,7 +4432,7 @@ class TurnRunner:
 
         while True:
             try:
-                if not ctx._run_still_current():
+                if ctx.progress_closed.is_set() or not ctx._run_still_current():
                     while not ctx.progress_queue.empty():
                         try:
                             ctx.progress_queue.get_nowait()
@@ -4458,7 +4493,7 @@ class TurnRunner:
                 if await _roll_progress_overflow_if_needed():
                     _last_edit_ts = time.monotonic()
                     await asyncio.sleep(0.3)
-                    if ctx._run_still_current():
+                    if not ctx.progress_closed.is_set() and ctx._run_still_current():
                         await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
                     continue
 
@@ -4475,7 +4510,7 @@ class TurnRunner:
                     await asyncio.sleep(_remaining)
                     continue
 
-                if not ctx._run_still_current():
+                if ctx.progress_closed.is_set() or not ctx._run_still_current():
                     return
 
                 if can_edit and progress_msg_id is not None:
@@ -4554,6 +4589,16 @@ class TurnRunner:
             except queue.Empty:
                 await asyncio.sleep(0.3)
             except asyncio.CancelledError:
+                # A streamed final closes progress before its final platform
+                # ACK. Never replay queued scratch/tool lines underneath that
+                # final answer during cancellation cleanup.
+                if ctx.progress_closed.is_set():
+                    while not ctx.progress_queue.empty():
+                        try:
+                            ctx.progress_queue.get_nowait()
+                        except Exception:
+                            break
+                    return
                 # Drain remaining queued messages
                 while not ctx.progress_queue.empty():
                     try:
@@ -4598,6 +4643,7 @@ class TurnRunner:
                         await _edit_progress_message(progress_msg_id, full_text)
                     except Exception:
                         pass
+                ctx.progress_closed.set()
                 return
             except Exception as e:
                 logger.error("Progress message error: %s", e)
@@ -4817,6 +4863,13 @@ class TurnRunner:
                             on_missing_cursor="raise",
                         )
                     )
+
+                    def _close_progress_before_stream_finalize():
+                        ctx.progress_closed.set()
+                        if _pause_typing_before_finalize is not None:
+                            return _pause_typing_before_finalize()
+                        return None
+
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=ctx.source.chat_id,
@@ -4827,7 +4880,12 @@ class TurnRunner:
                             if ctx.progress_queue is not None
                             else None
                         ),
-                        on_before_finalize=_pause_typing_before_finalize,
+                        on_content_delivered=(
+                            lambda: self._runner._record_content_delivered(
+                                ctx.session_key or "", ctx.run_generation
+                            )
+                        ),
+                        on_before_finalize=_close_progress_before_stream_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
                     )
@@ -5376,6 +5434,22 @@ class TurnRunner:
             _mem_notif = "on" if _mem_notif else "off"
         agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
 
+        def _mark_interactive_prompt_delivered() -> None:
+            """Record a confirmed clarify/approval prompt on the gateway loop."""
+            if not ctx.session_key:
+                return
+            try:
+                ctx._loop_for_step.call_soon_threadsafe(
+                    self._runner._record_content_delivered,
+                    ctx.session_key,
+                    ctx.run_generation,
+                )
+            except Exception:
+                logger.debug(
+                    "Interactive prompt delivery clock update failed",
+                    exc_info=True,
+                )
+
         # ------------------------------------------------------------------
         # Clarify callback: present a clarify prompt and block on a response.
         #
@@ -5461,6 +5535,8 @@ class TurnRunner:
                 # default rather than hanging.
                 _clarify_mod.clear_session(ctx.session_key or "")
                 return "[clarify prompt could not be delivered]"
+
+            _mark_interactive_prompt_delivered()
 
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
@@ -5601,6 +5677,7 @@ class TurnRunner:
                         raise RuntimeError("send_exec_approval: loop unavailable")
                     _approval_result = _approval_fut.result(timeout=15)
                     if _approval_result.success:
+                        _mark_interactive_prompt_delivered()
                         return
                     logger.warning(
                         "Button-based approval failed (send returned error), falling back to text: %s",
@@ -5636,7 +5713,9 @@ class TurnRunner:
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _approval_send_result = _approval_send_fut.result(timeout=15)
+                    if getattr(_approval_send_result, "success", False):
+                        _mark_interactive_prompt_delivered()
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
 
@@ -6337,6 +6416,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
+        self._agent_health_sink = None
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -6437,6 +6517,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # current stall episode (cleared when pending clears / activity resumes
         # / conversation boundary). See gateway.session_stall.
         self._session_stall_notified: Dict[str, bool] = {}
+        # Output-silence state is deliberately independent of agent activity:
+        # retries and tool loops may be busy while the user sees no content.
+        self._turn_started_at: Dict[str, float] = {}
+        self._last_content_sent_at: Dict[str, float] = {}
+        self._output_silence_notified: Dict[tuple[str, int], bool] = {}
+        self._turn_deadline_enforced: Dict[tuple[str, int], bool] = {}
+        # Generations where the watcher observed a concrete clarify/approval
+        # wait.  A's clock restarts when that wait ends so user think-time is
+        # never charged to the agent's output deadline.
+        self._output_silence_user_waiting: Dict[tuple[str, int], bool] = {}
+        self._agent_health_platform_states: Dict[str, str] = {}
+        self._agent_health_sink = None
+        self._agent_health_previous_status = None
+        self._agent_health_lifecycle_evidence = None
+        self._agent_health_previous_heartbeat = None
+        self._agent_health_previous_exit_diag: Optional[str] = None
+        self._agent_health_previous_memory_line: Optional[str] = None
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -8505,6 +8602,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_code=error_code,
                 error_message=error_message,
             )
+        except Exception:
+            pass
+
+        # C2: this is the single platform-state funnel.  Normalize the states
+        # adapters actually use today while retaining support for the policy's
+        # degraded/parked/failed vocabulary.  Transitional "connecting" does
+        # not erase an unhealthy state; only connected emits recovery.
+        if platform_state is None:
+            return
+        normalized = {
+            "retrying": "degraded",
+            "degraded": "degraded",
+            "paused": "parked",
+            "parked": "parked",
+            "fatal": "failed",
+            "failed": "failed",
+            "connected": "connected",
+        }.get(str(platform_state).strip().lower(), "transitional")
+        states = getattr(self, "_agent_health_platform_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._agent_health_platform_states = states
+        previous = states.get(platform)
+        if normalized == "transitional":
+            if previous is None:
+                states[platform] = normalized
+            return
+        if normalized == previous:
+            return
+        states[platform] = normalized
+        unhealthy = {"degraded", "parked", "failed"}
+
+        try:
+            from gateway.agent_health import HealthEvent
+
+            if normalized in unhealthy:
+                detail = str(error_message or error_code or "상세 원인 없음")
+                self._emit_agent_health_event(
+                    HealthEvent(
+                        rule=f"C2.platform_{normalized}",
+                        category="C",
+                        title=f"플랫폼 어댑터 {normalized}",
+                        reason=(
+                            f"{platform} 어댑터가 {previous or 'unknown'}에서 "
+                            f"{normalized} 상태로 전이했습니다."
+                        ),
+                        action="게이트웨이 연결, 자격 증명, 플랫폼 상태를 확인하세요.",
+                        platform=platform,
+                        resource=platform,
+                        details=(detail[:1200],),
+                        mention=True,
+                    )
+                )
+            elif normalized == "connected" and previous in unhealthy:
+                self._emit_agent_health_event(
+                    HealthEvent(
+                        rule="C2.platform_recovered",
+                        category="C",
+                        title="플랫폼 어댑터 복구",
+                        reason=(
+                            f"{platform} 어댑터가 {previous} 상태에서 connected로 "
+                            "복구했습니다."
+                        ),
+                        action="누락된 인바운드가 재전달되는지 확인하세요.",
+                        platform=platform,
+                        resource=platform,
+                        mention=True,
+                    )
+                )
         except Exception:
             pass
 
@@ -11251,6 +11417,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or self._shutdown_event.is_set()
         )
 
+    def _start_agent_health_sink(self) -> None:
+        """Best-effort start of the agent health sink. Never raises."""
+        if getattr(self, "_agent_health_sink", None) is not None:
+            return
+        try:
+            from gateway.agent_health_sink import AgentHealthSink
+
+            sink = AgentHealthSink.from_environment(self)
+            if sink is None:
+                self._agent_health_sink = None
+                return
+            self._agent_health_sink = sink
+            sink.start()
+        except Exception:
+            self._agent_health_sink = None
+            logger.debug("Agent health sink unavailable; continuing without it")
+
     async def _abort_startup_if_shutdown_requested(
         self,
         adapter: Optional[BasePlatformAdapter] = None,
@@ -11747,6 +11930,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            adapter.set_content_delivered_handler(self._record_content_delivered)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -12006,6 +12190,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
+
+        self._start_agent_health_sink()
 
         self._running = True
         self._update_runtime_status("running")
@@ -12837,6 +13023,568 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return configured stall timeout (seconds); 0 disables the watchdog."""
         return _float_env("HERMES_SESSION_STALL_TIMEOUT", 300)
 
+    def _agent_health_silence_timeout_seconds(self) -> float:
+        return _float_env("HERMES_HEALTH_SILENCE_TIMEOUT", 600)
+
+    def _agent_health_turn_deadline_seconds(self) -> float:
+        return _float_env("HERMES_HEALTH_TURN_DEADLINE", 1500)
+
+    def _emit_agent_health_event(self, event) -> bool:
+        """Best-effort non-blocking enqueue into the process health sink."""
+        sink = getattr(self, "_agent_health_sink", None)
+        if sink is None:
+            try:
+                from gateway.agent_health_sink import get_active_agent_health_sink
+
+                sink = get_active_agent_health_sink()
+            except Exception:
+                sink = None
+        if sink is None:
+            return False
+        try:
+            return bool(sink.emit(event))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _agent_health_last_matching_log_line(path: Path, marker: str) -> str:
+        """Read a bounded file tail and return the newest matching line."""
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 131072), os.SEEK_SET)
+                tail = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        for line in reversed(tail.splitlines()):
+            if marker in line:
+                return line.strip()[:1600]
+        return ""
+
+    @staticmethod
+    def _agent_health_previous_exit_diag_line(
+        path: Path,
+        *,
+        previous_pid: Optional[int] = None,
+        current_pid: Optional[int] = None,
+    ) -> str:
+        """Return the newest exit-diag record owned by the previous gateway.
+
+        ``gateway.start`` is written before :func:`start_gateway` reaches the
+        health bootstrap below, so blindly taking the file's last line reports
+        the *new* process as the previous exit.  Prefer the PID persisted in
+        the prior runtime status and otherwise exclude the current PID.
+        """
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 131072), os.SEEK_SET)
+                lines = handle.read().decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+
+        fallback = ""
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            record_pid = record.get("pid")
+            prior_pid = record.get("prior_pid")
+            if previous_pid is not None and (
+                record_pid == previous_pid or prior_pid == previous_pid
+            ):
+                return stripped[:1600]
+            if (
+                not fallback
+                and current_pid is not None
+                and record_pid != current_pid
+            ):
+                fallback = stripped[:1600]
+        return fallback
+
+    def _emit_gateway_restart_health(self) -> bool:
+        """C1 startup summary with prior status, exit diag, and memory tail."""
+        from gateway.agent_health import HealthEvent
+
+        previous = getattr(self, "_agent_health_previous_status", None)
+        previous = previous if isinstance(previous, dict) else {}
+        lifecycle = getattr(self, "_agent_health_lifecycle_evidence", None)
+        lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+        previous_heartbeat = getattr(
+            self, "_agent_health_previous_heartbeat", None
+        )
+        previous_heartbeat = (
+            previous_heartbeat if isinstance(previous_heartbeat, dict) else {}
+        )
+        prev_state = str(previous.get("gateway_state") or "unknown")
+        exit_reason = str(previous.get("exit_reason") or "")
+        memory = lifecycle.get("last_heartbeat_mem") or previous_heartbeat.get(
+            "mem"
+        )
+        rss = memory.get("rss_kib") if isinstance(memory, dict) else None
+
+        log_dir = _hermes_home / "logs"
+        exit_diag = getattr(self, "_agent_health_previous_exit_diag", None)
+        if exit_diag is None:
+            exit_diag = self._agent_health_previous_exit_diag_line(
+                log_dir / "gateway-exit-diag.log",
+                previous_pid=previous.get("pid"),
+                current_pid=os.getpid(),
+            )
+        if not exit_reason and exit_diag:
+            try:
+                exit_reason = str(json.loads(exit_diag).get("tag") or "")
+            except (TypeError, ValueError, AttributeError):
+                pass
+        exit_reason = exit_reason or "unknown"
+        memory_line = getattr(
+            self, "_agent_health_previous_memory_line", None
+        )
+        if memory_line is None:
+            memory_line = self._agent_health_last_matching_log_line(
+                log_dir / "gateway.log", "[MEMORY]"
+            ) or self._agent_health_last_matching_log_line(
+                log_dir / "agent.log", "[MEMORY]"
+            ) or self._agent_health_last_matching_log_line(
+                log_dir / "agent.log", "rss_kib="
+            )
+        rss_text = (
+            f"{float(rss) / 1024:.1f} MiB"
+            if isinstance(rss, (int, float))
+            else "unknown"
+        )
+        if rss_text == "unknown" and memory_line:
+            rss_match = re.search(r"\brss=(\d+(?:\.\d+)?)MB\b", memory_line)
+            if rss_match:
+                rss_text = f"{float(rss_match.group(1)):.1f} MiB"
+            else:
+                rss_kib_match = re.search(
+                    r"\brss_kib=(\d+)(?:->(\d+))?\b", memory_line
+                )
+                if rss_kib_match:
+                    rss_kib = rss_kib_match.group(2) or rss_kib_match.group(1)
+                    rss_text = f"{float(rss_kib) / 1024:.1f} MiB"
+        heartbeat_detail = ""
+        if previous_heartbeat:
+            heartbeat_detail = (
+                "직전 heartbeat: "
+                f"updated_at={previous_heartbeat.get('updated_at') or 'unknown'} "
+                f"mem={previous_heartbeat.get('mem') or {}}"
+            )
+        details = tuple(
+            item
+            for item in (
+                f"직전 runtime_status updated_at={previous.get('updated_at') or 'unknown'}",
+                f"직전 exit diag: {exit_diag}" if exit_diag else "",
+                heartbeat_detail,
+                f"마지막 메모리 로그: {memory_line}" if memory_line else "",
+            )
+            if item
+        )
+        suspected_oom = bool(lifecycle.get("suspected_oom"))
+        return self._emit_agent_health_event(
+            HealthEvent(
+                rule="C1.gateway_restart",
+                category="C",
+                title="Hermes 게이트웨이 재시작됨",
+                reason=(
+                    f"게이트웨이가 기동했습니다. 직전 state={prev_state}, "
+                    f"exit_reason={exit_reason}, 직전 RSS={rss_text}."
+                ),
+                action=(
+                    "OOM 가능성이 감지되었습니다. 메모리 압력과 커널 로그를 확인하세요."
+                    if suspected_oom
+                    else "비정상 종료 여부와 직전 진단 로그를 확인하세요."
+                ),
+                resource="hermes-gateway",
+                details=details,
+                mention=True,
+            )
+        )
+
+    async def _stop_agent_health_sink(self) -> None:
+        sink = getattr(self, "_agent_health_sink", None)
+        self._agent_health_sink = None
+        if sink is None:
+            return
+        try:
+            await asyncio.wait_for(sink.stop(), timeout=2.0)
+        except Exception:
+            pass
+
+    def _record_content_delivered(
+        self,
+        session_key: str,
+        run_generation: Optional[int] = None,
+    ) -> None:
+        """Advance A's output clock after a confirmed platform ACK.
+
+        Stale generations are ignored so a late send from an interrupted turn
+        cannot mask a silent replacement turn.  Successful content re-arms the
+        silence warning for a later silence episode in the same generation.
+        """
+        if not session_key:
+            return
+        if run_generation is not None and not self._is_session_run_current(
+            session_key, run_generation
+        ):
+            return
+        state = self._peek_session_state(session_key)
+        generation = int(
+            run_generation
+            if run_generation is not None
+            else (state.persistent.run_generation if state is not None else 0)
+        )
+        timestamps = getattr(self, "_last_content_sent_at", None)
+        if timestamps is None:
+            timestamps = {}
+            self._last_content_sent_at = timestamps
+        timestamps[session_key] = time.time()
+        notified = getattr(self, "_output_silence_notified", None)
+        if isinstance(notified, dict):
+            notified.pop((session_key, generation), None)
+
+        waiting = getattr(self, "_output_silence_user_waiting", None)
+        if isinstance(waiting, dict):
+            waiting.pop((session_key, generation), None)
+
+    def _session_waiting_on_user(self, session_key: str) -> bool:
+        """Return whether a live turn is blocked on an explicit user prompt.
+
+        Only concrete gateway primitives count.  Agent activity, heartbeat
+        touches, and free-form status text intentionally remain outside A's
+        policy so busy retry loops cannot hide real output silence.
+        """
+        if not session_key:
+            return False
+        try:
+            from tools import clarify_gateway as clarify_mod
+
+            if clarify_mod.get_pending_for_session(
+                session_key,
+                include_choice_prompts=True,
+            ) is not None:
+                return True
+        except Exception:
+            logger.debug(
+                "Could not inspect pending clarify for output-silence policy",
+                exc_info=True,
+            )
+        try:
+            from tools.approval import has_blocking_approval
+
+            return bool(has_blocking_approval(session_key))
+        except Exception:
+            logger.debug(
+                "Could not inspect pending approval for output-silence policy",
+                exc_info=True,
+            )
+            return False
+
+    def _resume_output_silence_clock(
+        self,
+        session_key: str,
+        run_generation: int,
+    ) -> bool:
+        """Restart A's clock after an observed explicit user wait ends."""
+        if not session_key or not self._is_session_run_current(
+            session_key, run_generation
+        ):
+            return False
+        timestamps = getattr(self, "_last_content_sent_at", None)
+        if not isinstance(timestamps, dict):
+            timestamps = {}
+            self._last_content_sent_at = timestamps
+        timestamps[session_key] = time.time()
+        latch_key = (session_key, int(run_generation))
+        for attr in (
+            "_output_silence_notified",
+            "_turn_deadline_enforced",
+            "_output_silence_user_waiting",
+        ):
+            latches = getattr(self, attr, None)
+            if isinstance(latches, dict):
+                latches.pop(latch_key, None)
+        return True
+
+    def _agent_health_session_id(self, session_key: str) -> str:
+        try:
+            value = self.session_store.peek_session_id(session_key)
+            return str(value or "")
+        except Exception:
+            return ""
+
+    def _agent_health_event_context(self, session_key: str, source) -> dict:
+        from gateway.agent_health import discord_jump_url
+
+        platform = getattr(getattr(source, "platform", None), "value", "")
+        jump_url = ""
+        if platform == "discord":
+            jump_url = discord_jump_url(
+                guild_id=str(
+                    getattr(source, "scope_id", None)
+                    or getattr(source, "guild_id", None)
+                    or ""
+                ),
+                chat_id=str(getattr(source, "chat_id", "") or ""),
+                thread_id=str(getattr(source, "thread_id", "") or ""),
+                message_id=str(getattr(source, "message_id", "") or ""),
+            )
+        return {
+            "session_id": self._agent_health_session_id(session_key),
+            "session_key": session_key,
+            "platform": str(platform or ""),
+            "jump_url": jump_url,
+        }
+
+    async def _check_output_silence(
+        self,
+        silence_timeout: Optional[float] = None,
+        turn_deadline: Optional[float] = None,
+    ) -> int:
+        """Detect live turns with no confirmed user-visible content.
+
+        This is deliberately separate from _check_session_stalls: pending
+        inbound and AIAgent activity are not inputs.  Every candidate is
+        re-read immediately before alert/interrupt to close the same stale
+        snapshot race as the existing stall notifier.
+        """
+        from gateway.agent_health import (
+            HealthEvent,
+            should_emit_output_silence,
+            should_enforce_turn_deadline,
+        )
+
+        threshold = (
+            self._agent_health_silence_timeout_seconds()
+            if silence_timeout is None
+            else float(silence_timeout)
+        )
+        deadline = (
+            self._agent_health_turn_deadline_seconds()
+            if turn_deadline is None
+            else float(turn_deadline)
+        )
+        if threshold <= 0 and deadline <= 0:
+            return 0
+
+        notified = getattr(self, "_output_silence_notified", None)
+        if not isinstance(notified, dict):
+            notified = {}
+            self._output_silence_notified = notified
+        enforced = getattr(self, "_turn_deadline_enforced", None)
+        if not isinstance(enforced, dict):
+            enforced = {}
+            self._turn_deadline_enforced = enforced
+        user_waiting = getattr(self, "_output_silence_user_waiting", None)
+        if not isinstance(user_waiting, dict):
+            user_waiting = {}
+            self._output_silence_user_waiting = user_waiting
+        starts = getattr(self, "_turn_started_at", None) or {}
+        contents = getattr(self, "_last_content_sent_at", None) or {}
+        emitted = 0
+
+        for session_key, agent in list(
+            (getattr(self, "_running_agents", None) or {}).items()
+        ):
+            if agent is None:
+                continue
+            state = self._peek_session_state(session_key)
+            if state is None:
+                continue
+            generation = int(state.persistent.run_generation)
+            latch_key = (session_key, generation)
+            waiting_now = self._session_waiting_on_user(session_key)
+            if waiting_now:
+                user_waiting[latch_key] = True
+                continue
+            if user_waiting.get(latch_key):
+                # User think-time is outside A.  Give the resumed agent a full
+                # fresh window, and never alert on the same tick that observes
+                # the wait ending.
+                self._resume_output_silence_clock(session_key, generation)
+                continue
+            started_at = float(
+                starts.get(session_key)
+                or getattr(state.turn, "started_ts", 0.0)
+                or 0.0
+            )
+            if started_at <= 0:
+                continue
+            last_output = float(contents.get(session_key, 0.0) or 0.0)
+            silence = max(0.0, time.time() - max(started_at, last_output))
+
+            deadline_due = should_enforce_turn_deadline(
+                silence_seconds=silence,
+                deadline=deadline,
+                turn_live=True,
+                already_enforced=bool(enforced.get(latch_key)),
+                waiting_on_user=waiting_now,
+            )
+            warning_due = should_emit_output_silence(
+                silence_seconds=silence,
+                threshold=threshold,
+                turn_live=True,
+                already_notified=bool(notified.get(latch_key)),
+                waiting_on_user=waiting_now,
+            )
+            if not deadline_due and not warning_due:
+                continue
+
+            # Re-read immediately before acting.  A streaming flush may have
+            # landed while an earlier candidate in this pass was handled.
+            if not self._is_session_run_current(session_key, generation):
+                notified.pop(latch_key, None)
+                enforced.pop(latch_key, None)
+                continue
+            fresh_state = self._peek_session_state(session_key)
+            fresh_agent = fresh_state.turn.agent if fresh_state is not None else None
+            if fresh_agent is None:
+                continue
+            fresh_waiting = self._session_waiting_on_user(session_key)
+            if fresh_waiting:
+                user_waiting[latch_key] = True
+                continue
+            if user_waiting.get(latch_key):
+                self._resume_output_silence_clock(session_key, generation)
+                continue
+            fresh_started = float(
+                (getattr(self, "_turn_started_at", None) or {}).get(session_key)
+                or getattr(fresh_state.turn, "started_ts", 0.0)
+                or 0.0
+            )
+            fresh_output = float(
+                (getattr(self, "_last_content_sent_at", None) or {}).get(
+                    session_key, 0.0
+                )
+                or 0.0
+            )
+            fresh_silence = max(
+                0.0, time.time() - max(fresh_started, fresh_output)
+            )
+            source = self._get_cached_session_source(session_key)
+
+            if should_enforce_turn_deadline(
+                silence_seconds=fresh_silence,
+                deadline=deadline,
+                turn_live=True,
+                already_enforced=bool(enforced.get(latch_key)),
+                waiting_on_user=fresh_waiting,
+            ):
+                if source is None:
+                    # Keep the latch clear and retry next tick; the exact reset
+                    # funnel requires a routable SessionSource.
+                    continue
+                enforced[latch_key] = True
+                notified[latch_key] = True
+                try:
+                    await self._interrupt_and_clear_session(
+                        session_key,
+                        source,
+                        interrupt_reason="agent-health output deadline",
+                        invalidation_reason="agent_health_turn_deadline",
+                    )
+                except Exception:
+                    # Do not let monitoring failure wedge the watcher.  The
+                    # next generation is already invalidated by the normal
+                    # interrupt funnel when it progressed far enough.
+                    pass
+
+                source_notice_sent = False
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    minutes = max(1, int(deadline // 60))
+                    user_text = (
+                        f"⚠️ 이 요청은 {minutes}분 동안 채널로 전달된 응답이 "
+                        "없어 자동 중단되었습니다. 다시 시도하거나 /reset으로 "
+                        "새 세션을 시작해 주세요."
+                    )
+                    try:
+                        metadata = dict(
+                            self._thread_metadata_for_source(source) or {}
+                        )
+                        metadata["notify"] = True
+                        result = await asyncio.wait_for(
+                            adapter.send(
+                                str(source.chat_id),
+                                user_text,
+                                metadata=metadata,
+                            ),
+                            timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
+                        )
+                        if getattr(result, "success", False):
+                            self._last_content_sent_at[session_key] = time.time()
+                            source_notice_sent = True
+                    except Exception:
+                        pass
+
+                context = self._agent_health_event_context(session_key, source)
+                self._emit_agent_health_event(
+                    HealthEvent(
+                        rule="A.turn_deadline",
+                        category="A",
+                        title="출력 무응답 하드 데드라인 강제 종료",
+                        reason=(
+                            f"턴이 {fresh_silence:.0f}초 동안 실제 채널 콘텐츠를 "
+                            "전달하지 못했습니다."
+                        ),
+                        action=(
+                            "동일 세션의 실행을 /reset 경로로 중단하고 원 스레드에 실패 사유를 게시했습니다."
+                            if source_notice_sent
+                            else "동일 세션의 실행을 /reset 경로로 중단했습니다. 원 스레드 실패 안내 전송은 실패하거나 시간 초과되었습니다."
+                        ),
+                        mention=True,
+                        **context,
+                    )
+                )
+                emitted += 1
+                continue
+
+            if not should_emit_output_silence(
+                silence_seconds=fresh_silence,
+                threshold=threshold,
+                turn_live=True,
+                already_notified=bool(notified.get(latch_key)),
+                waiting_on_user=fresh_waiting,
+            ):
+                notified.pop(latch_key, None)
+                continue
+            context = self._agent_health_event_context(session_key, source)
+            accepted = self._emit_agent_health_event(
+                HealthEvent(
+                    rule="A.output_silence",
+                    category="A",
+                    title="사용자 대기 중 채널 출력 무응답",
+                    reason=(
+                        f"실행 중인 턴이 {fresh_silence:.0f}초 동안 실제 채널 "
+                        "콘텐츠를 한 건도 전달하지 않았습니다."
+                    ),
+                    action=(
+                        (
+                            f"{max(1, int(deadline // 60))}분 하드 데드라인까지 "
+                            "출력이 없으면 턴을 자동 중단합니다."
+                        )
+                        if deadline > 0
+                        else "하드 데드라인은 비활성화되어 있어 자동 중단하지 않습니다."
+                    ),
+                    mention=True,
+                    **context,
+                )
+            )
+            if accepted:
+                notified[latch_key] = True
+                emitted += 1
+
+        return emitted
+
     def _iter_gateway_adapters(self):
         """Yield every live platform adapter (default + multiplex profiles)."""
         seen: set[int] = set()
@@ -13074,6 +13822,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout = self._session_stall_timeout_seconds()
                 if timeout > 0:
                     await self._check_session_stalls(timeout)
+                # Independent contract: wall-clock time since turn claim or
+                # last confirmed content.  No pending-inbound/activity gate.
+                health_silence = self._agent_health_silence_timeout_seconds()
+                health_deadline = self._agent_health_turn_deadline_seconds()
+                if health_silence > 0 or health_deadline > 0:
+                    await self._check_output_silence(
+                        health_silence,
+                        health_deadline,
+                    )
             except Exception as exc:
                 logger.debug("Session stall watcher error: %s", exc)
             # Interruptible sleep
@@ -13200,6 +13957,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    adapter.set_content_delivered_handler(self._record_content_delivered)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -13777,6 +14535,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(_stop_mention_inbox):
                 await _stop_mention_inbox()
 
+            # Stop the health drain while Discord is still connected.  It is
+            # bounded and fail-soft, and platform teardown transitions below
+            # must not enqueue alerts into a sink that can no longer deliver.
+            await self._stop_agent_health_sink()
+
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
@@ -14218,6 +14981,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        adapter.set_content_delivered_handler(self._record_content_delivered)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -15456,6 +16220,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Failed to resume typing after clarify response",
                                 exc_info=True,
                             )
+                    # When a reply resolves a choice prompt WITHOUT being a
+                    # number or an exact label, the mapping is inferred, and
+                    # get_pending_for_session resolves the OLDEST pending
+                    # prompt — which need not be the one on screen. Echo what
+                    # was answered so a mis-mapping is visible immediately
+                    # instead of silently consuming the message.
+                    try:
+                        _cl_choices = list(_pending_clarify.choices or [])
+                        _cl_reply = (_raw_clarify_reply or "").strip()
+                        _cl_is_selection = _cl_reply.isdigit() or any(
+                            _cl_reply.casefold() == str(_cl_choice).strip().casefold()
+                            for _cl_choice in _cl_choices
+                        )
+                    except Exception:
+                        _cl_choices, _cl_reply, _cl_is_selection = [], "", True
+                    _cl_inferred = (
+                        _cl_choices
+                        and not _cl_is_selection
+                        and not getattr(_pending_clarify, "awaiting_text", False)
+                    )
+                    if _cl_inferred:
+                        _cl_q = " ".join((_pending_clarify.question or "").split())
+                        if len(_cl_q) > 60:
+                            _cl_q = _cl_q[:60] + "…"
+                        _cl_shown = _cl_reply if len(_cl_reply) <= 80 else _cl_reply[:80] + "…"
+                        return f"'{_cl_shown}' 을(를) 「{_cl_q}」 질문의 답으로 처리했어요."
                     # Acknowledge with empty string so adapters that emit
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
@@ -16538,6 +17328,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        self._turn_started_at[_quick_key] = _claim_state.turn.started_ts
+        # Make A's deadline path routable even if the turn wedges during early
+        # preprocessing before the later session-source cache point.
+        self._cache_session_source(_quick_key, source)
 
         try:
             try:
@@ -19322,6 +20116,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
+
+            def _emit_terminal_agent_error(
+                *, rule: str, title: str, reason: str
+            ) -> None:
+                try:
+                    from agent.redact import redact_sensitive_text
+                    from gateway.agent_health import HealthEvent
+
+                    context = self._agent_health_event_context(
+                        session_key, source
+                    )
+                    if session_entry is not None:
+                        context["session_id"] = str(
+                            getattr(session_entry, "session_id", "") or ""
+                        )
+                    detail = redact_sensitive_text(
+                        str(e), force=True, redact_url_credentials=True
+                    )[:1200]
+                    self._emit_agent_health_event(
+                        HealthEvent(
+                            rule=rule,
+                            category="B",
+                            title=title,
+                            reason=reason,
+                            action="원 스레드에는 정보 노출을 막은 오류 안내가 게시됩니다. 서버 로그와 공급자 상태를 확인하세요.",
+                            details=(
+                                f"status_code={status_code!r} exception={type(e).__name__} history_len={_hist_len}",
+                                detail,
+                            ),
+                            mention=False,
+                            **context,
+                        )
+                    )
+                except Exception:
+                    pass
             if status_code == 401:
                 status_hint = " Check your API key or run `claude /login` to refresh OAuth credentials."
             elif status_code == 402:
@@ -19354,6 +20183,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # 500 with a large session often means the payload is too large
                 # for the API to process — treat it the same way.
                 if _hist_len > 50:
+                    _emit_terminal_agent_error(
+                        rule="B.context_overflow",
+                        title="세션 컨텍스트 초과로 종결",
+                        reason=(
+                            f"API status={status_code}이고 history_len={_hist_len}인 "
+                            "요청을 컨텍스트 초과로 판정했습니다."
+                        ),
+                    )
                     return (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
@@ -19361,6 +20198,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
+            _emit_terminal_agent_error(
+                rule="B.unexpected_agent_error",
+                title="에이전트 턴 예외 종결",
+                reason=(
+                    f"{type(e).__name__} 예외로 턴이 종결되었습니다 "
+                    f"(status={status_code!r}, history_len={_hist_len})."
+                ),
+            )
             return (
                 f"Sorry, I encountered an unexpected error.{status_hint}\n"
                 "Try again or use /reset to start a fresh session."
@@ -24156,6 +25001,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
             state.turn.clear()
+        starts = getattr(self, "_turn_started_at", None)
+        if isinstance(starts, dict):
+            starts.pop(session_key, None)
+        for attr in (
+            "_output_silence_notified",
+            "_turn_deadline_enforced",
+            "_output_silence_user_waiting",
+        ):
+            latches = getattr(self, attr, None)
+            if isinstance(latches, dict):
+                for latch_key in list(latches):
+                    if (
+                        isinstance(latch_key, tuple)
+                        and latch_key
+                        and latch_key[0] == session_key
+                    ):
+                        latches.pop(latch_key, None)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -25425,6 +26287,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
+                        on_content_delivered=(
+                            lambda: self._record_content_delivered(
+                                session_key or "", run_generation
+                            )
+                        ),
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
@@ -27449,6 +28316,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await task
                     except asyncio.CancelledError:
                         pass
+            turn_ctx.progress_closed.set()
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
@@ -28192,7 +29060,73 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
+    try:
+        from gateway.status import read_runtime_status as _read_runtime_status
+
+        _agent_health_previous_status = _read_runtime_status()
+    except Exception:
+        _agent_health_previous_status = None
+
     runner = GatewayRunner(config)
+    runner._agent_health_previous_status = _agent_health_previous_status
+    # Freeze the prior process's forensic lines before runner.start() can emit
+    # this process's own baseline RSS.  Empty strings are intentional snapshots:
+    # _emit_gateway_restart_health must not re-read and accidentally report the
+    # new process as the "previous" one.
+    _health_log_dir = _hermes_home / "logs"
+    _health_previous_pid = None
+    try:
+        if isinstance(_agent_health_previous_status, dict):
+            _health_previous_pid = int(
+                _agent_health_previous_status.get("pid") or 0
+            ) or None
+    except (TypeError, ValueError):
+        _health_previous_pid = None
+    runner._agent_health_previous_exit_diag = (
+        runner._agent_health_previous_exit_diag_line(
+            _health_log_dir / "gateway-exit-diag.log",
+            previous_pid=_health_previous_pid,
+            current_pid=os.getpid(),
+        )
+    )
+    runner._agent_health_previous_memory_line = (
+        runner._agent_health_last_matching_log_line(
+            _health_log_dir / "gateway.log", "[MEMORY]"
+        )
+        or runner._agent_health_last_matching_log_line(
+            _health_log_dir / "agent.log", "[MEMORY]"
+        )
+        or runner._agent_health_last_matching_log_line(
+            _health_log_dir / "agent.log", "rss_kib="
+        )
+    )
+    try:
+        from gateway.shutdown_watchdog import get_loop_heartbeat_path
+
+        _health_heartbeat = json.loads(
+            get_loop_heartbeat_path(_hermes_home).read_text(encoding="utf-8")
+        )
+        _health_heartbeat_pid = int(_health_heartbeat.get("pid") or 0)
+        if (
+            isinstance(_health_heartbeat, dict)
+            and _health_heartbeat_pid != os.getpid()
+            and (
+                _health_previous_pid is None
+                or _health_heartbeat_pid == _health_previous_pid
+            )
+        ):
+            runner._agent_health_previous_heartbeat = _health_heartbeat
+    except (OSError, TypeError, ValueError, AttributeError):
+        runner._agent_health_previous_heartbeat = None
+    # Start the bounded queue before MCP discovery/adapter connect so C3/C4
+    # records emitted during startup are retained until Discord is available.
+    try:
+        from gateway.agent_health_sink import AgentHealthSink
+
+        runner._agent_health_sink = AgentHealthSink.from_environment(runner)
+        runner._agent_health_sink.start()
+    except Exception:
+        runner._agent_health_sink = None
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.
@@ -28392,7 +29326,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # sentinel — a --replace loser exiting above must not clobber it.
     try:
         from gateway.lifecycle_ledger import record_startup as _lifecycle_record_startup
-        _lifecycle_record_startup()
+        runner._agent_health_lifecycle_evidence = _lifecycle_record_startup()
     except Exception as _lc_exc:
         logger.debug("Lifecycle ledger startup record failed: %s", _lc_exc)
 
@@ -28422,11 +29356,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     try:
         success = await runner.start()
     except BaseException:
+        await runner._stop_agent_health_sink()
         _shutdown_gateway_health_export(runner)
         raise
     if not success:
+        await runner._stop_agent_health_sink()
         _shutdown_gateway_health_export(runner)
         return False
+    runner._emit_gateway_restart_health()
     # Recover any pending messages flushed during a previous shutdown (#72680).
     try:
         from gateway.shutdown_flush import recover_pending_to_db
@@ -28438,6 +29375,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
     if runner.should_exit_cleanly:
+        await runner._stop_agent_health_sink()
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)

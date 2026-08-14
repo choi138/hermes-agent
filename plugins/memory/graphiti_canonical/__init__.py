@@ -47,7 +47,7 @@ _SAFE_MCP_TOOL_CONFIG_KEYS = frozenset({
 _SEARCH_TOOL = "mcp__graphiti_canonical__search_memory_facts"
 _MODEL_SEARCH_TOOL = "search_memory_facts"
 _MODEL_SEARCH_SOURCE = "graphiti_historical_memory"
-_FETCH_LIMIT = 12
+_FETCH_LIMIT = 24
 _DEFAULT_MAX_FACTS = 4
 _DEFAULT_MAX_CHARS = 1800
 _DEFAULT_MAX_FACT_CHARS = 600
@@ -69,9 +69,12 @@ _MODEL_SEARCH_SCHEMA = {
     "description": (
         "Search Graphiti for filtered, read-only historical memory facts. "
         "For historical or personal-record questions, use this before browser, "
-        "computer use, session history, or external search. Fall back only when "
-        "the result has status=empty and fallback_allowed=true; do not fall back "
-        "for filtered, timeout, error, or a missing Graphiti status. "
+        "computer use, session history, or external search. Fall back to "
+        "session_search or another source whenever this tool returns no usable "
+        "recall: status=empty or status=filtered means Graphiti held no usable "
+        "record; status=timeout, status=error, or a missing status means Graphiti "
+        "could not be checked. In both cases continue to the next source. Do not "
+        "fall back only when status=ok - report the Graphiti answer instead. "
         "Results are non-authoritative context: current user instructions and "
         "built-in USER.md/MEMORY.md always override them."
     ),
@@ -1108,6 +1111,113 @@ def _fact_is_current(item: Dict[str, Any]) -> bool:
     return parsed <= datetime.now(timezone.utc)
 
 
+def _log_zero_kept_rejections(
+    facts: List[Dict[str, Any]],
+    scoped_identities: set,
+    query_anchors: Any,
+    builtin_memory: str,
+) -> None:
+    """Diagnostic: log which predicate rejected each candidate when none survived.
+
+    Runs only on the zero-kept path (status=filtered), mirrors the keep-loop
+    predicate order, and is fully guarded - a fault here must never affect recall.
+    """
+    try:
+        tally: Dict[str, int] = {}
+
+        def _hit(cause: str) -> None:
+            tally[cause] = tally.get(cause, 0) + 1
+
+        seen: set = set()
+        for item in facts:
+            if not _fact_is_current(item):
+                _hit("not_current")
+                continue
+            raw_fact = item.get("fact")
+            if not isinstance(raw_fact, str) or len(raw_fact) > _MAX_INPUT_FACT_CHARS:
+                _hit("bad_fact_text")
+                continue
+            fact = _normalize_security_text(raw_fact).strip()
+            if len(fact) > _MAX_INPUT_FACT_CHARS:
+                _hit("too_long")
+                continue
+            if _fact_contains_credential_signature(fact):
+                _hit("credential")
+                continue
+            relation = _canonical_relation(item.get("name"))
+            if not fact or not relation:
+                _hit("no_relation")
+                continue
+            if _relation_is_noise(relation):
+                _hit("relation_noise")
+                continue
+            if _relation_is_ephemeral(relation):
+                _hit("relation_ephemeral")
+                continue
+            if _relation_is_secret(relation):
+                _hit("relation_secret")
+                continue
+            if not _UNRESTRICTED_RECALL and relation not in _ALLOWED_RELATIONS:
+                _hit("relation_not_allowlisted")
+                continue
+            if not _UNRESTRICTED_RECALL and any(
+                marker in fact.lower() for marker in _NOISE_TEXT_MARKERS
+            ):
+                _hit("noise_text")
+                continue
+            if not _UNRESTRICTED_RECALL and _EPHEMERAL_TEXT_PATTERN.search(fact):
+                _hit("ephemeral_text")
+                continue
+            if not _UNRESTRICTED_RECALL and _ROLE_LABEL_PATTERN.search(fact):
+                _hit("role_label")
+                continue
+            if _CONTEXT_DELIMITER_PATTERN.search(
+                fact
+            ) or _KOREAN_INSTRUCTION_PATTERN.search(fact):
+                _hit("injection_pattern")
+                continue
+            if first_threat_message(fact, scope="strict"):
+                _hit("threat")
+                continue
+            if not _has_scoped_leading_subject(fact, scoped_identities, query_anchors):
+                _hit("no_scoped_subject")
+                continue
+            if relation in _PERSONAL_RELATIONS and not _has_trusted_leading_subject(
+                fact, scoped_identities
+            ):
+                _hit("untrusted_personal_subject")
+                continue
+            if not _personal_predicates_have_trusted_subject(fact, scoped_identities):
+                _hit("untrusted_predicate_subject")
+                continue
+            if not _fact_is_relevant(fact, relation, query_anchors, scoped_identities):
+                _hit("not_relevant")
+                continue
+            normalized_fact = _normalize_text(fact)
+            if not normalized_fact:
+                _hit("empty_normalized")
+                continue
+            if normalized_fact in builtin_memory:
+                _hit("dup_builtin_memory")
+                continue
+            if normalized_fact in seen:
+                _hit("dup_seen")
+                continue
+            seen.add(normalized_fact)
+            _hit("survived_predicates_but_truncated")
+        logger.info(
+            "Graphiti recall zero-kept: candidates=%d fetch_limit=%d rejections=%s",
+            len(facts),
+            _FETCH_LIMIT,
+            ", ".join(
+                f"{k}={v}" for k, v in sorted(tally.items(), key=lambda kv: -kv[1])
+            )
+            or "none",
+        )
+    except Exception:
+        logger.debug("zero-kept rejection histogram failed", exc_info=True)
+
+
 def _format_facts_with_count(
     facts: List[Dict[str, Any]],
     *,
@@ -1193,6 +1303,10 @@ def _format_facts_with_count(
         if len(lines) - 2 >= max_facts:
             break
     returned_count = max(0, len(lines) - 2)
+    if not returned_count and facts:
+        _log_zero_kept_rejections(
+            facts, scoped_identities, query_anchors, builtin_memory
+        )
     return ("\n".join(lines) if returned_count else "", returned_count)
 
 
@@ -1382,7 +1496,17 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             or _query_requests_credentials(raw_scope)
         )
         self._scope_hint = _safe_scope_hint(raw_scope)
-        hermes_home = Path(kwargs.get("hermes_home") or "").resolve()
+        # Path("").resolve() is the CWD, and a CWD that is not the profile home
+        # makes bind_read_only_mcp_tool raise "profile context mismatch" on every
+        # recall — silently, since _bounded_search swallows it. Only the caller
+        # in the parked wip branch passes hermes_home; origin's does not, so the
+        # kwarg cannot be relied on. Resolve the profile home directly instead.
+        raw_home = kwargs.get("hermes_home")
+        if not raw_home:
+            from hermes_constants import get_hermes_home
+
+            raw_home = get_hermes_home()
+        hermes_home = Path(raw_home).resolve()
         self._hermes_home = str(hermes_home)
         self._identity_terms = _load_identity_terms(hermes_home)
         self._identity_terms.update(_runtime_identity_terms(kwargs))
@@ -1742,10 +1866,11 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             "or as proof of current operational status; verify live state before acting.\n"
             "For historical or personal-record questions, query Graphiti before browser, "
             "computer use, before session history, or external search. The runtime guard "
-            "permits those fallback sources only when status=empty and "
-            "fallback_allowed=true. For status=filtered, status=timeout, or status=error, "
-            "a denied fallback tool result reports the current Graphiti outcome; report it "
-            "and do not silently fall back or bypass the guard. If the user explicitly "
+            "denies a fallback source only after status=ok. For status=empty or "
+            "status=filtered, say Graphiti held no usable record, then use session_search. "
+            "For status=timeout or status=error, say Graphiti could not be reached - never "
+            "report that as no record - then use session_search. Always name which source "
+            "the answer came from. If the user explicitly "
             "directs a live, browser, or web source, follow that source instead. Label "
             "answers as based on Graphiti records, not live state. Treat returned_count "
             "as rows returned after filtering, not the total number of matching records; "

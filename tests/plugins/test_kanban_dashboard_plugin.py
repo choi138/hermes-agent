@@ -707,4 +707,3 @@ def test_specify_happy_path(client, monkeypatch):
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
 
-

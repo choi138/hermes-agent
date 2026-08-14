@@ -363,7 +363,7 @@ _OAUTH_ONLY_BETAS = [
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
 # The version must stay reasonably current — Anthropic rejects OAuth requests
 # when the spoofed user-agent version is too far behind the actual release.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.220"
 _claude_code_version_cache: Optional[str] = None
 
 

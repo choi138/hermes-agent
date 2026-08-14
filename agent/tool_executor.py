@@ -131,6 +131,8 @@ def _trusted_kanban_terminal_marker(tool_name: str, result: Any) -> Optional[dic
     if marker.get("tool") != tool_name or not isinstance(marker.get("status"), str):
         return None
     return {key: marker[key] for key in ("task_id", "tool", "status")}
+
+
 # Upper bound a concurrent worker will wait at the start-order gate for all
 # earlier-ordered tools to advance before proceeding out of order. Long enough
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
@@ -2433,6 +2435,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
+
+        terminal_marker = raw_terminal_marker
+        if terminal_marker is not None:
+            agent._kanban_terminal_transition = terminal_marker
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    json.dumps({
+                        "ok": False,
+                        "skipped": True,
+                        "reason": (
+                            f"skipped after successful {function_name} terminal transition"
+                        ),
+                    }),
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+                if not _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"skipped terminal batch result {skipped_name}",
+                ):
+                    return
+            break
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:

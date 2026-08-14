@@ -2762,6 +2762,12 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Runner-owned callback for successful user-visible response delivery.
+        # Progress/typing paths never call it.  The callback is synchronous so
+        # delivery ACK handling cannot be held up by monitoring I/O.
+        self._content_delivered_handler: Optional[
+            Callable[[str, Optional[int]], None]
+        ] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3326,6 +3332,24 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_content_delivered_handler(
+        self,
+        handler: Optional[Callable[[str, Optional[int]], None]],
+    ) -> None:
+        """Install a non-blocking callback for confirmed final content."""
+        self._content_delivered_handler = handler
+
+    def _notify_content_delivered(
+        self, session_key: str, run_generation: Optional[int]
+    ) -> None:
+        handler = getattr(self, "_content_delivered_handler", None)
+        if not callable(handler):
+            return
+        try:
+            handler(session_key, run_generation)
+        except Exception:
+            pass
 
     def set_topic_recovery_fn(
         self,
@@ -6110,6 +6134,15 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        if getattr(tts_result, "success", False):
+                            self._notify_content_delivered(
+                                session_key,
+                                getattr(
+                                    interrupt_event,
+                                    "_hermes_run_generation",
+                                    None,
+                                ),
+                            )
                     finally:
                         for _cleanup_path in _tts_cleanup_paths:
                             try:
@@ -6185,6 +6218,15 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if getattr(result, "success", False):
+                        self._notify_content_delivered(
+                            session_key,
+                            getattr(
+                                interrupt_event,
+                                "_hermes_run_generation",
+                                None,
+                            ),
+                        )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -6321,6 +6363,15 @@ class BasePlatformAdapter(ABC):
                                 is_voice=is_voice,
                                 metadata=_final_thread_metadata,
                             )
+                        else:
+                            self._notify_content_delivered(
+                                session_key,
+                                getattr(
+                                    interrupt_event,
+                                    "_hermes_run_generation",
+                                    None,
+                                ),
+                            )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -6353,6 +6404,15 @@ class BasePlatformAdapter(ABC):
                                 event.source.chat_id,
                                 file_path,
                                 metadata=_final_thread_metadata,
+                            )
+                        else:
+                            self._notify_content_delivered(
+                                session_key,
+                                getattr(
+                                    interrupt_event,
+                                    "_hermes_run_generation",
+                                    None,
+                                ),
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)

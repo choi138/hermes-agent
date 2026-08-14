@@ -25,6 +25,7 @@ Field notes:
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -49,6 +50,10 @@ class TurnContext:
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
     log_queue: Any = None
+    # Cross-thread finalization fence. The stream consumer sets this before
+    # its final platform send/edit; agent callbacks and the progress sender
+    # then reject or discard every later progress event for this turn.
+    progress_closed: threading.Event = field(default_factory=threading.Event)
 
     # --- mutable single-element containers (shared with the outer body) --
     last_progress_msg: list = field(default_factory=lambda: [None])

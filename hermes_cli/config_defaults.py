@@ -28,6 +28,18 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Gateway operator alerts.  Disabled by default because the destination is
+    # deployment-specific; numeric policy defaults are shared by every host.
+    "agent_health": {
+        "enabled": False,
+        "channel": "",
+        "mention": "",
+        "silence_timeout": 600,
+        "turn_deadline": 1500,
+        "upstream_failure_streak": 3,
+        "cooldown_seconds": 900,
+        "hourly_cap": 12,
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -178,6 +190,13 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
+        # When True, a native multi-choice clarify (buttons rendered,
+        # awaiting_text False) also accepts free prose as the answer instead
+        # of requiring a number or an exact option label. False keeps upstream
+        # behaviour, where an unrelated follow-up sent while the prompt is
+        # live cannot be swallowed as the answer (#62034). Multi-select
+        # prompts are unaffected either way.
+        "clarify_accept_prose": False,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.

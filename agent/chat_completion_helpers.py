@@ -27,10 +27,15 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
+from hermes_cli.provider_config import get_provider_backend_family
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
+from agent.failover_domain import (
+    INFRASTRUCTURE_FAILOVER_REASONS,
+    endpoint_origin,
+)
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -57,6 +62,14 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+
+# A cross-thread socket shutdown normally releases the request worker almost
+# immediately.  Some transports cannot find/shutdown the active socket,
+# however, and the daemon worker then outlives the timed-out call.  Give the
+# owner a short unwind window, then remember it so a retry cannot overlap the
+# same endpoint while the old request is still pending upstream.
+_ABORTED_REQUEST_WORKER_JOIN_SECONDS = 2.0
+_ABORTED_REQUEST_WORKER_DRAIN_SECONDS = 30.0
 
 
 def _context_thread_target(callback):
@@ -190,8 +203,22 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
 def _is_openai_codex_backend(agent) -> bool:
     base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
     base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    requested_provider = str(
+        getattr(agent, "requested_provider", "") or ""
+    ).strip().lower()
+    runtime_ids = {
+        value.split(":", 1)[1] if value.startswith("custom:") else value
+        for value in (provider, requested_provider)
+        if value
+    }
+    backend_family = get_provider_backend_family(
+        provider,
+        requested_provider=requested_provider,
+    )
     return (
-        getattr(agent, "provider", None) == "openai-codex"
+        "openai-codex" in runtime_ids
+        or backend_family == "openai-codex"
         or (
             base_url_hostname == "chatgpt.com"
             and "/backend-api/codex" in base_url_lower
@@ -216,6 +243,77 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     if est_tokens > 10_000:
         return 600.0
     return 0.0
+
+
+def apply_openai_codex_stale_timeout_floor(
+    agent,
+    api_payload: Any,
+    stale_timeout: float,
+) -> float:
+    """Apply Codex context floors when the resolved backend has that capability."""
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return stale_timeout
+    if not _is_openai_codex_backend(agent):
+        return stale_timeout
+    floor = openai_codex_stale_timeout_floor(
+        estimate_request_context_tokens(api_payload)
+    )
+    return max(stale_timeout, floor) if floor else stale_timeout
+
+
+def _request_endpoint_key(agent) -> tuple[str, str]:
+    """Return a model-independent identity for overlap prevention."""
+    api_mode = str(getattr(agent, "api_mode", "") or "").strip().lower()
+    base_url = str(
+        getattr(agent, "_base_url", None)
+        or getattr(agent, "base_url", None)
+        or ""
+    ).strip().rstrip("/").lower()
+    if not base_url:
+        base_url = str(getattr(agent, "provider", "") or "").strip().lower()
+    return api_mode, base_url
+
+
+def _draining_request_workers(agent) -> dict[tuple[str, str], threading.Thread]:
+    workers = getattr(agent, "_draining_request_workers", None)
+    if not isinstance(workers, dict):
+        workers = {}
+        agent._draining_request_workers = workers
+    return workers
+
+
+def _remember_draining_request_worker(agent, worker: threading.Thread) -> None:
+    """Remember an aborted owner thread only while it is genuinely alive."""
+    if worker.is_alive():
+        _draining_request_workers(agent)[_request_endpoint_key(agent)] = worker
+
+
+def _wait_for_previous_request_worker(agent) -> None:
+    """Prevent an overlapping retry while an aborted endpoint worker drains.
+
+    A retry issued while the previous request is still live can be coalesced by
+    a proxy/load-balancer with the old ``pending=1`` bridge entry.  That makes a
+    fresh model attempt inherit the hung request and repeats the timeout loop.
+    Wait for the owning worker to unwind; if it still cannot drain, fail this
+    attempt without opening another socket to the same endpoint.
+    """
+    workers = _draining_request_workers(agent)
+    for key, worker in list(workers.items()):
+        if not worker.is_alive():
+            workers.pop(key, None)
+
+    endpoint_key = _request_endpoint_key(agent)
+    worker = workers.get(endpoint_key)
+    if worker is None:
+        return
+
+    worker.join(timeout=_ABORTED_REQUEST_WORKER_DRAIN_SECONDS)
+    if worker.is_alive():
+        raise TimeoutError(
+            "Previous timed-out provider request is still draining; refusing "
+            "an overlapping retry to the same endpoint."
+        )
+    workers.pop(endpoint_key, None)
 
 
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
@@ -343,16 +441,27 @@ def _codex_wait_notice_recovery(
     idle_enabled: bool,
     idle_timeout: float,
     elapsed: float,
+    hard_timeout: Optional[float] = None,
 ) -> str:
     """Describe the earliest enabled Codex watchdog on the call timeline."""
     deadlines: list[float] = []
-    if math.isfinite(stale_timeout):
-        deadlines.append(stale_timeout)
+    hard_timeout_enabled = (
+        isinstance(hard_timeout, (int, float))
+        and hard_timeout > 0
+        and math.isfinite(hard_timeout)
+    )
     if last_event_ts is None:
+        if math.isfinite(stale_timeout):
+            deadlines.append(stale_timeout)
         if ttfb_enabled and math.isfinite(ttfb_timeout):
             deadlines.append(ttfb_timeout)
-    elif idle_enabled and math.isfinite(idle_timeout):
-        deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
+    else:
+        if idle_enabled and math.isfinite(idle_timeout):
+            deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
+        elif not hard_timeout_enabled and math.isfinite(stale_timeout):
+            deadlines.append(stale_timeout)
+    if hard_timeout_enabled:
+        deadlines.append(float(hard_timeout))
     if not deadlines or min(deadlines) <= elapsed:
         return ""
     return f"; auto-reconnect at {int(min(deadlines))}s"
@@ -459,7 +568,11 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider,
+        agent.model,
+        requested_provider=getattr(agent, "requested_provider", None),
+    )
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -923,6 +1036,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    # A socket abort can leave its owning daemon worker alive when the
+    # transport cannot locate/shutdown the active connection.  Never issue a
+    # new request to that same endpoint until the old owner has drained.
+    _wait_for_previous_request_worker(agent)
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -1058,7 +1176,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
+    _stale_timeout = apply_openai_codex_stale_timeout_floor(
+        agent,
+        api_kwargs,
+        agent._compute_non_stream_stale_timeout(api_kwargs),
+    )
 
     # ── Codex Responses stream watchdogs ────────────────────────────────
     # The chatgpt.com/backend-api/codex endpoint has an intermittent failure
@@ -1079,11 +1201,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _codex_watchdog_enabled = agent.api_mode == "codex_responses"
     _openai_codex_backend = _is_openai_codex_backend(agent)
     _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
-    if _codex_watchdog_enabled and _openai_codex_backend:
-        _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
-        if _codex_floor:
-            _stale_timeout = max(_stale_timeout, _codex_floor)
-
     # ── Codex absolute hard ceiling (#64507) ──────────────────────────
     # ``openai_codex_stale_timeout_floor`` *raises* the stale timeout (up to
     # 1200s at >100k tokens) so healthy gateway-scale payloads aren't aborted.
@@ -1100,12 +1217,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # limit. Tunable via HERMES_CODEX_HARD_TIMEOUT_SECONDS (set to 0 to
     # disable the ceiling entirely; that restores the pre-fix behavior).
     _codex_hard_timeout = _env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
-    if (
+    _codex_hard_timeout_enabled = (
         _codex_watchdog_enabled
         and _openai_codex_backend
         and _codex_hard_timeout > 0
-    ):
-        _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
+        and math.isfinite(_codex_hard_timeout)
+    )
 
     if _est_tokens_for_codex_watchdog > 100_000:
         _codex_idle_timeout_default = 180.0
@@ -1203,6 +1320,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     idle_enabled=_codex_idle_enabled,
                     idle_timeout=_codex_idle_timeout,
                     elapsed=_elapsed,
+                    hard_timeout=(
+                        _codex_hard_timeout
+                        if _codex_hard_timeout_enabled
+                        else None
+                    ),
                 )
                 agent._emit_wait_notice(
                     f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
@@ -1262,7 +1384,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
             )
             # Wait briefly for the worker to notice the closed connection.
-            t.join(timeout=2.0)
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -1307,7 +1430,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
-            t.join(timeout=2.0)
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
@@ -1315,9 +1439,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # General wall-clock stale detection is a time-to-response guard. Once
+        # a Codex request is actively emitting SSE events, liveness is governed
+        # by the event-idle watchdog above instead; killing a healthy stream at
+        # the original wall-clock deadline truncates long reasoning/tool turns.
+        # The separate hard ceiling remains absolute and still bounds an
+        # endlessly-active/open stream.
+        _codex_stream_started = (
+            _codex_watchdog_enabled
+            and _last_codex_event_ts is not None
+            and (_codex_idle_enabled or _codex_hard_timeout_enabled)
+        )
+        _hard_timeout_exceeded = (
+            _codex_hard_timeout_enabled
+            and _elapsed > _codex_hard_timeout
+        )
+        _stale_timeout_exceeded = (
+            _elapsed > _stale_timeout and not _codex_stream_started
+        )
+        if _hard_timeout_exceeded or _stale_timeout_exceeded:
+            _kill_timeout = (
+                _codex_hard_timeout
+                if _hard_timeout_exceeded
+                else _stale_timeout
+            )
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1326,7 +1471,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 except Exception:
                     _silent_hint = None
             _report_stale_nonstream_kill(
-                agent, api_kwargs, _elapsed, _stale_timeout, hint=_silent_hint
+                agent, api_kwargs, _elapsed, _kill_timeout, hint=_silent_hint
             )
             try:
                 # #67142: routes by client kind — anthropic now aborts the
@@ -1340,18 +1485,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _bump_stale_streak(agent)
             _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
-            t.join(timeout=2.0)
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
+                        f"with no response (threshold: {int(_kill_timeout)}s). "
                         f"{_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                        f"with no response (threshold: {int(_kill_timeout)}s)"
                     )
             break
 
@@ -1374,6 +1520,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _close_request_client_once("interrupt_abort")
             except Exception:
                 pass
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
@@ -1937,6 +2085,41 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+def _close_unused_fallback_client(client, live_client=None) -> None:
+    """Close a candidate client that was built but will not be activated.
+
+    Ownership proof — this only ever closes a client nobody else holds:
+    ``try_activate_fallback`` calls ``resolve_provider_client``
+    synchronously with ``async_mode=False`` / ``raw_codex=True``, and that
+    call normally returns a *newly constructed* candidate for this
+    activation attempt, which the live runtime does not reference: the
+    live client is only replaced further down, after the domain guard has
+    passed.  A caching or aliasing resolver can hand back the object that
+    already *is* ``agent.client`` though, and closing that would kill the
+    very request we are failing over — so callers pass the live client as
+    *live_client* and an identical object is left open.  Because
+    ``async_mode`` is false here the candidate is a sync client — there is
+    no ``aclose()`` to await, and none is attempted.
+
+    Called exactly once per skipped candidate, and only when the client
+    exposes ``close()`` — the router hands back whatever the provider needs
+    (OpenAI SDK client, adapter shim), and not every shim is closeable.
+    A failure to close must not abort the walk to the next chain entry.
+    """
+    if client is None or client is live_client:
+        return
+    closer = getattr(client, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception as exc:
+        logger.debug(
+            "Fallback skip: could not close unused candidate client (%s)",
+            type(exc).__name__,
+        )
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -2089,6 +2272,69 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_provider)
             unavailable.add(fb_key)
             return agent._try_activate_fallback(reason)  # try next in chain
+
+        # The config-level dedup above only sees configured names/URLs.  A
+        # chain entry with a different provider AND model and no explicit
+        # base_url can still resolve to the endpoint that just failed (a
+        # load-balancer alias in front of the same shim).  For endpoint-level
+        # failures that candidate is the dead capacity pool under a new name,
+        # so compare the resolved origins now — after the client exists, but
+        # before any agent state is mutated.  Model-specific failures
+        # (model_not_found, content_policy_blocked, …) are NOT in this set:
+        # a different model on the same endpoint is a legitimate recovery.
+        #
+        # Origin equality alone would over-block: a public provider hostname
+        # serves many models from independent capacity, so a different model
+        # there is a genuine recovery path too.  The candidate is rejected
+        # only when it replays the same model, or when the shared origin is a
+        # private / loopback address — one local process, every alias of it
+        # dead at once.
+        if reason in INFRASTRUCTURE_FAILOVER_REASONS:
+            from agent.failover_domain import (
+                is_private_or_loopback_origin,
+                normalize_model_identity,
+            )
+
+            # The live client knows where it actually ended up; ``base_url``
+            # may still hold the configured value.  Fall back to that only
+            # when the client yields no determinable origin (adapter shims,
+            # test doubles).
+            current_origin = endpoint_origin(
+                getattr(getattr(agent, "client", None), "base_url", "")
+            ) or endpoint_origin(getattr(agent, "base_url", ""))
+            candidate_base_url = getattr(fb_client, "base_url", "")
+            candidate_origin = endpoint_origin(candidate_base_url)
+            current_model = normalize_model_identity(
+                getattr(agent, "model", ""))
+            same_model = bool(current_model) and current_model in {
+                normalize_model_identity(fb_model),
+                normalize_model_identity(_resolved_fb_model),
+            }
+            if (
+                current_origin
+                and current_origin == candidate_origin
+                and (same_model
+                     or is_private_or_loopback_origin(current_origin))
+            ):
+                # Both sides are already canonical ``scheme://host:port``, so
+                # only the two origins are logged — never the full URLs, which
+                # can carry userinfo or query-string credentials.  An
+                # undeterminable origin on either side (empty string) fails
+                # open: the guard cannot prove a shared pool, so the candidate
+                # stays eligible.
+                logger.warning(
+                    "Fallback skip: %s/%s resolves to the same failure domain "
+                    "as the current endpoint (current=%s candidate=%s) on %s",
+                    fb_provider, fb_model, current_origin, candidate_origin,
+                    getattr(reason, "value", reason),
+                )
+                _close_unused_fallback_client(
+                    fb_client, live_client=getattr(agent, "client", None))
+                # Deliberately NOT added to ``unavailable``: the entry is only
+                # unusable for THIS failure reason, and stays a valid target
+                # for model-specific failures or once the primary moves.
+                return agent._try_activate_fallback(reason)
+
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2202,7 +2448,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        _fb_timeout = get_provider_request_timeout(
+            fb_provider,
+            fb_model,
+            requested_provider=fb_provider,
+        )
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
@@ -3315,7 +3565,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = get_provider_request_timeout(
+            agent.provider,
+            agent.model,
+            requested_provider=getattr(agent, "requested_provider", None),
+        )
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
@@ -4436,7 +4690,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider,
+        agent.model,
+        requested_provider=getattr(agent, "requested_provider", None),
+    )
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:

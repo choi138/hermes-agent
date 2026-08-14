@@ -333,3 +333,34 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+def test_goal_mode_requires_explicit_positive_max_turns(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="goal_max_turns must be >= 1"):
+            kb.create_task(conn, title="t", assignee="worker", goal_mode=True)
+
+
+def test_loop_default_budget_preserves_full_quality_boundary(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 25)
+    turns = []
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-default-budget",
+        goal_text="bounded task",
+        run_turn=lambda p: turns.append(p) or "still going",
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: blocked.update(reason=reason),
+        first_response="turn1",
+    )
+
+    assert res["outcome"] == "blocked_budget"
+    assert (
+        res["turns_used"]
+        == goals.KANBAN_DEFAULT_MAX_TURNS
+        == goals.DEFAULT_MAX_TURNS
+        == 20
+    )
+    assert len(turns) == 19
+    assert "20/20" in blocked["reason"]
