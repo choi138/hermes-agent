@@ -241,6 +241,146 @@ class TestFallbackChainAdvancement:
         assert agent.client is not None
 
 
+# ── Declared api_mode precedence ──────────────────────────────────────────
+
+
+class TestDeclaredFallbackApiMode:
+    @staticmethod
+    def _forbid_url_heuristics(agent):
+        checks = (
+            "_is_azure_openai_url",
+            "_is_direct_openai_url",
+            "_provider_model_requires_responses_api",
+        )
+        mocks = []
+        for name in checks:
+            mocked = MagicMock(
+                side_effect=AssertionError(
+                    f"URL heuristic {name} must not run for declared api_mode"
+                )
+            )
+            setattr(agent, name, mocked)
+            mocks.append(mocked)
+        return mocks
+
+    def test_chain_entry_api_mode_wins_over_provider_config_and_url(self):
+        fbs = [
+            {
+                "provider": "claude-nekos",
+                "model": "claude-sonnet-4-6",
+                "api_mode": "chat_completions",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        heuristic_mocks = self._forbid_url_heuristics(agent)
+        provider_config = {
+            "providers": {
+                "claude-nekos": {"api_mode": "anthropic_messages"},
+            }
+        }
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="https://proxy.example/anthropic"),
+                    "claude-sonnet-4-6",
+                ),
+            ),
+            patch("hermes_cli.config.load_config", return_value=provider_config),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=AssertionError("chat_completions must not build Anthropic"),
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "chat_completions"
+        assert agent.client is not None
+        for mocked in heuristic_mocks:
+            mocked.assert_not_called()
+
+    def test_provider_api_mode_wins_over_url_heuristics(self):
+        fbs = [
+            {
+                "provider": "claude-nekos",
+                "model": "claude-sonnet-4-6",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        heuristic_mocks = self._forbid_url_heuristics(agent)
+        provider_config = {
+            "providers": {
+                "claude-nekos": {
+                    "base_url": "https://claude.nekos.me",
+                    "api_mode": "anthropic_messages",
+                }
+            }
+        }
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="https://claude.nekos.me"),
+                    "claude-sonnet-4-6",
+                ),
+            ),
+            patch("hermes_cli.config.load_config", return_value=provider_config),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(name="anthropic-client"),
+            ) as build_anthropic,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "anthropic_messages"
+        assert agent.client is None
+        build_anthropic.assert_called_once()
+        for mocked in heuristic_mocks:
+            mocked.assert_not_called()
+
+    def test_missing_declarations_preserve_anthropic_url_heuristic(self):
+        fbs = [
+            {
+                "provider": "private-proxy",
+                "model": "claude-sonnet-4-6",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="https://proxy.example/anthropic"),
+                    "claude-sonnet-4-6",
+                ),
+            ),
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(name="anthropic-client"),
+            ) as build_anthropic,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "anthropic_messages"
+        build_anthropic.assert_called_once()
+
+
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
 

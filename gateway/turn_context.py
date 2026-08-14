@@ -35,6 +35,7 @@ class TurnContext:
     """Closed-over locals of ``_run_agent_inner`` needed by ``TurnRunner``."""
 
     # --- read-only turn identity / wiring -------------------------------
+    event: Any = None
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
