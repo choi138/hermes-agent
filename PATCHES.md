@@ -91,6 +91,7 @@ merged-upstream | vendored`다.
 - **rationale:** 목적별 model route 해석, passive provider health, gateway의 fail-open shadow decision logging을 운영에 유지한다. topic 자체는 pinned base에 독립적으로 replay하고, private Anthropic proxy를 route 대상으로 쓰는 운영 구성 때문에 production에서는 `anthropic-proxy-compat` 뒤에 조립한다. upstream에 동등한 routing/health 기능이 반영되고 현재 fail-open 및 설정 호환 계약이 검증되면 제거한다.
 - **commits:**
   - `6b0eaf75302b019424dd9dcf7bb4985b4ee8221f` feat(routing): add shadow model routing
+  - `8b7547a2f8ec6ba23b1da2ebbfc4fcb6f3c3cfff` fix(routing): make shadow evaluation observational
 - **touches:**
   - `agent/chat_completion_helpers.py`
   - `gateway/model_router.py`
@@ -102,3 +103,36 @@ merged-upstream | vendored`다.
   - `tests/gateway/test_model_router.py`
   - `tests/hermes_cli/test_model_routes.py`
   - `tests/run_agent/test_passive_provider_health.py`
+
+### 3. per-tool-disable
+
+- **branch:** `hermes/patches/per-tool-disable`
+- **origin:** `Soju06/hermes-agent soju/patches/per-tool-disable`
+- **upstream_pr:** `none`
+- **state:** `local-only`
+- **enabled:** `true`
+- **example:** `false`
+- **rationale:** `agent.disabled_toolsets`가 toolset 이름뿐 아니라 개별 tool 이름도 제외할 수 있게 확장하고, denylist를 Codex hermes-tools MCP sidecar까지 전파해 비활성 tool이 그 경로로도 노출·호출되지 않게 한다. upstream이 동등한 tool 단위 denylist와 sidecar 전파를 제공하면 제거한다.
+- **commits:**
+  - `aecd117c85d10988fbec71020f2e5f91d4bfcf7c` feat(toolsets): allow disabling individual tools
+- **touches:**
+  - `agent/transports/hermes_tools_mcp_server.py`
+  - `cli-config.yaml.example`
+  - `model_tools.py`
+  - `tests/agent/transports/test_hermes_tools_mcp_server.py`
+  - `tests/test_model_tools.py`
+
+### 4. strict-chat-reasoning-details
+
+- **branch:** `hermes/patches/strict-chat-reasoning-details`
+- **origin:** `Soju06/hermes-agent soju/patches/strict-chat-reasoning-details`
+- **upstream_pr:** `none`
+- **state:** `local-only`
+- **enabled:** `true`
+- **example:** `false`
+- **rationale:** 엄격한 OpenAI 호환 `chat_completions` 프로바이더가 assistant replay의 `reasoning`/`reasoning_details` 필드를 400으로 거부하는 문제를 해결한다. 세션 히스토리에는 보존하고 wire payload에서만 제거한다. 현재 fallback 체인이 `anthropic_messages` 프로바이더와 codex-lb를 한 세션에서 섞기 때문에 실제 운영 경로다. upstream이 strict 엔드포인트에서 reasoning replay를 스스로 정리하면 제거한다.
+- **commits:**
+  - `1a880f39b8a0382afa2a8353ce1e66515decebd6` fix(chat): sanitize reasoning replay for strict providers
+- **touches:**
+  - `agent/transports/chat_completions.py`
+  - `tests/run_agent/test_strict_api_validation.py`
