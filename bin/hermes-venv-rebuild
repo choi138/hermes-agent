@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Inspect or rebuild a path-pinned Hermes editable virtual environment.
+
+The default mode is read-only.  ``--apply`` is required before this tool runs
+``uv sync``.  A venv already mapped to another checkout is never retargeted
+unless the operator also supplies ``--allow-retarget``.
+
+This tool deliberately does not restart a gateway or change any Git ref.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+from urllib.parse import unquote, urlparse
+
+
+REPO = Path(__file__).resolve().parent.parent
+PACKAGE_NAME = "hermes-agent"
+EXTRA_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+INSPECT_INSTALL = r"""
+import importlib.metadata as metadata
+import json
+
+payload = {
+    "installed": False,
+    "version": None,
+    "editable": False,
+    "url": None,
+}
+try:
+    distribution = metadata.distribution("hermes-agent")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    payload["installed"] = True
+    payload["version"] = distribution.version
+    raw = distribution.read_text("direct_url.json")
+    if raw:
+        direct_url = json.loads(raw)
+        payload["url"] = direct_url.get("url")
+        payload["editable"] = bool(
+            direct_url.get("dir_info", {}).get("editable", False)
+        )
+print(json.dumps(payload, sort_keys=True))
+"""
+
+
+class VenvError(RuntimeError):
+    """An expected, operator-facing validation failure."""
+
+
+@dataclass(frozen=True)
+class InstallInfo:
+    installed: bool
+    version: str | None
+    editable: bool
+    url: str | None
+    source: Path | None
+
+
+@dataclass(frozen=True)
+class CheckoutInfo:
+    path: Path
+    branch: str
+    commit: str
+    dirty: bool
+    version: str
+
+
+def run(
+    command: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        list(command),
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown command failure").strip()
+        raise VenvError(f"{shlex.join(command)}\n{detail}")
+    return result
+
+
+def resolve_checkout(raw_path: str) -> CheckoutInfo:
+    requested = Path(raw_path).expanduser().resolve()
+    if not requested.is_dir():
+        raise VenvError(f"checkout does not exist or is not a directory: {requested}")
+
+    top_result = run(
+        ["git", "-C", str(requested), "rev-parse", "--show-toplevel"],
+        check=False,
+    )
+    if top_result.returncode != 0:
+        raise VenvError(f"checkout is not a Git worktree: {requested}")
+    top = Path(top_result.stdout.strip()).resolve()
+    if top != requested:
+        raise VenvError(
+            f"--checkout must name the worktree root exactly\n"
+            f"requested: {requested}\n"
+            f"root:      {top}"
+        )
+
+    pyproject = requested / "pyproject.toml"
+    lockfile = requested / "uv.lock"
+    if not pyproject.is_file() or not lockfile.is_file():
+        raise VenvError(
+            f"checkout must contain both pyproject.toml and uv.lock: {requested}"
+        )
+
+    with pyproject.open("rb") as handle:
+        project = tomllib.load(handle).get("project", {})
+    if project.get("name") != PACKAGE_NAME or not project.get("version"):
+        raise VenvError(f"not a Hermes project checkout: {requested}")
+
+    branch = run([
+        "git",
+        "-C",
+        str(requested),
+        "branch",
+        "--show-current",
+    ]).stdout.strip()
+    commit = run([
+        "git",
+        "-C",
+        str(requested),
+        "rev-parse",
+        "--short=12",
+        "HEAD",
+    ]).stdout.strip()
+    dirty = bool(
+        run(
+            ["git", "-C", str(requested), "status", "--porcelain"],
+        ).stdout
+    )
+    return CheckoutInfo(
+        path=requested,
+        branch=branch or "(detached)",
+        commit=commit,
+        dirty=dirty,
+        version=str(project["version"]),
+    )
+
+
+def resolve_venv(checkout: Path, raw_path: str | None) -> Path:
+    if raw_path:
+        return Path(raw_path).expanduser().resolve()
+    dot_venv = checkout / ".venv"
+    plain_venv = checkout / "venv"
+    if dot_venv.exists():
+        return dot_venv.resolve()
+    if plain_venv.exists():
+        return plain_venv.resolve()
+    return dot_venv.resolve()
+
+
+def venv_python(venv: Path) -> Path:
+    return venv / "bin" / "python"
+
+
+def source_from_file_url(url: str | None) -> Path | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return None
+    return Path(unquote(parsed.path)).resolve()
+
+
+def inspect_install(venv: Path) -> InstallInfo | None:
+    if not venv.exists():
+        return None
+    if not venv.is_dir():
+        raise VenvError(f"venv path exists but is not a directory: {venv}")
+
+    python = venv_python(venv)
+    if not python.is_file():
+        raise VenvError(
+            f"venv directory exists but has no bin/python; refusing to overwrite it: {venv}"
+        )
+
+    result = run([str(python), "-I", "-c", INSPECT_INSTALL], cwd=Path("/"))
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise VenvError(
+            f"could not inspect installed Hermes metadata in {venv}"
+        ) from exc
+    return InstallInfo(
+        installed=bool(payload.get("installed")),
+        version=payload.get("version"),
+        editable=bool(payload.get("editable")),
+        url=payload.get("url"),
+        source=source_from_file_url(payload.get("url")),
+    )
+
+
+def print_context(
+    checkout: CheckoutInfo, venv: Path, install: InstallInfo | None
+) -> None:
+    print("MODE: check (read-only)")
+    print(f"CHECKOUT: {checkout.path}")
+    print(
+        f"GIT: {checkout.branch} @ {checkout.commit} ({'dirty' if checkout.dirty else 'clean'})"
+    )
+    print(f"SOURCE VERSION: {checkout.version}")
+    print(f"VENV: {venv} ({'present' if install is not None else 'missing'})")
+    if install is None:
+        print("INSTALLED HERMES: missing")
+        return
+    if not install.installed:
+        print("INSTALLED HERMES: not installed")
+        return
+    print(f"INSTALLED HERMES: {install.version}")
+    print(f"EDITABLE: {'yes' if install.editable else 'no'}")
+    print(f"EDITABLE SOURCE: {install.source or install.url or 'unknown'}")
+
+
+def mismatch_reasons(
+    checkout: CheckoutInfo,
+    install: InstallInfo | None,
+) -> list[str]:
+    if install is None:
+        return ["the selected venv does not exist"]
+    if not install.installed:
+        return ["hermes-agent is not installed in the selected venv"]
+
+    reasons: list[str] = []
+    if not install.editable:
+        reasons.append("the installed hermes-agent is not editable")
+    elif install.source is None:
+        reasons.append("the editable source URL is not a local file URL")
+    elif install.source != checkout.path:
+        reasons.append(f"the venv is pinned to another checkout: {install.source}")
+    if install.version != checkout.version:
+        reasons.append(
+            f"installed version {install.version!r} does not match source version "
+            f"{checkout.version!r}"
+        )
+    return reasons
+
+
+def is_foreign_editable(checkout: CheckoutInfo, install: InstallInfo | None) -> bool:
+    return bool(
+        install
+        and install.installed
+        and install.editable
+        and install.source
+        and install.source != checkout.path
+    )
+
+
+def selected_extras(args: argparse.Namespace) -> list[str]:
+    modes = int(bool(args.extra)) + int(args.all_extras) + int(args.no_extras)
+    if modes > 1:
+        raise VenvError("choose only one of --extra, --all-extras, or --no-extras")
+    extras = args.extra if args.extra else ([] if args.no_extras else ["dev"])
+    for extra in extras:
+        if not EXTRA_RE.fullmatch(extra):
+            raise VenvError(f"invalid extra name: {extra!r}")
+    return extras
+
+
+def sync_command(
+    uv: str,
+    checkout: CheckoutInfo,
+    args: argparse.Namespace,
+) -> list[str]:
+    command = [
+        uv,
+        "sync",
+        "--project",
+        str(checkout.path),
+        "--locked",
+        "--inexact",
+        "--reinstall-package",
+        PACKAGE_NAME,
+    ]
+    if args.all_extras:
+        command.append("--all-extras")
+    else:
+        for extra in selected_extras(args):
+            command.extend(["--extra", extra])
+    return command
+
+
+def apply_rebuild(
+    checkout: CheckoutInfo,
+    venv: Path,
+    install: InstallInfo | None,
+    args: argparse.Namespace,
+) -> None:
+    if is_foreign_editable(checkout, install) and not args.allow_retarget:
+        assert install is not None
+        raise VenvError(
+            "refusing to retarget a venv owned by another checkout\n"
+            f"current editable source: {install.source}\n"
+            f"requested source:        {checkout.path}\n"
+            "Pass --allow-retarget only after confirming no other worktree or service "
+            "depends on this venv."
+        )
+
+    if venv.exists() and not venv_python(venv).is_file():
+        raise VenvError(
+            f"venv directory exists but has no bin/python; refusing to overwrite it: {venv}"
+        )
+    if not venv.exists() and not venv.parent.is_dir():
+        raise VenvError(f"venv parent directory does not exist: {venv.parent}")
+
+    uv = shutil.which("uv")
+    if not uv:
+        raise VenvError("uv is required but was not found on PATH")
+
+    command = sync_command(uv, checkout, args)
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    env.pop("UV_PYTHON", None)
+    env["UV_PROJECT_ENVIRONMENT"] = str(venv)
+    if venv_python(venv).is_file():
+        env["UV_PYTHON"] = str(venv_python(venv))
+
+    print("MODE: apply")
+    print(f"$ UV_PROJECT_ENVIRONMENT={shlex.quote(str(venv))} {shlex.join(command)}")
+    result = subprocess.run(command, cwd=checkout.path, env=env)
+    if result.returncode != 0:
+        raise VenvError(f"uv sync failed with exit code {result.returncode}")
+
+    refreshed = inspect_install(venv)
+    reasons = mismatch_reasons(checkout, refreshed)
+    if reasons:
+        raise VenvError(
+            "post-install verification failed:\n"
+            + "\n".join(f"- {reason}" for reason in reasons)
+        )
+
+    python = venv_python(venv)
+    smoke = (
+        "import run_agent, gateway.run, tools.delegate_tool; print('import smoke: OK')"
+    )
+    print(f"$ {shlex.join([str(python), '-I', '-c', smoke])}")
+    subprocess.run([str(python), "-I", "-c", smoke], cwd=Path("/"), check=True)
+    print("Editable install rebuilt and verified.")
+    print("No gateway was restarted; deploy/restart is a separate approved operation.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Inspect or rebuild the editable Hermes install for one explicit checkout. "
+            "The default mode is read-only."
+        )
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="inspect only (default); exit non-zero when a rebuild is needed",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="run a locked uv sync and verify the editable mapping",
+    )
+    parser.add_argument(
+        "--checkout",
+        default=str(REPO),
+        metavar="PATH",
+        help="Hermes worktree root (default: the checkout containing this script)",
+    )
+    parser.add_argument(
+        "--venv",
+        metavar="PATH",
+        help="target venv (default: checkout/.venv, then checkout/venv if present)",
+    )
+    parser.add_argument(
+        "--allow-retarget",
+        action="store_true",
+        help="with --apply, allow a venv currently pinned to another checkout",
+    )
+    parser.add_argument(
+        "--extra",
+        action="append",
+        metavar="NAME",
+        help="sync an optional dependency extra; repeatable (default: dev)",
+    )
+    parser.add_argument(
+        "--all-extras",
+        action="store_true",
+        help="sync all optional dependency extras",
+    )
+    parser.add_argument(
+        "--no-extras",
+        action="store_true",
+        help="sync core dependencies only",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        selected_extras(args)
+        if args.allow_retarget and not args.apply:
+            raise VenvError("--allow-retarget is valid only with --apply")
+
+        checkout = resolve_checkout(args.checkout)
+        venv = resolve_venv(checkout.path, args.venv)
+        install = inspect_install(venv)
+
+        if args.apply:
+            apply_rebuild(checkout, venv, install, args)
+            return 0
+
+        print_context(checkout, venv, install)
+        reasons = mismatch_reasons(checkout, install)
+        if reasons:
+            print("REBUILD REQUIRED:")
+            for reason in reasons:
+                print(f"- {reason}")
+            if is_foreign_editable(checkout, install):
+                print(
+                    "SAFETY: --apply will refuse this retarget without --allow-retarget."
+                )
+                return 2
+            print("Run again with --apply only after reviewing the selected paths.")
+            return 1
+
+        print("CHECK: OK (editable mapping and package version match)")
+        print(
+            "A source-only branch switch in this same checkout does not require a "
+            "reinstall; rebuild after metadata, entry-point, dependency, extra, or "
+            "checkout-path changes."
+        )
+        return 0
+    except VenvError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
