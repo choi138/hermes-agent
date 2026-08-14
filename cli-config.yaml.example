@@ -1104,6 +1104,18 @@ platform_toolsets:
 #
 # CLI override: hermes chat --toolsets terminal,web,file
 
+# agent.disabled_toolsets subtracts names from the resolved tool surface,
+# regardless of which platform or toolset enabled them. Entries may be:
+#   - a toolset name     (for example, "browser") to remove the whole bundle
+#   - a registered tool  (for example, "text_to_speech") to remove one tool
+# Toolset names take precedence when a name is both a toolset and a tool (for
+# example, "memory"). Disabling unused tools trims the model-visible schema
+# without unregistering them; remove an entry from the list to re-enable it.
+# agent:
+#   disabled_toolsets:
+#     - text_to_speech      # Drop voice output if unused
+#     - browser             # Drop the entire browser suite
+
 # =============================================================================
 # MCP (Model Context Protocol) Servers
 # =============================================================================
