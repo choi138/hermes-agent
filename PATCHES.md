@@ -79,3 +79,26 @@ merged-upstream | vendored`다.
   - `tests/hermes_cli/test_provider_config_validation.py`
   - `tests/run_agent/test_provider_fallback.py`
   - `tests/run_agent/test_thinking_sig_recovery_persistence.py`
+
+### 2. model-routing
+
+- **branch:** `hermes/patches/model-routing`
+- **origin:** `cherry-pick:986ffd775cdfe88028e7cabcc9af554067569fe7`
+- **upstream_pr:** `none`
+- **state:** `local-only`
+- **enabled:** `true`
+- **example:** `false`
+- **rationale:** 목적별 model route 해석, passive provider health, gateway의 fail-open shadow decision logging을 운영에 유지한다. topic 자체는 pinned base에 독립적으로 replay하고, private Anthropic proxy를 route 대상으로 쓰는 운영 구성 때문에 production에서는 `anthropic-proxy-compat` 뒤에 조립한다. upstream에 동등한 routing/health 기능이 반영되고 현재 fail-open 및 설정 호환 계약이 검증되면 제거한다.
+- **commits:**
+  - `6b0eaf75302b019424dd9dcf7bb4985b4ee8221f` feat(routing): add shadow model routing
+- **touches:**
+  - `agent/chat_completion_helpers.py`
+  - `gateway/model_router.py`
+  - `gateway/run.py`
+  - `gateway/turn_context.py`
+  - `hermes_cli/config.py`
+  - `hermes_cli/config_defaults.py`
+  - `hermes_cli/model_routes.py`
+  - `tests/gateway/test_model_router.py`
+  - `tests/hermes_cli/test_model_routes.py`
+  - `tests/run_agent/test_passive_provider_health.py`
