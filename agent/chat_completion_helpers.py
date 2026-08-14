@@ -499,6 +499,56 @@ def _reset_stale_streak(agent) -> None:
         pass
 
 
+# ── Passive provider health (model_routes) ──────────────────────────────────
+# Real completion traffic is the signal: route resolution never probes a
+# healthy/unknown provider and only uses active I/O to re-check a stale
+# unhealthy verdict.
+_PASSIVE_UNHEALTHY_REASONS = frozenset({
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def _record_passive_provider_outcome(agent, healthy: bool, reason: str) -> None:
+    """Best-effort verdict for the agent's current runtime; never raises."""
+    try:
+        from hermes_cli.model_routes import (
+            provider_key_for_runtime,
+            record_provider_outcome,
+        )
+
+        key = provider_key_for_runtime(
+            provider=getattr(agent, "provider", "") or "",
+            base_url=getattr(agent, "base_url", "") or "",
+        )
+        if key:
+            record_provider_outcome(key, healthy, reason)
+    except Exception as exc:
+        logger.debug(
+            "passive provider health record failed (%s)",
+            type(exc).__name__,
+        )
+
+
+def _note_provider_success(agent) -> None:
+    """Clear a matching unhealthy verdict after a real completion succeeds."""
+    try:
+        from hermes_cli.model_routes import has_unhealthy_verdicts
+
+        if not has_unhealthy_verdicts():
+            return
+    except Exception:
+        return
+    _record_passive_provider_outcome(
+        agent,
+        True,
+        "recovered (live completion succeeded)",
+    )
+
+
 def _report_stale_nonstream_kill(
     agent,
     api_kwargs: dict,
@@ -1001,6 +1051,7 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_state["done"] = True
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1529,6 +1580,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 
@@ -2085,6 +2137,62 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+_VALID_FALLBACK_API_MODES = frozenset({
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+})
+
+
+def _parse_fallback_api_mode(raw: Any) -> str:
+    """Validate modes that can be activated inside the current tool loop."""
+    value = str(raw or "").strip()
+    return value if value in _VALID_FALLBACK_API_MODES else ""
+
+
+def _declared_fallback_api_mode(fb: dict) -> str:
+    """Return a valid explicitly declared transport for a fallback entry.
+
+    The chain entry wins.  If it has no valid declaration, consult the named
+    ``providers.<name>.api_mode`` entry.  An empty return value tells the caller
+    to preserve the existing URL/provider/model heuristics.
+    """
+    declared = _parse_fallback_api_mode(fb.get("api_mode"))
+    if declared:
+        return declared
+
+    provider_name = str(fb.get("provider") or "").strip().lower()
+    if not provider_name:
+        return ""
+
+    try:
+        from hermes_cli.config import load_config
+
+        providers = (load_config().get("providers") or {})
+    except Exception:
+        return ""
+    if not isinstance(providers, dict):
+        return ""
+
+    provider_config = providers.get(provider_name)
+    if not isinstance(provider_config, dict):
+        # Provider ids are normalized at runtime, while hand-written mapping
+        # keys may retain case.  Match identity without making values mutable.
+        provider_config = next(
+            (
+                config
+                for name, config in providers.items()
+                if str(name).strip().lower() == provider_name
+                and isinstance(config, dict)
+            ),
+            None,
+        )
+    if not isinstance(provider_config, dict):
+        return ""
+    return _parse_fallback_api_mode(provider_config.get("api_mode"))
+
+
 def _close_unused_fallback_client(client, live_client=None) -> None:
     """Close a candidate client that was built but will not be activated.
 
@@ -2153,6 +2261,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason in _PASSIVE_UNHEALTHY_REASONS:
+        _record_passive_provider_outcome(
+            agent,
+            False,
+            reason.value if reason is not None else "unknown",
+        )
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2345,51 +2459,57 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # An explicit fallback declaration is authoritative.  This matters for
+        # private Anthropic-compatible proxies whose host/path carries no wire
+        # hint; when declared, skip URL heuristics entirely.
+        fb_api_mode = _declared_fallback_api_mode(fb)
         fb_base_url = str(fb_client.base_url)
-        _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
-            fb_api_mode = "codex_responses"
-        elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
-            # Portal is dual-wire: anthropic/* must land on /v1/messages.
-            # resolve_provider_client still returns an OpenAI client for
-            # Nous; the anthropic_messages branch below rebuilds the native
-            # client from that credential + base_url.
-            from hermes_cli.providers import nous_api_mode
-
-            fb_api_mode = nous_api_mode(fb_model)
-        elif (
-            fb_provider == "anthropic"
-            or fb_base_url.rstrip("/").lower().endswith("/anthropic")
-            or base_url_hostname(fb_base_url) == "api.anthropic.com"
-        ):
-            # Custom providers (e.g. cron-anthropic) point at the native
-            # api.anthropic.com host with no "/anthropic" path suffix, so the
-            # name/suffix checks above miss them and they default to
-            # chat_completions → POST /v1/chat/completions → 404. Match the
-            # host the same way determine_api_mode() and _detect_api_mode_for_url()
-            # do on the primary path. (#32243, #49247)
-            fb_api_mode = "anthropic_messages"
-        elif _fb_is_azure:
-            # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
-            # support the Responses API. Stay on chat_completions.
+        if not fb_api_mode:
+            # No declaration: preserve the legacy heuristics byte-for-byte.
             fb_api_mode = "chat_completions"
-        elif agent._is_direct_openai_url(fb_base_url):
-            fb_api_mode = "codex_responses"
-        elif agent._provider_model_requires_responses_api(
-            fb_model,
-            provider=fb_provider,
-        ):
-            # GPT-5.x models usually need Responses API, but keep
-            # provider-specific exceptions like Copilot gpt-5-mini on
-            # chat completions.
-            fb_api_mode = "codex_responses"
-        elif fb_provider == "bedrock" or (
-            base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
-            and base_url_host_matches(fb_base_url, "amazonaws.com")
-        ):
-            fb_api_mode = "bedrock_converse"
+            _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
+            if fb_provider == "openai-codex":
+                fb_api_mode = "codex_responses"
+            elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
+                # Portal is dual-wire: anthropic/* must land on /v1/messages.
+                # resolve_provider_client still returns an OpenAI client for
+                # Nous; the anthropic_messages branch below rebuilds the native
+                # client from that credential + base_url.
+                from hermes_cli.providers import nous_api_mode
+
+                fb_api_mode = nous_api_mode(fb_model)
+            elif (
+                fb_provider == "anthropic"
+                or fb_base_url.rstrip("/").lower().endswith("/anthropic")
+                or base_url_hostname(fb_base_url) == "api.anthropic.com"
+            ):
+                # Custom providers (e.g. cron-anthropic) point at the native
+                # api.anthropic.com host with no "/anthropic" path suffix, so the
+                # name/suffix checks above miss them and they default to
+                # chat_completions → POST /v1/chat/completions → 404. Match the
+                # host the same way determine_api_mode() and
+                # _detect_api_mode_for_url() do on the primary path.
+                # (#32243, #49247)
+                fb_api_mode = "anthropic_messages"
+            elif _fb_is_azure:
+                # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
+                # support the Responses API. Stay on chat_completions.
+                fb_api_mode = "chat_completions"
+            elif agent._is_direct_openai_url(fb_base_url):
+                fb_api_mode = "codex_responses"
+            elif agent._provider_model_requires_responses_api(
+                fb_model,
+                provider=fb_provider,
+            ):
+                # GPT-5.x models usually need Responses API, but keep
+                # provider-specific exceptions like Copilot gpt-5-mini on
+                # chat completions.
+                fb_api_mode = "codex_responses"
+            elif fb_provider == "bedrock" or (
+                base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
+                and base_url_host_matches(fb_base_url, "amazonaws.com")
+            ):
+                fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
         old_provider = agent.provider
@@ -3333,6 +3453,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # recovered provider doesn't carry a stale streak into later turns.
         if result["response"] is not None:
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -4978,12 +5099,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
             return _stub
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────
