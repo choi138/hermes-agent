@@ -101,6 +101,35 @@ logger = logging.getLogger(__name__)
 _CODEX_STREAM_RECOVERY_LIMIT = 2
 
 
+_ANTHROPIC_THINKING_REPLAY_KEYS = (
+    "reasoning_details",
+    "anthropic_content_blocks",
+)
+
+
+def _strip_anthropic_thinking_replay_channels(api_messages: List[Any]) -> int:
+    """Remove every Anthropic thinking replay channel from send-time messages.
+
+    ``anthropic_content_blocks`` is the ordered interleaved-thinking channel and
+    takes precedence over ``reasoning_details`` during Anthropic conversion.
+    Reactive invalid-signature recovery therefore has to remove both.  Returns
+    the number of messages changed and never mutates the canonical history when
+    the caller passes its normal shallow send-time copies.
+    """
+    stripped = 0
+    for message in api_messages:
+        if not isinstance(message, dict):
+            continue
+        had_replay_data = any(
+            key in message for key in _ANTHROPIC_THINKING_REPLAY_KEYS
+        )
+        for key in _ANTHROPIC_THINKING_REPLAY_KEYS:
+            message.pop(key, None)
+        if had_replay_data:
+            stripped += 1
+    return stripped
+
+
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
@@ -4359,9 +4388,9 @@ def run_conversation(
                 # content. Any upstream mutation (context compression,
                 # session truncation, message merging) invalidates the
                 # signature and the API replies HTTP 400 ("invalid
-                # signature" or "cannot be modified"). Recovery strips
-                # ``reasoning_details`` so the retry sends no thinking
-                # blocks at all. One-shot per outer loop.
+                # signature" or "cannot be modified"). Recovery strips both
+                # replay channels so the retry sends no thinking blocks at
+                # all. One-shot per outer loop.
                 #
                 # The strip targets ``api_messages``, which is the
                 # API-call-time list that ``_build_api_kwargs`` consumes
@@ -4386,19 +4415,18 @@ def run_conversation(
                     and not _retry.thinking_sig_retry_attempted
                 ):
                     _retry.thinking_sig_retry_attempted = True
-                    _api_stripped = 0
-                    for _m in api_messages:
-                        if isinstance(_m, dict) and "reasoning_details" in _m:
-                            _m.pop("reasoning_details", None)
-                            _api_stripped += 1
+                    _api_stripped = _strip_anthropic_thinking_replay_channels(
+                        api_messages
+                    )
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
-                        f"stripped reasoning_details from api_messages for retry...",
+                        f"stripped thinking replay data from api_messages for retry...",
                         force=True,
                     )
                     logger.warning(
                         "%sThinking block signature recovery: stripped "
-                        "reasoning_details from %d api_messages "
+                        "reasoning_details/anthropic_content_blocks from "
+                        "%d api_messages "
                         "(canonical messages unchanged)",
                         agent.log_prefix, _api_stripped,
                     )
