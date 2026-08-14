@@ -65,9 +65,9 @@ merged-upstream | vendored`다.
 - **example:** `false`
 - **rationale:** private Anthropic-compatible proxy(`claude.nekos.me`)를 안전하게 primary/fallback 런타임으로 사용한다. opt-in signature passthrough, OpenAI `response_format`의 Anthropic `output_config.format` 변환, fallback chain의 명시적 `api_mode` 우선순위를 각각 이식한다. `claude-fable-5` dev primary 전환과 이후 model routing 이식의 선행 호환 계층이다.
 - **commits:**
-  - `a57cfd80102a178eba0cf098ca237b3860456620` feat(anthropic): trust configured signature passthrough proxies
-  - `f32b07af4315f24e64fefa08ca512138d23b4020` fix(aux): translate structured output for Anthropic
-  - `9cb01326123ad6595fbd8ead18d40393a8189d0b` fix(fallback): honor declared API modes
+  - `af09003c8104111f1b98c19f0298913333c0d7e8` feat(anthropic): trust configured signature passthrough proxies
+  - `3f35fb0b7e101ef95728f0bd95ef79dded169469` fix(aux): translate structured output for Anthropic
+  - `6eb58de2307e07a030bb4ceb772ec0d76e33fc08` fix(fallback): honor declared API modes
 - **touches:**
   - `agent/anthropic_adapter.py`
   - `agent/auxiliary_client.py`
@@ -77,6 +77,5 @@ merged-upstream | vendored`다.
   - `tests/agent/test_anthropic_signature_passthrough.py`
   - `tests/agent/test_auxiliary_client.py`
   - `tests/hermes_cli/test_provider_config_validation.py`
-  - `tests/hermes_cli/test_config_validation.py`
   - `tests/run_agent/test_provider_fallback.py`
   - `tests/run_agent/test_thinking_sig_recovery_persistence.py`
