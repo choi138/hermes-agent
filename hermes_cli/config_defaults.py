@@ -8,6 +8,9 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Purpose-based route catalog. Empty keeps routing fully dormant; users
+    # opt into evaluation under model_routes.router.mode.
+    "model_routes": {},
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the

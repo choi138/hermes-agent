@@ -4816,6 +4816,34 @@ class TurnRunner:
             model=model,
         )
         self._runner._reasoning_config = reasoning_config
+        if ctx.event is not None:
+            _shadow_runtime = {
+                "model": str(model or ""),
+                "provider": str(runtime_kwargs.get("provider") or ""),
+                "api_mode": str(runtime_kwargs.get("api_mode") or ""),
+            }
+            if isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    _shadow_runtime["reasoning_effort"] = "none"
+                elif reasoning_config.get("effort"):
+                    _shadow_runtime["reasoning_effort"] = str(
+                        reasoning_config["effort"]
+                    )
+            try:
+                self._runner._evaluate_model_router_shadow(
+                    event=ctx.event,
+                    session_key=ctx.session_key or "",
+                    runtime=_shadow_runtime,
+                    user_config=ctx.user_config,
+                )
+            except Exception as exc:
+                # Never include exception text/traceback here: classifier
+                # transports can carry credentials in request URLs.
+                logger.warning(
+                    "model router shadow evaluation failed open for session=%s (%s)",
+                    ctx.session_key or "?",
+                    type(exc).__name__,
+                )
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
         )
@@ -7433,6 +7461,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if recovered is None:
             return source
         return dataclasses.replace(source, thread_id=recovered)
+
+    def _evaluate_model_router_shadow(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        runtime: dict,
+        user_config: Optional[dict] = None,
+    ):
+        """Evaluate and audit M3 routing without mutating the live runtime.
+
+        This method is called from ``TurnRunner.run_sync`` after the gateway's
+        canonical runtime resolution, which is already off the event loop. It
+        intentionally recognizes only ``mode: shadow``; ``off`` and
+        ``enforce`` are both non-mutating in M3. The data model retains
+        ``enforce`` for M4, but no switch/cache-invalidation path is wired here.
+        """
+        cfg = user_config if isinstance(user_config, dict) else {}
+        section = cfg.get("model_routes")
+        router_section = section.get("router") if isinstance(section, dict) else None
+        raw_mode = router_section.get("mode") if isinstance(router_section, dict) else None
+        mode = str(raw_mode or "").strip().lower() if isinstance(raw_mode, str) else "off"
+        if mode != "shadow":
+            return None
+
+        from gateway import model_router
+        from hermes_cli.model_routes import load_routes
+
+        catalog = load_routes(cfg)
+        if catalog.router.mode != "shadow":
+            return None
+        state = self.__dict__.get("_model_router_state")
+        if state is None:
+            state = {}
+            self._model_router_state = state
+        decision = model_router.evaluate_event(
+            event=event,
+            session_store=self.session_store,
+            runtime=runtime,
+            cfg=cfg,
+            catalog=catalog,
+            router=catalog.router,
+            mode="shadow",
+            state=state,
+            session_key_override=session_key,
+        )
+        if decision is not None:
+            model_router.log_decision(
+                decision.record,
+                decision_log=catalog.router.decision_log,
+            )
+        return decision
 
     def _resolve_session_agent_runtime(
         self,
@@ -19397,6 +19477,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     semantic_progress_text=_semantic_progress_text,
                     mention_inbox_execution_id=_mention_execution_id,
                     mention_inbox_execution_observer=_mention_execution_observer,
+                    routing_event=event,
                 )
             except BaseException:
                 if _mention_execution_observer is not None:
@@ -26463,6 +26544,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_text: Optional[str] = None,
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
+        routing_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -26486,6 +26568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 semantic_progress_text=semantic_progress_text,
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
+                routing_event=routing_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -26502,6 +26585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 semantic_progress_text=semantic_progress_text,
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
+                routing_event=routing_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -26628,6 +26712,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_text: Optional[str] = None,
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
+        routing_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -26889,6 +26974,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _LONG_TOOL_THRESHOLD_S = 30.0
 
         turn_ctx = TurnContext(
+            event=routing_event,
             source=source,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
@@ -28245,6 +28331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    routing_event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
