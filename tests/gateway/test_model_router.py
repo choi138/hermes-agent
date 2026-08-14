@@ -11,13 +11,17 @@ model_routes pytest guard. Decision logs go to tmp via
 ``HERMES_MODEL_ROUTER_DECISION_LOG``.
 """
 
+import copy
+import io
 import json
+import urllib.error
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 import gateway.model_router as mr_mod
+import hermes_cli.model_routes as routes_mod
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -26,6 +30,7 @@ from hermes_cli.model_routes import load_routes
 
 EXPECTED_RECORD_FIELDS = {
     "policy", "session_key", "label", "confidence", "evidence", "source",
+    "classification_reason", "resolution_reason",
     "provider", "model", "outcome", "directive_route", "runtime_model", "msg_head",
     "mode", "rule",
 }
@@ -229,7 +234,8 @@ def test_classifier_llm_json_parsed():
         complete=_complete("SYSTEM_DEV", confidence=0.83, evidence="S5 debug"),
     )
     assert detail == {
-        "label": "SYSTEM_DEV", "confidence": 0.83, "evidence": "S5 debug", "source": "llm",
+        "label": "SYSTEM_DEV", "confidence": 0.83, "evidence": "S5 debug",
+        "source": "llm", "classification_reason": "",
     }
 
 
@@ -249,7 +255,63 @@ def test_classifier_failure_falls_back_to_regex():
 
     normal = mr_mod.PolicyClassificationContext(current_user_message="오늘 날씨 어때?")
     detail = mr_mod.classify_dev_detailed(normal, complete=_boom)
-    assert detail == {"label": "NORMAL", "confidence": None, "evidence": "", "source": "fallback"}
+    assert detail == {
+        "label": "NORMAL", "confidence": None, "evidence": "",
+        "source": "fallback", "classification_reason": "classifier_error:TimeoutError",
+    }
+
+
+DEGRADED_CLASSIFIER_PAYLOADS = (
+    "",
+    "I cannot help with that.",
+    '{"error":"quota exceeded"}',
+    "Service Unavailable",
+)
+
+
+@pytest.mark.parametrize("payload", DEGRADED_CLASSIFIER_PAYLOADS)
+def test_degraded_classifier_payload_is_fallback(payload):
+    context = mr_mod.PolicyClassificationContext(current_user_message="오늘 뭐 먹지?")
+
+    detail = mr_mod.classify_dev_detailed(context, complete=lambda _prompt: payload)
+
+    assert detail["label"] == "NORMAL"
+    assert detail["source"] == "fallback"
+
+
+@pytest.mark.parametrize("payload", DEGRADED_CLASSIFIER_PAYLOADS)
+def test_three_consecutive_degraded_payloads_never_downgrade(payload):
+    state = {}
+    outcomes = [
+        _evaluate(
+            text="오늘 뭐 먹지?",
+            complete_dev=lambda _prompt: payload,
+            state=state,
+        ).outcome
+        for _ in range(3)
+    ]
+
+    assert outcomes == ["normal_fallback_no_downgrade"] * 3
+    assert state["tg:c1"]["normal_streak"] == 0
+    assert "downgrade_to_chat" not in outcomes
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"label":"NORMAL"}',
+        '{"evidence":"","label":"NORMAL","confidence":0.9}',
+        '{"evidence":"S7 else","label":"NORMAL","confidence":"high"}',
+        '{"evidence":"S7 else","label":"NORMAL","confidence":2}',
+    ],
+)
+def test_incomplete_structured_normal_is_not_authoritative(payload):
+    context = mr_mod.PolicyClassificationContext(current_user_message="오늘 뭐 먹지?")
+
+    detail = mr_mod.classify_dev_detailed(context, complete=lambda _prompt: payload)
+
+    assert detail["label"] == "NORMAL"
+    assert detail["source"] == "fallback"
 
 
 def test_missing_api_key_takes_fallback_path(monkeypatch, tmp_path):
@@ -310,13 +372,63 @@ def test_call_gemini_request_shape(monkeypatch):
     }
 
 
-def test_parse_dev_json_plain_token_fallback():
+def test_non_gemini_classifier_uses_strict_safe_schema_and_parses(monkeypatch):
+    captured = {}
+    shared_before = copy.deepcopy(mr_mod.DEV_RESPONSE_SCHEMA)
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        content = json.dumps({
+            "evidence": "S5 configured provider",
+            "label": "SYSTEM_DEV",
+            "confidence": 0.96,
+        })
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    detail = mr_mod.classify_dev_detailed(
+        mr_mod.PolicyClassificationContext(current_user_message="fix the gateway"),
+        provider="openai-api",
+        model="gpt-test",
+    )
+
+    assert detail["label"] == "SYSTEM_DEV"
+    assert detail["source"] == "llm"
+    response_format = captured["extra_body"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    strict_schema = response_format["json_schema"]["schema"]
+    assert strict_schema is not mr_mod.DEV_RESPONSE_SCHEMA
+    assert strict_schema["additionalProperties"] is False
+    assert strict_schema["required"] == list(strict_schema["properties"])
+    forbidden = {"propertyOrdering", "maxLength", "minimum", "maximum"}
+
+    def assert_strict_safe(value):
+        if isinstance(value, dict):
+            assert forbidden.isdisjoint(value)
+            for child in value.values():
+                assert_strict_safe(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_strict_safe(child)
+
+    assert_strict_safe(strict_schema)
+    assert mr_mod.DEV_RESPONSE_SCHEMA == shared_before
+
+
+def test_plain_label_response_is_not_authoritative():
     assert mr_mod._parse_dev_json("FRONTEND_DEV") is None
     detail = mr_mod.classify_dev_detailed(
         mr_mod.PolicyClassificationContext(current_user_message="x"),
         complete=lambda prompt: "FRONTEND_DEV",
     )
-    assert detail == {"label": "FRONTEND_DEV", "confidence": None, "evidence": "", "source": "llm"}
+    assert detail == {
+        "label": "NORMAL", "confidence": None, "evidence": "",
+        "source": "fallback", "classification_reason": "invalid_classifier_response",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +460,30 @@ def test_fallback_normal_never_advances_streak():
         decision = _evaluate(text="오늘 뭐 먹지?", complete_dev=_boom, state=state)
         assert decision.outcome == "normal_fallback_no_downgrade"
         assert decision.record["source"] == "fallback"
+    assert state["tg:c1"]["normal_streak"] == 0
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"label": "NORMAL", "confidence": None, "evidence": ""},
+        {"label": "NORMAL", "confidence": 0.9, "evidence": "x" * 121},
+        {"label": "UNKNOWN", "confidence": 0.9, "evidence": "S7 else"},
+    ],
+)
+def test_hysteresis_revalidates_llm_authority_at_consumer(monkeypatch, detail):
+    """A future parser cannot advance the streak by setting source alone."""
+    detail = dict(detail, source="llm", classification_reason="")
+    monkeypatch.setattr(
+        mr_mod,
+        "classify_dev_detailed",
+        lambda *args, **kwargs: detail,
+    )
+    state = {}
+
+    decision = _evaluate(text="오늘 뭐 먹지?", state=state)
+
+    assert decision.outcome == "normal_fallback_no_downgrade"
     assert state["tg:c1"]["normal_streak"] == 0
 
 
@@ -684,6 +820,7 @@ def test_configured_classifier_failure_falls_back_without_crashing(monkeypatch):
     )
 
     assert decision.record["source"] == "fallback"
+    assert decision.record["classification_reason"] == "classifier_error:RuntimeError"
     assert decision.label == "SYSTEM_DEV"
     assert decision.outcome == "switch"
 
@@ -741,6 +878,78 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
         fake_decision.record,
         decision_log=evaluate.call_args.kwargs["catalog"].router.decision_log,
     )
+
+
+def test_gateway_shadow_resolution_never_probes_or_rewrites_live_health(
+    monkeypatch, tmp_path,
+):
+    """A stale live verdict remains authoritative during shadow observation."""
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH_TEST", "1")
+    monkeypatch.setattr(routes_mod, "_last_passive_unhealthy_write", {})
+    monkeypatch.setattr(routes_mod, "_unhealthy_memo", {"mtime": None, "value": False})
+    health_path = tmp_path / "model_route_health.json"
+    decision_log = tmp_path / "router-decisions.jsonl"
+    cfg = _cfg(router={"mode": "shadow", "decision_log": str(decision_log)})
+    cfg["model_routes"]["health"] = {
+        "cache_path": str(health_path),
+        "fail_ttl_seconds": 1,
+    }
+    catalog = _catalog(cfg)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(routes_mod, "_now", lambda: clock["now"])
+    routes_mod.record_provider_outcome(
+        "p1", False, "server_error", health=catalog.health,
+    )
+    before = health_path.read_bytes()
+    assert json.loads(before)["p1"]["healthy"] is False
+    clock["now"] += catalog.health.fail_ttl_seconds + 1
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "base_url": "https://p1.example/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        },
+    )
+    auth_error = urllib.error.HTTPError(
+        "https://p1.example/v1/models",
+        401,
+        "Unauthorized",
+        None,
+        io.BytesIO(b'{"error":"unauthorized"}'),
+    )
+    urlopen = MagicMock(side_effect=auth_error)
+    monkeypatch.setattr(routes_mod, "_urlopen", urlopen)
+    monkeypatch.setattr(
+        mr_mod,
+        "_call_configured_classifier",
+        lambda *args, **kwargs: json.dumps({
+            "evidence": "S5 debug request",
+            "label": "SYSTEM_DEV",
+            "confidence": 0.99,
+        }),
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_state = {}
+    decision = runner._evaluate_model_router_shadow(
+        event=_event(),
+        session_key="canonical:session",
+        runtime={"model": "model-b", "provider": "p2"},
+        user_config=cfg,
+    )
+
+    urlopen.assert_not_called()
+    assert health_path.read_bytes() == before
+    verdict = json.loads(health_path.read_text(encoding="utf-8"))["p1"]
+    assert verdict["healthy"] is False
+    assert verdict["reason"] == "passive: server_error"
+    assert "recovery probe suppressed" in decision.record["resolution_reason"]
+    assert json.loads(decision_log.read_text(encoding="utf-8"))["mode"] == "shadow"
 
 
 @pytest.mark.parametrize("mode", ["off", "enforce"])

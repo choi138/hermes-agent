@@ -531,7 +531,9 @@ def _patch_health_map(monkeypatch, verdicts):
     """Scripted per-provider health; records call order."""
     calls = []
 
-    def fake(provider, model="", *, cfg=None, health=None):
+    def fake(
+        provider, model="", *, cfg=None, health=None, allow_recovery_probe=False,
+    ):
         calls.append(provider)
         return verdicts[provider]
 
@@ -664,7 +666,10 @@ def test_probe_matrix(monkeypatch, tmp_path, health_test_env, outcome, expect_he
     monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
-    healthy, reason = mr.provider_health("p1", "model-a", cfg=_cfg(), health=health)
+    healthy, reason = mr.provider_health(
+        "p1", "model-a", cfg=_cfg(), health=health,
+        allow_recovery_probe=True,
+    )
     assert healthy is expect_healthy
     assert reason_substr in reason
 
@@ -679,7 +684,9 @@ def test_probe_connection_error_reason_truncated(monkeypatch, tmp_path, health_t
     monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
-    healthy, reason = mr.provider_health("p1", cfg=_cfg(), health=health)
+    healthy, reason = mr.provider_health(
+        "p1", cfg=_cfg(), health=health, allow_recovery_probe=True,
+    )
     assert healthy is False
     assert reason == str(exc)[:80]
     assert len(reason) <= 80
@@ -704,7 +711,9 @@ def test_probe_openai_url_construction(monkeypatch, tmp_path, health_test_env, b
     monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
-    healthy, _ = mr.provider_health("p1", cfg=_cfg(), health=health)
+    healthy, _ = mr.provider_health(
+        "p1", cfg=_cfg(), health=health, allow_recovery_probe=True,
+    )
     assert healthy is True
     (req,) = captured
     assert req.full_url == expected_url
@@ -727,7 +736,10 @@ def test_probe_anthropic_messages_shape(monkeypatch, tmp_path, health_test_env):
     monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
-    mr.provider_health("p1", "model-a", cfg=_cfg(), health=health)
+    mr.provider_health(
+        "p1", "model-a", cfg=_cfg(), health=health,
+        allow_recovery_probe=True,
+    )
     (req,) = captured
     assert req.full_url == "https://a.example/v1/messages"
     assert req.get_method() == "POST"
@@ -750,7 +762,8 @@ def test_probe_no_base_url_unhealthy(monkeypatch, tmp_path, health_test_env):
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
     healthy, reason = mr.provider_health(
-        "p1", cfg={"providers": {}}, health=health
+        "p1", cfg={"providers": {}}, health=health,
+        allow_recovery_probe=True,
     )
     assert healthy is False
     assert reason == "no base_url resolved"
@@ -767,7 +780,9 @@ def test_probe_cred_resolution_failure_falls_back_to_cfg_entry(monkeypatch, tmp_
     monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
-    healthy, reason = mr.provider_health("p1", cfg=_cfg(), health=health)
+    healthy, reason = mr.provider_health(
+        "p1", cfg=_cfg(), health=health, allow_recovery_probe=True,
+    )
     # Known base_url + missing key → probe fires → 401 → fail-open healthy.
     assert healthy is True
     assert "assumed healthy" in reason
@@ -822,7 +837,9 @@ def test_stale_unhealthy_triggers_recovery_probe(monkeypatch, tmp_path, health_t
     health = _health(tmp_path)
     clock = _seed_stale_unhealthy(monkeypatch, health)
 
-    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    ) == (True, "HTTP 200")
     assert counts == {"p1": 1}
     cache = json.loads(health.resolved_cache_path().read_text(encoding="utf-8"))
     assert cache["p1"]["healthy"] is True
@@ -830,15 +847,61 @@ def test_stale_unhealthy_triggers_recovery_probe(monkeypatch, tmp_path, health_t
 
     # The recovered verdict is served from cache within ok_ttl…
     clock.t += health.ok_ttl_seconds - 1
-    healthy, reason = mr.provider_health("p1", health=health)
+    healthy, reason = mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    )
     assert healthy is True
     assert counts == {"p1": 1}
     # …and after ok_ttl it goes back to probe-free assumed-healthy.
     clock.t += 2
-    healthy, reason = mr.provider_health("p1", health=health)
+    healthy, reason = mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    )
     assert healthy is True
     assert "assumed healthy (passive" in reason
     assert counts == {"p1": 1}
+
+
+def test_route_resolution_is_read_only_by_default_and_live_probe_is_opt_in(
+    monkeypatch, tmp_path, health_test_env,
+):
+    health_path = tmp_path / "health.json"
+    cfg = _cfg(
+        routes={"dev": _route(provider="p1", model="model-a")},
+        health={"cache_path": str(health_path)},
+    )
+    catalog = mr.load_routes(cfg)
+    counts = _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+    _seed_stale_unhealthy(monkeypatch, catalog.health)
+    before = health_path.read_bytes()
+
+    observed = mr.resolve_route_detailed("dev", cfg, catalog=catalog)
+
+    assert observed.directive is None
+    assert "recovery probe suppressed" in observed.reason
+    assert counts == {}
+    assert health_path.read_bytes() == before
+
+    # Fail closed even if an untyped config/plumbing layer passes a truthy
+    # value.  Only an intentional literal True may authorize spend + mutation.
+    accidental = mr.resolve_route(
+        "dev", cfg, catalog=catalog, allow_recovery_probe="true",  # type: ignore[arg-type]
+    )
+
+    assert accidental is None
+    assert counts == {}
+    assert health_path.read_bytes() == before
+
+    live = mr.resolve_route(
+        "dev", cfg, catalog=catalog, allow_recovery_probe=True,
+    )
+
+    assert live["provider"] == "p1"
+    assert live["source"] == "default"
+    assert counts == {"p1": 1}
+    verdict = json.loads(health_path.read_text(encoding="utf-8"))["p1"]
+    assert verdict["healthy"] is True
+    assert verdict["reason"] == "recovery probe: HTTP 200"
 
 
 def test_fresh_unhealthy_verdict_suppresses_within_fail_ttl(monkeypatch, tmp_path, health_test_env):
@@ -848,17 +911,21 @@ def test_fresh_unhealthy_verdict_suppresses_within_fail_ttl(monkeypatch, tmp_pat
     monkeypatch.setattr(mr, "_now", clock)
     _seed_verdict(health, "p1", healthy=False, ts=clock.t)
 
-    healthy, reason = mr.provider_health("p1", health=health)
+    healthy, reason = mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    )
     assert healthy is False
     assert counts == {}  # fresh unhealthy verdict → cached, no probe
 
     clock.t += health.fail_ttl_seconds + 1
-    healthy, reason = mr.provider_health("p1", health=health)
+    healthy, reason = mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    )
     assert healthy is False  # recovery probe ran and still failed
     assert counts == {"p1": 1}
 
     clock.t += health.fail_ttl_seconds + 1
-    mr.provider_health("p1", health=health)
+    mr.provider_health("p1", health=health, allow_recovery_probe=True)
     assert counts == {"p1": 2}  # each fail-TTL expiry re-checks recovery
 
 
@@ -884,7 +951,9 @@ def test_cache_write_failure_swallowed(monkeypatch, tmp_path, health_test_env):
         raise OSError("disk full")
 
     monkeypatch.setattr(mr, "atomic_json_write", broken_write)
-    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    ) == (True, "HTTP 200")
 
 
 def test_cache_write_merges_concurrent_entries(monkeypatch, tmp_path, health_test_env):
@@ -906,7 +975,9 @@ def test_cache_write_merges_concurrent_entries(monkeypatch, tmp_path, health_tes
     monkeypatch.setattr(mr, "_probe_provider", fake_probe)
     monkeypatch.setattr(mr, "_now", _Clock(10_000.0))
     _seed_verdict(health, "p1", healthy=False, ts=10_000.0 - health.fail_ttl_seconds - 1)
-    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    ) == (True, "HTTP 200")
 
     cache = json.loads(path.read_text(encoding="utf-8"))
     assert cache["p2"] == foreign  # not clobbered by our pre-probe snapshot
@@ -926,8 +997,12 @@ def test_cache_write_survives_flock_failure(monkeypatch, tmp_path, health_test_e
     health = _health(tmp_path)
     _seed_stale_unhealthy(monkeypatch, health)
 
-    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
-    healthy, reason = mr.provider_health("p1", health=health)
+    assert mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    ) == (True, "HTTP 200")
+    healthy, reason = mr.provider_health(
+        "p1", health=health, allow_recovery_probe=True,
+    )
     assert healthy is True
     assert reason == "recovery probe: HTTP 200"  # cached verdict, probe not re-run
     assert counts == {"p1": 1}  # second call served from the cached verdict
@@ -953,7 +1028,9 @@ def test_kill_switch_precedence(monkeypatch, tmp_path, health_test_env):
 
     # Env "1" overrides config enabled=False → recovery probe runs.
     monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH", "1")
-    result = mr.provider_health("p1", health=_health(tmp_path, enabled=False))
+    result = mr.provider_health(
+        "p1", health=_health(tmp_path, enabled=False), allow_recovery_probe=True,
+    )
     assert result == (True, "HTTP 200")
     assert counts == {"p1": 1}
 

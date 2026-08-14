@@ -7,17 +7,18 @@ reasoning_effort) plus an ordered, health-checked fallback chain.
 Phase 1 scope is the config schema, loader/validation, resolver, and
 provider health tracking only.  Health is **passive-first**: verdicts come
 from real completion traffic (``record_provider_outcome``, wired into the
-agent's fallback-activation and completion-success paths), and the active
-probe survives only as a recovery check — a provider with a stale
-*unhealthy* verdict is re-probed before being trusted again.  Providers
-with no verdict (or a stale healthy one) are assumed healthy without any
-network I/O, so steady-state route resolution never probes and never
-burns a real completion against a healthy backend.  Probe/classification
-semantics stay fail-open (ported from the skill-gate plugin's
-``runtime_catalog.py``): only signals that indicate the PROVIDER cannot
-serve completions (credit/quota exhaustion, 402/429, 5xx, connection
-failures) count as unhealthy; auth-scoped 401/403 (or a malformed probe
-400) are treated as healthy so a probe defect can never freeze routing.
+agent's fallback-activation and completion-success paths). Route resolution
+is observation-only by default; a live caller must explicitly opt into the
+remaining recovery probe before a provider with a stale *unhealthy* verdict
+is re-checked and the shared verdict cache is updated. Providers with no
+verdict (or a stale healthy one) are assumed healthy without any network I/O,
+so steady-state route resolution never probes and never burns a real
+completion against a healthy backend. Probe semantics stay fail-open (ported
+from the skill-gate plugin's ``runtime_catalog.py``): only signals that
+indicate the PROVIDER cannot serve completions (credit/quota exhaustion,
+402/429, 5xx, connection failures) count as unhealthy; auth-scoped 401/403
+(or a malformed probe 400) are treated as healthy so a probe defect can never
+freeze routing. Observation-only callers cannot invoke that fail-open path.
 
 ``static_rules`` are parsed and validated here; condition matching and
 enforcement live in the gateway pre-dispatch router (``gateway/model_router.py``,
@@ -152,6 +153,14 @@ class RouteCatalog:
     static_rules: List[Dict[str, Any]] = field(default_factory=list)  # matched in gateway/model_router.py
     router: RouterConfig = field(default_factory=RouterConfig)
     issues: List[ConfigIssue] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RouteResolution:
+    """A route directive plus a secret-free explanation of the resolution."""
+
+    directive: Optional[Dict[str, str]]
+    reason: str
 
 
 # =============================================================================
@@ -951,22 +960,30 @@ def _lookup_route(catalog: RouteCatalog, route_name: str) -> Optional[RouteSpec]
     return None
 
 
-def resolve_route(
+def resolve_route_detailed(
     route_name: str,
     cfg: Optional[Dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
-) -> Optional[Dict[str, str]]:
-    """Walk default → fallbacks; return the first healthy runtime as flat strings.
+    allow_recovery_probe: bool = False,
+) -> RouteResolution:
+    """Walk default → fallbacks and retain why resolution did or did not win.
 
-    Returns ``None`` for unknown routes or when the whole chain is unhealthy
-    (callers emit no switch and stay put — never route to a dead provider).
+    Resolution is observation-only by default: cached health is read, but a
+    stale unhealthy verdict is not actively re-probed and the shared cache is
+    never rewritten. A live caller that is authorized to spend provider quota
+    and update shared health must pass ``allow_recovery_probe=True`` explicitly.
+
+    ``directive`` is ``None`` for unknown routes or when the whole chain is
+    unhealthy (callers emit no switch and stay put — never route to a dead
+    provider). ``reason`` remains populated so observation logs can distinguish
+    an unknown route, cached failure, and a suppressed recovery probe.
     """
     catalog = catalog or load_routes(cfg)
     spec = _lookup_route(catalog, route_name)
     if spec is None:
         logger.warning("model_routes: unknown route %r", route_name)
-        return None
+        return RouteResolution(None, f"unknown route {str(route_name or '').strip()!r}")
 
     chain: List[Tuple[str, str, str, str]] = [
         (spec.provider, spec.model, spec.reasoning_effort, "default")
@@ -976,9 +993,15 @@ def resolve_route(
 
     failures: List[str] = []
     for provider, model, effort, source in chain:
-        healthy, reason = provider_health(provider, model, cfg=cfg, health=catalog.health)
+        healthy, reason = provider_health(
+            provider,
+            model,
+            cfg=cfg,
+            health=catalog.health,
+            allow_recovery_probe=allow_recovery_probe,
+        )
         if healthy:
-            return {
+            directive = {
                 "route": spec.name,
                 "provider": provider,
                 "model": model,
@@ -986,13 +1009,39 @@ def resolve_route(
                 "source": source,
                 "reason": f"failover — {'; '.join(failures)}" if failures else "",
             }
+            resolution_reason = directive["reason"] or (
+                f"selected {source} {provider}/{model} ({reason})"
+            )
+            return RouteResolution(directive, resolution_reason)
         failures.append(f"{provider} unhealthy ({reason})")
 
+    resolution_reason = f"no healthy runtime — {'; '.join(failures)}"
     logger.warning(
         "model_routes: route %r has no healthy runtime: %s",
         spec.name, "; ".join(failures),
     )
-    return None
+    return RouteResolution(None, resolution_reason)
+
+
+def resolve_route(
+    route_name: str,
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    catalog: Optional[RouteCatalog] = None,
+    allow_recovery_probe: bool = False,
+) -> Optional[Dict[str, str]]:
+    """Return the first cached-healthy runtime; active recovery is opt-in.
+
+    The safe default is read-only and performs no provider I/O. Live callers
+    may explicitly pass ``allow_recovery_probe=True`` to re-check a stale
+    unhealthy verdict and persist the recovery result.
+    """
+    return resolve_route_detailed(
+        route_name,
+        cfg,
+        catalog=catalog,
+        allow_recovery_probe=allow_recovery_probe,
+    ).directive
 
 
 def resolve_route_runtime(
@@ -1000,6 +1049,7 @@ def resolve_route_runtime(
     cfg: Optional[Dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
+    allow_recovery_probe: bool = False,
 ) -> Optional[Dict[str, str]]:
     """Resolve a healthy route through the canonical runtime-provider chain.
 
@@ -1009,7 +1059,12 @@ def resolve_route_runtime(
     :func:`hermes_cli.runtime_provider.resolve_runtime_provider` and are never
     copied into route state or decision logs.
     """
-    directive = resolve_route(route_name, cfg, catalog=catalog)
+    directive = resolve_route(
+        route_name,
+        cfg,
+        catalog=catalog,
+        allow_recovery_probe=allow_recovery_probe,
+    )
     if directive is None:
         return None
     try:
@@ -1228,21 +1283,24 @@ def provider_health(
     *,
     cfg: Optional[Dict[str, Any]] = None,
     health: Optional[HealthConfig] = None,
+    allow_recovery_probe: bool = False,
 ) -> Tuple[bool, str]:
-    """Cached, fail-open health verdict for a provider (keyed by provider name).
+    """Cached passive health verdict with opt-in fail-open recovery probing.
 
     Passive-first semantics:
 
     - fresh cache entry (within its TTL) → cached verdict, no I/O
     - no entry, or a stale *healthy* entry → assumed healthy, no probe —
       real traffic (``record_provider_outcome``) is the health signal
-    - stale *unhealthy* entry → one live probe as a recovery check, so a
-      session parked on a fallback can be walked back to a healed primary
-      without waiting for someone else's traffic to prove it
+    - stale *unhealthy* entry → remains unhealthy by default (read-only); a
+      caller may explicitly opt into one live recovery probe, so a session
+      parked on a fallback can be walked back to a healed primary without
+      waiting for someone else's traffic to prove it
 
-    The recovery probe is the only active-probe path left: a healthy
-    provider is never probed, so steady state costs zero network calls and
-    zero completion tokens.
+    The recovery probe is the only active-probe path left and is fail-closed
+    behind ``allow_recovery_probe is True``. A healthy provider is never
+    probed, so steady state costs zero network calls and zero completion
+    tokens.
     """
     if health is None:
         health = load_routes(cfg).health
@@ -1279,6 +1337,13 @@ def provider_health(
         # record_provider_outcome; a probe here would burn a completion per
         # ok_ttl window against a provider that real traffic already covers.
         return True, "assumed healthy (passive; no fresh failure verdict)"
+
+    if allow_recovery_probe is not True:
+        cached_reason = str(entry.get("reason") or "cached unhealthy")
+        return False, (
+            "stale unhealthy verdict (recovery probe suppressed): "
+            f"{cached_reason}"
+        )
 
     healthy, reason = _probe_provider(key, str(model or ""), cfg, health)
     _store_health_verdict(path, key, {"healthy": healthy, "reason": f"recovery probe: {reason}", "ts": now})

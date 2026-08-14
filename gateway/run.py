@@ -7470,13 +7470,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         runtime: dict,
         user_config: Optional[dict] = None,
     ):
-        """Evaluate and audit M3 routing without mutating the live runtime.
+        """Evaluate and audit M3 routing without mutating live routing state.
 
         This method is called from ``TurnRunner.run_sync`` after the gateway's
         canonical runtime resolution, which is already off the event loop. It
         intentionally recognizes only ``mode: shadow``; ``off`` and
         ``enforce`` are both non-mutating in M3. The data model retains
         ``enforce`` for M4, but no switch/cache-invalidation path is wired here.
+        Route health resolution is read-only: shadow evaluation may append its
+        decision log, but cannot run a recovery probe or rewrite shared health.
         """
         cfg = user_config if isinstance(user_config, dict) else {}
         section = cfg.get("model_routes")

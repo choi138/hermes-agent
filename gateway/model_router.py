@@ -1,13 +1,14 @@
 """Dynamic model router — gateway pre-dispatch routing stage (ADR-003 Phase 2).
 
 Ported from the skill-gate plugin's ``dev_routing`` policy
-(``policy_router.py``).  The classifier system prompt, response schema,
+(``policy_router.py``). The classifier system prompt, response schema,
 fallback regexes, context-payload shape (fields, order, truncation limits,
-9000-char budget), and NORMAL→chat hysteresis semantics are verbatim from the
-skill-gate bench winner (2026-07-15 router benchmark: 230-case gold-labeled
-main set 98.7%, 120-case session-disjoint holdout 95.0%, 0 missed switches).
-Do not edit prompt/schema/regexes/context shape without re-running the
-230+120 bench.
+9000-char budget), and NORMAL→chat threshold are verbatim from the skill-gate
+bench winner (2026-07-15 router benchmark: 230-case gold-labeled main set
+98.7%, 120-case session-disjoint holdout 95.0%, 0 missed switches). Parsing
+adds an authority boundary: only complete structured decisions may advance
+NORMAL hysteresis. Do not edit prompt/schema/regexes/context shape without
+re-running the 230+120 bench.
 
 Design rules (inherited from the plugin):
 - the LLM classifier is the primary decision path; regex is a narrow outage
@@ -36,6 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -330,6 +332,61 @@ def _call_gemini(
     return str(body["candidates"][0]["content"]["parts"][0]["text"]).strip()
 
 
+_STRICT_SCHEMA_UNSUPPORTED_KEYS = frozenset({
+    # Gemini Schema extension; rejected by OpenAI strict structured output.
+    "propertyOrdering",
+    # Validation constraints outside OpenAI's supported strict subset. The
+    # classifier parser enforces the benchmarked bounds after decoding.
+    "minLength", "maxLength", "pattern", "format",
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minItems", "maxItems", "uniqueItems",
+    "minProperties", "maxProperties", "patternProperties", "propertyNames",
+    "unevaluatedProperties",
+})
+
+
+def _strict_safe_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return an OpenAI-strict-safe copy without mutating Gemini's schema.
+
+    Strict structured output requires every object node to reject undeclared
+    properties and to list every declared property as required. Unsupported
+    validation keywords are removed from the wire copy only; the shared
+    benchmark constant remains byte-for-byte unchanged, and decoding validates
+    its evidence/confidence invariants locally.
+    """
+
+    def clean(node: Any) -> Any:
+        if isinstance(node, list):
+            return [clean(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        cleaned: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in _STRICT_SCHEMA_UNSUPPORTED_KEYS:
+                continue
+            if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):
+                # Keys in these maps are user/schema names, not JSON-Schema
+                # keywords, so preserve them even when a name resembles one.
+                cleaned[key] = {
+                    str(name): clean(child) for name, child in value.items()
+                }
+            else:
+                cleaned[key] = clean(value)
+
+        if cleaned.get("type") == "object":
+            properties = cleaned.get("properties")
+            if not isinstance(properties, dict):
+                properties = {}
+                cleaned["properties"] = properties
+            cleaned["required"] = list(properties)
+            cleaned["additionalProperties"] = False
+        return cleaned
+
+    result = clean(schema)
+    return result if isinstance(result, dict) else {}
+
+
 def _call_configured_classifier(
     user_prompt: str,
     *,
@@ -374,7 +431,7 @@ def _call_configured_classifier(
             "json_schema": {
                 "name": "model_router_decision",
                 "strict": True,
-                "schema": response_schema,
+                "schema": _strict_safe_response_schema(response_schema),
             },
         }
     response = call_llm(
@@ -538,7 +595,7 @@ def fallback_dev_label(context: PolicyClassificationContext) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Classifier (payload budget + parsing verbatim from skill-gate)
+# Classifier (benchmarked payload budget + authoritative parsing)
 # ---------------------------------------------------------------------------
 
 
@@ -560,19 +617,12 @@ def _payload_json(context: PolicyClassificationContext) -> str:
     return text[:MAX_CONTEXT_CHARS]  # pathological single-message overflow only
 
 
-def _first_matching_label(raw: str, allowed: tuple[str, ...], default: str) -> str:
-    label = str(raw or "").strip().upper()
-    for candidate in allowed:
-        if label.startswith(candidate):
-            return candidate
-    return default
-
-
 def _parse_dev_json(raw: str) -> dict[str, Any] | None:
     """Parse the structured dev-router output {evidence, label, confidence}.
 
-    Returns None when the payload is unusable so the caller can fall back to
-    plain-label matching (covers tests/fakes that still answer one token).
+    Returns None unless every required field satisfies the shared schema. This
+    is the authority boundary: malformed JSON, plain labels, empty evidence,
+    and invalid confidence values must never become LLM-sourced decisions.
     """
     try:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -584,14 +634,35 @@ def _parse_dev_json(raw: str) -> dict[str, Any] | None:
     label = str(obj.get("label") or "").strip().upper()
     if label not in {"NORMAL", "DOCUMENT_WORK", "FRONTEND_DEV", "SYSTEM_DEV"}:
         return None
-    try:
-        confidence = float(obj.get("confidence")) if obj.get("confidence") is not None else None
-    except Exception:
-        confidence = None
+    evidence_raw = obj.get("evidence")
+    if not isinstance(evidence_raw, str) or len(evidence_raw) > 120:
+        return None
+    evidence = evidence_raw.strip()
+    if not evidence:
+        return None
+    confidence_raw = obj.get("confidence")
+    if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
+        return None
+    confidence = float(confidence_raw)
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return None
     return {
         "label": label,
         "confidence": confidence,
-        "evidence": str(obj.get("evidence") or "")[:200],
+        "evidence": evidence,
+    }
+
+
+def _fallback_classification(
+    context: PolicyClassificationContext,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "label": fallback_dev_label(context),
+        "confidence": None,
+        "evidence": "",
+        "source": "fallback",
+        "classification_reason": reason,
     }
 
 
@@ -605,9 +676,10 @@ def classify_dev_detailed(
 ) -> dict[str, Any]:
     """Classify dev routing with structured output.
 
-    Returns {label, confidence, evidence, source} where source is one of
-    'llm' (structured or plain-label LLM answer) / 'fallback' (regex outage
-    path). Hysteresis logic must only trust 'llm' NORMALs — a fail-open
+    Returns {label, confidence, evidence, source, classification_reason}.
+    ``source='llm'`` is reserved for a fully valid structured decision;
+    malformed/plain responses and transport errors use the regex fallback.
+    Hysteresis logic must only trust authoritative LLM NORMALs — a fail-open
     NORMAL from an API outage must never trigger a chat downgrade.
     """
     user_prompt = f"Context JSON:\n{_payload_json(context)}"
@@ -626,21 +698,26 @@ def classify_dev_detailed(
                 response_schema=DEV_RESPONSE_SCHEMA,
             )
     except Exception as exc:
+        reason = f"classifier_error:{type(exc).__name__}"
         fallback = fallback_dev_label(context)
         logger.debug(
             "model router dev classifier failed; fallback=%s (%s)",
             fallback,
             type(exc).__name__,
         )
-        return {"label": fallback, "confidence": None, "evidence": "", "source": "fallback"}
+        return _fallback_classification(context, reason)
     parsed = _parse_dev_json(raw)
     if parsed is not None:
         parsed["source"] = "llm"
+        parsed["classification_reason"] = ""
         return parsed
-    label = _first_matching_label(
-        raw, ("FRONTEND_DEV", "SYSTEM_DEV", "DOCUMENT_WORK", "NORMAL"), "NORMAL"
+    fallback = fallback_dev_label(context)
+    logger.debug(
+        "model router dev classifier returned an invalid structured response; "
+        "fallback=%s",
+        fallback,
     )
-    return {"label": label, "confidence": None, "evidence": "", "source": "llm"}
+    return _fallback_classification(context, "invalid_classifier_response")
 
 
 # ---------------------------------------------------------------------------
@@ -764,34 +841,46 @@ def _runtime_already_satisfies(
         return False
 
 
-def _resolve_route_directive(
+def _resolve_route_directive_detailed(
     route_name: str,
     cfg: dict[str, Any] | None,
     catalog: Any,
-) -> Optional[dict]:
+) -> tuple[Optional[dict], str]:
     """Health-checked route resolution via the Phase 1 catalog.
 
     A resolved directive always carries a non-empty ``reason`` so log and
     notify text is never blank: failover reasons from ``resolve_route`` are
     kept as-is, and an empty reason (healthy default) is filled with the
-    route name.
+    route name. The second return value retains secret-free resolution
+    diagnostics even when no directive can be selected.
     """
     if not str(route_name or "").strip():
-        return None
+        return None, "route not configured"
     try:
-        from hermes_cli.model_routes import resolve_route
+        from hermes_cli.model_routes import resolve_route_detailed
 
-        directive = resolve_route(route_name, cfg, catalog=catalog)
+        resolution = resolve_route_detailed(route_name, cfg, catalog=catalog)
+        directive = resolution.directive
+        resolution_reason = resolution.reason
     except Exception as exc:
         logger.debug(
             "model router: route resolution failed for %r (%s)",
             route_name,
             type(exc).__name__,
         )
-        return None
+        return None, f"resolution_error:{type(exc).__name__}"
     if directive is not None and not str(directive.get("reason") or "").strip():
         directive = dict(directive, reason=str(directive.get("route") or route_name))
-    return directive
+    return directive, resolution_reason
+
+
+def _resolve_route_directive(
+    route_name: str,
+    cfg: dict[str, Any] | None,
+    catalog: Any,
+) -> Optional[dict]:
+    """Compatibility wrapper for callers that only need the directive."""
+    return _resolve_route_directive_detailed(route_name, cfg, catalog)[0]
 
 
 def static_rule_decision(
@@ -814,10 +903,14 @@ def static_rule_decision(
     """
     route_name = str(rule.get("route") or "")
     directive: Optional[dict] = None
+    resolution_reason = ""
     if _runtime_already_satisfies(runtime, route_name, cfg, catalog):
         outcome = "noop_satisfied"
+        resolution_reason = f"runtime already satisfies route {route_name}"
     else:
-        directive = _resolve_route_directive(route_name, cfg, catalog)
+        directive, resolution_reason = _resolve_route_directive_detailed(
+            route_name, cfg, catalog,
+        )
         if directive is None:
             # Whole fallback chain unhealthy (or unknown route): stay put.
             outcome = "none"
@@ -830,6 +923,8 @@ def static_rule_decision(
         "confidence": None,
         "evidence": str(rule.get("reason") or ""),
         "source": "static",
+        "classification_reason": "",
+        "resolution_reason": resolution_reason,
         "provider": None,
         "model": None,
         "outcome": outcome,
@@ -843,6 +938,24 @@ def static_rule_decision(
         directive=directive, outcome=outcome, label=route_name,
         rule=rule_name, record=record,
     )
+
+
+def _is_authoritative_llm_decision(detail: dict[str, Any]) -> bool:
+    """Defense-in-depth for hysteresis if a future parser path is loosened."""
+    if detail.get("source") != "llm" or detail.get("label") != "NORMAL":
+        return False
+    evidence = detail.get("evidence")
+    if (
+        not isinstance(evidence, str)
+        or not evidence.strip()
+        or len(evidence) > 120
+    ):
+        return False
+    confidence = detail.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return False
+    value = float(confidence)
+    return math.isfinite(value) and 0.0 <= value <= 1.0
 
 
 def classifier_decision(
@@ -891,10 +1004,13 @@ def classifier_decision(
 
     directive = None
     outcome = "none"
+    resolution_reason = ""
 
     if dev_label in {"FRONTEND_DEV", "SYSTEM_DEV", "DOCUMENT_WORK"}:
         entry["normal_streak"] = 0
-        directive = _resolve_route_directive(str(label_routes.get(dev_label) or ""), cfg, catalog)
+        directive, resolution_reason = _resolve_route_directive_detailed(
+            str(label_routes.get(dev_label) or ""), cfg, catalog,
+        )
         if directive and _runtime_already_satisfies(runtime, str(directive.get("route") or ""), cfg, catalog):
             directive, outcome = None, "noop_satisfied"
         elif directive:
@@ -902,10 +1018,13 @@ def classifier_decision(
     else:  # NORMAL
         # Only LLM-sourced NORMALs advance the downgrade streak. A fail-open
         # NORMAL from an outage must never walk a session toward CHAT.
-        if detail.get("source") == "llm":
+        authoritative_normal = _is_authoritative_llm_decision(detail)
+        if authoritative_normal:
             entry["normal_streak"] = int(entry.get("normal_streak") or 0) + 1
         chat_route = str(getattr(router, "chat_route", "") or "")
-        chat_directive = _resolve_route_directive(chat_route, cfg, catalog)
+        chat_directive, resolution_reason = _resolve_route_directive_detailed(
+            chat_route, cfg, catalog,
+        )
         threshold = int(getattr(router, "normal_downgrade_streak", 0) or DEFAULT_NORMAL_DOWNGRADE_STREAK)
         if chat_directive is None:
             outcome = "normal_no_chat_route"
@@ -913,7 +1032,7 @@ def classifier_decision(
             outcome = "noop_already_chat"
         elif not runtime:
             outcome = "normal_unknown_runtime"
-        elif detail.get("source") != "llm":
+        elif not authoritative_normal:
             outcome = "normal_fallback_no_downgrade"
         elif entry["normal_streak"] >= threshold:
             directive = dict(chat_directive)
@@ -932,6 +1051,8 @@ def classifier_decision(
         "confidence": detail.get("confidence"),
         "evidence": detail.get("evidence"),
         "source": detail.get("source"),
+        "classification_reason": detail.get("classification_reason") or "",
+        "resolution_reason": resolution_reason,
         "provider": provider,
         "model": model,
         "outcome": outcome,
