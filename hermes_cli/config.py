@@ -2054,6 +2054,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
+    # Deferred import avoids config.py <-> model_routes.py import cycles while
+    # still making `hermes doctor` the single validation surface.
+    try:
+        from hermes_cli.model_routes import validate_model_routes
+
+        issues.extend(validate_model_routes(config))
+    except Exception:
+        logger.debug("model_routes config validation failed", exc_info=True)
+
     return issues
 
 

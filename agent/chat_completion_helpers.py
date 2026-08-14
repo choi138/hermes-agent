@@ -499,6 +499,56 @@ def _reset_stale_streak(agent) -> None:
         pass
 
 
+# ── Passive provider health (model_routes) ──────────────────────────────────
+# Real completion traffic is the signal: route resolution never probes a
+# healthy/unknown provider and only uses active I/O to re-check a stale
+# unhealthy verdict.
+_PASSIVE_UNHEALTHY_REASONS = frozenset({
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def _record_passive_provider_outcome(agent, healthy: bool, reason: str) -> None:
+    """Best-effort verdict for the agent's current runtime; never raises."""
+    try:
+        from hermes_cli.model_routes import (
+            provider_key_for_runtime,
+            record_provider_outcome,
+        )
+
+        key = provider_key_for_runtime(
+            provider=getattr(agent, "provider", "") or "",
+            base_url=getattr(agent, "base_url", "") or "",
+        )
+        if key:
+            record_provider_outcome(key, healthy, reason)
+    except Exception as exc:
+        logger.debug(
+            "passive provider health record failed (%s)",
+            type(exc).__name__,
+        )
+
+
+def _note_provider_success(agent) -> None:
+    """Clear a matching unhealthy verdict after a real completion succeeds."""
+    try:
+        from hermes_cli.model_routes import has_unhealthy_verdicts
+
+        if not has_unhealthy_verdicts():
+            return
+    except Exception:
+        return
+    _record_passive_provider_outcome(
+        agent,
+        True,
+        "recovered (live completion succeeded)",
+    )
+
+
 def _report_stale_nonstream_kill(
     agent,
     api_kwargs: dict,
@@ -1001,6 +1051,7 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_state["done"] = True
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1529,6 +1580,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 
@@ -2153,6 +2205,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason in _PASSIVE_UNHEALTHY_REASONS:
+        _record_passive_provider_outcome(
+            agent,
+            False,
+            reason.value if reason is not None else "unknown",
+        )
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -3333,6 +3391,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # recovered provider doesn't carry a stale streak into later turns.
         if result["response"] is not None:
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -4978,12 +5037,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
             return _stub
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────
