@@ -789,12 +789,27 @@ def _require_valid_for_apply(
     manifest: Manifest,
     *,
     allow_upstream_match_drift: bool = False,
+    allow_production_drift: bool = False,
 ) -> None:
     report = validate_manifest(manifest)
     errors = list(report.errors)
     if allow_upstream_match_drift:
         errors = [
             error for error in errors if "every content commit matches" not in error
+        ]
+    if allow_production_drift:
+        # rebuild --apply is the operation that creates or repairs
+        # hermes/production.  Topic/base/manifest drift must still block, but
+        # the current production ref being absent, stale, or non-merge-shaped is
+        # exactly the condition this command is allowed to fix.
+        production_prefixes = (
+            f"{PRODUCTION_BRANCH} is missing while ",
+            f"{PRODUCTION_BRANCH} parents do not match ",
+            f"{PRODUCTION_BRANCH} should equal ",
+        )
+        errors = [
+            error for error in errors
+            if not error.startswith(production_prefixes)
         ]
     if errors:
         _print_report(ValidationReport(tuple(errors), report.warnings))
@@ -863,7 +878,7 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
         return 0
 
     reject_attached([PRODUCTION_BRANCH], operation="production rebuild")
-    _require_valid_for_apply(manifest)
+    _require_valid_for_apply(manifest, allow_production_drift=True)
 
     previous = branch_tip(PRODUCTION_BRANCH)
     if not active:
