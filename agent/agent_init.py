@@ -1715,6 +1715,12 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
+    # ADR-004 Phase 0: per-agent memory-ingest kill switch. False for every
+    # live agent (unchanged behavior). Forks that need memory READ access but
+    # zero graph-write leakage (background review, the future ingest curator)
+    # set this True at fork construction — every write-leak call site gates on
+    # agent.memory_manager.memory_ingest_allowed(agent).
+    agent._memory_ingest_disabled = False
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""

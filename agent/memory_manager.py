@@ -49,6 +49,11 @@ _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
+def memory_ingest_allowed(agent: Any) -> bool:
+    """Return whether this agent may write/ingest into memory providers."""
+    return not getattr(agent, "_memory_ingest_disabled", False)
+
+
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     """Return a function-tool dict with a resolvable top-level ``name``.
 

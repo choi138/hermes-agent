@@ -3263,7 +3263,13 @@ def _finalize_child_results(
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 
-        if parent_agent and getattr(parent_agent, "_memory_manager", None):
+        from agent.memory_manager import memory_ingest_allowed
+
+        if (
+            parent_agent
+            and getattr(parent_agent, "_memory_manager", None)
+            and memory_ingest_allowed(parent_agent)
+        ):
             for entry in results:
                 try:
                     task_index = entry.get("task_index", -1)

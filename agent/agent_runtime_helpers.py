@@ -3061,8 +3061,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
-            # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager:
+            # (MemoryManager.notify_memory_tool_write). Skipped for
+            # ingest-disabled forks (ADR-004 Phase 0) — their built-in
+            # MEMORY.md writes must not fan out to the external graph.
+            from agent.memory_manager import memory_ingest_allowed
+            if agent._memory_manager and memory_ingest_allowed(agent):
                 agent._memory_manager.notify_memory_tool_write(
                     result,
                     next_args,

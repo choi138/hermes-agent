@@ -803,6 +803,15 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # ADR-004 Phase 0: systematic guarantee against graph-write leaks.
+            # skip_memory=True above already prevents this fork from BUILDING a
+            # memory manager, but the ingest-curator recipe (and any future
+            # variant) rebinds the PARENT's manager onto the fork for
+            # memory_search read access — this flag is what keeps that safe:
+            # every sync/ingest/prefetch call site gates on it
+            # (agent.memory_manager.memory_ingest_allowed), so the fork's
+            # harness prompt can never reach the external graph.
+            review_agent._memory_ingest_disabled = True
             # The review fork pins the parent's cached system prompt and keeps
             # ``tools[]`` byte-identical to the parent so its outbound request
             # hits the same provider cache prefix (see the toolset-parity note
