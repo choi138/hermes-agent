@@ -1050,6 +1050,7 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
+    reason: str = "",
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -1059,6 +1060,11 @@ def memory_tool(
       - Single op: action + (content / old_text).
       - Batch:     operations=[{action, content?, old_text?}, ...] applied
                    atomically against the final char budget in ONE call.
+
+    ``reason`` is a suitability guardrail required for 'add'/'replace': the
+    caller must say why USER/MEMORY is the right store rather than a skill,
+    Graphiti, or session history. It is validated at this boundary only and is
+    deliberately NOT persisted with the entry.
 
     Returns JSON string with results.
     """
@@ -1078,6 +1084,10 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        if any(op.get("action") in {"add", "replace"} for op in operations if isinstance(op, dict)):
+            reason_error = _validate_memory_write_reason(reason)
+            if reason_error:
+                return tool_error(reason_error, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1101,6 +1111,15 @@ def memory_tool(
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
 
+    # Suitability guardrail for durable writes. Checked here — after the
+    # required-param validation (so the more actionable missing-field error
+    # still wins) and BEFORE the gate, for the same reason the params are:
+    # a write that will be refused must not be staged for approval first.
+    if action in {"add", "replace"}:
+        reason_error = _validate_memory_write_reason(reason)
+        if reason_error:
+            return tool_error(reason_error, success=False)
+
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
     gate_result = _apply_write_gate(action, target, content, old_text)
@@ -1120,6 +1139,40 @@ def memory_tool(
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
     return json.dumps(result, ensure_ascii=False)
+
+
+def _validate_memory_write_reason(reason: str = "") -> Optional[str]:
+    """Validate the suitability reason required for memory add/replace.
+
+    The reason is a tool-boundary guardrail only; it is intentionally not
+    persisted with the memory entry. Keep this deliberately simple: require a
+    real sentence and reject the most common vacuous justifications. Semantic
+    routing between memory/skills remains the caller's responsibility and can be
+    further guarded by profile-local skill-gate rules.
+    """
+    normalized = " ".join(str(reason or "").strip().split())
+    generic_reasons = {
+        "important",
+        "user asked",
+        "remember this",
+        "durable",
+        "useful",
+        "preference",
+        "the user asked me to remember this",
+    }
+    if normalized.casefold() in generic_reasons:
+        return (
+            "reason is too generic for memory add/replace: explain why USER/MEMORY is "
+            "the right store instead of a skill, Graphiti, or session history."
+        )
+
+    if len(normalized) < 20:
+        return (
+            "reason is required for memory add/replace: briefly explain why this belongs "
+            "in USER/MEMORY rather than a skill, Graphiti, or session history."
+        )
+
+    return None
 
 
 def check_memory_requirements() -> bool:
@@ -1211,6 +1264,14 @@ MEMORY_SCHEMA = {
                     "required": ["action"],
                 },
             },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required for 'add' and 'replace'. Briefly explain why this belongs in "
+                    "USER/MEMORY rather than a skill, Graphiti, or session history. This "
+                    "reason is used only as a guardrail and is not stored."
+                )
+            },
         },
         "required": ["target"],
     },
@@ -1230,6 +1291,7 @@ registry.register(
         content=args.get("content"),
         old_text=args.get("old_text"),
         operations=args.get("operations"),
+        reason=args.get("reason", ""),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

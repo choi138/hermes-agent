@@ -72,7 +72,11 @@ def test_memory_gate_off_allows_write(hermes_home):
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "user", "save me", store=store))
+    r = json.loads(memory_tool(
+        "add", "user", "save me",
+        reason="Durable user fact that must persist across sessions.",
+        store=store,
+    ))
     assert r["success"] is True
     assert r["entry_count"] == 1
     assert wa.pending_count("memory") == 0
@@ -90,7 +94,11 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
 
     _set_approval("memory", True)
     staging = MemoryStore(); staging.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "remember the launch date", store=staging))
+    r = json.loads(memory_tool(
+        "add", "memory", "remember the launch date",
+        reason="Durable environment fact that must persist across sessions.",
+        store=staging,
+    ))
     assert r.get("pending_id"), r
     assert wa.pending_count("memory") == 1
 
@@ -220,7 +228,11 @@ def test_memory_inline_approve_writes(hermes_home, approval_callback_cleanup):
     set_approval_callback(approve_cb)
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "approved fact", store=store))
+    r = json.loads(memory_tool(
+        "add", "memory", "approved fact",
+        reason="Durable environment fact that must persist across sessions.",
+        store=store,
+    ))
     assert r["success"] is True
     assert r.get("staged") is None  # real write, not staged
     assert store.memory_entries == ["approved fact"]
@@ -238,7 +250,11 @@ def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
     set_approval_callback(lambda command, description, **kw: "deny")
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "denied fact", store=store))
+    r = json.loads(memory_tool(
+        "add", "memory", "denied fact",
+        reason="Durable environment fact that must persist across sessions.",
+        store=store,
+    ))
     assert r["success"] is False
     assert "denied" in r["error"].lower()
     assert store.memory_entries == []
