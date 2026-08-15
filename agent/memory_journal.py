@@ -162,16 +162,22 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
 class PendingTurnWAL:
     """Durable per-turn buffer for the external-memory sync path.
 
-    One JSONL file per session under ``state/memory-pending/``. Two record
+    One JSONL file per session under ``state/memory-pending/``. Three record
     shapes::
 
         {"type": "turn", "id": ..., "ts": ..., "session_id": ..., "seq": n,
          "records": [{"role": "user", "content": ...},
                      {"role": "assistant", "content": ...}]}
-        {"type": "ack", "id": <turn entry id>, "ts": ...}
+        {"type": "proposal", "id": ..., "ts": ..., "session_id": ...,
+         "kind": "proposal", "content": ..., "kind_hint": ...,
+         "evidence_refs": [...], "origin": ...}
+        {"type": "ack", "id": <turn/proposal entry id>, "ts": ...}
 
-    A turn whose id has a matching ack was successfully ingested; anything
-    else is unconsumed and survives restarts for the Phase-2 curator.
+    A turn/proposal whose id has a matching ack was successfully consumed;
+    anything else is unconsumed and survives restarts for the Phase-2
+    curator. Proposals are the ``memory_propose`` writer's records (ADR-004
+    §③ writer list): 0 LLM calls, non-blocking, drained by the curator
+    (salience accumulator weight +3 per proposal, §4.3).
     """
 
     def __init__(self, base_dir: Optional[Path] = None):
@@ -245,6 +251,44 @@ class PendingTurnWAL:
             logger.debug("memory-pending WAL append failed (fail-open)", exc_info=True)
             return None
 
+    def append_proposal(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        kind_hint: str = "",
+        evidence_refs: Optional[List[Dict[str, Any]]] = None,
+        origin: str = "user",
+    ) -> Optional[str]:
+        """Durably queue a ``memory_propose`` record (ADR-004 §③ writer list,
+        Phase 1). Zero LLM calls, append-only, fail-open — the Phase-2
+        curator is the consumer. Returns the entry id, or None when
+        disabled/failed."""
+        if journals_disabled():
+            return None
+        try:
+            path = self._path_for(session_id)
+            entry_id = uuid.uuid4().hex[:12]
+            record = {
+                "type": "proposal",
+                "id": entry_id,
+                "ts": round(time.time(), 3),
+                "session_id": session_id or "",
+                "kind": "proposal",
+                "content": _scrub(content),
+                "kind_hint": str(kind_hint or ""),
+                "evidence_refs": list(evidence_refs or []),
+                "origin": str(origin or "user"),
+            }
+            _append_jsonl(path, record)
+            return entry_id
+        except Exception:
+            logger.debug(
+                "memory-pending WAL proposal append failed (fail-open)",
+                exc_info=True,
+            )
+            return None
+
     def ack(self, session_id: str, entry_id: str) -> None:
         """Mark a turn entry as consumed (all provider ingests succeeded)."""
         if journals_disabled() or not entry_id:
@@ -284,7 +328,11 @@ class PendingTurnWAL:
                         rec_id = rec.get("id")
                         if not rec_id:
                             continue
-                        if rec_type == "turn":
+                        if rec_type in ("turn", "proposal"):
+                            # Proposals are unconsumed until a curator ack,
+                            # exactly like turns — a proposals-only file must
+                            # not look "fully acked" and get GC'd (that would
+                            # silently drop queued memory_propose records).
                             turn_ids.add(rec_id)
                         elif rec_type == "ack":
                             acked_ids.add(rec_id)
