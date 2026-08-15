@@ -59,6 +59,8 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Notes tier — declarative gist + curator proposals (ADR-004 Phase 1)
+    "notes_write", "notes_read", "memory_propose",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -237,7 +239,7 @@ TOOLSETS = {
     
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        "tools": ["memory", "notes_write", "notes_read", "memory_propose"],
         "includes": []
     },
 

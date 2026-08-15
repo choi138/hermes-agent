@@ -54,6 +54,9 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "delegate_task",  # no recursive delegation
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
+        "notes_write",  # no writes to the shared notes tier (ADR-004)
+        "notes_read",  # keeps the memory toolset fully blocked for children
+        "memory_propose",  # no queueing curator proposals in the parent's name
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
     ]

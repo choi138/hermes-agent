@@ -823,6 +823,12 @@ def _begin_tool_execution(
             pass
 
 
+def _dispatch_notes_tool(agent, function_name: str, args: dict) -> str:
+    """Dispatch a notes-tier tool with agent-level state (ADR-004 Phase 1)."""
+    from tools.notes_tool import dispatch_notes_tool_for_agent
+    return dispatch_notes_tool_for_agent(agent, function_name, args)
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> bool:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1942,6 +1948,59 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
+        elif function_name == "notes_write":
+            # Notes tier (ADR-004 Phase 1) — dispatched inline (like `memory`)
+            # so the handler gets the session id and, for the flag-gated
+            # notes→graph backfill, this agent's MemoryManager (withheld from
+            # ingest-disabled forks for the same reason built-in memory writes
+            # don't fan out there, Phase 0).
+            def _execute(next_args: dict) -> Any:
+                return _dispatch_notes_tool(agent, "notes_write", next_args)
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
+        elif function_name == "notes_read":
+            def _execute(next_args: dict) -> Any:
+                return _dispatch_notes_tool(agent, "notes_read", next_args)
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
+        elif function_name == "memory_propose":
+            def _execute(next_args: dict) -> Any:
+                return _dispatch_notes_tool(agent, "memory_propose", next_args)
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif function_name == "clarify":
             def _execute(next_args: dict) -> Any:
                 from tools.clarify_tool import clarify_tool as _clarify_tool

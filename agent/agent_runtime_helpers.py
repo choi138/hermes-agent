@@ -99,7 +99,18 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "delegate_task"}
+    {
+        "todo",
+        "session_search",
+        "memory",
+        "notes_write",
+        "notes_read",
+        "memory_propose",
+        "clarify",
+        "read_terminal",
+        "read_preview",
+        "delegate_task",
+    }
 )
 
 
@@ -3075,6 +3086,31 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
+    elif function_name == "notes_write":
+        # Notes tier (ADR-004 Phase 1) — agent-state resolution (session id,
+        # ingest-allowed MemoryManager for the flag-gated backfill) lives in
+        # tools.notes_tool.dispatch_notes_tool_for_agent, shared with the
+        # sequential path.
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "notes_write", next_args),
+                next_args,
+            )
+    elif function_name == "notes_read":
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "notes_read", next_args),
+                next_args,
+            )
+    elif function_name == "memory_propose":
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "memory_propose", next_args),
+                next_args,
+            )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
