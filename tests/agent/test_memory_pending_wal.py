@@ -219,6 +219,30 @@ class TestFailOpen:
         assert wal.scan_and_gc() is None
         assert not (tmp_path / "memory-pending").exists()
 
+    def test_journal_dir_pinned_at_construction(self, tmp_path, monkeypatch):
+        """The journal directory is resolved EAGERLY on the constructing
+        thread. Appends run later on the mem-sync worker — if they re-resolved
+        HERMES_HOME at write time, a queued write could land in whatever home
+        the environment points at by then (observed: delayed background syncs
+        writing into the real ~/.hermes after test teardown restored env)."""
+        from agent.memory_journal import L0Mirror
+
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        wal = PendingTurnWAL()
+        mirror = L0Mirror()
+
+        # Env changes AFTER construction (teardown, profile switch) …
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        wal.append_turn("sess-1", "u", "a")
+        mirror.append_turn("sess-1", "u", "a")
+
+        # … but writes stay pinned to the home active at construction.
+        assert (home_a / "state" / "memory-pending" / "sess-1.jsonl").exists()
+        assert list((home_a / "memory" / "l0-mirror").glob("*.jsonl"))
+        assert not home_b.exists()
+
 
 # ---------------------------------------------------------------------------
 # MemoryManager integration

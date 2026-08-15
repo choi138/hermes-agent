@@ -128,17 +128,25 @@ class PendingTurnWAL:
     """
 
     def __init__(self, base_dir: Optional[Path] = None):
-        self._base_dir = Path(base_dir) if base_dir else None
+        # Resolve the journal directory EAGERLY, on the constructing thread.
+        # Appends run later on the mem-sync worker; resolving get_hermes_home()
+        # there would chase whatever HERMES_HOME / profile context the worker
+        # sees at write time (a context-local override does not reliably
+        # propagate to pool threads), so a queued write could land in the
+        # wrong profile's home. The home active at manager construction is
+        # authoritative for everything this manager journals.
+        if base_dir is not None:
+            self._base_dir = Path(base_dir)
+        else:
+            from hermes_constants import get_hermes_home
+            self._base_dir = get_hermes_home() / "state" / "memory-pending"
         self._lock = threading.Lock()
         # Per-session turn sequence, lazily seeded from the existing file so
         # restarts continue the sequence instead of restarting at 0.
         self._seq: Dict[str, int] = {}
 
     def _dir(self) -> Path:
-        if self._base_dir is not None:
-            return self._base_dir
-        from hermes_constants import get_hermes_home
-        return get_hermes_home() / "state" / "memory-pending"
+        return self._base_dir
 
     def _path_for(self, session_id: str) -> Path:
         return self._dir() / _safe_session_filename(session_id)
@@ -302,13 +310,17 @@ class L0Mirror:
     """
 
     def __init__(self, base_dir: Optional[Path] = None):
-        self._base_dir = Path(base_dir) if base_dir else None
+        # Eager resolution on the constructing thread — same rationale as
+        # PendingTurnWAL.__init__: mirror writes run on the mem-sync worker
+        # and must not chase a changed HERMES_HOME / profile context.
+        if base_dir is not None:
+            self._base_dir = Path(base_dir)
+        else:
+            from hermes_constants import get_hermes_home
+            self._base_dir = get_hermes_home() / "memory" / "l0-mirror"
 
     def _dir(self) -> Path:
-        if self._base_dir is not None:
-            return self._base_dir
-        from hermes_constants import get_hermes_home
-        return get_hermes_home() / "memory" / "l0-mirror"
+        return self._base_dir
 
     def _path_for(self, ts: float) -> Path:
         return self._dir() / (time.strftime("%Y-%m", time.localtime(ts)) + ".jsonl")
