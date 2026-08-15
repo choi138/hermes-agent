@@ -1005,17 +1005,37 @@ class MemoryManager:
                     provider.name, e,
                 )
 
+    def _mirror_boundary(self, kind: str, messages: List[Dict[str, Any]]) -> None:
+        """Journal a boundary extraction marker to the L0-mirror, off-thread.
+
+        The marker record is derived inline (pure, content-free, cheap —
+        message dicts must not be walked later on another thread while the
+        caller keeps mutating them) and the disk append is submitted to the
+        single background worker, so boundary hooks never pay journal I/O on
+        the calling thread. Fail-open; skipped when no provider will consume
+        the payload.
+        """
+        mirror = self._l0_mirror
+        if not self._providers or mirror is None:
+            return
+        record = mirror.build_boundary_record(
+            kind,
+            messages,
+            provider_names=[p.name for p in self._providers],
+        )
+        if record is not None:
+            self._submit_background(lambda: mirror.append_record(record))
+
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
-        # ADR-004 Phase 0 (§② L0-mirror): the end-of-session extraction input
-        # is an outgoing episode payload too — mirror it before handing it to
-        # providers. Fail-open; skipped when no provider will consume it.
-        if self._providers and self._l0_mirror is not None:
-            self._l0_mirror.append_messages(
-                "session_end",
-                messages,
-                provider_names=[p.name for p in self._providers],
-            )
+        # ADR-004 Phase 0 (§② L0-mirror): record that a session-end
+        # extraction payload left for providers. The content itself is
+        # already mirrored per-turn by sync_all, so only a compact boundary
+        # MARKER is derived here (cheap, pure — see build_boundary_record)
+        # and the disk append is dispatched to the background worker: this
+        # method runs on the calling thread, and inline journal I/O on
+        # provider paths is exactly what _submit_background exists to avoid.
+        self._mirror_boundary("session_end", messages)
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -1129,14 +1149,12 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
-        # ADR-004 Phase 0 (§② L0-mirror): mirror the pre-compression
-        # extraction input before providers consume it. Fail-open.
-        if self._providers and self._l0_mirror is not None:
-            self._l0_mirror.append_messages(
-                "pre_compress",
-                messages,
-                provider_names=[p.name for p in self._providers],
-            )
+        # ADR-004 Phase 0 (§② L0-mirror): record the pre-compression
+        # extraction boundary. on_pre_compress fires MID-TURN inside
+        # compress_context, so only the cheap content-free marker is derived
+        # inline; the append runs on the background worker (per-turn content
+        # is already mirrored by sync_all).
+        self._mirror_boundary("pre_compress", messages)
         parts = []
         for provider in self._providers:
             try:

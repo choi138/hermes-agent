@@ -198,6 +198,26 @@ class TestGC:
             "files": 0, "unconsumed_entries": 0, "gc_deleted_files": 0,
         }
 
+    def test_startup_scan_runs_once_per_directory_not_per_process(self, tmp_path, monkeypatch):
+        """A multi-profile process constructs managers over several
+        HERMES_HOMEs; a process-global once flag would pin scan+GC to
+        whichever profile constructed first and never sweep the others."""
+        import agent.memory_journal as mj
+
+        scanned: List[str] = []
+        monkeypatch.setattr(
+            PendingTurnWAL, "scan_and_gc",
+            lambda self: scanned.append(str(self._dir())),
+        )
+        monkeypatch.setattr(mj, "_scanned_pending_dirs", set())
+
+        dir_a, dir_b = tmp_path / "home-a", tmp_path / "home-b"
+        mj.run_pending_startup_scan_once(PendingTurnWAL(base_dir=dir_a))
+        mj.run_pending_startup_scan_once(PendingTurnWAL(base_dir=dir_a))  # dedup
+        mj.run_pending_startup_scan_once(PendingTurnWAL(base_dir=dir_b))
+
+        assert scanned == [str(dir_a), str(dir_b)]
+
 
 # ---------------------------------------------------------------------------
 # Fail-open contract + kill switch
