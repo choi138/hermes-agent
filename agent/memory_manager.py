@@ -34,6 +34,7 @@ import threading
 from concurrent.futures import Future, wait
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.memory_journal import PendingTurnWAL, run_pending_startup_scan_once
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -488,6 +489,17 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        # ADR-004 Phase 0 (§4.2): durable per-turn WAL. Turns are journaled
+        # BEFORE ingest dispatch and ack-marked after success, so buffered
+        # turns survive process restarts. Strictly fail-open — a broken
+        # journal must never affect the sync path.
+        self._pending_wal: Optional[PendingTurnWAL] = None
+        try:
+            self._pending_wal = PendingTurnWAL()
+            run_pending_startup_scan_once(self._pending_wal)
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("memory-pending WAL unavailable (fail-open)", exc_info=True)
+            self._pending_wal = None
 
     # -- Registration --------------------------------------------------------
 
@@ -761,6 +773,16 @@ class MemoryManager:
         user_content = clean_user_content
 
         def _run() -> None:
+            # ADR-004 Phase 0 (§4.2): journal the turn durably BEFORE any
+            # provider ingest is attempted. Runs on the mem-sync worker (not
+            # the hot path) and is fail-open — append_turn returns None on
+            # any failure and never raises.
+            wal = self._pending_wal
+            wal_entry_id = (
+                wal.append_turn(session_id, user_content, assistant_content)
+                if wal is not None else None
+            )
+            all_synced = True
             for provider in providers:
                 try:
                     if messages is not None and self._provider_sync_accepts_messages(provider):
@@ -777,10 +799,16 @@ class MemoryManager:
                             session_id=session_id,
                         )
                 except Exception as e:
+                    all_synced = False
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
                         provider.name, e,
                     )
+            # Ack only after every provider accepted the turn — a failed
+            # ingest leaves the entry unconsumed so it survives for the
+            # Phase-2 curator's replay (and is counted by the startup scan).
+            if wal is not None and wal_entry_id and all_synced:
+                wal.ack(session_id, wal_entry_id)
 
         self._submit_background(_run)
 
