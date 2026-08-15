@@ -17,9 +17,17 @@ Every durable *notes* write flows through here::
                        never write without having seen its neighbors first.
      5. grounded admission — every evidence ref is format-validated and,
         where a local journal holds the record, its quote must
-        substring-match the (scrubbed) WAL / L0-mirror content. Episode
-        UUIDs are format-validated (graph existence checks are the graph
-        side's job).
+        substring-match the (scrubbed) WAL / L0-mirror content. Quotes must
+        be substantive (minimum effective length, not redaction-mask
+        material) and must not contain secrets — a quote the scrubber would
+        alter is refused outright, so secret-bearing quotes can neither
+        ground nor be persisted. Episode UUIDs are format-validated (graph
+        existence checks are the graph side's job).
+     5b. write-approval gate — mutating verdicts respect
+        ``memory.write_approval`` (the same switch that gates MEMORY.md
+        writes): gate on → the fully-resolved plan is staged for
+        out-of-band review and replayed token-free by
+        :func:`apply_notes_pending` on approval.
      6. ledger append  ~/.hermes/state/memory-notes-ledger.jsonl
                        (verdict, checks, caller) — fail-open telemetry.
      7. backfill seam  notes create/update enqueue a typed episode backfill
@@ -68,6 +76,8 @@ from agent.notes_store import (
     NotesStore,
     NoteValidationError,
     note_ref,
+    validate_kind,
+    validate_topic_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +100,64 @@ _EPISODE_UUID_RE = re.compile(
 )
 
 _MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+_HANGUL_RE = re.compile(r"[가-힣]")
+
+# Term splitter shared by neighbor retrieval and the UPDATE conflict check.
+_TERM_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣_.-]+")
+
+# Redaction-mask shapes the scrubber emits into journals: «redacted:…»
+# sentinels, bare *** placeholders, and head...tail masks (ghp_A1...Q7r8).
+# A quote made of these is "grounding" against redaction artifacts, not
+# against content — it must not count toward quote substance.
+_MASK_TOKEN_RE = re.compile(r"«[^»]{0,120}»|\*{3,}|\S{1,16}\.\.\.\S{1,16}")
+
+# Minimum effective quote length. Hangul characters count double (Korean
+# packs roughly twice the information per character), so e.g. an 8-char
+# Korean span passes while a 2-char English fragment ("is") — which
+# substring-matches virtually any record — cannot ground anything.
+MIN_QUOTE_EFFECTIVE_LEN = 15
+# Minimum effective length remaining after mask tokens are stripped.
+_MIN_QUOTE_RESIDUAL_LEN = 8
+
+
+def _effective_len(text: str) -> int:
+    return len(text) + len(_HANGUL_RE.findall(text))
+
+
+def _quote_admissibility_error(quote: str) -> Optional[str]:
+    """Substance checks for a wal/l0 evidence quote (ADR-004 §③ step 5).
+
+    Returns an error string when the quote cannot serve as a citation:
+    * it contains secret material (the scrub would alter it) — refusing at
+      the door means a raw secret can never ride a quote into a proposal,
+      the ledger, or note frontmatter;
+    * it is too short to identify a record (trivial substrings match
+      everything, which made grounding vacuous);
+    * after stripping redaction-mask tokens too little content remains
+      (a mask is a redaction artifact, not evidence).
+    """
+    normalized = " ".join(quote.split())
+    if _scrub(normalized) != normalized:
+        return (
+            "quote contains secret material (the redactor would alter it) — "
+            "citations must never carry secrets; quote the non-secret span "
+            "of the record instead"
+        )
+    if _effective_len(normalized) < MIN_QUOTE_EFFECTIVE_LEN:
+        return (
+            f"quote is too short to identify a record (needs effective "
+            f"length >= {MIN_QUOTE_EFFECTIVE_LEN}; Hangul counts double) — "
+            f"cite a longer verbatim span"
+        )
+    residual = " ".join(_MASK_TOKEN_RE.sub(" ", normalized).split())
+    if _effective_len(residual) < _MIN_QUOTE_RESIDUAL_LEN:
+        return (
+            "quote is (mostly) redaction-mask material — a redaction "
+            "placeholder is not evidence; cite the surrounding non-secret "
+            "text instead"
+        )
+    return None
 
 
 def _memory_config() -> Dict[str, Any]:
@@ -141,11 +209,17 @@ def evidence_ref_is_tainted(ref: Dict[str, Any]) -> bool:
 
 
 def serialize_evidence_ref(ref: Dict[str, Any]) -> str:
-    """Compact string form stored in note frontmatter ``evidence`` lists."""
+    """Compact string form stored in note frontmatter ``evidence`` lists.
+
+    The quote is scrubbed before serialization: frontmatter re-enters
+    prompts via notes_read, so it is a safety boundary in its own right —
+    even though _quote_admissibility_error already refuses secret-bearing
+    quotes upstream, this serializer must be safe for ANY caller.
+    """
     rtype = ref.get("type")
     if rtype == "episode":
         return f"episode:{ref.get('uuid', '')}"
-    quote = str(ref.get("quote") or "").strip()
+    quote = _scrub(str(ref.get("quote") or "").strip())
     suffix = f" :: {quote[:160]}" if quote else ""
     if rtype == "wal":
         return f"wal:{ref.get('session_id', '')}:{ref.get('entry_id', '')}{suffix}"
@@ -326,7 +400,15 @@ class MemoryWritePipeline:
             )
 
         # Step 3 — neighbor retrieval (deterministic, ADR-004 §⑨-12).
-        terms = [t for t in re.split(r"[^0-9A-Za-z가-힣_.-]+", content) if len(t) >= 3]
+        # 2-char tokens count when they contain Hangul: common Korean nouns
+        # are two syllables, and dropping them starved neighbor recall on the
+        # primary (Korean) corpus — the exact parallel-ADD risk §③'s
+        # canonicalization eval exists to catch.
+        terms = [
+            t
+            for t in _TERM_SPLIT_RE.split(content)
+            if len(t) >= 3 or (len(t) == 2 and _HANGUL_RE.search(t))
+        ]
         neighbors = self._store.neighbor_search(
             terms[:16], topic_key=topic_key_hint or None, limit=5
         )
@@ -396,7 +478,10 @@ class MemoryWritePipeline:
     ) -> Dict[str, Any]:
         """Steps 4–6. ``target`` (\"kind/topic_key\") names the neighbor an
         UPDATE/SUPERSEDE acts on and MUST come from the token's neighbor
-        snapshot. Returns the written note metadata (or the NOOP record)."""
+        snapshot. ``kind`` may only differ from the proposed kind on
+        SUPERSEDE (the sanctioned re-typing path). Mutating verdicts
+        require a session-bound token (non-empty session_id at propose).
+        Returns the written note metadata (or the NOOP/staged record)."""
         verdict = (verdict or "").strip().upper()
         if verdict not in VERDICTS:
             return self._reject(
@@ -451,6 +536,37 @@ class MemoryWritePipeline:
                            "expected most-frequent outcome.",
             }
 
+        # Mutating verdicts need a real session binding: with an empty
+        # session id the propose/confirm session check is vacuously true, so
+        # a token could be confirmed from any empty-session context. NOOP
+        # (above) stays allowed — it writes nothing.
+        if not proposal.session_id:
+            return self._reject(
+                "confirm",
+                "mutating verdicts require a session-bound token: the "
+                "proposal was created without a session_id, so the "
+                "propose/confirm session binding cannot be enforced. "
+                "Re-propose with a session_id.",
+                caller=caller,
+                check="token",
+            )
+
+        # kind is bound at propose time: §①-5b status routing keys on the
+        # proposed kind+origin, so re-typing a 'decision' proposal into a
+        # 'fact' at confirm would dodge the unconfirmed landing. SUPERSEDE's
+        # new_kind is the one sanctioned re-typing path.
+        kind_arg = (kind or "").strip().lower()
+        if kind_arg and kind_arg != proposal.kind and verdict != "SUPERSEDE":
+            return self._reject(
+                "confirm",
+                f"kind is fixed at propose ({proposal.kind!r}); confirm "
+                f"cannot re-type it to {kind_arg!r}. Re-propose with the "
+                f"right kind, or use SUPERSEDE (the sanctioned re-typing "
+                f"path).",
+                caller=caller,
+                check="kind-binding",
+            )
+
         # Step 5 — grounded admission (mechanical, zero LLM calls).
         grounding: List[Dict[str, Any]] = []
         for ref in proposal.evidence_refs:
@@ -476,61 +592,92 @@ class MemoryWritePipeline:
         evidence_strs = [serialize_evidence_ref(r) for r in proposal.evidence_refs]
 
         # Step 4 verdict application (the caller decided; we enforce the
-        # neighbor-snapshot contract).
-        write_kind = (kind or proposal.kind).strip().lower()
+        # neighbor-snapshot contract). First resolve the full write plan —
+        # every input the store mutation needs — WITHOUT mutating anything,
+        # so the write-approval gate can stage a token-free replayable
+        # payload (the token TTL is far shorter than a human review cycle).
+        write_kind = (kind_arg or proposal.kind)
+        plan: Dict[str, Any] = {
+            "tool": "notes_write",
+            "verdict": verdict,
+            "content": proposal.content,
+            "evidence": evidence_strs,
+            "origin": proposal.origin,
+        }
+        update_conflict = False
+        if verdict == "ADD":
+            if not topic_key:
+                return self._reject(
+                    "confirm", "ADD requires topic_key.", caller=caller
+                )
+            # Validate identity fields BEFORE the gate: an invalid plan must
+            # fail now, not after a human approved a staged copy of it.
+            try:
+                validate_kind(write_kind)
+                validate_topic_key(topic_key)
+            except NoteValidationError as e:
+                return self._reject("confirm", str(e), caller=caller)
+            # One-shot kinds land unconfirmed until corroborated
+            # (ADR-004 §①-5b: visible, lower confidence — not hidden).
+            status = (
+                "unconfirmed"
+                if write_kind in ("decision", "incident")
+                and proposal.origin != "user"
+                else "active"
+            )
+            plan.update(kind=write_kind, topic_key=topic_key, status=status)
+        else:  # UPDATE / SUPERSEDE (VERDICTS + NOOP handled above)
+            target = (target or "").strip()
+            if target not in proposal.neighbor_refs:
+                return self._reject(
+                    "confirm",
+                    f"{verdict} target {target!r} is not in the token's "
+                    f"neighbor snapshot {proposal.neighbor_refs} — verdicts "
+                    f"only act on neighbors the caller was shown.",
+                    caller=caller,
+                    check="neighbor-binding",
+                )
+            t_kind, _, t_key = target.partition("/")
+            plan.update(target_kind=t_kind, target_topic_key=t_key)
+            if verdict == "UPDATE":
+                # Conflict brake (ADR-004 §①-6): UPDATE wholesale-replaces
+                # the body, so a replacement sharing NO content terms with
+                # the stored gist is a contradiction candidate — it lands
+                # with confidence 'contested' (a conflict flag, always
+                # applicable) and is ledgered distinctly. The full
+                # stored-quote contradiction check is Phase-2 curator work.
+                try:
+                    old_note = self._store.read(t_kind, t_key)
+                    update_conflict = not self._shares_content_terms(
+                        old_note.get("body") or "", proposal.content
+                    )
+                except (NoteNotFoundError, NoteValidationError):
+                    pass  # store.update below produces the real error
+                plan["update_conflict"] = update_conflict
+            else:
+                try:
+                    if kind_arg:
+                        validate_kind(write_kind)
+                    if topic_key:
+                        validate_topic_key(topic_key)
+                except NoteValidationError as e:
+                    return self._reject("confirm", str(e), caller=caller)
+                plan.update(
+                    new_kind=write_kind if kind_arg else None,
+                    new_topic_key=topic_key or None,
+                )
+
+        # Durable-write approval gate — same subsystem flag as the memory
+        # tool's MEMORY.md writes (memory.write_approval), so the notes tier
+        # is never less supervised than the instruction tier beside it.
+        gated = self._apply_write_gate(plan, grounding=grounding,
+                                       token=token, caller=caller,
+                                       proposal=proposal)
+        if gated is not None:
+            return gated
+
         try:
-            if verdict == "ADD":
-                if not topic_key:
-                    return self._reject(
-                        "confirm", "ADD requires topic_key.", caller=caller
-                    )
-                # One-shot kinds land unconfirmed until corroborated
-                # (ADR-004 §①-5b: visible, lower confidence — not hidden).
-                status = (
-                    "unconfirmed"
-                    if write_kind in ("decision", "incident")
-                    and proposal.origin != "user"
-                    else "active"
-                )
-                note = self._store.create(
-                    write_kind,
-                    topic_key,
-                    proposal.content,
-                    evidence=evidence_strs,
-                    origin=proposal.origin,
-                    status=status,
-                )
-            elif verdict in ("UPDATE", "SUPERSEDE"):
-                target = (target or "").strip()
-                if target not in proposal.neighbor_refs:
-                    return self._reject(
-                        "confirm",
-                        f"{verdict} target {target!r} is not in the token's "
-                        f"neighbor snapshot {proposal.neighbor_refs} — verdicts "
-                        f"only act on neighbors the caller was shown.",
-                        caller=caller,
-                        check="neighbor-binding",
-                    )
-                t_kind, _, t_key = target.partition("/")
-                if verdict == "UPDATE":
-                    note = self._store.update(
-                        t_kind,
-                        t_key,
-                        body=proposal.content,
-                        evidence_add=evidence_strs,
-                    )
-                else:
-                    note = self._store.supersede(
-                        t_kind,
-                        t_key,
-                        body=proposal.content,
-                        evidence=evidence_strs,
-                        origin=proposal.origin,
-                        new_kind=write_kind if kind else None,
-                        new_topic_key=topic_key or None,
-                    )
-            else:  # pragma: no cover - VERDICTS guard above
-                raise NoteValidationError(f"unhandled verdict {verdict}")
+            note = apply_notes_plan(plan, store=self._store)
         except (NoteValidationError, NoteNotFoundError) as e:
             self._ledger({
                 "event": "confirm",
@@ -544,7 +691,7 @@ class MemoryWritePipeline:
             })
             return {"success": False, "step": "confirm", "error": str(e)}
 
-        self._ledger({
+        ledger_record = {
             "event": "confirm",
             "verdict": verdict,
             "token": token,
@@ -556,7 +703,15 @@ class MemoryWritePipeline:
             "session_id": proposal.session_id,
             "content_sha": proposal.content_sha,
             "checks": {"grounding": grounding},
-        })
+        }
+        if verdict == "UPDATE":
+            # Body-replacing UPDATEs are ledgered distinctly (§①-6 audit
+            # trail for the deferred contradiction check).
+            ledger_record["update"] = {
+                "body_replaced": True,
+                "conflict_flagged": update_conflict,
+            }
+        self._ledger(ledger_record)
         return {
             "success": True,
             "step": "confirm",
@@ -584,15 +739,17 @@ class MemoryWritePipeline:
         if rtype == "wal":
             if not ref.get("session_id") or not ref.get("entry_id"):
                 return "wal ref requires session_id and entry_id"
-            if not str(ref.get("quote") or "").strip():
+            quote = str(ref.get("quote") or "").strip()
+            if not quote:
                 return "wal ref requires a verbatim quote"
-            return None
+            return _quote_admissibility_error(quote)
         if rtype == "l0":
             if not _MONTH_RE.match(str(ref.get("month") or "")):
                 return f"l0 ref has invalid month {ref.get('month')!r} (YYYY-MM)"
-            if not str(ref.get("quote") or "").strip():
+            quote = str(ref.get("quote") or "").strip()
+            if not quote:
                 return "l0 ref requires a verbatim quote"
-            return None
+            return _quote_admissibility_error(quote)
         return (
             f"unknown evidence ref type {rtype!r}: use 'episode', 'wal', or 'l0'"
         )
@@ -673,6 +830,106 @@ class MemoryWritePipeline:
             return {"ref": serialize_evidence_ref(ref), "ok": False,
                     "checked": "l0", "detail": f"L0-mirror read failed: {e}"}
 
+    # -- write-approval gate (memory.write_approval) ------------------------------
+
+    @staticmethod
+    def _shares_content_terms(old_body: str, new_body: str) -> bool:
+        """True when the two bodies share at least one content term
+        (deterministic: same splitter as neighbor retrieval, casefolded,
+        len >= 2). Zero overlap on a body replacement = contradiction
+        candidate."""
+        def _terms(text: str) -> set:
+            return {
+                t.casefold() for t in _TERM_SPLIT_RE.split(text) if len(t) >= 2
+            }
+        return bool(_terms(old_body) & _terms(new_body))
+
+    def _apply_write_gate(
+        self,
+        plan: Dict[str, Any],
+        *,
+        grounding: List[Dict[str, Any]],
+        token: str,
+        caller: str,
+        proposal: _Proposal,
+    ) -> Optional[Dict[str, Any]]:
+        """Evaluate the durable-write approval gate for a resolved plan.
+
+        Returns None when the write should proceed; otherwise the tool
+        result to return (blocked, or staged for out-of-band approval).
+        Reuses the ``memory`` subsystem flag (``memory.write_approval``) —
+        one switch supervises both durable memory tiers. The staged payload
+        is the fully-resolved plan (scrubbed content, serialized evidence,
+        grounding already passed), replayed token-free by
+        :func:`apply_notes_pending` on approval. Gate-module import failure
+        fails open, mirroring tools/memory_tool.py.
+        """
+        try:
+            from tools import write_approval as wa
+        except Exception:
+            return None
+
+        verdict = plan["verdict"]
+        if verdict == "ADD":
+            ref = note_ref(plan["kind"], plan["topic_key"])
+        elif verdict == "SUPERSEDE" and (plan.get("new_kind") or plan.get("new_topic_key")):
+            ref = (
+                f"{plan['target_kind']}/{plan['target_topic_key']} -> "
+                f"{plan.get('new_kind') or plan['target_kind']}/"
+                f"{plan.get('new_topic_key') or plan['target_topic_key']}"
+            )
+        else:
+            ref = f"{plan['target_kind']}/{plan['target_topic_key']}"
+        summary = f"notes {verdict.lower()}: {ref}"
+        decision = wa.evaluate_gate(
+            wa.MEMORY, inline_summary=summary, inline_detail=plan["content"]
+        )
+        if decision.allow:
+            return None
+
+        if decision.blocked:
+            self._ledger({
+                "event": "confirm",
+                "verdict": verdict,
+                "token": token,
+                "result": "blocked",
+                "reason": "write denied by user (write_approval gate)",
+                "caller": caller,
+                "session_id": proposal.session_id,
+                "checks": {"grounding": grounding},
+            })
+            return {"success": False, "step": "confirm",
+                    "error": decision.message}
+
+        # "action" is display-only (pending-list rendering); replay routing
+        # keys on plan["tool"] in tools.memory_tool.apply_memory_pending.
+        plan.setdefault("action", f"notes_{verdict.lower()}")
+        record = wa.stage_write(
+            wa.MEMORY, plan,
+            summary=f"{summary}: {plan['content'][:120]}",
+            origin=wa.current_origin(),
+        )
+        self._ledger({
+            "event": "confirm",
+            "verdict": verdict,
+            "token": token,
+            "result": "staged",
+            "pending_id": record.get("id"),
+            "caller": caller,
+            "origin": proposal.origin,
+            "session_id": proposal.session_id,
+            "content_sha": proposal.content_sha,
+            "checks": {"grounding": grounding},
+        })
+        return {
+            "success": True,
+            "step": "confirm",
+            "verdict": verdict,
+            "staged": True,
+            "pending_id": record.get("id"),
+            "message": decision.message,
+        }
+
     # -- misc ---------------------------------------------------------------------
 
     def _prune_expired_locked(self) -> None:
@@ -700,6 +957,94 @@ class MemoryWritePipeline:
         if reroute:
             out["reroute"] = reroute
         return out
+
+
+# ---------------------------------------------------------------------------
+# Resolved-plan applier — the single store-mutation point for confirm and for
+# the write-approval replay path.
+# ---------------------------------------------------------------------------
+
+def apply_notes_plan(
+    plan: Dict[str, Any], *, store: Optional[NotesStore] = None
+) -> Dict[str, Any]:
+    """Apply a fully-resolved notes write plan to the store.
+
+    The plan is produced by :meth:`MemoryWritePipeline.confirm` AFTER scrub,
+    grounding, and neighbor-binding all passed — this function only performs
+    the store mutation (the store re-validates body/evidence/caps itself).
+    Raises NoteValidationError / NoteNotFoundError on store refusal.
+    """
+    if store is None:
+        store = NotesStore(max_entries=notes_max_entries())
+    verdict = plan.get("verdict")
+    if verdict == "ADD":
+        return store.create(
+            plan["kind"],
+            plan["topic_key"],
+            plan["content"],
+            evidence=plan["evidence"],
+            origin=plan["origin"],
+            status=plan.get("status") or "active",
+        )
+    if verdict == "UPDATE":
+        return store.update(
+            plan["target_kind"],
+            plan["target_topic_key"],
+            body=plan["content"],
+            evidence_add=plan["evidence"],
+            confidence="contested" if plan.get("update_conflict") else None,
+        )
+    if verdict == "SUPERSEDE":
+        return store.supersede(
+            plan["target_kind"],
+            plan["target_topic_key"],
+            body=plan["content"],
+            evidence=plan["evidence"],
+            origin=plan["origin"],
+            new_kind=plan.get("new_kind") or None,
+            new_topic_key=plan.get("new_topic_key") or None,
+        )
+    raise NoteValidationError(f"unknown staged notes verdict {verdict!r}")
+
+
+def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Replay an approved staged notes write (write-approval pending store).
+
+    Called by ``tools.memory_tool.apply_memory_pending`` when a pending
+    ``memory``-subsystem record carries ``tool: notes_write``. Token-free by
+    design: the staged payload is the resolved plan, and human review is the
+    admission control at this point. Returns a store-style result dict.
+    """
+    pipeline = MemoryWritePipeline()
+    try:
+        note = apply_notes_plan(payload, store=pipeline.store)
+    except (NoteValidationError, NoteNotFoundError) as e:
+        pipeline._ledger({
+            "event": "apply-pending",
+            "verdict": payload.get("verdict"),
+            "result": "rejected",
+            "reason": str(e),
+            "caller": "write-approval",
+        })
+        return {"success": False, "error": str(e)}
+    pipeline._ledger({
+        "event": "apply-pending",
+        "verdict": payload.get("verdict"),
+        "result": "written",
+        "kind": note["kind"],
+        "topic_key": note["topic_key"],
+        "caller": "write-approval",
+        "origin": payload.get("origin"),
+    })
+    return {
+        "success": True,
+        "note": {
+            "ref": note_ref(note["kind"], note["topic_key"]),
+            "path": note["path"],
+            "status": note["status"],
+            "confidence": note["confidence"],
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -196,6 +196,66 @@ class TestSupersedeChain:
         assert old["superseded_by"] == "fact/nas.nfs.outage"
         assert store.read("fact", "nas.nfs.outage")["status"] == "active"
 
+    def test_cross_key_supersede_at_cap_leaves_predecessor_untouched(
+        self, tmp_path
+    ):
+        """Supersede must validate the successor BEFORE demoting the
+        predecessor: at the cap, a cross-key supersede fails cleanly and the
+        canonical note is not lost from active surfaces."""
+        small = NotesStore(tmp_path / "notes", max_entries=1)
+        _mknote(small, topic="nas.nfs.access")
+        with pytest.raises(NoteValidationError, match="cap"):
+            small.supersede(
+                "fact", "nas.nfs.access",
+                body="rekeyed story",
+                evidence=["episode:" + "b" * 32],
+                origin="curator",
+                new_topic_key="nas.nfs.outage",
+            )
+        old = small.read("fact", "nas.nfs.access")
+        assert old["status"] == "active"
+        assert old["superseded_by"] is None
+        assert not small.exists("fact", "nas.nfs.outage")
+
+    def test_supersede_with_invalid_successor_leaves_predecessor_untouched(
+        self, store
+    ):
+        _mknote(store)
+        # Same-key: oversized successor body fails validation up front.
+        with pytest.raises(NoteValidationError, match="cap"):
+            store.supersede(
+                "fact", "nas.nfs.access",
+                body="x" * (MAX_BODY_BYTES + 1),
+                evidence=["episode:" + "b" * 32],
+                origin="curator",
+            )
+        assert store.list_superseded("fact", "nas.nfs.access") == []
+        # Cross-key: missing evidence fails validation up front.
+        with pytest.raises(NoteValidationError, match="evidence"):
+            store.supersede(
+                "fact", "nas.nfs.access",
+                body="rekeyed", evidence=[], origin="curator",
+                new_topic_key="nas.nfs.outage",
+            )
+        old = store.read("fact", "nas.nfs.access")
+        assert old["status"] == "active"
+        assert old["superseded_by"] is None
+
+    def test_supersede_refuses_to_overwrite_existing_successor(self, store):
+        _mknote(store, topic="nas.nfs.access")
+        _mknote(store, topic="nas.nfs.outage")
+        with pytest.raises(NoteValidationError, match="already exists"):
+            store.supersede(
+                "fact", "nas.nfs.access",
+                body="collides", evidence=["episode:" + "b" * 32],
+                origin="curator", new_topic_key="nas.nfs.outage",
+            )
+        assert store.read("fact", "nas.nfs.access")["status"] == "active"
+
+    def test_agent_origin_is_valid_writer_provenance(self, store):
+        note = _mknote(store, origin="agent")
+        assert note["origin"] == "agent"
+
     def test_superseded_note_refuses_further_writes(self, store):
         _mknote(store)
         store.supersede(

@@ -1199,6 +1199,12 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 
     Returns the store's result dict.
     """
+    # Notes-tier staged writes share the memory subsystem's pending store
+    # (one memory.write_approval switch covers both durable tiers) but apply
+    # to the NotesStore, not MEMORY.md — route them to their own applier.
+    if payload.get("tool") == "notes_write":
+        from agent.memory_pipeline import apply_notes_pending
+        return apply_notes_pending(payload)
     action = payload.get("action")
     target = payload.get("target", "memory")
     content = payload.get("content") or ""

@@ -15,7 +15,7 @@ Frontmatter schema (ADR-004 §②)::
     valid_from: ISO-8601
     superseded_by: null | "kind/topic_key"
     evidence: [ref, ...]            # ≥1 required, serialized ref strings
-    origin: user|curator|dream|legacy
+    origin: user|agent|curator|dream|legacy
     usage: {search_hits: n, last_hit: ts|null}
     status: active|unconfirmed|demoted|tombstoned
 
@@ -75,7 +75,11 @@ NOTE_KINDS = frozenset(
     {"decision", "incident", "preference", "relationship", "project", "fact"}
 )
 NOTE_CONFIDENCE = ("supported", "corroborated", "contested")
-NOTE_ORIGINS = frozenset({"user", "curator", "dream", "legacy"})
+# "user" = the user stated/pinned it; "agent" = the main agent decided to
+# write it mid-session (the notes_write tool surface); "curator"/"dream" =
+# background writers; "legacy" = migrated seed notes. Writer provenance is
+# load-bearing: §①-5b keys one-shot decision/incident status on origin.
+NOTE_ORIGINS = frozenset({"user", "agent", "curator", "dream", "legacy"})
 NOTE_STATUSES = frozenset({"active", "unconfirmed", "demoted", "tombstoned"})
 
 # Body cap: 4KB of UTF-8 bytes (ADR-004 §② budget column).
@@ -272,6 +276,15 @@ class NotesStore:
         topic_key = validate_topic_key(topic_key)
         return self._base_dir / kind / f"{topic_key}.md"
 
+    @property
+    def _index_guard(self) -> Path:
+        """Store-wide lock sentinel serializing cap accounting: concurrent
+        creates of DIFFERENT topic_keys share no per-note lock, so without
+        this two racing ADDs could both pass ``_count_canonical`` and push
+        the index past its cap. Lock order (deadlock-free, fixed): index
+        guard FIRST, then per-note locks."""
+        return self._base_dir / ".index-guard"
+
     # -- validation -----------------------------------------------------------
 
     @staticmethod
@@ -394,7 +407,10 @@ class NotesStore:
             )
         body = self._validate_body(body)
         evidence_refs = self._validate_evidence(evidence)
-        with _file_lock(path):
+        # Index guard before the note lock: cap accounting must be serialized
+        # store-wide (two concurrent ADDs of different keys hold disjoint
+        # per-note locks and would otherwise both pass the count check).
+        with _file_lock(self._index_guard), _file_lock(path):
             if path.exists():
                 raise NoteValidationError(
                     f"Note {note_ref(kind, topic_key)} already exists — use "
@@ -507,25 +523,47 @@ class NotesStore:
         leaves the predecessor at its path. Either way the predecessor gets
         ``superseded_by`` set and ``status: demoted`` (body preserved —
         forgetting is interference, not deletion, ADR-004 §①-4).
+
+        Ordering is non-destructive-first: the successor is fully validated
+        (body, evidence, cap, target availability) BEFORE the predecessor is
+        touched, and on the cross-key path the successor file is written
+        before the predecessor is demoted — a failure or crash at any point
+        can duplicate a note (successor written, predecessor not yet
+        demoted) but can never orphan the canonical fact.
         """
         succ_kind = validate_kind(new_kind or kind)
         succ_key = validate_topic_key(new_topic_key or topic_key)
         old_path = self.path_for(kind, topic_key)
         same_key = succ_kind == validate_kind(kind) and succ_key == validate_topic_key(topic_key)
-        with _file_lock(old_path):
-            old = self.read(kind, topic_key)
-            if old["status"] == "tombstoned":
-                raise NoteValidationError(
-                    f"Note {note_ref(kind, topic_key)} is tombstoned; tombstones "
-                    f"are permanent."
-                )
-            if old.get("superseded_by"):
-                raise NoteValidationError(
-                    f"Note {note_ref(kind, topic_key)} was already superseded by "
-                    f"{old['superseded_by']}."
-                )
-            successor_ref = note_ref(succ_kind, succ_key)
-            old_frontmatter = {
+
+        # Validate ALL successor inputs before any predecessor mutation.
+        if origin not in NOTE_ORIGINS:
+            raise NoteValidationError(
+                f"Invalid origin {origin!r}: expected one of {sorted(NOTE_ORIGINS)}."
+            )
+        if confidence not in NOTE_CONFIDENCE:
+            raise NoteValidationError(
+                f"Invalid confidence {confidence!r}: expected one of "
+                f"{list(NOTE_CONFIDENCE)}."
+            )
+        new_body = self._validate_body(body)
+        new_evidence = self._validate_evidence(evidence)
+        successor_ref = note_ref(succ_kind, succ_key)
+        succ_frontmatter = {
+            "kind": succ_kind,
+            "topic_key": succ_key,
+            "confidence": confidence,
+            "valid_from": _utcnow_iso(),
+            "superseded_by": None,
+            "evidence": new_evidence,
+            "origin": origin,
+            "usage": {"search_hits": 0, "last_hit": None},
+            "status": "active",
+        }
+        succ_serialized = _serialize(succ_frontmatter, new_body)
+
+        def _demoted_predecessor(old: Dict[str, Any]) -> str:
+            fm = {
                 "kind": old["kind"],
                 "topic_key": old["topic_key"],
                 "confidence": old["confidence"],
@@ -536,28 +574,63 @@ class NotesStore:
                 "usage": old.get("usage") or {"search_hits": 0, "last_hit": None},
                 "status": "demoted",
             }
-            old_serialized = _serialize(old_frontmatter, old["body"])
-            if same_key:
+            return _serialize(fm, old["body"])
+
+        def _check_old(old: Dict[str, Any]) -> None:
+            if old["status"] == "tombstoned":
+                raise NoteValidationError(
+                    f"Note {note_ref(kind, topic_key)} is tombstoned; tombstones "
+                    f"are permanent."
+                )
+            if old.get("superseded_by"):
+                raise NoteValidationError(
+                    f"Note {note_ref(kind, topic_key)} was already superseded by "
+                    f"{old['superseded_by']}."
+                )
+
+        if same_key:
+            # Successor replaces the predecessor at the same path — the index
+            # count is unchanged, so no cap check and no index guard needed.
+            with _file_lock(old_path):
+                old = self.read(kind, topic_key)
+                _check_old(old)
                 arch_dir = old_path.parent / _SUPERSEDED_DIRNAME
                 n = len(list(arch_dir.glob(f"{old['topic_key']}.*.md"))) + 1 \
                     if arch_dir.is_dir() else 1
                 arch_path = arch_dir / f"{old['topic_key']}.{n}.md"
-                _atomic_write(arch_path, old_serialized)
-                try:
-                    old_path.unlink()
-                except OSError:
-                    pass
-            else:
-                _atomic_write(old_path, old_serialized)
-        return self.create(
-            succ_kind,
-            succ_key,
-            body,
-            evidence=evidence,
-            origin=origin,
-            confidence=confidence,
-            status="active",
-        )
+                # Archive a demoted COPY first (non-destructive), then swap
+                # the successor in atomically — the canonical path is never
+                # missing and never holds a half-written file.
+                _atomic_write(arch_path, _demoted_predecessor(old))
+                _atomic_write(old_path, succ_serialized)
+            return self.read(succ_kind, succ_key)
+
+        # Cross-key: the demoted predecessor stays canonical, so the index
+        # grows by one — cap accounting under the store-wide guard (same
+        # lock order as create: index guard, then note locks in sorted order
+        # so racing supersedes can't deadlock).
+        new_path = self.path_for(succ_kind, succ_key)
+        first, second = sorted((old_path, new_path), key=str)
+        with _file_lock(self._index_guard), _file_lock(first), _file_lock(second):
+            old = self.read(kind, topic_key)
+            _check_old(old)
+            if new_path.exists():
+                raise NoteValidationError(
+                    f"Note {successor_ref} already exists — supersede cannot "
+                    f"overwrite an existing successor; UPDATE it instead."
+                )
+            if self._count_canonical() >= self._max_entries:
+                raise NoteValidationError(
+                    f"Notes index is at its cap ({self._max_entries} entries, "
+                    f"ADR-004 §②): a cross-key supersede keeps the demoted "
+                    f"predecessor canonical, so it needs a free slot. Merge, "
+                    f"supersede same-key, or tombstone before re-keying."
+                )
+            # Successor first, demotion second: a crash between the two
+            # leaves both notes readable (duplicate), never neither.
+            _atomic_write(new_path, succ_serialized)
+            _atomic_write(old_path, _demoted_predecessor(old))
+        return self.read(succ_kind, succ_key)
 
     def tombstone(self, kind: str, topic_key: str) -> Dict[str, Any]:
         """Permanent removal marker. Body is preserved for audit; the note

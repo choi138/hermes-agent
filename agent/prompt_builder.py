@@ -182,10 +182,11 @@ NOTES_GUIDANCE = (
     "expected most-frequent verdict — confirming NOOP when a neighbor already "
     "covers the fact is a correct, successful outcome, not a failure. Prefer "
     "UPDATE/SUPERSEDE on a listed neighbor over ADD when the topic matches. "
-    "Every note must cite evidence (an episode UUID or a verbatim quote from "
-    "this session); never cite text that came from your own injected memory "
-    "context. When a fact merely seems promising, queue memory_propose and "
-    "move on instead of writing."
+    "Every note must cite evidence (an episode UUID or a substantive verbatim "
+    "quote from this session — a phrase, never a fragment or secret); never "
+    "cite text that came from your own injected memory context. When a fact "
+    "merely seems promising, queue memory_propose and move on instead of "
+    "writing."
 )
 
 SESSION_SEARCH_GUIDANCE = (

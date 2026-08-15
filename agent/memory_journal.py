@@ -94,6 +94,36 @@ def _safe_session_filename(session_id: str) -> str:
     return (name or "_no_session") + ".jsonl"
 
 
+def _scrub_evidence_refs(refs: Any) -> List[Dict[str, Any]]:
+    """Recursively scrub every string value in a list of evidence-ref dicts.
+
+    The WAL must never hold secrets (ADR-004 §4.2 triple-scrub rule (a) —
+    the prefetch buffer-scan is a third reader), and an evidence ref's
+    ``quote`` field is caller-supplied free text just like ``content``.
+    Refs are flat dicts by contract, but the tool schema only enforces
+    ``type: object``, so nested structure is scrubbed too rather than
+    trusted. Non-dict items are coerced to scrubbed strings rather than
+    dropped so the curator can still see that something malformed was cited.
+    """
+
+    def _scrub_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return _scrub(value)
+        if isinstance(value, dict):
+            return {str(k): _scrub_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_scrub_value(v) for v in value]
+        return value
+
+    out: List[Dict[str, Any]] = []
+    for ref in refs or []:
+        if isinstance(ref, dict):
+            out.append(_scrub_value(ref))
+        else:
+            out.append({"malformed": _scrub(str(ref))})
+    return out
+
+
 # One lock per journal file, module-level so it is shared across every
 # WAL/mirror INSTANCE in the process: the gateway builds many MemoryManagers
 # whose mem-sync workers all append to the same monthly mirror file, and each
@@ -277,7 +307,7 @@ class PendingTurnWAL:
                 "kind": "proposal",
                 "content": _scrub(content),
                 "kind_hint": str(kind_hint or ""),
-                "evidence_refs": list(evidence_refs or []),
+                "evidence_refs": _scrub_evidence_refs(evidence_refs),
                 "origin": str(origin or "user"),
             }
             _append_jsonl(path, record)

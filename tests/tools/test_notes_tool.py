@@ -103,6 +103,27 @@ class TestNotesWriteTool:
         refs = [n["ref"] for n in second["neighbors"]]
         assert "preference/jun.reply.style" in refs
 
+    def test_agent_origin_one_shot_decision_lands_unconfirmed(self):
+        """§①-5b is live on the hot path: the tool surface writes with
+        origin='agent' (not 'user'), so an agent-initiated one-shot
+        decision lands visible-but-unconfirmed."""
+        proposed = _propose(
+            content="decided to retire the legacy reranker", kind="decision"
+        )
+        confirmed = _call_write(
+            step="confirm", token=proposed["token"], verdict="ADD",
+            topic_key="reranker.retire.decision",
+        )
+        assert confirmed["success"] is True
+        assert confirmed["note"]["status"] == "unconfirmed"
+
+        from tools.notes_tool import _get_pipeline
+
+        note = _get_pipeline().store.read(
+            "decision", "reranker.retire.decision"
+        )
+        assert note["origin"] == "agent"
+
     def test_handle_notes_tool_routes_by_name(self):
         res = json.loads(
             handle_notes_tool(
@@ -192,6 +213,35 @@ class TestNotesReadTool:
         )
         assert res["success"] is False
 
+    def test_tombstoned_notes_leave_every_read_surface(self):
+        from tools.notes_tool import _get_pipeline
+
+        proposed = _propose()
+        _call_write(
+            step="confirm", token=proposed["token"], verdict="ADD",
+            topic_key="jun.reply.style",
+        )
+        store = _get_pipeline().store
+        store.tombstone("preference", "jun.reply.style")
+
+        # read: refused, and usage must not accrue.
+        read = json.loads(
+            notes_read_tool(action="read", kind="preference",
+                            topic_key="jun.reply.style")
+        )
+        assert read["success"] is False
+        assert "tombstoned" in read["error"]
+        assert store.read("preference", "jun.reply.style")["usage"]["search_hits"] == 0
+
+        # list: excluded from count AND index (they can never disagree).
+        listed = json.loads(notes_read_tool(action="list"))
+        assert listed["count"] == 0
+        assert listed["index"] == []
+
+        # audit escape hatch: explicit status filter still shows them.
+        audit = json.loads(notes_read_tool(action="list", status="tombstoned"))
+        assert audit["count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # memory_propose → pending WAL record shape
@@ -232,7 +282,7 @@ class TestMemoryProposeTool:
         assert rec["content"] == "soju07 daemon deploy is still pending"
         assert rec["kind_hint"] == "project"
         assert rec["evidence_refs"] == EP
-        assert rec["origin"] == "user"
+        assert rec["origin"] == "agent"  # honest writer provenance (§②)
         assert isinstance(rec["ts"], float)
 
     def test_proposals_count_as_unconsumed_in_the_startup_scan(self):
@@ -249,6 +299,24 @@ class TestMemoryProposeTool:
         )
         recs = self._wal_records()
         assert "A1b2C3d4E5f6G7h8I9j0" not in recs[-1]["content"]
+
+    def test_secrets_are_scrubbed_from_proposal_evidence_refs(self):
+        """ADR §4.2 triple-scrub rule (a): evidence quotes are caller free
+        text just like content — a raw secret must never land in the
+        pending WAL through the quote field."""
+        secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        memory_propose_tool(
+            content="ci deploy token exists",
+            evidence=[{
+                "type": "wal", "session_id": SESSION, "entry_id": "e1",
+                "quote": f"the token is {secret}",
+            }],
+            session_id=SESSION,
+        )
+        recs = self._wal_records()
+        raw = json.dumps(recs[-1], ensure_ascii=False)
+        assert secret not in raw
+        assert recs[-1]["evidence_refs"][0]["quote"].startswith("the token is")
 
     def test_empty_content_is_rejected(self):
         res = json.loads(memory_propose_tool(content="", session_id=SESSION))

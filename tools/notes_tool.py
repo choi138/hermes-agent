@@ -68,11 +68,16 @@ def notes_write_tool(
     step = (step or "").strip().lower()
 
     if step == "propose":
+        # origin="agent": this surface is the main agent deciding to write
+        # mid-session — NOT the user pinning a fact. Honest writer
+        # provenance keeps §①-5b live for the hot path (agent-origin
+        # one-shot decision/incident lands status=unconfirmed). Curator/
+        # dream callers use the pipeline API directly with their own origin.
         result = pipeline.propose(
             content or "",
             kind_hint=kind or "",
             evidence_refs=evidence,
-            origin="user",
+            origin="agent",
             session_id=session_id,
             caller="agent-tool",
             topic_key_hint=topic_key or "",
@@ -92,9 +97,12 @@ def notes_write_tool(
         # §③ step 7 — typed episode backfill for landed writes. Inert unless
         # memory.notes_backfill_enabled (default OFF: daemon pass-through not
         # yet deployed) AND the caller supplied an ingest-allowed manager.
-        if result.get("success") and result.get("verdict") in (
-            "ADD", "UPDATE", "SUPERSEDE",
-        ):
+        if result.get("success") and result.get("note") and result.get(
+            "verdict"
+        ) in ("ADD", "UPDATE", "SUPERSEDE"):
+            # (staged results carry no "note" — nothing was written yet, so
+            # there is nothing to backfill; the approval replay path is
+            # local-only by design.)
             try:
                 from agent.memory_pipeline import maybe_enqueue_note_backfill
 
@@ -146,6 +154,16 @@ def notes_read_tool(
             )
         except NoteValidationError as e:
             return tool_error(str(e), success=False)
+        # A tombstone leaves every read surface (permanent removal marker;
+        # the body stays on disk for offline audit only) — and it must not
+        # accrue usage, or reading a removed note would feed the promotion
+        # signal.
+        if note.get("status") == "tombstoned":
+            return tool_error(
+                f"Note {kind}/{topic_key} is tombstoned (permanently "
+                f"removed).",
+                success=False,
+            )
         # An explicit read is a retrieval event — it feeds the usage signal
         # the dream promotion pass consumes (ADR-004 §⑤). Fail-open.
         store.bump_usage(kind, topic_key)
@@ -156,11 +174,12 @@ def notes_read_tool(
             notes = store.list_notes(kind=kind or None, status=status or None)
         except NoteValidationError as e:
             return tool_error(str(e), success=False)
-        index = [
-            NotesStore.render_index_line(n)
-            for n in notes
-            if n.get("status") != "tombstoned"
-        ]
+        # Tombstones leave every read surface unless explicitly requested
+        # (status='tombstoned' is the audit escape hatch); count and index
+        # cover the SAME filtered set so they can never disagree.
+        if status != "tombstoned":
+            notes = [n for n in notes if n.get("status") != "tombstoned"]
+        index = [NotesStore.render_index_line(n) for n in notes]
         return json.dumps(
             {"success": True, "count": len(notes), "index": index},
             ensure_ascii=False,
@@ -192,7 +211,7 @@ def memory_propose_tool(
             content,
             kind_hint=kind_hint or "",
             evidence_refs=list(evidence or []),
-            origin="user",
+            origin="agent",  # honest provenance: the agent flagged it
         )
     except Exception as e:  # pragma: no cover - append_proposal is fail-open
         return tool_error(f"proposal queueing failed: {e}", success=False)
@@ -296,9 +315,10 @@ _EVIDENCE_SCHEMA = {
         "{type:'wal', session_id, entry_id, quote} / "
         "{type:'l0', month:'YYYY-MM', quote, wal_entry_id?} for a local "
         "journal record — the quote must be a VERBATIM substring of that "
-        "record. Set tainted:true on any span that came from injected "
-        "memory context (it will be refused — memory citing itself is not "
-        "evidence)."
+        "record, substantive (a phrase, not a 2-word fragment), and must "
+        "never contain secret material. Set tainted:true on any span that "
+        "came from injected memory context (it will be refused — memory "
+        "citing itself is not evidence)."
     ),
     "items": {"type": "object"},
 }

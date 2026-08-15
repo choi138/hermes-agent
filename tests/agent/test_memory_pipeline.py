@@ -295,11 +295,11 @@ class TestGrounding:
 
     def test_wal_missing_entry_fails_closed(self, tmp_path):
         wal = PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
-        wal.append_turn(SESSION, "u", "a")
+        wal.append_turn(SESSION, "the NAS array lost its 8TB data disk", "ack")
         pipeline = MemoryWritePipeline(hermes_home=tmp_path)
         ref = {
             "type": "wal", "session_id": SESSION, "entry_id": "doesnotexist",
-            "quote": "u",
+            "quote": "the NAS array lost its 8TB data disk",
         }
         res = _propose(pipeline, evidence_refs=[ref])
         confirm = pipeline.confirm(
@@ -313,7 +313,7 @@ class TestGrounding:
         mirror.append_turn(SESSION, "codex-lb는 10.0.0.113이다", "응")
         month = time.strftime("%Y-%m")
         pipeline = MemoryWritePipeline(hermes_home=tmp_path)
-        ref = {"type": "l0", "month": month, "quote": "10.0.0.113"}
+        ref = {"type": "l0", "month": month, "quote": "codex-lb는 10.0.0.113이다"}
         res = _propose(pipeline, content="codex-lb 호스트 주소",
                        kind_hint="project", evidence_refs=[ref])
         confirm = pipeline.confirm(
@@ -331,6 +331,228 @@ class TestGrounding:
         assert written
         assert written[-1]["checks"]["grounding"][0]["checked"] == "format-only"
         assert written[-1]["caller"] == "agent"
+
+
+# ---------------------------------------------------------------------------
+# Quote admissibility (secret-bypass + gameable-grounding fixes)
+# ---------------------------------------------------------------------------
+
+SECRET = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+
+class TestQuoteAdmissibility:
+    def _wal_with(self, tmp_path, text):
+        wal = PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
+        entry_id = wal.append_turn(SESSION, text, "ack")
+        return entry_id
+
+    def test_secret_bearing_quote_is_refused_and_never_persisted(self, tmp_path):
+        """A raw secret scrubs to the same mask the WAL holds, so it used to
+        ground successfully AND land verbatim in note frontmatter. Both are
+        now impossible: the quote is refused at the door."""
+        entry_id = self._wal_with(tmp_path, f"the deploy token is {SECRET}")
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": SESSION, "entry_id": entry_id,
+            "quote": f"the deploy token is {SECRET}",
+        }
+        res = _propose(pipeline, content="deploy token location",
+                       evidence_refs=[ref])
+        assert res["success"] is False
+        assert "secret" in res["error"]
+        # The raw secret must not exist anywhere under the pipeline's home
+        # (no note, no ledger line, no proposal state).
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert SECRET not in path.read_text(encoding="utf-8", errors="ignore")
+
+    def test_trivial_substring_quote_cannot_ground(self, tmp_path):
+        entry_id = self._wal_with(tmp_path, "hermes runs on soju07 hardware")
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": SESSION, "entry_id": entry_id,
+            "quote": "on",  # substring-matches virtually anything
+        }
+        res = _propose(pipeline, content="hermes runs on mars",
+                       evidence_refs=[ref])
+        assert res["success"] is False
+        assert "too short" in res["error"]
+
+    def test_short_korean_quote_passes_hangul_weighting(self, tmp_path):
+        entry_id = self._wal_with(tmp_path, "NAS 디스크가 분리됐다")
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": SESSION, "entry_id": entry_id,
+            "quote": "디스크가 분리됐다",  # 8 hangul chars → effective 17
+        }
+        res = _propose(pipeline, content="NAS 디스크 분리 인시던트",
+                       kind_hint="incident", evidence_refs=[ref])
+        assert res["success"] is True
+
+    def test_redaction_mask_quote_is_refused(self, tmp_path):
+        # The scrubbed WAL contains the mask itself — quoting the mask must
+        # not count as grounding.
+        entry_id = self._wal_with(tmp_path, f"token is {SECRET} ok")
+        pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+        ref = {
+            "type": "wal", "session_id": SESSION, "entry_id": entry_id,
+            "quote": "ghp_A1...Q7r8 abc12",  # mask + <8 residual chars
+        }
+        res = _propose(pipeline, content="a token exists",
+                       evidence_refs=[ref])
+        assert res["success"] is False
+        assert "redaction-mask" in res["error"]
+
+    def test_serialize_evidence_ref_scrubs_quotes(self):
+        ref = {
+            "type": "wal", "session_id": "s", "entry_id": "e",
+            "quote": f"token is {SECRET}",
+        }
+        serialized = mp.serialize_evidence_ref(ref)
+        assert SECRET not in serialized
+        assert "token is" in serialized
+
+
+# ---------------------------------------------------------------------------
+# Confirm-time bindings (kind + session)
+# ---------------------------------------------------------------------------
+
+class TestConfirmBindings:
+    def test_kind_override_at_confirm_is_rejected(self, pipeline):
+        """§①-5b bypass: a curator 'decision' proposal must not be
+        confirmable as kind='fact' (which would land status=active)."""
+        res = _propose(
+            pipeline,
+            content="decided to drop the temporal reranker",
+            kind_hint="decision",
+            origin="curator",
+        )
+        confirm = pipeline.confirm(
+            res["token"], "ADD", topic_key="reranker.drop.decision",
+            kind="fact", session_id=SESSION,
+        )
+        assert confirm["success"] is False
+        assert "fixed at propose" in confirm["error"]
+
+    def test_supersede_may_retype(self, pipeline):
+        pipeline.store.create(
+            "fact", "reranker.status.note", "temporal reranker is in use",
+            evidence=["episode:" + "b" * 32], origin="user",
+        )
+        res = _propose(
+            pipeline,
+            content="temporal reranker deprecated by decision",
+            kind_hint="fact",
+            topic_key_hint="reranker.status.note",
+        )
+        confirm = pipeline.confirm(
+            res["token"], "SUPERSEDE", target="fact/reranker.status.note",
+            kind="decision", topic_key="reranker.drop.decision",
+            session_id=SESSION,
+        )
+        assert confirm["success"] is True
+        assert confirm["note"]["ref"] == "decision/reranker.drop.decision"
+
+    def test_empty_session_cannot_confirm_mutating_verdicts(self, pipeline):
+        res = _propose(pipeline, session_id="")
+        confirm = pipeline.confirm(
+            res["token"], "ADD", topic_key="a.b.c", session_id=""
+        )
+        assert confirm["success"] is False
+        assert "session" in confirm["error"]
+
+    def test_empty_session_noop_is_still_allowed(self, pipeline):
+        res = _propose(pipeline, session_id="")
+        confirm = pipeline.confirm(res["token"], "NOOP", session_id="")
+        assert confirm["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# UPDATE conflict brake (§①-6, minimal deterministic form)
+# ---------------------------------------------------------------------------
+
+class TestUpdateConflictBrake:
+    def _neighbored_update(self, pipeline, old_body, new_body):
+        pipeline.store.create(
+            "fact", "nas.health.status", old_body,
+            evidence=["episode:" + "b" * 32], origin="user",
+        )
+        res = _propose(
+            pipeline, content=new_body, kind_hint="fact",
+            topic_key_hint="nas.health.status",
+        )
+        return pipeline.confirm(
+            res["token"], "UPDATE", target="fact/nas.health.status",
+            session_id=SESSION,
+        )
+
+    def test_zero_overlap_body_replacement_lands_contested(
+        self, pipeline, tmp_path
+    ):
+        confirm = self._neighbored_update(
+            pipeline, "NAS is DOWN after SATA detach", "모든 시스템 정상 가동"
+        )
+        assert confirm["success"] is True
+        note = pipeline.store.read("fact", "nas.health.status")
+        assert note["confidence"] == "contested"
+        events = _ledger_events(tmp_path)
+        written = [e for e in events if e.get("result") == "written"][-1]
+        assert written["update"] == {
+            "body_replaced": True, "conflict_flagged": True,
+        }
+
+    def test_overlapping_update_keeps_confidence(self, pipeline, tmp_path):
+        confirm = self._neighbored_update(
+            pipeline,
+            "NAS is DOWN after SATA detach",
+            "NAS is back up after SATA reseat",
+        )
+        assert confirm["success"] is True
+        note = pipeline.store.read("fact", "nas.health.status")
+        assert note["confidence"] == "supported"
+        events = _ledger_events(tmp_path)
+        written = [e for e in events if e.get("result") == "written"][-1]
+        assert written["update"]["conflict_flagged"] is False
+
+
+# ---------------------------------------------------------------------------
+# Write-approval gate (memory.write_approval covers the notes tier too)
+# ---------------------------------------------------------------------------
+
+class TestWriteApprovalGate:
+    def test_gate_on_stages_instead_of_writing(self, pipeline, monkeypatch):
+        from tools import write_approval as wa
+
+        monkeypatch.setattr(wa, "write_approval_enabled", lambda s: True)
+        res = _propose(pipeline)
+        confirm = pipeline.confirm(
+            res["token"], "ADD", topic_key="jun.search.pref",
+            session_id=SESSION,
+        )
+        assert confirm["success"] is True
+        assert confirm["staged"] is True
+        assert confirm["pending_id"]
+        assert pipeline.store.list_notes() == []  # nothing written
+
+        # Approval replay: the staged payload applies token-free through the
+        # memory tool's pending applier.
+        from tools.memory_tool import apply_memory_pending
+
+        record = wa.get_pending(wa.MEMORY, confirm["pending_id"])
+        assert record["payload"]["tool"] == "notes_write"
+        result = apply_memory_pending(record["payload"], None)
+        assert result["success"] is True
+        assert Path(result["note"]["path"]).exists()
+
+    def test_gate_off_writes_directly(self, pipeline):
+        res = _propose(pipeline)
+        confirm = pipeline.confirm(
+            res["token"], "ADD", topic_key="jun.search.pref",
+            session_id=SESSION,
+        )
+        assert confirm["success"] is True
+        assert "staged" not in confirm
+        assert len(pipeline.store.list_notes()) == 1
 
 
 # ---------------------------------------------------------------------------
