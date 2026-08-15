@@ -1404,6 +1404,7 @@ def test_router_absent_defaults_off():
     assert catalog.router.timeout_ms == 8000.0
     assert catalog.router.recent_turns == 5
     assert catalog.router.normal_downgrade_streak == 3
+    assert catalog.router.repromote_after_turns == 3
     assert catalog.router.chat_route == ""
     assert catalog.router.label_routes == ()
     assert catalog.router.decision_log == ""
@@ -1416,6 +1417,7 @@ def test_router_full_valid_block():
         "timeout_ms": 5000,
         "recent_turns": 8,
         "normal_downgrade_streak": 2,
+        "repromote_after_turns": 4,
         "chat_route": "chat",
         "label_routes": {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev", "DOCUMENT_WORK": ""},
         "decision_log": "/tmp/decisions.jsonl",
@@ -1427,6 +1429,7 @@ def test_router_full_valid_block():
     assert rc.timeout_ms == 5000.0
     assert rc.recent_turns == 8
     assert rc.normal_downgrade_streak == 2
+    assert rc.repromote_after_turns == 4
     assert rc.chat_route == "chat"
     # empty-string DOCUMENT_WORK means "never switches" — not an error
     assert rc.label_route_map() == {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev"}
@@ -1470,6 +1473,52 @@ def test_router_invalid_numeric_warns_and_defaults(key, value):
     warnings = _warnings(catalog)
     assert any(key in w.message for w in warnings)
     assert getattr(catalog.router, key) == getattr(mr.RouterConfig(), key)
+
+
+def test_repromote_after_turns_defaults():
+    catalog = mr.load_routes(_cfg(routes=_router_routes()))
+    assert catalog.issues == []
+    assert catalog.router.repromote_after_turns == 3
+    assert catalog.routes["dev"].repromote_after_turns is None
+
+
+def test_router_repromote_after_turns_zero_disables_without_warning():
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"repromote_after_turns": 0})
+    )
+    assert catalog.issues == []
+    assert catalog.router.repromote_after_turns == 0
+
+
+def test_route_repromote_after_turns_override_parsed():
+    routes = _router_routes()
+    routes["dev"]["repromote_after_turns"] = 5
+    routes["chat"]["repromote_after_turns"] = 0
+    catalog = mr.load_routes(_cfg(routes=routes))
+    assert catalog.issues == []
+    assert catalog.routes["dev"].repromote_after_turns == 5
+    assert catalog.routes["chat"].repromote_after_turns == 0
+
+
+@pytest.mark.parametrize("bad", ["3", True, False, -1, 2.5])
+def test_router_repromote_after_turns_invalid_warns_and_defaults(bad):
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"repromote_after_turns": bad})
+    )
+    assert any("repromote_after_turns" in w.message for w in _warnings(catalog))
+    assert _errors(catalog) == []
+    assert catalog.router.repromote_after_turns == 3
+
+
+@pytest.mark.parametrize("bad", ["3", True, False, -1, 2.5])
+def test_route_repromote_after_turns_invalid_warns_route_kept(bad):
+    catalog = mr.load_routes(
+        _cfg(routes={"dev": _route(repromote_after_turns=bad)})
+    )
+    assert any("repromote_after_turns" in w.message for w in _warnings(catalog))
+    assert _errors(catalog) == []
+    assert "dev" in catalog.routes
+    assert catalog.routes["dev"].repromote_after_turns is None
 
 
 def test_router_chat_route_must_name_declared_route():

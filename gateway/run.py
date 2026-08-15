@@ -7541,12 +7541,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(decision, "rule", None):
             return str(getattr(decision, "label", "") or "").strip()
         outcome = str(getattr(decision, "outcome", "") or "")
-        if outcome == "noop_already_chat":
+        label = str(getattr(decision, "label", "") or "")
+        if label == "NORMAL" and (
+            outcome in {"noop_already_chat", "repromote_held"}
+            or outcome.startswith("noop_satisfied_repromote_")
+        ):
             return str(getattr(router, "chat_route", "") or "").strip()
         label_routes = dict(getattr(router, "label_routes", None) or {})
-        return str(
-            label_routes.get(str(getattr(decision, "label", "") or "")) or ""
-        ).strip()
+        return str(label_routes.get(label) or "").strip()
 
     async def _model_router_stage(
         self,
@@ -7608,7 +7610,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime=runtime,
                 cfg=cfg,
                 catalog=catalog,
+                router=catalog.router,
                 mode=mode,
+                state=state,
             )
         else:
             decision = await asyncio.to_thread(
@@ -7631,7 +7635,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             mode == "enforce"
             and directive
-            and decision.outcome in {"switch", "downgrade_to_chat"}
+            and decision.outcome in {
+                "switch",
+                "downgrade_to_chat",
+                "repromote_to_primary",
+            }
         ):
             reasoning_effort = str(directive.get("reasoning_effort") or "")
             try:
@@ -7651,10 +7659,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             decision.record["applied"] = bool(applied)
             if reasoning_effort:
                 decision.record["reasoning_applied"] = bool(reasoning_applied)
-        elif mode == "enforce" and decision.outcome in {
-            "noop_satisfied",
-            "noop_already_chat",
-        }:
+        elif mode == "enforce" and (
+            decision.outcome in {
+                "noop_satisfied",
+                "noop_already_chat",
+                "repromote_held",
+            }
+            or decision.outcome.startswith("noop_satisfied_repromote_")
+        ):
             # A no-op still selected a concrete route; retain that explicit
             # intent rather than reconstructing it later from model membership.
             selected_route = self._selected_model_route(decision, catalog.router)

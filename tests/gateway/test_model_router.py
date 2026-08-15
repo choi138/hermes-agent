@@ -17,7 +17,7 @@ import io
 import json
 import urllib.error
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -561,6 +561,500 @@ def test_decision_record_schema():
 
 
 # ---------------------------------------------------------------------------
+# Re-promotion hysteresis (member → route primary)
+# ---------------------------------------------------------------------------
+
+
+def _member_cfg(*, router=None, static_rules=None):
+    """Return routes with non-primary accepted members on dev and chat."""
+    cfg = _cfg(router=router, static_rules=static_rules)
+    cfg["model_routes"]["routes"]["dev"]["accepted"] = ["model-a", "model-alt"]
+    cfg["model_routes"]["routes"]["chat"]["accepted"] = ["model-b", "grok-x"]
+    return cfg
+
+
+_MEMBER_RUNTIME = {"model": "model-alt", "provider": "p1"}
+
+
+def test_repromote_streak_advances_and_emits_at_threshold():
+    state = {}
+    cfg = _member_cfg()
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        outcomes.append(decision.outcome)
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "dev"
+    assert decision.directive["model"] == "model-a"
+    assert decision.directive["reason"] == (
+        "repromote to route primary after 3 accepted-member turns "
+        "(model-alt -> model-a)"
+    )
+    assert set(decision.record) == EXPECTED_RECORD_FIELDS
+    # Emission resets even in shadow, where the directive is not applied.
+    assert state["tg:c1"]["repromote_streak"] == 0
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+
+
+def test_repromote_fallback_label_never_advances():
+    state = {}
+
+    def _boom(prompt):
+        raise TimeoutError("classifier down")
+
+    cfg = _member_cfg()
+    for _ in range(5):
+        decision = _evaluate(
+            text="gateway 고장났어 디버깅해줘",
+            complete_dev=_boom,
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+        assert decision.record["source"] == "fallback"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_static_noop_always_advances(monkeypatch):
+    rules = [
+        {"name": "pin", "route": "dev", "when": {"text_matches_any": ["codex-lb"]}}
+    ]
+    cfg = _member_cfg(static_rules=rules)
+    sentinel = MagicMock(side_effect=AssertionError("classifier must not run"))
+    monkeypatch.setattr(mr_mod, "_call_gemini", sentinel)
+    state = {}
+    outcomes = [
+        _evaluate(
+            text="codex-lb 확인해줘",
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+            state=state,
+        ).outcome
+        for _ in range(3)
+    ]
+    sentinel.assert_not_called()
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+
+
+def test_repromote_streak_shared_across_static_and_classifier_paths():
+    rules = [
+        {"name": "pin", "route": "dev", "when": {"text_matches_any": ["codex-lb"]}}
+    ]
+    cfg = _member_cfg(static_rules=rules)
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            text="codex-lb 확인해줘",
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+            state=state,
+        )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+        state=state,
+    )
+    assert decision.outcome == "repromote_to_primary"
+
+
+def test_repromote_resets_on_primary_runtime():
+    cfg = _member_cfg()
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    assert state["tg:c1"]["repromote_streak"] == 2
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime={"model": "model-a", "provider": "p1"},
+    )
+    assert decision.outcome == "noop_satisfied"
+    assert state["tg:c1"]["repromote_streak"] == 0
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+
+
+def test_repromote_route_change_resets_then_advances():
+    cfg = _member_cfg()
+    cfg["model_routes"]["routes"]["doc"] = {
+        "description": "doc route",
+        "provider": "p1",
+        "model": "model-d",
+        "accepted": ["model-alt", "model-d"],
+    }
+    cfg["model_routes"]["router"]["label_routes"] = {
+        "SYSTEM_DEV": "dev",
+        "FRONTEND_DEV": "dev",
+        "DOCUMENT_WORK": "doc",
+    }
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    assert state["tg:c1"] == {
+        "normal_streak": 0,
+        "repromote_streak": 2,
+        "repromote_route": "dev",
+    }
+    decision = _evaluate(
+        complete_dev=_complete("DOCUMENT_WORK"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+    assert state["tg:c1"]["repromote_route"] == "doc"
+    assert state["tg:c1"]["repromote_streak"] == 1
+
+
+def test_repromote_resets_on_any_emission():
+    cfg = _member_cfg()
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime={"model": "model-z", "provider": "p1"},
+    )
+    assert decision.outcome == "switch"
+    assert state["tg:c1"]["repromote_streak"] == 0
+    assert state["tg:c1"]["repromote_route"] == ""
+
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    for expected in (
+        "normal_streak_1_of_3",
+        "normal_streak_2_of_3",
+        "downgrade_to_chat",
+    ):
+        decision = _evaluate(
+            complete_dev=_complete("NORMAL"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == expected
+    assert state["tg:c1"]["repromote_streak"] == 0
+
+
+def test_repromote_held_when_primary_unhealthy(monkeypatch):
+    cfg = _member_cfg()
+    state = {}
+    unhealthy = {
+        "route": "dev",
+        "provider": "p2",
+        "model": "model-b",
+        "reasoning_effort": "",
+        "source": "fallback:1",
+        "reason": "failover — p1 unhealthy (HTTP 500)",
+    }
+    monkeypatch.setattr(
+        mr_mod,
+        "_resolve_route_directive",
+        lambda *args, **kwargs: dict(unhealthy),
+    )
+    outcomes = [
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        ).outcome
+        for _ in range(4)
+    ]
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_held",
+        "repromote_held",
+    ]
+    assert state["tg:c1"]["repromote_streak"] == 3
+
+    healthy = {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-a",
+        "reasoning_effort": "xhigh",
+        "source": "default",
+        "reason": "dev",
+    }
+    monkeypatch.setattr(
+        mr_mod,
+        "_resolve_route_directive",
+        lambda *args, **kwargs: dict(healthy),
+    )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "repromote_to_primary"
+    assert decision.directive["model"] == "model-a"
+
+
+def test_repromote_held_when_resolution_matches_runtime(monkeypatch):
+    cfg = _member_cfg()
+    state = {
+        "tg:c1": {
+            "normal_streak": 0,
+            "repromote_streak": 2,
+            "repromote_route": "dev",
+        }
+    }
+    same = {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-alt",
+        "reasoning_effort": "",
+        "source": "default",
+        "reason": "dev",
+    }
+    monkeypatch.setattr(
+        mr_mod,
+        "_resolve_route_directive",
+        lambda *args, **kwargs: dict(same),
+    )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "repromote_held"
+    assert decision.directive is None
+
+
+def test_repromote_chat_member_via_noop_already_chat():
+    cfg = _member_cfg()
+    state = {}
+    runtime = {"model": "grok-x", "provider": "p2"}
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(
+            complete_dev=_complete("NORMAL"),
+            state=state,
+            cfg=cfg,
+            runtime=runtime,
+        )
+        outcomes.append(decision.outcome)
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "chat"
+    assert decision.directive["model"] == "model-b"
+    assert decision.directive["reason"] == (
+        "repromote to route primary after 3 accepted-member turns (grok-x -> model-b)"
+    )
+    assert state["tg:c1"]["normal_streak"] == 3
+    assert state["tg:c1"]["repromote_streak"] == 0
+
+
+def test_repromote_chat_plain_outcomes_untouched():
+    cfg = _member_cfg()
+    state = {}
+    decision = _evaluate(
+        complete_dev=_complete("NORMAL"),
+        cfg=cfg,
+        state=state,
+        runtime={"model": "model-b", "provider": "p2"},
+    )
+    assert decision.outcome == "noop_already_chat"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+    def _boom(prompt):
+        raise TimeoutError("down")
+
+    decision = _evaluate(
+        text="오늘 뭐 먹지?",
+        complete_dev=_boom,
+        cfg=cfg,
+        state=state,
+        runtime={"model": "grok-x", "provider": "p2"},
+    )
+    assert decision.outcome == "noop_already_chat"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_disabled_by_zero_threshold():
+    cfg = _member_cfg()
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 0
+    state = {}
+    for _ in range(4):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+    cfg = _member_cfg(router={"repromote_after_turns": 0})
+    state = {}
+    for _ in range(4):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+
+
+def test_repromote_route_override_wins_over_router_value():
+    def _outcomes(cfg):
+        state = {}
+        return [
+            _evaluate(
+                complete_dev=_complete("SYSTEM_DEV"),
+                state=state,
+                cfg=cfg,
+                runtime=_MEMBER_RUNTIME,
+            ).outcome
+            for _ in range(2)
+        ]
+
+    cfg = _member_cfg(router={"repromote_after_turns": 5})
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 2
+    assert _outcomes(cfg) == [
+        "noop_satisfied_repromote_1_of_2",
+        "repromote_to_primary",
+    ]
+
+    cfg = _member_cfg(router={"repromote_after_turns": 0})
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 2
+    assert _outcomes(cfg) == [
+        "noop_satisfied_repromote_1_of_2",
+        "repromote_to_primary",
+    ]
+
+
+def test_repromote_recovery_probe_is_enforce_only(monkeypatch, tmp_path):
+    """Shadow holds on cached health; enforce may probe a stale primary."""
+    monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH_TEST", "1")
+    monkeypatch.setattr(routes_mod, "_last_passive_unhealthy_write", {})
+    monkeypatch.setattr(routes_mod, "_unhealthy_memo", {"mtime": None, "value": False})
+    health_path = tmp_path / "health.json"
+    cfg = _member_cfg()
+    cfg["model_routes"]["health"] = {
+        "cache_path": str(health_path),
+        "fail_ttl_seconds": 1,
+    }
+    catalog = _catalog(cfg)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(routes_mod, "_now", lambda: clock["now"])
+    routes_mod.record_provider_outcome(
+        "p1",
+        False,
+        "server_error",
+        health=catalog.health,
+    )
+    before = health_path.read_bytes()
+    clock["now"] += catalog.health.fail_ttl_seconds + 1
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "base_url": "https://p1.example/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        },
+    )
+    auth_error = urllib.error.HTTPError(
+        "https://p1.example/v1/models",
+        401,
+        "Unauthorized",
+        None,
+        io.BytesIO(b'{"error":"unauthorized"}'),
+    )
+    urlopen = MagicMock(side_effect=auth_error)
+    monkeypatch.setattr(routes_mod, "_urlopen", urlopen)
+
+    state = {}
+    shadow_outcomes = [
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+            mode="shadow",
+        ).outcome
+        for _ in range(3)
+    ]
+    assert shadow_outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_held",
+    ]
+    urlopen.assert_not_called()
+    assert health_path.read_bytes() == before
+
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+        mode="enforce",
+    )
+    assert decision.outcome == "repromote_to_primary"
+    assert decision.directive["source"] == "default"
+    urlopen.assert_called_once()
+    assert json.loads(health_path.read_text(encoding="utf-8"))["p1"]["healthy"] is True
+
+
+# ---------------------------------------------------------------------------
 # Static rules
 # ---------------------------------------------------------------------------
 
@@ -954,6 +1448,72 @@ def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
 
     assert result is decision
     assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
+
+
+def test_gateway_enforce_applies_repromote_once_at_threshold(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    cfg = _member_cfg(router={"mode": "enforce"})
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(return_value=_MEMBER_RUNTIME)
+    runner._apply_model_router_directive = AsyncMock(return_value=(True, False))
+    logged = MagicMock()
+    monkeypatch.setattr(mr_mod, "log_decision", logged)
+    monkeypatch.setattr(
+        mr_mod,
+        "_call_configured_classifier",
+        lambda *args, **kwargs: json.dumps({
+            "evidence": "S5 routed dev work",
+            "label": "SYSTEM_DEV",
+            "confidence": 0.9,
+        }),
+    )
+
+    decisions = [
+        asyncio.run(
+            runner._model_router_stage(
+                _event("gateway 버그 고쳐줘"),
+                _source(),
+                "tg:c1",
+                mode="enforce",
+                user_config=cfg,
+            )
+        )
+        for _ in range(3)
+    ]
+
+    assert [decision.outcome for decision in decisions] == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    runner._apply_model_router_directive.assert_awaited_once()
+    applied_directive = runner._apply_model_router_directive.await_args.args[1]
+    assert applied_directive["route"] == "dev"
+    assert applied_directive["model"] == "model-a"
+    records = [call.args[0] for call in logged.call_args_list]
+    assert [record["applied"] for record in records] == [False, False, True]
+    assert records[-1]["reasoning_applied"] is False
+    assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["noop_satisfied_repromote_1_of_3", "repromote_held"],
+)
+def test_gateway_chat_repromote_noops_preserve_chat_route_intent(outcome):
+    from gateway.run import GatewayRunner
+
+    router = _catalog(_member_cfg()).router
+    decision = SimpleNamespace(
+        directive=None,
+        outcome=outcome,
+        label="NORMAL",
+        rule=None,
+    )
+
+    assert GatewayRunner._selected_model_route(decision, router) == "chat"
 
 
 def test_gateway_shadow_resolution_never_probes_or_rewrites_live_health(
