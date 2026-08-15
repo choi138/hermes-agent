@@ -1,8 +1,8 @@
 """Tests for the dynamic model router (ADR-003 Phase 2).
 
 Covers gateway/model_router.py (context payload parity, classifier fallback,
-hysteresis, static rules) and the current GatewayRunner shadow-only wiring
-(shadow evaluation, off/enforce no-op behavior, decision-log isolation).
+hysteresis, static rules) and GatewayRunner routing wiring (observational
+shadow evaluation, enforce application, and decision-log isolation).
 
 No network: the classifier is exercised either via the ``complete_dev`` seam
 or by monkeypatching ``gateway.model_router._call_gemini`` /
@@ -11,6 +11,7 @@ model_routes pytest guard. Decision logs go to tmp via
 ``HERMES_MODEL_ROUTER_DECISION_LOG``.
 """
 
+import asyncio
 import copy
 import io
 import json
@@ -872,12 +873,87 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     assert result is fake_decision
     assert runtime == runtime_before
     assert "_session_model_overrides" not in runner.__dict__
+    assert "_sessions" not in runner.__dict__
     assert evaluate.call_args.kwargs["mode"] == "shadow"
     assert evaluate.call_args.kwargs["session_key_override"] == "canonical:session"
     logged.assert_called_once_with(
         fake_decision.record,
         decision_log=evaluate.call_args.kwargs["catalog"].router.decision_log,
     )
+
+
+def test_gateway_enforce_apply_records_and_rebinds_exact_route_intent(monkeypatch):
+    from gateway.run import GatewayRunner
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    runner = object.__new__(GatewayRunner)
+    runner._evict_cached_agent = MagicMock()
+    switch = MagicMock(return_value=ModelSwitchResult(
+        success=True,
+        new_model="model-a",
+        target_provider="p1",
+        api_key="test-key",
+        base_url="https://p1.example/v1",
+        api_mode="chat_completions",
+    ))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch)
+    directive = {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-a",
+        "reasoning_effort": "xhigh",
+        "reason": "dev",
+    }
+
+    assert asyncio.run(
+        runner._apply_model_router_directive(
+            "tg:c1",
+            directive,
+            _cfg(router={"mode": "enforce"}),
+            source=_source(),
+        )
+    ) == (True, True)
+
+    conversation = runner._session_state("tg:c1").conversation
+    assert conversation.active_route_name == "dev"
+    assert conversation.model_override["model"] == "model-a"
+    rebuilt_agent = SimpleNamespace()
+    runner._bind_active_model_route(rebuilt_agent, "tg:c1")
+    assert rebuilt_agent._active_route_name == "dev"
+    runner._evict_cached_agent.assert_called_once_with("tg:c1")
+
+
+def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    cfg = _cfg(router={"mode": "enforce"})
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(
+        return_value={"model": "model-a", "provider": "p1"},
+    )
+    decision = SimpleNamespace(
+        directive=None,
+        outcome="noop_satisfied",
+        label="SYSTEM_DEV",
+        rule=None,
+        record={"source": "llm"},
+    )
+    monkeypatch.setattr(mr_mod, "classifier_decision", MagicMock(return_value=decision))
+    monkeypatch.setattr(mr_mod, "log_decision", MagicMock())
+
+    result = asyncio.run(
+        runner._model_router_stage(
+            _event(),
+            _source(),
+            "tg:c1",
+            mode="enforce",
+            user_config=cfg,
+        )
+    )
+
+    assert result is decision
+    assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
 
 
 def test_gateway_shadow_resolution_never_probes_or_rewrites_live_health(

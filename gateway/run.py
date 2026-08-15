@@ -2555,7 +2555,8 @@ _AGENT_PENDING_SENTINEL = object()
 # ``ConversationState.clear()`` — adding a field to ConversationState means
 # every boundary picks it up automatically.  This tuple is retained for:
 #   (a) plain-dict conversation-scoped stores not yet folded into
-#       SessionState (currently ``_pending_model_notes``), which
+#       SessionState (currently ``_pending_model_notes`` and
+#       ``_model_router_state``), which
 #       _clear_conversation_scope still pops per-key; and
 #   (b) the public test contract (tests import and iterate this tuple).
 # History: boundaries used to each carry a hand-copied pop-list that drifted
@@ -2578,6 +2579,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_reasoning_overrides",
     "_session_service_tier_overrides",
     "_pending_model_notes",
+    "_model_router_state",
     "_last_resolved_model",
     "_queued_events",
     # Stall-watchdog "already notified" latch (#72016). Cleared on /new so a
@@ -3293,6 +3295,16 @@ def _load_gateway_config() -> dict:
     except Exception:
         pass
     return raw
+
+
+def _model_router_mode(config: Optional[dict] = None) -> str:
+    """Return the configured dynamic-router mode without importing the router."""
+    cfg = config if isinstance(config, dict) else _load_gateway_config()
+    section = cfg.get("model_routes") if isinstance(cfg, dict) else None
+    router = section.get("router") if isinstance(section, dict) else None
+    raw_mode = router.get("mode") if isinstance(router, dict) else None
+    mode = str(raw_mode or "").strip().lower() if isinstance(raw_mode, str) else "off"
+    return mode if mode in {"shadow", "enforce"} else "off"
 
 
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
@@ -5393,6 +5405,10 @@ class TurnRunner:
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
+        # Route identity is session intent, not model membership.  Rebind it
+        # after both fresh construction and cache reuse so outage fallback can
+        # prefer the correct route even when accepted models overlap.
+        self._runner._bind_active_model_route(agent, ctx.session_key)
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -7462,6 +7478,318 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _model_router_runtime_snapshot(
+        self,
+        source: SessionSource,
+        session_key: str,
+        *,
+        user_config: Optional[dict] = None,
+    ) -> dict:
+        """Return the current non-secret runtime axes for route evaluation."""
+        try:
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=user_config,
+            )
+        except Exception:
+            logger.debug("model router: runtime snapshot failed", exc_info=True)
+            return {}
+        snapshot: dict = {}
+        if model:
+            snapshot["model"] = model
+        for name in ("provider", "base_url"):
+            value = (runtime_kwargs or {}).get(name)
+            if value:
+                snapshot[name] = value
+        try:
+            reasoning = self._resolve_session_reasoning_config(
+                source=source,
+                session_key=session_key,
+                model=str(model or ""),
+            )
+        except Exception:
+            logger.debug("model router: reasoning snapshot failed", exc_info=True)
+            reasoning = None
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                snapshot["reasoning_effort"] = "none"
+            elif reasoning.get("effort"):
+                snapshot["reasoning_effort"] = str(reasoning["effort"])
+        return snapshot
+
+    def _set_active_model_route(self, session_key: str, route_name: str) -> None:
+        """Persist applied route intent for agent rebuilds in this conversation."""
+        if not session_key:
+            return
+        self._session_state(session_key).conversation.active_route_name = str(
+            route_name or ""
+        ).strip()
+
+    def _bind_active_model_route(self, agent: Any, session_key: str) -> None:
+        """Copy conversation route intent onto a newly built or cached agent."""
+        state = self._peek_session_state(session_key) if session_key else None
+        route_name = state.conversation.active_route_name if state else ""
+        agent._active_route_name = str(route_name or "").strip()
+
+    @staticmethod
+    def _selected_model_route(decision: Any, router: Any) -> str:
+        """Recover the selected route for no-op decisions without model scans."""
+        directive = getattr(decision, "directive", None)
+        if isinstance(directive, dict):
+            return str(directive.get("route") or "").strip()
+        if getattr(decision, "rule", None):
+            return str(getattr(decision, "label", "") or "").strip()
+        outcome = str(getattr(decision, "outcome", "") or "")
+        if outcome == "noop_already_chat":
+            return str(getattr(router, "chat_route", "") or "").strip()
+        label_routes = dict(getattr(router, "label_routes", None) or {})
+        return str(
+            label_routes.get(str(getattr(decision, "label", "") or "")) or ""
+        ).strip()
+
+    async def _model_router_stage(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        *,
+        mode: str,
+        user_config: Optional[dict] = None,
+    ):
+        """Evaluate routing and apply directives only when mode is enforce.
+
+        Shadow continues through ``_evaluate_model_router_shadow`` in the
+        off-loop turn builder.  This pre-dispatch rail exists for live enforce
+        decisions so a successful route selection can rebuild the agent before
+        the current turn starts and carry the exact route intent with it.
+        """
+        from gateway import model_router
+        from hermes_cli.model_routes import load_routes
+
+        mode = str(mode or "").strip().lower()
+        if mode not in {"shadow", "enforce"}:
+            return None
+        raw_text = str(getattr(event, "text", None) or "")
+        text = raw_text.strip()
+        if not text:
+            return None
+
+        cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
+        catalog = load_routes(cfg)
+        if str(getattr(catalog.router, "mode", "") or "").lower() != mode:
+            return None
+        state = self.__dict__.get("_model_router_state")
+        if state is None:
+            state = {}
+            self._model_router_state = state
+
+        matched = model_router.match_static_rule(
+            list(catalog.static_rules or []),
+            text=raw_text,
+            source_context=model_router._source_dict(event),
+        )
+        if matched is None and text.startswith("/"):
+            return None
+
+        runtime = self._model_router_runtime_snapshot(
+            source,
+            session_key,
+            user_config=cfg,
+        )
+        if matched is not None:
+            rule, rule_name = matched
+            decision = await asyncio.to_thread(
+                model_router.static_rule_decision,
+                rule=rule,
+                rule_name=rule_name,
+                text=raw_text,
+                session_key=session_key,
+                runtime=runtime,
+                cfg=cfg,
+                catalog=catalog,
+                mode=mode,
+            )
+        else:
+            decision = await asyncio.to_thread(
+                model_router.classifier_decision,
+                event=event,
+                session_store=self.session_store,
+                runtime=runtime,
+                cfg=cfg,
+                catalog=catalog,
+                router=catalog.router,
+                mode=mode,
+                state=state,
+                complete_dev=None,
+                session_key_override=session_key,
+            )
+
+        directive = decision.directive
+        if mode == "enforce":
+            decision.record["applied"] = False
+        if (
+            mode == "enforce"
+            and directive
+            and decision.outcome in {"switch", "downgrade_to_chat"}
+        ):
+            reasoning_effort = str(directive.get("reasoning_effort") or "")
+            try:
+                applied, reasoning_applied = await self._apply_model_router_directive(
+                    session_key,
+                    directive,
+                    cfg,
+                    source=source,
+                )
+            except Exception:
+                logger.warning(
+                    "model router: applying directive %s failed",
+                    directive,
+                    exc_info=True,
+                )
+                applied, reasoning_applied = False, False
+            decision.record["applied"] = bool(applied)
+            if reasoning_effort:
+                decision.record["reasoning_applied"] = bool(reasoning_applied)
+        elif mode == "enforce" and decision.outcome in {
+            "noop_satisfied",
+            "noop_already_chat",
+        }:
+            # A no-op still selected a concrete route; retain that explicit
+            # intent rather than reconstructing it later from model membership.
+            selected_route = self._selected_model_route(decision, catalog.router)
+            if selected_route:
+                self._set_active_model_route(session_key, selected_route)
+
+        await asyncio.to_thread(
+            model_router.log_decision,
+            decision.record,
+            decision_log=catalog.router.decision_log,
+        )
+        return decision
+
+    async def _apply_model_router_directive(
+        self,
+        session_key: str,
+        directive: dict,
+        cfg: dict,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> tuple[bool, bool]:
+        """Apply a resolved route before dispatch and retain its exact intent."""
+        from hermes_cli.model_switch import switch_model
+
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        current_model = model_cfg.get("default", "")
+        current_provider = model_cfg.get("provider", "openrouter")
+        current_base_url = model_cfg.get("base_url", "")
+        current_api_key = ""
+        user_providers = cfg.get("providers") if isinstance(cfg, dict) else None
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_providers = (
+                cfg.get("custom_providers") if isinstance(cfg, dict) else None
+            )
+        state = self._peek_session_state(session_key)
+        override = state.conversation.model_override if state else None
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        result = await asyncio.to_thread(
+            switch_model,
+            raw_input=str(directive.get("model") or ""),
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=False,
+            explicit_provider=str(directive.get("provider") or "") or None,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+        )
+        if not result.success:
+            logger.warning(
+                "model router: switch to %s@%s failed: %s",
+                directive.get("model"),
+                directive.get("provider"),
+                result.error_message,
+            )
+            return False, False
+
+        session_db = getattr(self, "_session_db", None)
+        async_store = getattr(self, "async_session_store", None)
+        if session_db is not None and source is not None and async_store is not None:
+            try:
+                session_entry = await async_store.get_or_create_session(source)
+                await session_db.update_session_model(
+                    session_entry.session_id,
+                    result.new_model,
+                )
+            except Exception:
+                logger.debug(
+                    "model router: persist model switch to session DB failed",
+                    exc_info=True,
+                )
+
+        route_name = str(directive.get("route") or "").strip()
+        route_reason = str(directive.get("reason") or "").strip()
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {current_model} to "
+            f"{result.new_model} by the model router (route '{route_name}'"
+            + (
+                f": {route_reason}"
+                if route_reason and route_reason != route_name
+                else ""
+            )
+            + "). Adjust your self-identification accordingly.]"
+        )
+
+        self._session_state(session_key).conversation.model_override = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+        # Record route intent only after the runtime switch commits.  This is
+        # the source of truth consumed by route-aware outage fallback; never
+        # infer it later from ambiguous accepted-model membership.
+        self._set_active_model_route(session_key, route_name)
+        if async_store is not None:
+            try:
+                await async_store.set_model_override(
+                    session_key,
+                    self._session_state(session_key).conversation.model_override,
+                )
+            except Exception:
+                logger.debug(
+                    "model router: persist session override failed",
+                    exc_info=True,
+                )
+
+        reasoning_applied = False
+        effort = str(directive.get("reasoning_effort") or "")
+        if effort:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(effort)
+            if parsed is not None:
+                self._set_session_reasoning_override(session_key, parsed)
+                reasoning_applied = True
+
+        self._evict_cached_agent(session_key)
+        return True, reasoning_applied
+
     def _evaluate_model_router_shadow(
         self,
         *,
@@ -7474,9 +7802,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         This method is called from ``TurnRunner.run_sync`` after the gateway's
         canonical runtime resolution, which is already off the event loop. It
-        intentionally recognizes only ``mode: shadow``; ``off`` and
-        ``enforce`` are both non-mutating in M3. The data model retains
-        ``enforce`` for M4, but no switch/cache-invalidation path is wired here.
+        intentionally recognizes only ``mode: shadow``; enforce decisions use
+        the pre-dispatch ``_model_router_stage`` so an applied switch is visible
+        before agent construction.
         Route health resolution is read-only: shadow evaluation may append its
         decision log, but cannot run a recovery probe or rewrite shared health.
         """
@@ -18268,6 +18596,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
             session_entry.was_auto_reset = False
+
+        # Apply enforce-mode routing only after the canonical session key and
+        # any auto-reset boundary are final, but before this turn builds or
+        # reuses an agent.  That makes recorded route intent follow the same
+        # session identity as the agent itself (including topic/inbox aliases)
+        # and lets the freshly selected override feed this turn's runtime.
+        # Shadow evaluation remains observational in TurnRunner.run_sync.
+        if not getattr(event, "internal", False):
+            try:
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        router_cfg = _load_gateway_config()
+                        if _model_router_mode(router_cfg) == "enforce":
+                            await self._model_router_stage(
+                                event,
+                                source,
+                                session_key,
+                                mode="enforce",
+                                user_config=router_cfg,
+                            )
+                else:
+                    router_cfg = _load_gateway_config()
+                    if _model_router_mode(router_cfg) == "enforce":
+                        await self._model_router_stage(
+                            event,
+                            source,
+                            session_key,
+                            mode="enforce",
+                            user_config=router_cfg,
+                        )
+            except Exception:
+                logger.warning("model router enforce stage failed open", exc_info=True)
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -25012,6 +25374,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {
             "had_override": override is not None,
             "override": dict(override) if override is not None else None,
+            "active_route_name": (
+                _snap_state.conversation.active_route_name if _snap_state else ""
+            ),
         }
 
     def _restore_session_model_override(self, session_key: str, snapshot: dict) -> None:
@@ -25026,6 +25391,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _rst_state = self._peek_session_state(session_key)
             if _rst_state is not None:
                 _rst_state.conversation.model_override = None
+        self._set_active_model_route(
+            session_key,
+            str(snapshot.get("active_route_name") or ""),
+        )
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
