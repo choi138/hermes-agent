@@ -139,8 +139,12 @@ def test_load_on_disk_store_honors_configured_char_limits(hermes_home, monkeypat
 
     monkeypatch.setattr("hermes_cli.config.load_config", _boom)
     fallback = load_on_disk_store()
-    assert fallback.memory_char_limit == 2200
-    assert fallback.user_char_limit == 1375
+    # Behavior contract: the fallback IS the shared code default (single
+    # source of truth in tools/memory_tool.py), not an independent literal.
+    from tools.memory_tool import DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT
+
+    assert fallback.memory_char_limit == DEFAULT_MEMORY_CHAR_LIMIT
+    assert fallback.user_char_limit == DEFAULT_USER_CHAR_LIMIT
 
 
 # ---------------------------------------------------------------------------
