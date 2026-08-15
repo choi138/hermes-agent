@@ -34,7 +34,11 @@ import threading
 from concurrent.futures import Future, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_journal import PendingTurnWAL, run_pending_startup_scan_once
+from agent.memory_journal import (
+    L0Mirror,
+    PendingTurnWAL,
+    run_pending_startup_scan_once,
+)
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -500,6 +504,17 @@ class MemoryManager:
         except Exception:  # pragma: no cover - constructor is allocation-only
             logger.debug("memory-pending WAL unavailable (fail-open)", exc_info=True)
             self._pending_wal = None
+        # ADR-004 Phase 0 (§② L0-mirror): local evidence journal. Every
+        # payload that leaves for external memory (per-turn sync, session-end
+        # extraction input, pre-compress extraction input) is mirrored to a
+        # monthly JSONL on this host, so the graph is no longer the only copy
+        # of the evidence. Fail-open, zero LLM calls, disk only.
+        self._l0_mirror: Optional[L0Mirror] = None
+        try:
+            self._l0_mirror = L0Mirror()
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("l0-mirror unavailable (fail-open)", exc_info=True)
+            self._l0_mirror = None
 
     # -- Registration --------------------------------------------------------
 
@@ -782,6 +797,16 @@ class MemoryManager:
                 wal.append_turn(session_id, user_content, assistant_content)
                 if wal is not None else None
             )
+            # ADR-004 Phase 0 (§② L0-mirror): mirror the outgoing episode
+            # payload locally just before ingest submit. Fail-open.
+            if self._l0_mirror is not None:
+                self._l0_mirror.append_turn(
+                    session_id,
+                    user_content,
+                    assistant_content,
+                    provider_names=[p.name for p in providers],
+                    wal_entry_id=wal_entry_id,
+                )
             all_synced = True
             for provider in providers:
                 try:
@@ -982,6 +1007,15 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        # ADR-004 Phase 0 (§② L0-mirror): the end-of-session extraction input
+        # is an outgoing episode payload too — mirror it before handing it to
+        # providers. Fail-open; skipped when no provider will consume it.
+        if self._providers and self._l0_mirror is not None:
+            self._l0_mirror.append_messages(
+                "session_end",
+                messages,
+                provider_names=[p.name for p in self._providers],
+            )
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -1095,6 +1129,14 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        # ADR-004 Phase 0 (§② L0-mirror): mirror the pre-compression
+        # extraction input before providers consume it. Fail-open.
+        if self._providers and self._l0_mirror is not None:
+            self._l0_mirror.append_messages(
+                "pre_compress",
+                messages,
+                provider_names=[p.name for p in self._providers],
+            )
         parts = []
         for provider in self._providers:
             try:

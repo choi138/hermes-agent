@@ -1,7 +1,7 @@
 """Durable local journals for the external-memory pipeline (ADR-004 Phase 0).
 
-An append-only JSONL journal, written from the mem-sync worker just before a
-turn is dispatched to external memory providers:
+Two append-only JSONL journals, written from the mem-sync worker just before
+a turn is dispatched to external memory providers:
 
 * **pending/ WAL** (``~/.hermes/state/memory-pending/{session_id}.jsonl``,
   ADR-004 §4.2) — per-turn write-ahead log. Each turn is appended BEFORE
@@ -12,7 +12,13 @@ turn is dispatched to external memory providers:
   durability only: the startup scan counts unconsumed entries (the §⑩
   buffer-hit metric) and GCs fully-acked files, but never replays.
 
-Contract:
+* **L0-mirror** (``~/.hermes/memory/l0-mirror/{YYYY-MM}.jsonl``, ADR-004 §②)
+  — local co-primary evidence journal. Every payload that leaves for the
+  graph (per-turn sync, end-of-session extraction input, pre-compression
+  extraction input) is mirrored to a monthly file on this host, so a total
+  graph loss can be rebuilt from local disk. Zero LLM calls, disk only.
+
+Contract (both journals):
 
 * **Fail-open** — no public method may raise or block; any exception is
   swallowed and logged at debug. A broken disk must never fail a turn.
@@ -25,7 +31,7 @@ Contract:
 * **Crash-tolerant** — a truncated trailing line (crash mid-append) is
   skipped by the scanner, never fatal.
 
-Kill switch: set ``HERMES_MEMORY_JOURNAL_DISABLED=1`` to no-op the journal
+Kill switch: set ``HERMES_MEMORY_JOURNAL_DISABLED=1`` to no-op both journals
 (checked per call, so tests and operators can flip it without a restart).
 """
 
@@ -267,6 +273,115 @@ def _iter_jsonl_records(path: Path) -> Iterable[Dict[str, Any]]:
                 continue
             if isinstance(rec, dict):
                 yield rec
+
+
+def _flatten_message_text(content: Any) -> str:
+    """Flatten string/multimodal message content to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content if isinstance(b, dict)
+        ).strip()
+    if content is None:
+        return ""
+    return str(content)
+
+
+# ---------------------------------------------------------------------------
+# L0-mirror
+# ---------------------------------------------------------------------------
+
+class L0Mirror:
+    """Append-only local mirror of every payload sent to external memory.
+
+    Monthly JSONL files under ``memory/l0-mirror/``. Enough is recorded to
+    rebuild evidence episodes after a total graph loss: the role-tagged body,
+    the session id (group hint), the WAL entry id (join key to pending/), the
+    payload kind, and the destination provider names (source metadata).
+    """
+
+    def __init__(self, base_dir: Optional[Path] = None):
+        self._base_dir = Path(base_dir) if base_dir else None
+
+    def _dir(self) -> Path:
+        if self._base_dir is not None:
+            return self._base_dir
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "memory" / "l0-mirror"
+
+    def _path_for(self, ts: float) -> Path:
+        return self._dir() / (time.strftime("%Y-%m", time.localtime(ts)) + ".jsonl")
+
+    def append_turn(
+        self,
+        session_id: str,
+        user_content: str,
+        assistant_content: str,
+        *,
+        provider_names: Iterable[str] = (),
+        wal_entry_id: Optional[str] = None,
+    ) -> None:
+        """Mirror a per-turn sync payload just before ingest dispatch."""
+        if journals_disabled():
+            return
+        try:
+            ts = time.time()
+            _append_jsonl(self._path_for(ts), {
+                "ts": round(ts, 3),
+                "kind": "sync_turn",
+                "session_id": session_id or "",
+                "wal_entry_id": wal_entry_id or "",
+                "body": {
+                    "user": _scrub(user_content),
+                    "assistant": _scrub(assistant_content),
+                },
+                "meta": {"providers": list(provider_names)},
+            })
+        except Exception:
+            logger.debug("l0-mirror append_turn failed (fail-open)", exc_info=True)
+
+    def append_messages(
+        self,
+        kind: str,
+        messages: Optional[List[Dict[str, Any]]],
+        *,
+        session_id: str = "",
+        provider_names: Iterable[str] = (),
+    ) -> None:
+        """Mirror a message-list payload (``session_end`` / ``pre_compress``)
+        just before it is handed to provider extraction."""
+        if journals_disabled():
+            return
+        try:
+            body = []
+            for msg in messages or []:
+                if not isinstance(msg, dict):
+                    continue
+                entry: Dict[str, Any] = {
+                    "role": msg.get("role") or "",
+                    "content": _scrub(_flatten_message_text(msg.get("content"))),
+                }
+                tool_calls = msg.get("tool_calls") or []
+                if tool_calls:
+                    entry["tool_calls"] = [
+                        (tc.get("function") or {}).get("name", "?")
+                        for tc in tool_calls if isinstance(tc, dict)
+                    ]
+                body.append(entry)
+            ts = time.time()
+            _append_jsonl(self._path_for(ts), {
+                "ts": round(ts, 3),
+                "kind": kind,
+                "session_id": session_id or "",
+                "body": body,
+                "meta": {
+                    "providers": list(provider_names),
+                    "message_count": len(body),
+                },
+            })
+        except Exception:
+            logger.debug("l0-mirror append_messages failed (fail-open)", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
