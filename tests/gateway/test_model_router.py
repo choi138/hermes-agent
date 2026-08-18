@@ -1,8 +1,8 @@
 """Tests for the dynamic model router (ADR-003 Phase 2).
 
 Covers gateway/model_router.py (context payload parity, classifier fallback,
-hysteresis, static rules) and the current GatewayRunner shadow-only wiring
-(shadow evaluation, off/enforce no-op behavior, decision-log isolation).
+hysteresis, static rules) and GatewayRunner routing wiring (observational
+shadow evaluation, enforce application, and decision-log isolation).
 
 No network: the classifier is exercised either via the ``complete_dev`` seam
 or by monkeypatching ``gateway.model_router._call_gemini`` /
@@ -11,12 +11,16 @@ model_routes pytest guard. Decision logs go to tmp via
 ``HERMES_MODEL_ROUTER_DECISION_LOG``.
 """
 
+import asyncio
 import copy
 import io
 import json
+import os
+import threading
 import urllib.error
+from contextvars import ContextVar
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -67,6 +71,7 @@ def _cfg(*, router=None, static_rules=None):
             "mode": "shadow",
             "model": "gemini-3-flash-preview",
             "timeout_ms": 8000,
+            "classify_timeout_s": 2,
             "recent_turns": 5,
             "normal_downgrade_streak": 3,
             "chat_route": "chat",
@@ -103,6 +108,15 @@ def _event(text="hermes gateway 고장났어 디버깅해줘", **kwargs) -> Mess
 class _FakeDB:
     def __init__(self, messages):
         self.messages = list(messages)
+        self.recent_dialogue_limit = None
+
+    def get_recent_dialogue_messages(self, session_id, limit):
+        self.recent_dialogue_limit = limit
+        dialogue = [
+            message for message in self.messages
+            if message.get("role") in {"user", "assistant"}
+        ]
+        return dialogue[-limit:]
 
     def get_messages_as_conversation(self, session_id, include_ancestors=False):
         return list(self.messages)
@@ -221,6 +235,35 @@ def test_recent_turns_limit_applied():
     ])
     context = mr_mod.build_context(event=_event("hi"), session_store=store, recent_turn_limit=3)
     assert [t.content for t in context.recent_turns] == ["m7", "m8", "m9"]
+    assert store._db.recent_dialogue_limit == 3
+
+
+def test_recent_turns_real_db_limits_dialogue_tail_before_decode(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "router-state.db")
+    try:
+        db.create_session("sid-1", "gateway")
+        for index in range(12):
+            db.append_message("sid-1", "user", f"user-{index}")
+            db.append_message("sid-1", "tool", f"tool-{index}")
+            db.append_message("sid-1", "assistant", f"assistant-{index}")
+
+        store = _FakeStore()
+        store._db = db
+        context = mr_mod.build_context(
+            event=_event("hi"),
+            session_store=store,
+            recent_turn_limit=3,
+        )
+    finally:
+        db.close()
+
+    assert [(turn.role, turn.content) for turn in context.recent_turns] == [
+        ("assistant", "assistant-10"),
+        ("user", "user-11"),
+        ("assistant", "assistant-11"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +368,16 @@ def test_missing_api_key_takes_fallback_path(monkeypatch, tmp_path):
     )
     assert called == []  # never reached the network seam
     assert detail["source"] == "fallback"
+
+
+def test_classifier_key_read_uses_cached_scope_aware_env_resolver(monkeypatch):
+    import hermes_cli.config as config_mod
+
+    read = MagicMock(return_value=" scoped-key ")
+    monkeypatch.setattr(config_mod, "get_env_value", read)
+
+    assert mr_mod._read_env_key("GEMINI_API_KEY") == "scoped-key"
+    read.assert_called_once_with("GEMINI_API_KEY")
 
 
 def test_call_gemini_request_shape(monkeypatch):
@@ -560,6 +613,500 @@ def test_decision_record_schema():
 
 
 # ---------------------------------------------------------------------------
+# Re-promotion hysteresis (member → route primary)
+# ---------------------------------------------------------------------------
+
+
+def _member_cfg(*, router=None, static_rules=None):
+    """Return routes with non-primary accepted members on dev and chat."""
+    cfg = _cfg(router=router, static_rules=static_rules)
+    cfg["model_routes"]["routes"]["dev"]["accepted"] = ["model-a", "model-alt"]
+    cfg["model_routes"]["routes"]["chat"]["accepted"] = ["model-b", "grok-x"]
+    return cfg
+
+
+_MEMBER_RUNTIME = {"model": "model-alt", "provider": "p1"}
+
+
+def test_repromote_streak_advances_and_emits_at_threshold():
+    state = {}
+    cfg = _member_cfg()
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        outcomes.append(decision.outcome)
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "dev"
+    assert decision.directive["model"] == "model-a"
+    assert decision.directive["reason"] == (
+        "repromote to route primary after 3 accepted-member turns "
+        "(model-alt -> model-a)"
+    )
+    assert set(decision.record) == EXPECTED_RECORD_FIELDS
+    # Emission resets even in shadow, where the directive is not applied.
+    assert state["tg:c1"]["repromote_streak"] == 0
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+
+
+def test_repromote_fallback_label_never_advances():
+    state = {}
+
+    def _boom(prompt):
+        raise TimeoutError("classifier down")
+
+    cfg = _member_cfg()
+    for _ in range(5):
+        decision = _evaluate(
+            text="gateway 고장났어 디버깅해줘",
+            complete_dev=_boom,
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+        assert decision.record["source"] == "fallback"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_static_noop_always_advances(monkeypatch):
+    rules = [
+        {"name": "pin", "route": "dev", "when": {"text_matches_any": ["codex-lb"]}}
+    ]
+    cfg = _member_cfg(static_rules=rules)
+    sentinel = MagicMock(side_effect=AssertionError("classifier must not run"))
+    monkeypatch.setattr(mr_mod, "_call_gemini", sentinel)
+    state = {}
+    outcomes = [
+        _evaluate(
+            text="codex-lb 확인해줘",
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+            state=state,
+        ).outcome
+        for _ in range(3)
+    ]
+    sentinel.assert_not_called()
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+
+
+def test_repromote_streak_shared_across_static_and_classifier_paths():
+    rules = [
+        {"name": "pin", "route": "dev", "when": {"text_matches_any": ["codex-lb"]}}
+    ]
+    cfg = _member_cfg(static_rules=rules)
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            text="codex-lb 확인해줘",
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+            state=state,
+        )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+        state=state,
+    )
+    assert decision.outcome == "repromote_to_primary"
+
+
+def test_repromote_resets_on_primary_runtime():
+    cfg = _member_cfg()
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    assert state["tg:c1"]["repromote_streak"] == 2
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime={"model": "model-a", "provider": "p1"},
+    )
+    assert decision.outcome == "noop_satisfied"
+    assert state["tg:c1"]["repromote_streak"] == 0
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+
+
+def test_repromote_route_change_resets_then_advances():
+    cfg = _member_cfg()
+    cfg["model_routes"]["routes"]["doc"] = {
+        "description": "doc route",
+        "provider": "p1",
+        "model": "model-d",
+        "accepted": ["model-alt", "model-d"],
+    }
+    cfg["model_routes"]["router"]["label_routes"] = {
+        "SYSTEM_DEV": "dev",
+        "FRONTEND_DEV": "dev",
+        "DOCUMENT_WORK": "doc",
+    }
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    assert state["tg:c1"] == {
+        "normal_streak": 0,
+        "repromote_streak": 2,
+        "repromote_route": "dev",
+    }
+    decision = _evaluate(
+        complete_dev=_complete("DOCUMENT_WORK"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+    assert state["tg:c1"]["repromote_route"] == "doc"
+    assert state["tg:c1"]["repromote_streak"] == 1
+
+
+def test_repromote_resets_on_any_emission():
+    cfg = _member_cfg()
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime={"model": "model-z", "provider": "p1"},
+    )
+    assert decision.outcome == "switch"
+    assert state["tg:c1"]["repromote_streak"] == 0
+    assert state["tg:c1"]["repromote_route"] == ""
+
+    state = {}
+    for _ in range(2):
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+    for expected in (
+        "normal_streak_1_of_3",
+        "normal_streak_2_of_3",
+        "downgrade_to_chat",
+    ):
+        decision = _evaluate(
+            complete_dev=_complete("NORMAL"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == expected
+    assert state["tg:c1"]["repromote_streak"] == 0
+
+
+def test_repromote_held_when_primary_unhealthy(monkeypatch):
+    cfg = _member_cfg()
+    state = {}
+    unhealthy = {
+        "route": "dev",
+        "provider": "p2",
+        "model": "model-b",
+        "reasoning_effort": "",
+        "source": "fallback:1",
+        "reason": "failover — p1 unhealthy (HTTP 500)",
+    }
+    monkeypatch.setattr(
+        mr_mod,
+        "_resolve_route_directive",
+        lambda *args, **kwargs: dict(unhealthy),
+    )
+    outcomes = [
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        ).outcome
+        for _ in range(4)
+    ]
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_held",
+        "repromote_held",
+    ]
+    assert state["tg:c1"]["repromote_streak"] == 3
+
+    healthy = {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-a",
+        "reasoning_effort": "xhigh",
+        "source": "default",
+        "reason": "dev",
+    }
+    monkeypatch.setattr(
+        mr_mod,
+        "_resolve_route_directive",
+        lambda *args, **kwargs: dict(healthy),
+    )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "repromote_to_primary"
+    assert decision.directive["model"] == "model-a"
+
+
+def test_repromote_held_when_resolution_matches_runtime(monkeypatch):
+    cfg = _member_cfg()
+    state = {
+        "tg:c1": {
+            "normal_streak": 0,
+            "repromote_streak": 2,
+            "repromote_route": "dev",
+        }
+    }
+    same = {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-alt",
+        "reasoning_effort": "",
+        "source": "default",
+        "reason": "dev",
+    }
+    monkeypatch.setattr(
+        mr_mod,
+        "_resolve_route_directive",
+        lambda *args, **kwargs: dict(same),
+    )
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "repromote_held"
+    assert decision.directive is None
+
+
+def test_repromote_chat_member_via_noop_already_chat():
+    cfg = _member_cfg()
+    state = {}
+    runtime = {"model": "grok-x", "provider": "p2"}
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(
+            complete_dev=_complete("NORMAL"),
+            state=state,
+            cfg=cfg,
+            runtime=runtime,
+        )
+        outcomes.append(decision.outcome)
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "chat"
+    assert decision.directive["model"] == "model-b"
+    assert decision.directive["reason"] == (
+        "repromote to route primary after 3 accepted-member turns (grok-x -> model-b)"
+    )
+    assert state["tg:c1"]["normal_streak"] == 3
+    assert state["tg:c1"]["repromote_streak"] == 0
+
+
+def test_repromote_chat_plain_outcomes_untouched():
+    cfg = _member_cfg()
+    state = {}
+    decision = _evaluate(
+        complete_dev=_complete("NORMAL"),
+        cfg=cfg,
+        state=state,
+        runtime={"model": "model-b", "provider": "p2"},
+    )
+    assert decision.outcome == "noop_already_chat"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+    def _boom(prompt):
+        raise TimeoutError("down")
+
+    decision = _evaluate(
+        text="오늘 뭐 먹지?",
+        complete_dev=_boom,
+        cfg=cfg,
+        state=state,
+        runtime={"model": "grok-x", "provider": "p2"},
+    )
+    assert decision.outcome == "noop_already_chat"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_disabled_by_zero_threshold():
+    cfg = _member_cfg()
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 0
+    state = {}
+    for _ in range(4):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+    cfg = _member_cfg(router={"repromote_after_turns": 0})
+    state = {}
+    for _ in range(4):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+
+
+def test_repromote_route_override_wins_over_router_value():
+    def _outcomes(cfg):
+        state = {}
+        return [
+            _evaluate(
+                complete_dev=_complete("SYSTEM_DEV"),
+                state=state,
+                cfg=cfg,
+                runtime=_MEMBER_RUNTIME,
+            ).outcome
+            for _ in range(2)
+        ]
+
+    cfg = _member_cfg(router={"repromote_after_turns": 5})
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 2
+    assert _outcomes(cfg) == [
+        "noop_satisfied_repromote_1_of_2",
+        "repromote_to_primary",
+    ]
+
+    cfg = _member_cfg(router={"repromote_after_turns": 0})
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 2
+    assert _outcomes(cfg) == [
+        "noop_satisfied_repromote_1_of_2",
+        "repromote_to_primary",
+    ]
+
+
+def test_repromote_recovery_probe_is_enforce_only(monkeypatch, tmp_path):
+    """Shadow holds on cached health; enforce may probe a stale primary."""
+    monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH_TEST", "1")
+    monkeypatch.setattr(routes_mod, "_last_passive_unhealthy_write", {})
+    monkeypatch.setattr(routes_mod, "_unhealthy_memo", {"mtime": None, "value": False})
+    health_path = tmp_path / "health.json"
+    cfg = _member_cfg()
+    cfg["model_routes"]["health"] = {
+        "cache_path": str(health_path),
+        "fail_ttl_seconds": 1,
+    }
+    catalog = _catalog(cfg)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(routes_mod, "_now", lambda: clock["now"])
+    routes_mod.record_provider_outcome(
+        "p1",
+        False,
+        "server_error",
+        health=catalog.health,
+    )
+    before = health_path.read_bytes()
+    clock["now"] += catalog.health.fail_ttl_seconds + 1
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "base_url": "https://p1.example/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        },
+    )
+    auth_error = urllib.error.HTTPError(
+        "https://p1.example/v1/models",
+        401,
+        "Unauthorized",
+        None,
+        io.BytesIO(b'{"error":"unauthorized"}'),
+    )
+    urlopen = MagicMock(side_effect=auth_error)
+    monkeypatch.setattr(routes_mod, "_urlopen", urlopen)
+
+    state = {}
+    shadow_outcomes = [
+        _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"),
+            state=state,
+            cfg=cfg,
+            runtime=_MEMBER_RUNTIME,
+            mode="shadow",
+        ).outcome
+        for _ in range(3)
+    ]
+    assert shadow_outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_held",
+    ]
+    urlopen.assert_not_called()
+    assert health_path.read_bytes() == before
+
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"),
+        state=state,
+        cfg=cfg,
+        runtime=_MEMBER_RUNTIME,
+        mode="enforce",
+    )
+    assert decision.outcome == "repromote_to_primary"
+    assert decision.directive["source"] == "default"
+    urlopen.assert_called_once()
+    assert json.loads(health_path.read_text(encoding="utf-8"))["p1"]["healthy"] is True
+
+
+# ---------------------------------------------------------------------------
 # Static rules
 # ---------------------------------------------------------------------------
 
@@ -781,6 +1328,51 @@ def test_log_decision_swallows_write_errors(monkeypatch, tmp_path):
     mr_mod.log_decision({"policy": "dev_routing"})  # must not raise
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_log_decision_creates_private_file_and_parent(monkeypatch, tmp_path):
+    log_path = tmp_path / "private-logs" / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+
+    mr_mod.log_decision({"sequence": 1})
+
+    assert (log_path.parent.stat().st_mode & 0o777) == 0o700
+    assert (log_path.stat().st_mode & 0o777) == 0o600
+    lock_path = log_path.with_name(f"{log_path.name}.lock")
+    assert (lock_path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_log_decision_migrates_existing_0644_file(monkeypatch, tmp_path):
+    log_path = tmp_path / "existing" / "decisions.jsonl"
+    log_path.parent.mkdir()
+    log_path.write_text('{"sequence":0}\n', encoding="utf-8")
+    log_path.chmod(0o644)
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+
+    mr_mod.log_decision({"sequence": 1})
+
+    assert (log_path.stat().st_mode & 0o777) == 0o600
+    assert [json.loads(line)["sequence"] for line in log_path.read_text().splitlines()] == [0, 1]
+
+
+def test_log_decision_rotates_by_size_and_keeps_three(monkeypatch, tmp_path):
+    log_path = tmp_path / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+    monkeypatch.setattr(mr_mod, "_DECISION_LOG_MAX_BYTES", 1)
+
+    for sequence in range(5):
+        mr_mod.log_decision({"sequence": sequence})
+
+    def sequence(path):
+        return json.loads(path.read_text(encoding="utf-8"))["sequence"]
+
+    assert sequence(log_path) == 4
+    assert sequence(log_path.with_name(f"{log_path.name}.1")) == 3
+    assert sequence(log_path.with_name(f"{log_path.name}.2")) == 2
+    assert sequence(log_path.with_name(f"{log_path.name}.3")) == 1
+    assert not log_path.with_name(f"{log_path.name}.4").exists()
+
+
 def test_configured_classifier_provider_and_model_are_forwarded(monkeypatch):
     calls = []
 
@@ -872,12 +1464,349 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     assert result is fake_decision
     assert runtime == runtime_before
     assert "_session_model_overrides" not in runner.__dict__
+    assert "_sessions" not in runner.__dict__
     assert evaluate.call_args.kwargs["mode"] == "shadow"
     assert evaluate.call_args.kwargs["session_key_override"] == "canonical:session"
     logged.assert_called_once_with(
         fake_decision.record,
         decision_log=evaluate.call_args.kwargs["catalog"].router.decision_log,
     )
+
+
+def test_gateway_route_catalog_cache_invalidates_on_relevant_config_reload(
+    monkeypatch,
+):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    cfg = _cfg(router={"mode": "shadow"})
+    load = MagicMock(wraps=routes_mod.load_routes)
+    monkeypatch.setattr(routes_mod, "load_routes", load)
+
+    first = runner._model_route_catalog(cfg)
+    same_content = runner._model_route_catalog(copy.deepcopy(cfg))
+    irrelevant = copy.deepcopy(cfg)
+    irrelevant["display"] = {"compact": True}
+    same_routes = runner._model_route_catalog(irrelevant)
+
+    changed = copy.deepcopy(cfg)
+    changed["model_routes"]["router"]["recent_turns"] = 9
+    reloaded = runner._model_route_catalog(changed)
+
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", "off")
+    env_reloaded = runner._model_route_catalog(changed)
+
+    assert same_content is first
+    assert same_routes is first
+    assert reloaded is not first
+    assert reloaded.router.recent_turns == 9
+    assert env_reloaded is not reloaded
+    assert env_reloaded.router.mode == "off"
+    assert load.call_count == 3
+
+
+def test_gateway_shadow_turn_does_not_wait_for_hung_classifier(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    returned = threading.Event()
+    scheduled = {}
+
+    def hang(**_kwargs):
+        started.set()
+        release.wait(5)
+        finished.set()
+        return SimpleNamespace(record={"mode": "shadow"})
+
+    monkeypatch.setattr(runner, "_evaluate_model_router_shadow", hang)
+
+    def schedule_from_turn():
+        scheduled["value"] = runner._schedule_model_router_shadow(
+            event=_event(),
+            session_key="tg:c1",
+            runtime={"model": "model-b"},
+            user_config=_cfg(router={"mode": "shadow"}),
+        )
+        returned.set()
+
+    caller = threading.Thread(target=schedule_from_turn, daemon=True)
+    caller.start()
+    try:
+        assert started.wait(2)
+        assert returned.wait(2), "the user turn waited for shadow classification"
+    finally:
+        release.set()
+    caller.join(2)
+    assert finished.wait(2)
+    assert scheduled["value"] is True
+
+
+def test_gateway_shadow_worker_inherits_turn_context(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    marker = ContextVar("router_profile_marker", default="default")
+    token = marker.set("profile-a")
+    runner = object.__new__(GatewayRunner)
+    observed = {}
+    finished = threading.Event()
+
+    def evaluate(**_kwargs):
+        observed["marker"] = marker.get()
+        finished.set()
+        return None
+
+    monkeypatch.setattr(runner, "_evaluate_model_router_shadow", evaluate)
+    try:
+        assert runner._schedule_model_router_shadow(
+            event=_event(),
+            session_key="tg:c1",
+            runtime={"model": "model-b"},
+            user_config=_cfg(router={"mode": "shadow"}),
+        ) is True
+        assert finished.wait(2)
+    finally:
+        marker.reset(token)
+
+    assert observed["marker"] == "profile-a"
+
+
+@pytest.mark.parametrize(
+    ("configured", "override", "expected"),
+    [
+        ("shadow", "off", "off"),
+        ("off", "shadow", "shadow"),
+        ("shadow", "enforce", "enforce"),
+        ("enforce", "invalid", "off"),
+    ],
+)
+def test_gateway_router_mode_env_bridge_takes_precedence(
+    monkeypatch, configured, override, expected,
+):
+    from gateway.run import _model_router_mode
+
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", override)
+    assert _model_router_mode(_cfg(router={"mode": configured})) == expected
+
+
+def test_gateway_enforce_apply_records_and_rebinds_exact_route_intent(monkeypatch):
+    from gateway.run import GatewayRunner
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    runner = object.__new__(GatewayRunner)
+    runner._evict_cached_agent = MagicMock()
+    switch = MagicMock(return_value=ModelSwitchResult(
+        success=True,
+        new_model="model-a",
+        target_provider="p1",
+        api_key="test-key",
+        base_url="https://p1.example/v1",
+        api_mode="chat_completions",
+    ))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch)
+    directive = {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-a",
+        "reasoning_effort": "xhigh",
+        "reason": "dev",
+    }
+
+    assert asyncio.run(
+        runner._apply_model_router_directive(
+            "tg:c1",
+            directive,
+            _cfg(router={"mode": "enforce"}),
+            source=_source(),
+        )
+    ) == (True, True)
+
+    conversation = runner._session_state("tg:c1").conversation
+    assert conversation.active_route_name == "dev"
+    assert conversation.model_override["model"] == "model-a"
+    rebuilt_agent = SimpleNamespace()
+    runner._bind_active_model_route(rebuilt_agent, "tg:c1")
+    assert rebuilt_agent._active_route_name == "dev"
+    runner._evict_cached_agent.assert_called_once_with("tg:c1")
+
+
+def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    cfg = _cfg(router={"mode": "enforce"})
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(
+        return_value={"model": "model-a", "provider": "p1"},
+    )
+    decision = SimpleNamespace(
+        directive=None,
+        outcome="noop_satisfied",
+        label="SYSTEM_DEV",
+        rule=None,
+        record={"source": "llm"},
+    )
+    runner._classify_model_router_with_budget = AsyncMock(return_value=decision)
+    monkeypatch.setattr(mr_mod, "log_decision", MagicMock())
+
+    result = asyncio.run(
+        runner._model_router_stage(
+            _event(),
+            _source(),
+            "tg:c1",
+            mode="enforce",
+            user_config=cfg,
+        )
+    )
+
+    assert result is decision
+    assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
+
+
+def test_gateway_enforce_classifier_timeout_uses_fallback_without_late_state(
+    monkeypatch,
+):
+    from gateway.run import GatewayRunner
+
+    cfg = _cfg(router={"mode": "enforce", "classify_timeout_s": 0.05})
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(
+        return_value={"model": "model-b", "provider": "p2"},
+    )
+    runner._apply_model_router_directive = AsyncMock(return_value=(True, False))
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def hanging_classifier(_context, **_kwargs):
+        started.set()
+        release.wait(5)
+        finished.set()
+        return {
+            "label": "NORMAL",
+            "confidence": 0.99,
+            "evidence": "S1 ordinary chat",
+            "source": "llm",
+            "classification_reason": "",
+        }
+
+    monkeypatch.setattr(mr_mod, "classify_dev_detailed", hanging_classifier)
+    monkeypatch.setattr(mr_mod, "log_decision", MagicMock())
+
+    async def scenario():
+        task = asyncio.create_task(
+            runner._model_router_stage(
+                _event("gateway 버그 고쳐줘"),
+                _source(),
+                "tg:c1",
+                mode="enforce",
+                user_config=cfg,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            decision = await asyncio.wait_for(task, timeout=2)
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await asyncio.sleep(0)
+        return decision
+
+    decision = asyncio.run(scenario())
+    assert decision.record["source"] == "fallback"
+    assert decision.record["classification_reason"] == "classifier_timeout"
+    assert decision.label == "SYSTEM_DEV"
+    assert runner._model_router_state["tg:c1"]["normal_streak"] == 0
+
+
+def test_enforce_state_transaction_rejects_stale_shadow_commit():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    key, shared, shadow_identity, shadow_local = (
+        runner._begin_model_router_state("tg:c1", invalidate=False)
+    )
+    shadow_local[key]["normal_streak"] = 9
+
+    enforce_key, enforce_shared, _enforce_identity, _enforce_local = (
+        runner._begin_model_router_state("tg:c1", invalidate=True)
+    )
+
+    assert enforce_key == key
+    assert enforce_shared is shared
+    assert runner._commit_model_router_state(
+        key, shared, shadow_identity, shadow_local
+    ) is False
+    assert shared[key]["normal_streak"] == 0
+
+
+def test_gateway_enforce_applies_repromote_once_at_threshold(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    cfg = _member_cfg(router={"mode": "enforce"})
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(return_value=_MEMBER_RUNTIME)
+    runner._apply_model_router_directive = AsyncMock(return_value=(True, False))
+    logged = MagicMock()
+    monkeypatch.setattr(mr_mod, "log_decision", logged)
+    monkeypatch.setattr(
+        mr_mod,
+        "_call_configured_classifier",
+        lambda *args, **kwargs: json.dumps({
+            "evidence": "S5 routed dev work",
+            "label": "SYSTEM_DEV",
+            "confidence": 0.9,
+        }),
+    )
+
+    decisions = [
+        asyncio.run(
+            runner._model_router_stage(
+                _event("gateway 버그 고쳐줘"),
+                _source(),
+                "tg:c1",
+                mode="enforce",
+                user_config=cfg,
+            )
+        )
+        for _ in range(3)
+    ]
+
+    assert [decision.outcome for decision in decisions] == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    runner._apply_model_router_directive.assert_awaited_once()
+    applied_directive = runner._apply_model_router_directive.await_args.args[1]
+    assert applied_directive["route"] == "dev"
+    assert applied_directive["model"] == "model-a"
+    records = [call.args[0] for call in logged.call_args_list]
+    assert [record["applied"] for record in records] == [False, False, True]
+    assert records[-1]["reasoning_applied"] is False
+    assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["noop_satisfied_repromote_1_of_3", "repromote_held"],
+)
+def test_gateway_chat_repromote_noops_preserve_chat_route_intent(outcome):
+    from gateway.run import GatewayRunner
+
+    router = _catalog(_member_cfg()).router
+    decision = SimpleNamespace(
+        directive=None,
+        outcome=outcome,
+        label="NORMAL",
+        rule=None,
+    )
+
+    assert GatewayRunner._selected_model_route(decision, router) == "chat"
 
 
 def test_gateway_shadow_resolution_never_probes_or_rewrites_live_health(

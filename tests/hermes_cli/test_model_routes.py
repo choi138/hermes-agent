@@ -10,6 +10,7 @@ import errno
 import io
 import json
 import os
+import threading
 import urllib.error
 from pathlib import Path
 
@@ -1056,7 +1057,11 @@ def test_pytest_guard(monkeypatch, tmp_path):
 def passive_state(monkeypatch):
     """Isolate module-level passive-health state between tests."""
     monkeypatch.setattr(mr, "_last_passive_unhealthy_write", {})
-    monkeypatch.setattr(mr, "_unhealthy_memo", {"mtime": None, "value": False})
+    monkeypatch.setattr(
+        mr,
+        "_unhealthy_memo",
+        {"mtime": None, "value": False, "cache": {}},
+    )
 
 
 def _read_cache(health):
@@ -1143,6 +1148,105 @@ def test_has_unhealthy_verdicts_memo(monkeypatch, tmp_path, health_test_env, pas
 
     monkeypatch.setattr(mr, "_read_health_cache", boom)
     assert mr.has_unhealthy_verdicts(health=health) is True
+
+
+def test_provider_health_reuses_unchanged_cache_snapshot(
+    monkeypatch, tmp_path, health_test_env, passive_state,
+):
+    health = _health(tmp_path)
+    _seed_verdict(health, "p1", healthy=False, ts=1000.0)
+    monkeypatch.setattr(mr, "_now", _Clock(1000.0))
+
+    assert mr.provider_health("p1", health=health) == (False, "seeded")
+
+    def boom(path):
+        raise AssertionError("unchanged health cache must not be re-read")
+
+    monkeypatch.setattr(mr, "_read_health_cache", boom)
+    assert mr.provider_health("p1", health=health) == (False, "seeded")
+
+
+def test_unhealthy_memo_check_and_write_are_atomic_across_threads(
+    monkeypatch, tmp_path, health_test_env, passive_state,
+):
+    health = _health(tmp_path)
+    _seed_verdict(health, "p1", healthy=False, ts=100.0)
+    monkeypatch.setattr(mr, "_now", _Clock(200.0))
+    original_read = mr._read_health_cache
+    scan_read = threading.Event()
+    release_scan = threading.Event()
+    scan_done = threading.Event()
+    clear_done = threading.Event()
+
+    def slow_scanner_read(path):
+        cache = original_read(path)
+        if threading.current_thread().name == "memo-scan":
+            scan_read.set()
+            release_scan.wait(2)
+        return cache
+
+    monkeypatch.setattr(mr, "_read_health_cache", slow_scanner_read)
+
+    def scan():
+        mr.has_unhealthy_verdicts(health=health)
+        scan_done.set()
+
+    def clear():
+        mr.record_provider_outcome("p1", True, "recovered", health=health)
+        clear_done.set()
+
+    threading.Thread(target=scan, name="memo-scan", daemon=True).start()
+    assert scan_read.wait(2)
+    threading.Thread(target=clear, name="memo-clear", daemon=True).start()
+
+    acquired = mr._health_state_lock.acquire(blocking=False)
+    if acquired:
+        mr._health_state_lock.release()
+    try:
+        assert acquired is False, "memo scan did not hold the atomic state lock"
+    finally:
+        release_scan.set()
+
+    assert scan_done.wait(2)
+    assert clear_done.wait(2)
+    assert mr.has_unhealthy_verdicts(health=health) is False
+    assert mr._unhealthy_memo["value"] is False
+
+
+def test_healthy_clear_rejects_threaded_stale_unhealthy_write(
+    monkeypatch, tmp_path, health_test_env, passive_state,
+):
+    health = _health(tmp_path)
+    path = health.resolved_cache_path()
+    _seed_verdict(health, "p1", healthy=False, ts=50.0)
+    monkeypatch.setattr(mr, "_now", _Clock(200.0))
+    clear_done = threading.Event()
+    stale_done = threading.Event()
+    stale_result = {}
+
+    def clear():
+        mr.record_provider_outcome("p1", True, "recovered", health=health)
+        clear_done.set()
+
+    def stale_failure():
+        clear_done.wait(2)
+        stale_result["stored"] = mr._store_health_verdict(
+            path,
+            "p1",
+            {"healthy": False, "reason": "passive: stale", "ts": 100.0},
+        )
+        stale_done.set()
+
+    threading.Thread(target=stale_failure, daemon=True).start()
+    threading.Thread(target=clear, daemon=True).start()
+    assert clear_done.wait(2)
+    assert stale_done.wait(2)
+
+    entry = _read_cache(health)["p1"]
+    assert stale_result["stored"] is False
+    assert entry["healthy"] is True
+    assert entry["ts"] == 200.0
+    assert mr.has_unhealthy_verdicts(health=health) is False
 
 
 def test_has_unhealthy_verdicts_skips_full_catalog_parse(
@@ -1402,8 +1506,10 @@ def test_router_absent_defaults_off():
     assert catalog.router.mode == "off"
     assert catalog.router.model == mr.DEFAULT_ROUTER_MODEL
     assert catalog.router.timeout_ms == 8000.0
+    assert catalog.router.classify_timeout_s == 2.0
     assert catalog.router.recent_turns == 5
     assert catalog.router.normal_downgrade_streak == 3
+    assert catalog.router.repromote_after_turns == 3
     assert catalog.router.chat_route == ""
     assert catalog.router.label_routes == ()
     assert catalog.router.decision_log == ""
@@ -1414,8 +1520,10 @@ def test_router_full_valid_block():
         "mode": "shadow",
         "model": "gemini-3-flash-preview",
         "timeout_ms": 5000,
+        "classify_timeout_s": 1.5,
         "recent_turns": 8,
         "normal_downgrade_streak": 2,
+        "repromote_after_turns": 4,
         "chat_route": "chat",
         "label_routes": {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev", "DOCUMENT_WORK": ""},
         "decision_log": "/tmp/decisions.jsonl",
@@ -1425,8 +1533,10 @@ def test_router_full_valid_block():
     rc = catalog.router
     assert rc.mode == "shadow"
     assert rc.timeout_ms == 5000.0
+    assert rc.classify_timeout_s == 1.5
     assert rc.recent_turns == 8
     assert rc.normal_downgrade_streak == 2
+    assert rc.repromote_after_turns == 4
     assert rc.chat_route == "chat"
     # empty-string DOCUMENT_WORK means "never switches" — not an error
     assert rc.label_route_map() == {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev"}
@@ -1454,6 +1564,25 @@ def test_router_yaml_false_mode_is_off_without_issue():
     assert catalog.router.mode == "off"
 
 
+@pytest.mark.parametrize(
+    ("configured", "override", "expected"),
+    [
+        ("shadow", "off", "off"),
+        ("off", "shadow", "shadow"),
+        ("shadow", "enforce", "enforce"),
+        ("enforce", "typo", "off"),
+    ],
+)
+def test_router_mode_env_bridge_takes_precedence(
+    monkeypatch, configured, override, expected,
+):
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", override)
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"mode": configured})
+    )
+    assert catalog.router.mode == expected
+
+
 def test_router_unknown_key_warns():
     catalog = mr.load_routes(
         _cfg(routes=_router_routes(), router={"mode": "shadow", "modle": "typo"})
@@ -1463,13 +1592,67 @@ def test_router_unknown_key_warns():
     assert catalog.router.mode == "shadow"
 
 
-@pytest.mark.parametrize("key", ["timeout_ms", "recent_turns", "normal_downgrade_streak"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "timeout_ms",
+        "classify_timeout_s",
+        "recent_turns",
+        "normal_downgrade_streak",
+    ],
+)
 @pytest.mark.parametrize("value", [0, -1, "5", True, None])
 def test_router_invalid_numeric_warns_and_defaults(key, value):
     catalog = mr.load_routes(_cfg(routes=_router_routes(), router={key: value}))
     warnings = _warnings(catalog)
     assert any(key in w.message for w in warnings)
     assert getattr(catalog.router, key) == getattr(mr.RouterConfig(), key)
+
+
+def test_repromote_after_turns_defaults():
+    catalog = mr.load_routes(_cfg(routes=_router_routes()))
+    assert catalog.issues == []
+    assert catalog.router.repromote_after_turns == 3
+    assert catalog.routes["dev"].repromote_after_turns is None
+
+
+def test_router_repromote_after_turns_zero_disables_without_warning():
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"repromote_after_turns": 0})
+    )
+    assert catalog.issues == []
+    assert catalog.router.repromote_after_turns == 0
+
+
+def test_route_repromote_after_turns_override_parsed():
+    routes = _router_routes()
+    routes["dev"]["repromote_after_turns"] = 5
+    routes["chat"]["repromote_after_turns"] = 0
+    catalog = mr.load_routes(_cfg(routes=routes))
+    assert catalog.issues == []
+    assert catalog.routes["dev"].repromote_after_turns == 5
+    assert catalog.routes["chat"].repromote_after_turns == 0
+
+
+@pytest.mark.parametrize("bad", ["3", True, False, -1, 2.5])
+def test_router_repromote_after_turns_invalid_warns_and_defaults(bad):
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"repromote_after_turns": bad})
+    )
+    assert any("repromote_after_turns" in w.message for w in _warnings(catalog))
+    assert _errors(catalog) == []
+    assert catalog.router.repromote_after_turns == 3
+
+
+@pytest.mark.parametrize("bad", ["3", True, False, -1, 2.5])
+def test_route_repromote_after_turns_invalid_warns_route_kept(bad):
+    catalog = mr.load_routes(
+        _cfg(routes={"dev": _route(repromote_after_turns=bad)})
+    )
+    assert any("repromote_after_turns" in w.message for w in _warnings(catalog))
+    assert _errors(catalog) == []
+    assert "dev" in catalog.routes
+    assert catalog.routes["dev"].repromote_after_turns is None
 
 
 def test_router_chat_route_must_name_declared_route():

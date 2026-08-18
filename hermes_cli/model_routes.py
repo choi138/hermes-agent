@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -37,7 +38,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover — non-POSIX; merge-on-write still applies
     fcntl = None  # type: ignore[assignment]
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,24 +71,56 @@ _HEALTH_CACHE_FILENAME = "model_route_health.json"  # under get_hermes_home()/"s
 _CREDIT_SNIFF_KEYWORDS = ("credit", "insufficient", "quota", "billing")
 _HEALTH_ENV = "HERMES_MODEL_ROUTES_HEALTH"
 _HEALTH_TEST_ENV = "HERMES_MODEL_ROUTES_HEALTH_TEST"
+_ROUTER_MODE_ENV = "HERMES_MODEL_ROUTER_MODE"
+_health_state_lock = threading.RLock()
 
 _SECTION_KEYS = {"routes", "health", "static_rules", "router"}
-_ROUTE_KEYS = {"description", "provider", "model", "reasoning_effort", "accepted", "fallbacks"}
+_ROUTE_KEYS = {
+    "description", "provider", "model", "reasoning_effort", "accepted", "fallbacks",
+    "repromote_after_turns",
+}
 _FALLBACK_KEYS = {"provider", "model", "reasoning_effort"}
 _HEALTH_KEYS = {"enabled", "cache_path", "ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds"}
 _HEALTH_NUMERIC_KEYS = ("ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds")
 _RULE_KEYS = {"name", "route", "when", "reason"}
 _ROUTER_KEYS = {
-    "mode", "provider", "model", "timeout_ms", "recent_turns", "normal_downgrade_streak",
-    "chat_route", "label_routes", "decision_log",
+    "mode", "provider", "model", "timeout_ms", "classify_timeout_s", "recent_turns", "normal_downgrade_streak",
+    "repromote_after_turns", "chat_route", "label_routes", "decision_log",
 }
 _ROUTER_MODES = ("off", "shadow", "enforce")
 # Classifier labels that may map to a route. NORMAL is not mappable — its
 # downgrade target is ``chat_route`` (hysteresis-gated).
 _ROUTER_LABELS = ("SYSTEM_DEV", "FRONTEND_DEV", "DOCUMENT_WORK")
-_ROUTER_NUMERIC_KEYS = ("timeout_ms", "recent_turns", "normal_downgrade_streak")
+_ROUTER_NUMERIC_KEYS = (
+    "timeout_ms",
+    "classify_timeout_s",
+    "recent_turns",
+    "normal_downgrade_streak",
+)
 DEFAULT_ROUTER_MODEL = "gemini-3-flash-preview"
 DEFAULT_ROUTER_PROVIDER = "gemini"
+
+
+def _effective_router_mode(configured: Any = "off") -> str:
+    """Resolve router mode with the emergency environment bridge applied.
+
+    A non-empty environment value is authoritative. Unknown values fail safe
+    to ``off`` so a typo in an emergency override can never enable routing.
+    """
+    override = os.environ.get(_ROUTER_MODE_ENV, "").strip().lower()
+    if override:
+        return override if override in _ROUTER_MODES else "off"
+    mode = (
+        str(configured or "").strip().lower()
+        if isinstance(configured, str)
+        else "off"
+    )
+    return mode if mode in _ROUTER_MODES else "off"
+
+
+def _with_effective_router_mode(router: "RouterConfig") -> "RouterConfig":
+    mode = _effective_router_mode(router.mode)
+    return router if mode == router.mode else replace(router, mode=mode)
 
 
 # =============================================================================
@@ -111,6 +144,8 @@ class RouteSpec:
     reasoning_effort: str = ""  # "" = unspecified
     accepted: Tuple[str, ...] = ()  # model ids; empty → legacy membership
     fallbacks: Tuple["FallbackSpec", ...] = ()
+    # None = inherit router.repromote_after_turns; <= 0 disables for this route.
+    repromote_after_turns: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -135,8 +170,10 @@ class RouterConfig:
     provider: str = DEFAULT_ROUTER_PROVIDER
     model: str = DEFAULT_ROUTER_MODEL
     timeout_ms: float = 8000.0
+    classify_timeout_s: float = 2.0
     recent_turns: int = 5
     normal_downgrade_streak: int = 3
+    repromote_after_turns: int = 3  # accepted-member noops before primary re-promotion
     chat_route: str = ""  # NORMAL downgrade target; "" = downgrades disabled
     label_routes: Tuple[Tuple[str, str], ...] = ()  # (label, route-name) pairs
     decision_log: str = ""  # "" → get_hermes_home()/logs/model_router_decisions.jsonl
@@ -487,6 +524,26 @@ def _parse_route(
                 parsed.append(fb)
             fallbacks = tuple(parsed)
 
+    repromote_after_turns: Optional[int] = None
+    raw_repromote = entry.get("repromote_after_turns")
+    if raw_repromote is not None:
+        # Unlike the shared numeric validators, zero is meaningful here. A
+        # bad tuning value only warns: it must not invalidate the whole route.
+        if (
+            isinstance(raw_repromote, int)
+            and not isinstance(raw_repromote, bool)
+            and raw_repromote >= 0
+        ):
+            repromote_after_turns = raw_repromote
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"{prefix}: repromote_after_turns must be an integer >= 0 "
+                f"(got {raw_repromote!r}) — router default inherited",
+                "Use 0 to disable re-promotion for this route, or omit to inherit "
+                "router.repromote_after_turns",
+            ))
+
     if has_error:
         return None
     return RouteSpec(
@@ -497,6 +554,7 @@ def _parse_route(
         reasoning_effort=effort,
         accepted=accepted,
         fallbacks=fallbacks,
+        repromote_after_turns=repromote_after_turns,
     )
 
 
@@ -707,14 +765,14 @@ def _parse_router(
     issues: List[ConfigIssue],
 ) -> RouterConfig:
     if raw is None:
-        return RouterConfig()
+        return _with_effective_router_mode(RouterConfig())
     if not isinstance(raw, dict):
         issues.append(ConfigIssue(
             "error",
             f"model_routes: 'router' must be a mapping (got {type(raw).__name__}) — router stays off",
             f"Supported router keys: {', '.join(sorted(_ROUTER_KEYS))}",
         ))
-        return RouterConfig()
+        return _with_effective_router_mode(RouterConfig())
 
     for key in sorted(set(raw) - _ROUTER_KEYS):
         issues.append(ConfigIssue(
@@ -792,12 +850,31 @@ def _parse_router(
             continue
         value = raw[key]
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
-            kwargs[key] = int(value) if key != "timeout_ms" else float(value)
+            kwargs[key] = (
+                int(value)
+                if key in {"recent_turns", "normal_downgrade_streak"}
+                else float(value)
+            )
         else:
             issues.append(ConfigIssue(
                 "warning",
                 f"model_routes: router.{key} must be a number > 0 ({value!r}) — default used",
                 f"Example: {key}: {getattr(RouterConfig(), key)}",
+            ))
+
+    if "repromote_after_turns" in raw:
+        value = raw["repromote_after_turns"]
+        # Not part of _ROUTER_NUMERIC_KEYS: an explicit zero disables the
+        # feature and must not warn then silently fall back to the default.
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            kwargs["repromote_after_turns"] = value
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.repromote_after_turns must be an integer >= 0 "
+                f"({value!r}) — default used",
+                f"Example: repromote_after_turns: {RouterConfig().repromote_after_turns} "
+                "(0 disables re-promotion)",
             ))
 
     valid_names = {_norm(name) for name in routes}
@@ -868,7 +945,7 @@ def _parse_router(
                 'Use "" for the default <hermes home>/logs/model_router_decisions.jsonl',
             ))
 
-    router = RouterConfig(**kwargs)
+    router = _with_effective_router_mode(RouterConfig(**kwargs))
     if router.mode != "off" and not routes:
         issues.append(ConfigIssue(
             "warning",
@@ -891,8 +968,10 @@ def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
     catalog = RouteCatalog()
     section = cfg.get("model_routes")
     if not section:
+        catalog.router = _with_effective_router_mode(catalog.router)
         return catalog
     if not isinstance(section, dict):
+        catalog.router = _with_effective_router_mode(catalog.router)
         catalog.issues.append(ConfigIssue(
             "error",
             f"model_routes must be a mapping (got {type(section).__name__})",
@@ -1234,7 +1313,54 @@ def _read_health_cache(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> None:
+def _health_entry_timestamp(entry: Any) -> float:
+    if not isinstance(entry, dict):
+        return float("-inf")
+    try:
+        return float(entry.get("ts"))
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _health_cache_signature(path: Path) -> Optional[Tuple[str, int, int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        str(path),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        int(getattr(stat, "st_ino", 0) or 0),
+    )
+
+
+def _update_unhealthy_memo_locked(path: Path, cache: Dict[str, Any]) -> None:
+    _unhealthy_memo["mtime"] = _health_cache_signature(path)
+    _unhealthy_memo["cache"] = cache
+    _unhealthy_memo["value"] = any(
+        isinstance(verdict, dict) and not verdict.get("healthy")
+        for verdict in cache.values()
+    )
+
+
+def _read_health_cache_memoized_locked(path: Path) -> Dict[str, Any]:
+    """Return the cached read-only snapshot when the file is unchanged."""
+    signature = _health_cache_signature(path)
+    if signature is None:
+        _unhealthy_memo["mtime"] = None
+        _unhealthy_memo["cache"] = {}
+        _unhealthy_memo["value"] = False
+        return {}
+    cached = _unhealthy_memo.get("cache")
+    if _unhealthy_memo.get("mtime") == signature and isinstance(cached, dict):
+        return cached
+    cache = _read_health_cache(path)
+    _update_unhealthy_memo_locked(path, cache)
+    return cache
+
+
+def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> bool:
     """Merge one verdict into the shared cache under an exclusive flock.
 
     Concurrent hermes processes (gateway + interactive CLI) share this file;
@@ -1242,39 +1368,57 @@ def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> None:
     process clobber the other's fresh verdict (lost update), dropping its
     fail_ttl suppression and re-blocking on a dead provider.  Re-reading
     inside the lock means every merge starts from the latest snapshot.
-    Best-effort: any failure is logged and the verdict is simply not cached.
+    Older observations never replace newer ones. At equal timestamps a healthy
+    verdict wins, preventing a delayed stale failure from undoing recovery.
+    Best-effort: returns ``False`` when rejected or not cached.
     """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = path.with_name(path.name + ".lock")
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
-            locked = False
-            if fcntl is not None:
+    with _health_state_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = path.with_name(path.name + ".lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_file:
+                locked = False
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                        locked = True
+                    except OSError as exc:
+                        # e.g. ENOLCK on NFS without lockd, or FUSE mounts that
+                        # reject flock — degrade to the lock-less re-read+merge
+                        # rather than skipping the cache write entirely.
+                        logger.debug(
+                            "model_routes: flock unavailable for %s; writing lock-less (%s)",
+                            lock_path,
+                            type(exc).__name__,
+                        )
                 try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                    locked = True
-                except OSError as exc:
-                    # e.g. ENOLCK on NFS without lockd, or FUSE mounts that
-                    # reject flock — degrade to the lock-less re-read+merge
-                    # rather than skipping the cache write entirely.
-                    logger.debug(
-                        "model_routes: flock unavailable for %s; writing lock-less (%s)",
-                        lock_path,
-                        type(exc).__name__,
+                    cache = _read_health_cache(path)
+                    existing = cache.get(key)
+                    existing_ts = _health_entry_timestamp(existing)
+                    incoming_ts = _health_entry_timestamp(entry)
+                    stale = existing_ts > incoming_ts or (
+                        existing_ts == incoming_ts
+                        and isinstance(existing, dict)
+                        and bool(existing.get("healthy"))
+                        and not bool(entry.get("healthy"))
                     )
-            try:
-                cache = _read_health_cache(path)
-                cache[key] = entry
-                atomic_json_write(path, cache)
-            finally:
-                if locked:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    except Exception as exc:
-        logger.debug(
-            "model_routes: health cache write failed for %s (%s)",
-            path,
-            type(exc).__name__,
-        )
+                    if stale:
+                        _update_unhealthy_memo_locked(path, cache)
+                        return False
+                    cache[key] = entry
+                    atomic_json_write(path, cache)
+                    _update_unhealthy_memo_locked(path, cache)
+                    return True
+                finally:
+                    if locked:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception as exc:
+            logger.debug(
+                "model_routes: health cache write failed for %s (%s)",
+                path,
+                type(exc).__name__,
+            )
+            return False
 
 
 def provider_health(
@@ -1310,7 +1454,8 @@ def provider_health(
         return True, "pytest"
 
     path = health.resolved_cache_path()
-    cache = _read_health_cache(path)
+    with _health_state_lock:
+        cache = _read_health_cache_memoized_locked(path)
 
     now = _now()
     key = str(provider or "")
@@ -1346,7 +1491,17 @@ def provider_health(
         )
 
     healthy, reason = _probe_provider(key, str(model or ""), cfg, health)
-    _store_health_verdict(path, key, {"healthy": healthy, "reason": f"recovery probe: {reason}", "ts": now})
+    stored = _store_health_verdict(
+        path,
+        key,
+        {"healthy": healthy, "reason": f"recovery probe: {reason}", "ts": now},
+    )
+    if not stored:
+        latest = _read_health_cache(path).get(key)
+        if isinstance(latest, dict) and _health_entry_timestamp(latest) >= now:
+            return bool(latest.get("healthy")), str(
+                latest.get("reason") or "newer cached verdict"
+            )
     return healthy, reason
 
 
@@ -1452,22 +1607,30 @@ def record_provider_outcome(
         if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
             return  # same seam as provider_health — agent-path unit tests must not touch the real cache
         path = health.resolved_cache_path()
-        now = _now()
-        if healthy:
-            entry = _read_health_cache(path).get(key)
-            if not (isinstance(entry, dict) and not entry.get("healthy")):
-                return  # nothing to clear
-            _last_passive_unhealthy_write.pop(key, None)
-        else:
-            last = _last_passive_unhealthy_write.get(key, 0.0)
-            if now - last < _PASSIVE_WRITE_SUPPRESS_SECONDS:
-                return
-            _last_passive_unhealthy_write[key] = now
-        _store_health_verdict(
-            path,
-            key,
-            {"healthy": bool(healthy), "reason": f"passive: {reason}", "ts": now},
-        )
+        observed_at = _now()
+        with _health_state_lock:
+            if healthy:
+                entry = _read_health_cache(path).get(key)
+                if not (isinstance(entry, dict) and not entry.get("healthy")):
+                    return  # nothing to clear
+            else:
+                last = _last_passive_unhealthy_write.get(key, 0.0)
+                if observed_at - last < _PASSIVE_WRITE_SUPPRESS_SECONDS:
+                    return
+            stored = _store_health_verdict(
+                path,
+                key,
+                {
+                    "healthy": bool(healthy),
+                    "reason": f"passive: {reason}",
+                    "ts": observed_at,
+                },
+            )
+            if stored:
+                if healthy:
+                    _last_passive_unhealthy_write.pop(key, None)
+                else:
+                    _last_passive_unhealthy_write[key] = observed_at
     except Exception as exc:
         logger.debug(
             "model_routes: passive health record failed for %r (%s)",
@@ -1492,20 +1655,9 @@ def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
         if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
             return False
         path = health.resolved_cache_path()
-        try:
-            mtime = path.stat().st_mtime_ns
-        except OSError:
-            return False
-        if _unhealthy_memo["mtime"] == (str(path), mtime):
-            return bool(_unhealthy_memo["value"])
-        cache = _read_health_cache(path)
-        value = any(
-            isinstance(entry, dict) and not entry.get("healthy")
-            for entry in cache.values()
-        )
-        _unhealthy_memo["mtime"] = (str(path), mtime)
-        _unhealthy_memo["value"] = value
-        return value
+        with _health_state_lock:
+            _read_health_cache_memoized_locked(path)
+            return bool(_unhealthy_memo.get("value"))
     except Exception as exc:
         logger.debug(
             "model_routes: unhealthy-verdict scan failed (%s)",

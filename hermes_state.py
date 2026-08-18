@@ -7712,6 +7712,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             return best if best is not None else session_id
 
+    def get_recent_dialogue_messages(
+        self,
+        session_id: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Load the newest user/assistant rows with a query-level limit.
+
+        This is the lightweight context path for classifiers that need only a
+        small dialogue tail. Rows are selected newest-first so SQLite can stop
+        at ``limit``, then restored to insertion order for prompt construction.
+        """
+        try:
+            bounded_limit = int(limit)
+        except (TypeError, ValueError):
+            return []
+        if bounded_limit <= 0:
+            return []
+
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT id, role, content FROM ("
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "AND role IN ('user', 'assistant') "
+                "ORDER BY id DESC LIMIT ?"
+                ") ORDER BY id",
+                (session_id, bounded_limit),
+            ).fetchall()
+
+        messages: List[Dict[str, Any]] = []
+        for row in rows:
+            content = self._decode_content(row["content"])
+            if isinstance(content, str):
+                content = sanitize_context(content).strip()
+            messages.append({"role": row["role"], "content": content})
+        messages = _strip_background_review_harness(messages)
+        return _strip_stale_tool_call_markers(messages)
+
     def get_messages_as_conversation(
         self,
         session_id: str,
