@@ -1318,6 +1318,12 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  # default_route: ""                         # model_routes route used when delegate_task names no route.
+  #                                           # Empty/absent keeps delegation.model/provider behavior above.
+  #                                           # When valid routes exist, delegate_task exposes a config-derived
+  #                                           # route enum at the top level and per task (per-task wins).
+  #                                           # The route's health-checked runtime and reasoning_effort apply;
+  #                                           # unknown or fully unhealthy routes error without silent fallback.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
