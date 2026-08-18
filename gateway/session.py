@@ -2742,9 +2742,15 @@ class SessionStore:
             if entry is None:
                 return
             cleaned = sanitize_model_override(override)
-            if entry.model_override == cleaned:
+            has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
+            if entry.model_override == cleaned and not (
+                cleaned is not None and has_runtime_route
+            ):
                 return
             entry.model_override = cleaned
+            if cleaned is not None:
+                entry.runtime_model = None
+                entry.runtime_provider = None
             self._save()
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
@@ -2783,6 +2789,8 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
+            if model is not _RUNTIME_UNSET or provider is not _RUNTIME_UNSET:
+                entry.model_override = None
             if model is not _RUNTIME_UNSET:
                 entry.runtime_model = str(model).strip() if model else None
             if provider is not _RUNTIME_UNSET:

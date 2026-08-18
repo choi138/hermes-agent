@@ -113,10 +113,10 @@ def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypat
     runner._load_reasoning_config = MagicMock(
         return_value={"enabled": True, "effort": "low"}
     )
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs_for_provider",
-        lambda provider: {
+    def resolve_persisted_runtime(provider, *, target_model=None):
+        assert provider == "codex-nekos"
+        assert target_model == "gpt-5.5"
+        return {
             "api_key": "runtime-secret",
             "base_url": "https://codex.nekos.me/v1",
             "provider": provider,
@@ -125,7 +125,12 @@ def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypat
             "command": None,
             "args": [],
             "credential_pool": None,
-        },
+        }
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        resolve_persisted_runtime,
     )
 
     model, runtime = runner._resolve_session_agent_runtime(
@@ -211,4 +216,3 @@ fallback_providers:
     assert model == "minimax/minimax-m2.7"
     assert runtime_kwargs["provider"] == "openrouter"
     assert runtime_kwargs["api_key"] == "sk-openrouter"
-
