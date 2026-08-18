@@ -12835,7 +12835,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             response_text = await self._handle_message(synthetic_event)
         finally:
             _handoff_trace = turn_trace.safe_get_bound(synthetic_event)
+            if _handoff_trace is None:
+                _handoff_trace = turn_trace.safe_get_bound(
+                    getattr(synthetic_event, "source", None)
+                )
             turn_trace.safe_finish(_handoff_trace, status="ok")
+            if _handoff_trace is not None:
+                turn_trace.safe_bind(
+                    getattr(synthetic_event, "source", None), None
+                )
         if not response_text:
             # Streaming may have already delivered the response inline.
             # Either way, agent ran without raising — count as success.
@@ -18083,6 +18091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _trace is not None:
             turn_trace.safe_bind(event, _trace)
+            turn_trace.safe_bind(source, _trace)
             try:
                 _debounce_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
                 if _debounce_ts:

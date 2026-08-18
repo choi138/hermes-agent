@@ -5586,7 +5586,13 @@ class BasePlatformAdapter(ABC):
             if _turn_trace_mod is None:
                 return
             _trace = _turn_trace_mod.safe_get_bound(event)
+            if _trace is None:
+                _trace = _turn_trace_mod.safe_get_bound(
+                    getattr(event, "source", None)
+                )
             _turn_trace_mod.safe_finish(_trace, status="ok")
+            if _trace is not None:
+                _turn_trace_mod.safe_bind(getattr(event, "source", None), None)
         except Exception:
             pass
 
@@ -5966,12 +5972,27 @@ class BasePlatformAdapter(ABC):
                 metadata=_thread_metadata,
             )
 
-        def _finish_turn_trace(status: str) -> None:
+        def _resolve_turn_trace():
             try:
                 if _turn_trace_mod is None:
-                    return
+                    return None
                 _trace = _turn_trace_mod.safe_get_bound(event)
+                if _trace is None:
+                    _trace = _turn_trace_mod.safe_get_bound(
+                        getattr(event, "source", None)
+                    )
+                return _trace
+            except Exception:
+                return None
+
+        def _finish_turn_trace(status: str) -> None:
+            try:
+                _trace = _resolve_turn_trace()
                 _turn_trace_mod.safe_finish(_trace, status=status)
+                if _trace is not None and _turn_trace_mod is not None:
+                    _turn_trace_mod.safe_bind(
+                        getattr(event, "source", None), None
+                    )
             except Exception:
                 pass
 
@@ -5981,8 +6002,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            if _turn_trace_mod is not None:
-                _turn_trace = _turn_trace_mod.safe_get_bound(event)
+            _turn_trace = _resolve_turn_trace()
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6475,6 +6495,7 @@ class BasePlatformAdapter(ABC):
                         delivered=delivery_succeeded,
                     )
                 _turn_trace_mod.safe_finish(_turn_trace, status="ok")
+                _turn_trace_mod.safe_bind(getattr(event, "source", None), None)
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
