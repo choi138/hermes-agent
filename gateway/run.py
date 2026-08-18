@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -18695,27 +18696,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc_info=True,
                                     )
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_context_files=True,
-                                    skip_memory=True,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                    session_db=_hyg_session_db,
-                                )
-                                _seed_hygiene_system_prompt(
-                                    _hyg_agent,
-                                    _hyg_session_row,
-                                )
-                                # If compression must rebuild instead of retaining
-                                # the cached prompt, make the persisted result
-                                # deliberately stale for every real gateway surface.
-                                _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
-                                _hyg_cleanup_deferred = False
-                                try:
+                                _hyg_sid = session_entry.session_id
+
+                                def _hyg_build_agent():
+                                    # AIAgent.__init__ binds session state —
+                                    # raw SessionDB reads under the writer
+                                    # lock. It must NEVER run on the event
+                                    # loop: a writer-lock convoy here freezes
+                                    # every platform heartbeat (2026-07-28
+                                    # outage: 160s Discord stall dumped this
+                                    # exact stack). Build in the executor,
+                                    # same thread pool as the compression.
+                                    agent = AIAgent(
+                                        **_hyg_runtime,
+                                        model=_hyg_model,
+                                        max_iterations=4,
+                                        quiet_mode=True,
+                                        skip_context_files=True,
+                                        skip_memory=True,
+                                        enabled_toolsets=["memory"],
+                                        session_id=_hyg_sid,
+                                        session_db=_hyg_session_db,
+                                    )
+                                    _seed_hygiene_system_prompt(
+                                        agent,
+                                        _hyg_session_row,
+                                    )
+                                    # If compression must rebuild instead of retaining
+                                    # the cached prompt, make the persisted result
+                                    # deliberately stale for every real gateway surface.
+                                    agent.platform = _GATEWAY_HYGIENE_PLATFORM
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
                                     # Prefer in-place compaction here: it archives
@@ -18725,32 +18735,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # bindings.  If no SessionDB is available,
                                     # compress_context leaves this flag false and
                                     # the guard below preserves the transcript.
-                                    _hyg_agent.compression_in_place = True
+                                    agent.compression_in_place = True
                                     _bind_hyg_state = getattr(
-                                        getattr(_hyg_agent, "context_compressor", None),
+                                        getattr(agent, "context_compressor", None),
                                         "bind_session_state",
                                         None,
                                     )
                                     if callable(_bind_hyg_state):
-                                        _bind_hyg_state(
-                                            _hyg_session_db,
-                                            session_entry.session_id,
-                                        )
+                                        _bind_hyg_state(_hyg_session_db, _hyg_sid)
                                     # It must never finalize on close() — close()
                                     # would end the live gateway session row.
-                                    _hyg_agent._end_session_on_close = False
-                                    _hyg_agent._print_fn = lambda *a, **kw: None
+                                    agent._end_session_on_close = False
+                                    agent._print_fn = lambda *a, **kw: None
+                                    return agent
 
-                                    loop = asyncio.get_running_loop()
-                                    _hyg_commit_fence = CompressionCommitFence()
-                                    _hyg_future = loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
-                                            _hyg_msgs, "",
-                                            approx_tokens=_approx_tokens,
-                                            commit_fence=_hyg_commit_fence,
-                                        ),
-                                    )
+                                loop = asyncio.get_running_loop()
+                                _hyg_agent = await loop.run_in_executor(
+                                    None, _hyg_build_agent
+                                )
+                                _hyg_cleanup_deferred = False
+                                _hyg_commit_fence = CompressionCommitFence()
+                                _hyg_future = loop.run_in_executor(
+                                    None,
+                                    lambda: _hyg_agent._compress_context(
+                                        _hyg_msgs, "",
+                                        approx_tokens=_approx_tokens,
+                                        commit_fence=_hyg_commit_fence,
+                                    ),
+                                )
+                                try:
                                     try:
                                         # Progress-aware wait: the timeout is an
                                         # INACTIVITY budget, not a total one. The
@@ -28511,6 +28524,90 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return response
 
 
+def _run_loop_stall_watchdog(
+    stop_event: threading.Event,
+    loop: asyncio.AbstractEventLoop,
+    *,
+    ping_interval: float = 2.0,
+    stall_threshold: float = 5.0,
+) -> None:
+    """Detect and loudly report event-loop stalls.
+
+    Pings the loop via ``call_soon_threadsafe`` and measures how long the
+    callback takes to run. 2026-07-28: the loop blocked for 160s on the
+    SessionDB writer lock and the only signal was discord.py's heartbeat
+    warning — invisible when Discord isn't connected. This watchdog is
+    transport-independent: on a stall it logs ERROR with the MainThread
+    stack (the exact frame holding the loop) and a cgroup PSI snapshot so
+    host CPU/memory starvation is distinguishable from an in-process
+    block. Alarms escalate (5s, then doubling) and recovery logs the
+    total stall duration.
+    """
+    # The loop normally runs on MainThread; record the actual ident from
+    # inside a pong so the dump targets the right thread even when the
+    # loop was started elsewhere (tests, embedders).
+    loop_ident = [threading.main_thread().ident]
+
+    def _loop_stack() -> str:
+        try:
+            frame = sys._current_frames().get(loop_ident[0])
+            if frame is None:
+                return "<loop thread frame unavailable>"
+            return "".join(traceback.format_stack(frame))
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            return f"<stack capture failed: {exc}>"
+
+    def _psi_snapshot() -> str:
+        try:
+            cg = ""
+            with open("/proc/self/cgroup", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("0::"):
+                        cg = line.strip().split("::", 1)[1]
+                        break
+            parts = []
+            for kind in ("cpu", "memory"):
+                try:
+                    with open(f"/sys/fs/cgroup{cg}/{kind}.pressure", encoding="utf-8") as fh:
+                        parts.append(f"{kind} {fh.readline().strip()}")
+                except OSError:
+                    continue
+            return "; ".join(parts) or "<unavailable>"
+        except Exception:  # pragma: no cover - diagnostics only
+            return "<unavailable>"
+
+    while not stop_event.wait(ping_interval):
+        pong = threading.Event()
+        t0 = time.monotonic()
+
+        def _pong(_evt=pong):
+            loop_ident[0] = threading.get_ident()
+            _evt.set()
+
+        try:
+            loop.call_soon_threadsafe(_pong)
+        except RuntimeError:
+            return  # loop closed — shutdown race
+        next_alarm = stall_threshold
+        alarmed = False
+        while not pong.wait(0.25):
+            if stop_event.is_set():
+                return
+            lag = time.monotonic() - t0
+            if lag >= next_alarm:
+                alarmed = True
+                logger.error(
+                    "event loop blocked for %.1fs — loop thread stack:\n%s\nPSI: %s",
+                    lag, _loop_stack(), _psi_snapshot(),
+                )
+                next_alarm = max(next_alarm * 2, lag + stall_threshold)
+        if alarmed:
+            logger.warning(
+                "event loop recovered after %.1fs stall",
+                time.monotonic() - t0,
+            )
+
+
 def _run_planned_stop_watcher(
     stop_event: threading.Event,
     runner,
@@ -29288,6 +29385,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     _planned_stop_watcher_thread.start()
 
+    # Loop-stall watchdog: platform-independent successor to relying on
+    # discord.py's "heartbeat blocked" warnings for loop-freeze detection
+    # (2026-07-28 outage). ERROR + MainThread stack + PSI on stalls ≥5s.
+    _loop_stall_watchdog_stop = threading.Event()
+    _loop_stall_watchdog_thread = threading.Thread(
+        target=_run_loop_stall_watchdog,
+        args=(_loop_stall_watchdog_stop, loop),
+        daemon=True,
+        name="loop-stall-watchdog",
+    )
+    _loop_stall_watchdog_thread.start()
+
     # Claim the PID file BEFORE bringing up any platform adapters.
     # This closes the --replace race window: two concurrent `gateway run
     # --replace` invocations both pass the termination-wait above, but
@@ -29522,6 +29631,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
+    _loop_stall_watchdog_stop.set()
+    _loop_stall_watchdog_thread.join(timeout=2)
 
     # Close MCP server connections
     try:

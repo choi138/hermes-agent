@@ -819,9 +819,11 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("cd /app && node server.js &>/tmp/srv.log &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0]
+        # The shell command is the LAST argv element; a nice(1) prefix may
+        # precede the shell itself (see _nice_argv).
+        shell_cmd = captured_cmd[0][-1]
         # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd
 
     def test_simple_background_preserved(self, registry):
         """Simple cmd & (no &&) must NOT be rewritten — no subshell bug."""
@@ -844,7 +846,7 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("sleep 5 &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0][2]
+        shell_cmd = captured_cmd[0][-1]
         # Simple background must remain as-is
         assert "sleep 5 &" in shell_cmd
 
@@ -873,8 +875,8 @@ class TestSpawnRewriteCompoundBackground:
         assert mock_pty_module.PtyProcess.spawn.called, \
             "PTY spawn should have been attempted"
         pty_args = mock_pty_module.PtyProcess.spawn.call_args[0][0]
-        assert "&& { node server.js & }" in pty_args[2], \
-            f"PTY path should use rewritten command, got: {pty_args[2]}"
+        assert "&& { node server.js & }" in pty_args[-1], \
+            f"PTY path should use rewritten command, got: {pty_args[-1]}"
         assert session.command == "cd /app && node server.js &"
 
 

@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -2116,6 +2117,24 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+def _db_maintenance_loop(
+    db_ref: "weakref.ReferenceType[SessionDB]",
+    stop_event: threading.Event,
+    interval: float,
+) -> None:
+    """Drive checkpoint/FTS maintenance without retaining the SessionDB."""
+    while not stop_event.wait(interval):
+        db = db_ref()
+        if db is None:
+            return
+        try:
+            db._db_maintenance_tick()
+        except Exception:
+            logger.debug("db maintenance tick failed", exc_info=True)
+        finally:
+            del db
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -2283,6 +2302,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = False
         self._token_writer_busy = False
+        self._last_checkpoint_write_count = 0
+        self._last_fts_merge_write_count = 0
+        self._maint_stop = threading.Event()
+        self._maint_thread: Optional[threading.Thread] = None
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -2458,6 +2481,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise
                 _connect_and_init_with_lock_patience()
 
+            self._start_db_maintenance_thread()
+
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
             # v22 inline FTS untouched here; only the explicit foreground
@@ -2480,6 +2505,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    # ── Background DB maintenance ──
+
+    _MAINT_INTERVAL_S = 5.0
+
+    def _start_db_maintenance_thread(self) -> None:
+        if self.read_only or self._maint_thread is not None:
+            return
+        thread = threading.Thread(
+            target=_db_maintenance_loop,
+            args=(weakref.ref(self), self._maint_stop, self._MAINT_INTERVAL_S),
+            name="session-db-maintenance",
+            daemon=True,
+        )
+        self._maint_thread = thread
+        thread.start()
+
+    def _db_maintenance_tick(self) -> None:
+        """Run due maintenance outside the caller's write transaction."""
+        write_count = self._write_count
+        if (
+            write_count - self._last_checkpoint_write_count
+            >= self._CHECKPOINT_EVERY_N_WRITES
+        ):
+            self._last_checkpoint_write_count = write_count
+            self._try_wal_checkpoint()
+        if (
+            write_count - self._last_fts_merge_write_count
+            >= self._FTS_MERGE_EVERY_N_WRITES
+        ):
+            self._last_fts_merge_write_count = write_count
+            self._try_incremental_merge_fts()
 
     # ── Read-path split ──
 
@@ -2969,12 +3026,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                # Maintenance is driven by the dedicated DB thread; the write
+                # hot path only advances the cadence counter.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor
@@ -3171,6 +3225,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         checkpoint so exiting writer processes help shrink the WAL file.
         Read-only connections never request a checkpoint.
         """
+        self._maint_stop.set()
+        maint = self._maint_thread
+        if maint is not None and maint.is_alive():
+            maint.join(timeout=2.0)
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
         # method); without unregistering, every closed SessionDB stays
