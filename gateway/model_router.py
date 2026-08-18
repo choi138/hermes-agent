@@ -261,20 +261,13 @@ def _safe_message_head(text: Any) -> str:
 
 
 def _read_env_key(name: str) -> str:
-    value = os.getenv(name)
-    if value:
-        return value.strip()
-    env_path = get_hermes_home() / ".env"
     try:
-        for line in env_path.read_text().splitlines():
-            if not line or line.lstrip().startswith("#") or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            if key.strip() == name:
-                return val.strip().strip('"').strip("'")
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(name)
     except Exception:
-        return ""
-    return ""
+        value = os.getenv(name)
+    return str(value or "").strip()
 
 
 def _api_key() -> str:

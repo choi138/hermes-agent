@@ -17,6 +17,7 @@ import io
 import json
 import threading
 import urllib.error
+from contextvars import ContextVar
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -366,6 +367,16 @@ def test_missing_api_key_takes_fallback_path(monkeypatch, tmp_path):
     )
     assert called == []  # never reached the network seam
     assert detail["source"] == "fallback"
+
+
+def test_classifier_key_read_uses_cached_scope_aware_env_resolver(monkeypatch):
+    import hermes_cli.config as config_mod
+
+    read = MagicMock(return_value=" scoped-key ")
+    monkeypatch.setattr(config_mod, "get_env_value", read)
+
+    assert mr_mod._read_env_key("GEMINI_API_KEY") == "scoped-key"
+    read.assert_called_once_with("GEMINI_API_KEY")
 
 
 def test_call_gemini_request_shape(monkeypatch):
@@ -1485,6 +1496,35 @@ def test_gateway_shadow_turn_does_not_wait_for_hung_classifier(monkeypatch):
     caller.join(2)
     assert finished.wait(2)
     assert scheduled["value"] is True
+
+
+def test_gateway_shadow_worker_inherits_turn_context(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    marker = ContextVar("router_profile_marker", default="default")
+    token = marker.set("profile-a")
+    runner = object.__new__(GatewayRunner)
+    observed = {}
+    finished = threading.Event()
+
+    def evaluate(**_kwargs):
+        observed["marker"] = marker.get()
+        finished.set()
+        return None
+
+    monkeypatch.setattr(runner, "_evaluate_model_router_shadow", evaluate)
+    try:
+        assert runner._schedule_model_router_shadow(
+            event=_event(),
+            session_key="tg:c1",
+            runtime={"model": "model-b"},
+            user_config=_cfg(router={"mode": "shadow"}),
+        ) is True
+        assert finished.wait(2)
+    finally:
+        marker.reset(token)
+
+    assert observed["marker"] == "profile-a"
 
 
 @pytest.mark.parametrize(

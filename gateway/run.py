@@ -7686,8 +7686,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 slots.release()
 
         try:
+            worker_context = copy_context()
             threading.Thread(
-                target=evaluate,
+                target=worker_context.run,
+                args=(evaluate,),
                 daemon=True,
                 name=f"model-router-shadow-{key[:24]}",
             ).start()
