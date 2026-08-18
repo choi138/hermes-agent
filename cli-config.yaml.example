@@ -213,8 +213,9 @@ model:
 #                                      # env HERMES_MODEL_ROUTER_MODE wins when set
 #     provider: gemini                 # classifier provider
 #     model: gemini-3-flash-preview    # classifier model (bench winner; keep unless re-benched)
-#     timeout_ms: 8000                 # on failure a narrow regex fallback decides
-#                                      # (fallback labels never trigger hysteresis)
+#     timeout_ms: 8000                 # classifier transport timeout
+#     classify_timeout_s: 2            # enforce-mode wall-clock budget; timeout uses
+#                                      # the narrow regex fallback (never hysteresis)
 #     recent_turns: 5                  # dialogue turns shown to the classifier
 #     normal_downgrade_streak: 3       # consecutive trusted NORMALs before chat downgrade
 #     repromote_after_turns: 3         # trusted no-op turns on a non-primary accepted member

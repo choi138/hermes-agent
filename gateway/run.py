@@ -86,6 +86,8 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+_MODEL_ROUTER_SHADOW_MAX_INFLIGHT = 4
+_MODEL_ROUTER_INIT_LOCK = threading.Lock()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -4849,17 +4851,17 @@ class TurnRunner:
                         reasoning_config["effort"]
                     )
             try:
-                self._runner._evaluate_model_router_shadow(
+                self._runner._schedule_model_router_shadow(
                     event=ctx.event,
                     session_key=ctx.session_key or "",
                     runtime=_shadow_runtime,
                     user_config=ctx.user_config,
                 )
             except Exception as exc:
-                # Never include exception text/traceback here: classifier
-                # transports can carry credentials in request URLs.
+                # Scheduling is best-effort. Never include exception text or a
+                # traceback: classifier transports can carry credentials.
                 logger.warning(
-                    "model router shadow evaluation failed open for session=%s (%s)",
+                    "model router shadow scheduling failed open for session=%s (%s)",
                     ctx.session_key or "?",
                     type(exc).__name__,
                 )
@@ -6521,6 +6523,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        self._model_router_state: Dict[str, dict] = {}
+        self._model_router_state_lock = threading.Lock()
+        self._model_router_shadow_slots = threading.BoundedSemaphore(
+            _MODEL_ROUTER_SHADOW_MAX_INFLIGHT
+        )
+        self._model_router_shadow_inflight: set[str] = set()
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -7485,6 +7493,158 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _ensure_model_router_runtime_state(self):
+        """Return lazily initialized guards for bare-test and live runners."""
+        if all(
+            getattr(self, name, None) is not None
+            for name in (
+                "_model_router_state_lock",
+                "_model_router_state",
+                "_model_router_shadow_slots",
+                "_model_router_shadow_inflight",
+            )
+        ):
+            return (
+                self._model_router_state_lock,
+                self._model_router_state,
+                self._model_router_shadow_slots,
+                self._model_router_shadow_inflight,
+            )
+
+        with _MODEL_ROUTER_INIT_LOCK:
+            if getattr(self, "_model_router_state_lock", None) is None:
+                self._model_router_state_lock = threading.Lock()
+            if getattr(self, "_model_router_state", None) is None:
+                self._model_router_state = {}
+            if getattr(self, "_model_router_shadow_slots", None) is None:
+                self._model_router_shadow_slots = threading.BoundedSemaphore(
+                    _MODEL_ROUTER_SHADOW_MAX_INFLIGHT
+                )
+            if getattr(self, "_model_router_shadow_inflight", None) is None:
+                self._model_router_shadow_inflight = set()
+        return (
+            self._model_router_state_lock,
+            self._model_router_state,
+            self._model_router_shadow_slots,
+            self._model_router_shadow_inflight,
+        )
+
+    def _begin_model_router_state(self, session_key: str, *, invalidate: bool):
+        """Create an isolated state transaction for one routing decision."""
+        lock, shared, _slots, _inflight = self._ensure_model_router_runtime_state()
+        key = str(session_key or "unknown")
+        with lock:
+            current = shared.get(key)
+            if not isinstance(current, dict):
+                current = {"normal_streak": 0}
+                shared[key] = current
+            elif invalidate:
+                # Enforce supersedes any older detached shadow transaction.
+                current = dict(current)
+                shared[key] = current
+            local = {key: dict(current)}
+        return key, shared, current, local
+
+    def _commit_model_router_state(
+        self,
+        key: str,
+        shared: dict,
+        identity: dict,
+        local: dict,
+    ) -> bool:
+        """Commit only if no boundary or newer decision replaced this entry."""
+        lock, current_shared, _slots, _inflight = (
+            self._ensure_model_router_runtime_state()
+        )
+        with lock:
+            if current_shared is not shared or shared.get(key) is not identity:
+                return False
+            entry = local.get(key)
+            if not isinstance(entry, dict):
+                return False
+            shared[key] = entry
+            return True
+
+    def _schedule_model_router_shadow(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        runtime: dict,
+        user_config: Optional[dict] = None,
+    ) -> bool:
+        """Start bounded fire-and-forget shadow evaluation.
+
+        Only one task per session and at most four tasks per gateway may be in
+        flight. Saturation drops shadow observations instead of queueing work
+        behind the user-facing turn.
+        """
+        cfg = user_config if isinstance(user_config, dict) else {}
+        if _model_router_mode(cfg) != "shadow":
+            return False
+
+        lock, shared, slots, inflight = self._ensure_model_router_runtime_state()
+        if not slots.acquire(blocking=False):
+            logger.debug("model router: shadow capacity full; observation skipped")
+            return False
+
+        key = str(session_key or "unknown")
+        with lock:
+            if key in inflight:
+                slots.release()
+                logger.debug(
+                    "model router: shadow observation already running for %s",
+                    key,
+                )
+                return False
+            inflight.add(key)
+            identity = shared.get(key)
+            if not isinstance(identity, dict):
+                identity = {"normal_streak": 0}
+                shared[key] = identity
+            local_state = {key: dict(identity)}
+
+        def evaluate() -> None:
+            try:
+                decision = self._evaluate_model_router_shadow(
+                    event=event,
+                    session_key=session_key,
+                    runtime=runtime,
+                    user_config=cfg,
+                    state_override=local_state,
+                )
+                if decision is not None and _model_router_mode(cfg) == "shadow":
+                    self._commit_model_router_state(
+                        key, shared, identity, local_state
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "model router shadow evaluation failed open for session=%s (%s)",
+                    session_key or "?",
+                    type(exc).__name__,
+                )
+            finally:
+                with lock:
+                    inflight.discard(key)
+                slots.release()
+
+        try:
+            threading.Thread(
+                target=evaluate,
+                daemon=True,
+                name=f"model-router-shadow-{key[:24]}",
+            ).start()
+        except Exception as exc:
+            with lock:
+                inflight.discard(key)
+            slots.release()
+            logger.warning(
+                "model router shadow worker failed to start (%s)",
+                type(exc).__name__,
+            )
+            return False
+        return True
+
     def _model_router_runtime_snapshot(
         self,
         source: SessionSource,
@@ -7557,6 +7717,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         label_routes = dict(getattr(router, "label_routes", None) or {})
         return str(label_routes.get(label) or "").strip()
 
+    async def _classify_model_router_with_budget(
+        self,
+        *,
+        model_router: Any,
+        event: MessageEvent,
+        session_key: str,
+        runtime: dict,
+        cfg: dict,
+        catalog: Any,
+        mode: str,
+        state: dict,
+    ):
+        """Classify within the enforce deadline, then apply state once.
+
+        The overdue worker performs classification only. Its eventual result is
+        discarded, so it cannot mutate hysteresis or apply a late directive.
+        """
+        context = await asyncio.to_thread(
+            model_router.build_context,
+            event=event,
+            session_store=self.session_store,
+            runtime=runtime,
+            recent_turn_limit=int(
+                getattr(catalog.router, "recent_turns", 5) or 5
+            ),
+            loaded_skills=[],
+            session_key_override=session_key,
+        )
+        provider, model, transport_timeout, budget = (
+            model_router._classifier_request_settings(catalog.router)
+        )
+        classify_task = asyncio.create_task(
+            asyncio.to_thread(
+                model_router.classify_dev_detailed,
+                context,
+                provider=provider,
+                model=model,
+                timeout=min(transport_timeout, budget),
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {classify_task}, timeout=budget
+            )
+        except asyncio.CancelledError:
+            classify_task.cancel()
+            classify_task.add_done_callback(consume_detached_task_result)
+            raise
+
+        if classify_task in done:
+            detail = await classify_task
+        else:
+            classify_task.cancel()
+            classify_task.add_done_callback(consume_detached_task_result)
+            detail = model_router._fallback_classification(
+                context, "classifier_timeout"
+            )
+            logger.warning(
+                "model router: classifier exceeded %.3fs; using fallback",
+                budget,
+            )
+
+        return await asyncio.to_thread(
+            model_router.classifier_decision_from_detail,
+            context=context,
+            detail=detail,
+            runtime=runtime,
+            cfg=cfg,
+            catalog=catalog,
+            router=catalog.router,
+            mode=mode,
+            state=state,
+            provider=provider,
+            model=model,
+        )
+
     async def _model_router_stage(
         self,
         event: MessageEvent,
@@ -7568,10 +7804,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ):
         """Evaluate routing and apply directives only when mode is enforce.
 
-        Shadow continues through ``_evaluate_model_router_shadow`` in the
-        off-loop turn builder.  This pre-dispatch rail exists for live enforce
-        decisions so a successful route selection can rebuild the agent before
-        the current turn starts and carry the exact route intent with it.
+        Shadow is scheduled fire-and-forget by the off-loop turn builder. This
+        pre-dispatch rail exists for live enforce decisions so a successful
+        route selection can rebuild the agent before the current turn starts
+        and carry the exact route intent with it.
         """
         from gateway import model_router
         from hermes_cli.model_routes import load_routes
@@ -7588,11 +7824,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         catalog = load_routes(cfg)
         if str(getattr(catalog.router, "mode", "") or "").lower() != mode:
             return None
-        state = self.__dict__.get("_model_router_state")
-        if state is None:
-            state = {}
-            self._model_router_state = state
-
         matched = model_router.match_static_rule(
             list(catalog.static_rules or []),
             text=raw_text,
@@ -7600,6 +7831,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if matched is None and text.startswith("/"):
             return None
+
+        state_key, shared_state, state_identity, local_state = (
+            self._begin_model_router_state(
+                session_key,
+                invalidate=mode == "enforce",
+            )
+        )
 
         runtime = self._model_router_runtime_snapshot(
             source,
@@ -7619,28 +7857,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 catalog=catalog,
                 router=catalog.router,
                 mode=mode,
-                state=state,
+                state=local_state,
             )
         else:
-            decision = await asyncio.to_thread(
-                model_router.classifier_decision,
+            decision = await self._classify_model_router_with_budget(
+                model_router=model_router,
                 event=event,
-                session_store=self.session_store,
+                session_key=session_key,
                 runtime=runtime,
                 cfg=cfg,
                 catalog=catalog,
-                router=catalog.router,
                 mode=mode,
-                state=state,
-                complete_dev=None,
-                session_key_override=session_key,
+                state=local_state,
             )
 
+        state_committed = self._commit_model_router_state(
+            state_key,
+            shared_state,
+            state_identity,
+            local_state,
+        )
         directive = decision.directive
         if mode == "enforce":
             decision.record["applied"] = False
         if (
             mode == "enforce"
+            and state_committed
             and directive
             and decision.outcome in {
                 "switch",
@@ -7666,7 +7908,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             decision.record["applied"] = bool(applied)
             if reasoning_effort:
                 decision.record["reasoning_applied"] = bool(reasoning_applied)
-        elif mode == "enforce" and (
+        elif mode == "enforce" and state_committed and (
             decision.outcome in {
                 "noop_satisfied",
                 "noop_already_chat",
@@ -7816,14 +8058,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         runtime: dict,
         user_config: Optional[dict] = None,
+        state_override: Optional[dict] = None,
     ):
         """Evaluate and audit M3 routing without mutating live routing state.
 
-        This method is called from ``TurnRunner.run_sync`` after the gateway's
-        canonical runtime resolution, which is already off the event loop. It
-        intentionally recognizes only ``mode: shadow``; enforce decisions use
-        the pre-dispatch ``_model_router_stage`` so an applied switch is visible
-        before agent construction.
+        A bounded daemon worker calls this after ``TurnRunner.run_sync`` has
+        resolved the canonical runtime. It intentionally recognizes only
+        ``mode: shadow``; enforce decisions use the pre-dispatch
+        ``_model_router_stage`` so an applied switch is visible before agent
+        construction.
         Route health resolution is read-only: shadow evaluation may append its
         decision log, but cannot run a recovery probe or rewrite shared health.
         """
@@ -7838,10 +8081,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         catalog = load_routes(cfg)
         if catalog.router.mode != "shadow":
             return None
-        state = self.__dict__.get("_model_router_state")
-        if state is None:
-            state = {}
-            self._model_router_state = state
+        if isinstance(state_override, dict):
+            state = state_override
+        else:
+            _lock, state, _slots, _inflight = (
+                self._ensure_model_router_runtime_state()
+            )
         decision = model_router.evaluate_event(
             event=event,
             session_store=self.session_store,
@@ -25598,6 +25843,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for attr in _CONVERSATION_SCOPED_STATE:
             store = getattr(self, attr, None)
             if isinstance(store, dict):
+                if attr == "_model_router_state":
+                    lock = getattr(self, "_model_router_state_lock", None)
+                    if lock is not None:
+                        with lock:
+                            store.pop(session_key, None)
+                        continue
                 store.pop(session_key, None)
         self._clear_session_boundary_security_state(session_key)
         logger.debug(

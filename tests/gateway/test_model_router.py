@@ -15,6 +15,7 @@ import asyncio
 import copy
 import io
 import json
+import threading
 import urllib.error
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -68,6 +69,7 @@ def _cfg(*, router=None, static_rules=None):
             "mode": "shadow",
             "model": "gemini-3-flash-preview",
             "timeout_ms": 8000,
+            "classify_timeout_s": 2,
             "recent_turns": 5,
             "normal_downgrade_streak": 3,
             "chat_route": "chat",
@@ -1376,6 +1378,45 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     )
 
 
+def test_gateway_shadow_turn_does_not_wait_for_hung_classifier(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    returned = threading.Event()
+    scheduled = {}
+
+    def hang(**_kwargs):
+        started.set()
+        release.wait(5)
+        finished.set()
+        return SimpleNamespace(record={"mode": "shadow"})
+
+    monkeypatch.setattr(runner, "_evaluate_model_router_shadow", hang)
+
+    def schedule_from_turn():
+        scheduled["value"] = runner._schedule_model_router_shadow(
+            event=_event(),
+            session_key="tg:c1",
+            runtime={"model": "model-b"},
+            user_config=_cfg(router={"mode": "shadow"}),
+        )
+        returned.set()
+
+    caller = threading.Thread(target=schedule_from_turn, daemon=True)
+    caller.start()
+    try:
+        assert started.wait(2)
+        assert returned.wait(2), "the user turn waited for shadow classification"
+    finally:
+        release.set()
+    caller.join(2)
+    assert finished.wait(2)
+    assert scheduled["value"] is True
+
+
 @pytest.mark.parametrize(
     ("configured", "override", "expected"),
     [
@@ -1451,7 +1492,7 @@ def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
         rule=None,
         record={"source": "llm"},
     )
-    monkeypatch.setattr(mr_mod, "classifier_decision", MagicMock(return_value=decision))
+    runner._classify_model_router_with_budget = AsyncMock(return_value=decision)
     monkeypatch.setattr(mr_mod, "log_decision", MagicMock())
 
     result = asyncio.run(
@@ -1466,6 +1507,84 @@ def test_gateway_enforce_authoritative_noop_records_route_intent(monkeypatch):
 
     assert result is decision
     assert runner._session_state("tg:c1").conversation.active_route_name == "dev"
+
+
+def test_gateway_enforce_classifier_timeout_uses_fallback_without_late_state(
+    monkeypatch,
+):
+    from gateway.run import GatewayRunner
+
+    cfg = _cfg(router={"mode": "enforce", "classify_timeout_s": 0.05})
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _FakeStore()
+    runner._model_router_runtime_snapshot = MagicMock(
+        return_value={"model": "model-b", "provider": "p2"},
+    )
+    runner._apply_model_router_directive = AsyncMock(return_value=(True, False))
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def hanging_classifier(_context, **_kwargs):
+        started.set()
+        release.wait(5)
+        finished.set()
+        return {
+            "label": "NORMAL",
+            "confidence": 0.99,
+            "evidence": "S1 ordinary chat",
+            "source": "llm",
+            "classification_reason": "",
+        }
+
+    monkeypatch.setattr(mr_mod, "classify_dev_detailed", hanging_classifier)
+    monkeypatch.setattr(mr_mod, "log_decision", MagicMock())
+
+    async def scenario():
+        task = asyncio.create_task(
+            runner._model_router_stage(
+                _event("gateway 버그 고쳐줘"),
+                _source(),
+                "tg:c1",
+                mode="enforce",
+                user_config=cfg,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            decision = await asyncio.wait_for(task, timeout=2)
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await asyncio.sleep(0)
+        return decision
+
+    decision = asyncio.run(scenario())
+    assert decision.record["source"] == "fallback"
+    assert decision.record["classification_reason"] == "classifier_timeout"
+    assert decision.label == "SYSTEM_DEV"
+    assert runner._model_router_state["tg:c1"]["normal_streak"] == 0
+
+
+def test_enforce_state_transaction_rejects_stale_shadow_commit():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    key, shared, shadow_identity, shadow_local = (
+        runner._begin_model_router_state("tg:c1", invalidate=False)
+    )
+    shadow_local[key]["normal_streak"] = 9
+
+    enforce_key, enforce_shared, _enforce_identity, _enforce_local = (
+        runner._begin_model_router_state("tg:c1", invalidate=True)
+    )
+
+    assert enforce_key == key
+    assert enforce_shared is shared
+    assert runner._commit_model_router_state(
+        key, shared, shadow_identity, shadow_local
+    ) is False
+    assert shared[key]["normal_streak"] == 0
 
 
 def test_gateway_enforce_applies_repromote_once_at_threshold(monkeypatch):

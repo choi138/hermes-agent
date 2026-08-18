@@ -1080,6 +1080,18 @@ def _is_authoritative_llm_decision(detail: dict[str, Any]) -> bool:
     return math.isfinite(value) and 0.0 <= value <= 1.0
 
 
+def _classifier_request_settings(router: Any) -> tuple[str, str, float, float]:
+    """Return provider, model, transport timeout, and wall-clock budget."""
+    provider = str(getattr(router, "provider", "") or DEV_DEFAULT_PROVIDER)
+    model = str(getattr(router, "model", "") or DEV_DEFAULT_MODEL)
+    transport_timeout = (
+        float(getattr(router, "timeout_ms", DEFAULT_TIMEOUT_MS) or DEFAULT_TIMEOUT_MS)
+        / 1000.0
+    )
+    classify_timeout = float(getattr(router, "classify_timeout_s", 2.0) or 2.0)
+    return provider, model, transport_timeout, classify_timeout
+
+
 def classifier_decision(
     *,
     event: Any,
@@ -1098,9 +1110,8 @@ def classifier_decision(
 
     ``state`` is the GatewayRunner-owned per-session hysteresis dict
     ({session_key: {"normal_streak": int, "repromote_streak": int,
-    "repromote_route": str}}); shadow and enforce share it. Contains the
-    blocking classifier HTTP call — gateway callers run this off the event
-    loop.
+    "repromote_route": str}}); shadow and enforce share it. Gateway callers
+    run the blocking classification off the event loop.
     """
     context = build_context(
         event=event,
@@ -1110,9 +1121,7 @@ def classifier_decision(
         loaded_skills=[],  # no core equivalent at this base; keep payload shape parity
         session_key_override=session_key_override,
     )
-    provider = str(getattr(router, "provider", "") or DEV_DEFAULT_PROVIDER)
-    model = str(getattr(router, "model", "") or DEV_DEFAULT_MODEL)
-    timeout = float(getattr(router, "timeout_ms", DEFAULT_TIMEOUT_MS) or DEFAULT_TIMEOUT_MS) / 1000.0
+    provider, model, timeout, _budget = _classifier_request_settings(router)
     detail = classify_dev_detailed(
         context,
         provider=provider,
@@ -1120,6 +1129,38 @@ def classifier_decision(
         timeout=timeout,
         complete=complete_dev,
     )
+    return classifier_decision_from_detail(
+        context=context,
+        detail=detail,
+        runtime=runtime,
+        cfg=cfg,
+        catalog=catalog,
+        router=router,
+        mode=mode,
+        state=state,
+        provider=provider,
+        model=model,
+    )
+
+
+def classifier_decision_from_detail(
+    *,
+    context: PolicyClassificationContext,
+    detail: dict[str, Any],
+    runtime: dict[str, Any] | None,
+    cfg: dict[str, Any] | None,
+    catalog: Any,
+    router: Any,  # hermes_cli.model_routes.RouterConfig
+    mode: str,
+    state: dict[str, Any],
+    provider: str,
+    model: str,
+) -> RoutingDecision:
+    """Apply one completed classification to hysteresis and route state.
+
+    This phase performs no classifier call, so a gateway deadline can discard
+    a late classification before any shared routing state is mutated.
+    """
     dev_label = detail["label"]
     state_key = context.session_key or context.session_id or "unknown"
     entry = state.setdefault(state_key, {"normal_streak": 0})

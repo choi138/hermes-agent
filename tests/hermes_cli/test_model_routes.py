@@ -1402,6 +1402,7 @@ def test_router_absent_defaults_off():
     assert catalog.router.mode == "off"
     assert catalog.router.model == mr.DEFAULT_ROUTER_MODEL
     assert catalog.router.timeout_ms == 8000.0
+    assert catalog.router.classify_timeout_s == 2.0
     assert catalog.router.recent_turns == 5
     assert catalog.router.normal_downgrade_streak == 3
     assert catalog.router.repromote_after_turns == 3
@@ -1415,6 +1416,7 @@ def test_router_full_valid_block():
         "mode": "shadow",
         "model": "gemini-3-flash-preview",
         "timeout_ms": 5000,
+        "classify_timeout_s": 1.5,
         "recent_turns": 8,
         "normal_downgrade_streak": 2,
         "repromote_after_turns": 4,
@@ -1427,6 +1429,7 @@ def test_router_full_valid_block():
     rc = catalog.router
     assert rc.mode == "shadow"
     assert rc.timeout_ms == 5000.0
+    assert rc.classify_timeout_s == 1.5
     assert rc.recent_turns == 8
     assert rc.normal_downgrade_streak == 2
     assert rc.repromote_after_turns == 4
@@ -1485,7 +1488,15 @@ def test_router_unknown_key_warns():
     assert catalog.router.mode == "shadow"
 
 
-@pytest.mark.parametrize("key", ["timeout_ms", "recent_turns", "normal_downgrade_streak"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "timeout_ms",
+        "classify_timeout_s",
+        "recent_turns",
+        "normal_downgrade_streak",
+    ],
+)
 @pytest.mark.parametrize("value", [0, -1, "5", True, None])
 def test_router_invalid_numeric_warns_and_defaults(key, value):
     catalog = mr.load_routes(_cfg(routes=_router_routes(), router={key: value}))

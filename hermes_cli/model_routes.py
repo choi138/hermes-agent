@@ -82,14 +82,19 @@ _HEALTH_KEYS = {"enabled", "cache_path", "ok_ttl_seconds", "fail_ttl_seconds", "
 _HEALTH_NUMERIC_KEYS = ("ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds")
 _RULE_KEYS = {"name", "route", "when", "reason"}
 _ROUTER_KEYS = {
-    "mode", "provider", "model", "timeout_ms", "recent_turns", "normal_downgrade_streak",
+    "mode", "provider", "model", "timeout_ms", "classify_timeout_s", "recent_turns", "normal_downgrade_streak",
     "repromote_after_turns", "chat_route", "label_routes", "decision_log",
 }
 _ROUTER_MODES = ("off", "shadow", "enforce")
 # Classifier labels that may map to a route. NORMAL is not mappable — its
 # downgrade target is ``chat_route`` (hysteresis-gated).
 _ROUTER_LABELS = ("SYSTEM_DEV", "FRONTEND_DEV", "DOCUMENT_WORK")
-_ROUTER_NUMERIC_KEYS = ("timeout_ms", "recent_turns", "normal_downgrade_streak")
+_ROUTER_NUMERIC_KEYS = (
+    "timeout_ms",
+    "classify_timeout_s",
+    "recent_turns",
+    "normal_downgrade_streak",
+)
 DEFAULT_ROUTER_MODEL = "gemini-3-flash-preview"
 DEFAULT_ROUTER_PROVIDER = "gemini"
 
@@ -163,6 +168,7 @@ class RouterConfig:
     provider: str = DEFAULT_ROUTER_PROVIDER
     model: str = DEFAULT_ROUTER_MODEL
     timeout_ms: float = 8000.0
+    classify_timeout_s: float = 2.0
     recent_turns: int = 5
     normal_downgrade_streak: int = 3
     repromote_after_turns: int = 3  # accepted-member noops before primary re-promotion
@@ -842,7 +848,11 @@ def _parse_router(
             continue
         value = raw[key]
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
-            kwargs[key] = int(value) if key != "timeout_ms" else float(value)
+            kwargs[key] = (
+                int(value)
+                if key in {"recent_turns", "normal_downgrade_streak"}
+                else float(value)
+            )
         else:
             issues.append(ConfigIssue(
                 "warning",
