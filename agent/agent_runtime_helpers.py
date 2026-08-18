@@ -100,6 +100,8 @@ def _ra():
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
     {
+        "model_status",
+        "model_switch",
         "todo",
         "session_search",
         "memory",
@@ -3024,7 +3026,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
-    if function_name == "todo":
+    if function_name == "model_status":
+        def _execute(next_args: dict) -> Any:
+            from agent.runtime_control import model_status as _model_status
+
+            return _finish_agent_tool(_model_status(agent), next_args)
+    elif function_name == "model_switch":
+        def _execute(next_args: dict) -> Any:
+            from agent.runtime_control import dispatch_model_switch
+
+            return _finish_agent_tool(
+                dispatch_model_switch(agent, next_args),
+                next_args,
+            )
+    elif function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
             return _finish_agent_tool(

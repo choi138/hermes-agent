@@ -2580,6 +2580,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
+    # One-shot desired-route intent from pre_gateway_dispatch runtime routers;
+    # stale route intent must not survive a conversation reset.
+    "_pending_runtime_route_states",
     "_session_service_tier_overrides",
     "_pending_model_notes",
     "_model_router_state",
@@ -2674,14 +2677,24 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(
+    provider: str,
+    *,
+    target_model: Optional[str] = None,
+) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        if target_model is None:
+            runtime = resolve_runtime_provider(requested=provider)
+        else:
+            runtime = resolve_runtime_provider(
+                requested=provider,
+                target_model=target_model,
+            )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -5413,20 +5426,69 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        if hasattr(agent, "_runtime_reasoning_source"):
+            try:
+                delattr(agent, "_runtime_reasoning_source")
+            except AttributeError:
+                pass
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Route identity is session intent, not model membership.  Rebind it
         # after both fresh construction and cache reuse so outage fallback can
         # prefer the correct route even when accepted models overlap.
         self._runner._bind_active_model_route(agent, ctx.session_key)
+        # Consume the route state exactly once. It is rendered onto the current
+        # user-message sidecar below; assigning unconditionally ensures a reused
+        # cached agent cannot replay the preceding turn's directive.
+        agent._runtime_route_state = (
+            self._runner._consume_pending_runtime_route_state(ctx.session_key)
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
         # intro, voice-channel change).  Assigned unconditionally so a
         # reused cached agent never replays a stale note.
-        agent._gateway_turn_context_notes = "\n\n".join(
-            self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
+        turn_sidecar_parts = self._runner._consume_pending_turn_sidecar_notes(
+            ctx.session_key
         )
+        if agent._runtime_route_state:
+            try:
+                from agent.system_prompt import format_routing_directive
+
+                directive_line = format_routing_directive(agent._runtime_route_state)
+                if directive_line:
+                    turn_sidecar_parts.append(directive_line)
+            except Exception:
+                logger.debug("routing directive render failed", exc_info=True)
+        agent._gateway_turn_context_notes = "\n\n".join(turn_sidecar_parts)
+
+        def _runtime_update_callback(
+            *, scope: str, model_override=None, reasoning_config=None
+        ) -> None:
+            if scope != "session" or not ctx.session_key:
+                return
+            state = self._runner._session_state(ctx.session_key)
+            if model_override:
+                state.conversation.model_override = {
+                    "model": model_override.get("model", ""),
+                    "provider": model_override.get("provider", ""),
+                    "api_key": model_override.get("api_key", ""),
+                    "base_url": model_override.get("base_url", ""),
+                    "api_mode": model_override.get("api_mode", ""),
+                }
+            if reasoning_config is not None:
+                state.conversation.reasoning_override = dict(reasoning_config)
+            if model_override or reasoning_config is not None:
+                self._runner._persist_session_runtime_override(
+                    ctx.session_key,
+                    model=(model_override or {}).get("model"),
+                    provider=(model_override or {}).get("provider"),
+                    reasoning_config=reasoning_config,
+                    include_model=bool(model_override),
+                    include_reasoning=reasoning_config is not None,
+                )
+
+        agent.runtime_update_callback = _runtime_update_callback
 
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
@@ -8183,15 +8245,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
-        if resolved_session_key:
-            self._rehydrate_session_model_override(resolved_session_key)
-        _override_state = (
-            self._peek_session_state(resolved_session_key)
+        override = (
+            self._get_session_model_override(resolved_session_key)
             if resolved_session_key
             else None
-        )
-        override = (
-            _override_state.conversation.model_override if _override_state else None
         )
         if override:
             override_model = override.get("model", model)
@@ -8203,6 +8260,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
+            if override.get("_runtime_bundle_complete") is True:
+                if override_runtime["max_tokens"] is None:
+                    override_runtime.pop("max_tokens")
+                override_runtime["command"] = override.get("command")
+                override_runtime["args"] = list(override.get("args") or [])
+                logger.debug(
+                    "Persisted runtime bundle (fast): session=%s config_model=%s "
+                    "-> override_model=%s provider=%s",
+                    resolved_session_key or "",
+                    model,
+                    override_model,
+                    override_runtime.get("provider"),
+                )
+                return override_model, override_runtime
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
@@ -9636,7 +9707,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve reasoning effort for a session, honoring session overrides.
 
         Priority: session-scoped ``/reasoning --session`` override >
-        per-model override (``agent.reasoning_overrides``) > global
+        persisted ``SessionEntry.runtime_reasoning_effort`` (rehydrated
+        after a gateway restart) > per-model override
+        (``agent.reasoning_overrides``) > global
         ``agent.reasoning_effort``. ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
         per-model overrides track what the session actually runs — when
@@ -9653,6 +9726,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+            entry = self._get_session_entry(resolved_session_key)
+            persisted_effort = getattr(entry, "runtime_reasoning_effort", None)
+            if persisted_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                persisted = parse_reasoning_effort(persisted_effort)
+                if persisted is not None:
+                    self._session_state(
+                        resolved_session_key
+                    ).conversation.reasoning_override = dict(persisted)
+                    return persisted
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -16710,9 +16794,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #   {"action": "prepend", "text":  ...}     -> prepend text, continue
+        #   {"action": "runtime_override", ...}      -> update runtime after auth
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
+        _runtime_override_directives: list[dict] = []
+        _hook_prepends: list[str] = []
         if not is_internal:
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -16741,6 +16829,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.chat_id or "unknown",
                     )
                     return None
+                if _action == "runtime_override":
+                    _runtime_override_directives.append(_result)
+                    continue
+                if _action == "prepend":
+                    _prepend_text = _result.get("text")
+                    if isinstance(_prepend_text, str) and _prepend_text.strip():
+                        _hook_prepends.append(_prepend_text.strip())
+                    continue
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
@@ -16749,6 +16845,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+
+            if _hook_prepends:
+                _combined = "\n\n".join(_hook_prepends)
+                _original = event.text or ""
+                event = dataclasses.replace(
+                    event,
+                    text=f"{_combined}\n\n{_original}" if _original else _combined,
+                )
+                source = event.source
 
         if is_internal:
             pass
@@ -16819,6 +16924,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Runtime directives are trusted only after the normal authorization
+        # path succeeds. Apply them before command interception or agent setup
+        # so the first model call observes the selected session runtime.
+        if _runtime_override_directives:
+            for _directive in _runtime_override_directives:
+                self._apply_gateway_runtime_override(_directive, source)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -25593,6 +25705,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
+    @staticmethod
+    def _reasoning_effort_from_config(
+        reasoning_config: Optional[dict],
+    ) -> Optional[str]:
+        if reasoning_config is None:
+            return None
+        if reasoning_config.get("enabled") is False:
+            return "none"
+        effort = str(reasoning_config.get("effort") or "").strip().lower()
+        return effort or "medium"
+
+    def _get_session_entry(self, session_key: Optional[str]):
+        if not session_key:
+            return None
+        store = getattr(self, "session_store", None)
+        getter = getattr(store, "get_entry", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to load SessionEntry for runtime override",
+                exc_info=True,
+            )
+            return None
+
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Lazily restore a persisted /model override after a gateway restart.
 
@@ -25622,8 +25761,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug(
                 "Failed to read persisted session model override", exc_info=True
             )
-            return
-        if not persisted:
+            persisted = None
+        if not persisted or not isinstance(persisted, dict):
+            entry = self._get_session_entry(session_key)
+            runtime_model = getattr(entry, "runtime_model", None) if entry else None
+            runtime_provider = (
+                getattr(entry, "runtime_provider", None) if entry else None
+            )
+            if not isinstance(runtime_model, str) or not runtime_model.strip():
+                return
+            if not isinstance(runtime_provider, str) or not runtime_provider.strip():
+                return
+            runtime_model = runtime_model.strip()
+            runtime_provider = runtime_provider.strip()
+            try:
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    runtime_provider,
+                    target_model=runtime_model,
+                )
+            except Exception:
+                logger.warning(
+                    "Persisted runtime override for session=%s could not be "
+                    "resolved; using defaults",
+                    session_key,
+                    exc_info=True,
+                )
+                return
+            resolved_provider = runtime.get("provider")
+            if not isinstance(resolved_provider, str) or not resolved_provider.strip():
+                return
+            override = {
+                "model": runtime_model,
+                "provider": resolved_provider.strip(),
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "api_mode": runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+                "_runtime_bundle_complete": True,
+            }
+            self._session_state(session_key).conversation.model_override = override
+            logger.info(
+                "Rehydrated persisted runtime override for session=%s: "
+                "model=%s provider=%s",
+                session_key,
+                runtime_model,
+                resolved_provider,
+            )
             return
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
@@ -25654,6 +25839,294 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
         )
+
+    def _get_session_model_override(
+        self, session_key: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not session_key:
+            return None
+        state = self._peek_session_state(session_key)
+        override = state.conversation.model_override if state else None
+        if override:
+            return dict(override)
+        self._rehydrate_session_model_override(session_key)
+        state = self._peek_session_state(session_key)
+        override = state.conversation.model_override if state else None
+        if override:
+            return dict(override)
+        return None
+
+    def _persist_session_runtime_override(
+        self,
+        session_key: str,
+        *,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        reasoning_config: Optional[dict] = None,
+        include_model: bool = False,
+        include_reasoning: bool = False,
+    ) -> None:
+        store = getattr(self, "session_store", None)
+        updater = getattr(store, "update_runtime_override", None)
+        if not session_key or not callable(updater):
+            return
+        kwargs: Dict[str, Any] = {}
+        if include_model:
+            kwargs.update(model=model, provider=provider)
+        if include_reasoning:
+            kwargs["reasoning_effort"] = self._reasoning_effort_from_config(
+                reasoning_config
+            )
+        if not kwargs:
+            return
+        try:
+            updater(session_key, **kwargs)
+        except Exception:
+            logger.debug("Failed to persist session runtime override", exc_info=True)
+
+    def _clear_persisted_session_runtime_overrides(
+        self,
+        session_key: str,
+        *,
+        model: bool = True,
+        reasoning: bool = True,
+    ) -> None:
+        store = getattr(self, "session_store", None)
+        clearer = getattr(store, "clear_runtime_overrides", None)
+        if not session_key or not callable(clearer):
+            return
+        try:
+            clearer(session_key, model=model, reasoning=reasoning)
+        except Exception:
+            logger.debug("Failed to clear session runtime override", exc_info=True)
+
+    def _build_pending_runtime_route_state(
+        self,
+        directive: dict,
+        *,
+        target_model: str = "",
+        target_provider: str = "",
+        target_reasoning_effort: str = "",
+        reason: str = "",
+    ) -> dict:
+        label = (
+            directive.get("label")
+            or directive.get("route_label")
+            or directive.get("policy_label")
+            or directive.get("policy")
+            or "RUNTIME_OVERRIDE"
+        )
+        return {
+            "label": str(label),
+            "target_provider": str(
+                target_provider or directive.get("provider") or ""
+            ).strip(),
+            "target_model": str(
+                target_model
+                or directive.get("model")
+                or directive.get("raw_input")
+                or ""
+            ).strip(),
+            "target_reasoning_effort": str(
+                target_reasoning_effort or directive.get("reasoning_effort") or ""
+            )
+            .strip()
+            .lower(),
+            "source": str(
+                directive.get("source") or "pre_gateway_dispatch"
+            ).strip(),
+            "strictness": str(
+                directive.get("strictness") or "auto_reconsiderable"
+            ).strip(),
+            "confidence": directive.get("confidence", "unknown"),
+            "reason": str(
+                reason or directive.get("reason") or "pre-dispatch routing"
+            ).strip(),
+        }
+
+    def _set_pending_runtime_route_state(
+        self, session_key: str, route_state: dict
+    ) -> None:
+        if not session_key or not isinstance(route_state, dict):
+            return
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._pending_runtime_route_states = states
+        states[session_key] = route_state
+
+    def _consume_pending_runtime_route_state(
+        self, session_key: str
+    ) -> Optional[dict]:
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not session_key or not isinstance(states, dict):
+            return None
+        state = states.pop(session_key, None)
+        return state if isinstance(state, dict) else None
+
+    def _apply_gateway_runtime_override(
+        self, directive: dict, source: SessionSource
+    ) -> bool:
+        if not isinstance(directive, dict) or source is None:
+            return False
+        model_input = str(
+            directive.get("model") or directive.get("raw_input") or ""
+        ).strip()
+        explicit_provider = str(
+            directive.get("provider") or directive.get("explicit_provider") or ""
+        ).strip()
+        reasoning_effort = str(
+            directive.get("reasoning_effort") or ""
+        ).strip().lower()
+        if not model_input and not explicit_provider and not reasoning_effort:
+            return False
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = ""
+        if not session_key:
+            return False
+
+        changed = False
+        # Effective-delta guard: evict the cached agent (a full system-prompt
+        # and provider prompt-cache rebuild) only when the override actually
+        # moves a model runtime axis. A router that re-selects the already-active
+        # route every triggering message must not bust the cache each time.
+        # Reasoning-only overrides never require eviction: reasoning is excluded
+        # from the agent-cache signature and re-applied per turn in run_sync.
+        evict_needed = False
+        if model_input or explicit_provider:
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+                from hermes_cli.model_switch import switch_model as _switch_model
+
+                cfg = _load_gateway_config()
+                model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+                current_model = model_cfg.get("default", "")
+                current_provider = model_cfg.get("provider", "openrouter")
+                current_base_url = model_cfg.get("base_url", "")
+                current_api_key = ""
+                user_provs = cfg.get("providers") if isinstance(cfg, dict) else None
+                try:
+                    custom_provs = get_compatible_custom_providers(cfg)
+                except Exception:
+                    custom_provs = (
+                        cfg.get("custom_providers") if isinstance(cfg, dict) else None
+                    )
+                override = self._get_session_model_override(session_key) or {}
+                current_model = override.get("model", current_model)
+                current_provider = override.get("provider", current_provider)
+                current_base_url = override.get("base_url", current_base_url)
+                current_api_key = override.get("api_key", current_api_key)
+                result = _switch_model(
+                    raw_input=model_input,
+                    current_provider=current_provider,
+                    current_model=current_model,
+                    current_base_url=current_base_url,
+                    current_api_key=current_api_key,
+                    is_global=False,
+                    explicit_provider=explicit_provider or None,
+                    user_providers=user_provs,
+                    custom_providers=custom_provs,
+                )
+                if not getattr(result, "success", False):
+                    logger.warning(
+                        "pre_gateway_dispatch runtime_override failed for %s: %s",
+                        session_key,
+                        getattr(result, "error_message", "model switch failed"),
+                    )
+                    return changed
+                result_model = getattr(result, "new_model", "")
+                result_provider = getattr(result, "target_provider", "")
+                result_base_url = getattr(result, "base_url", "") or ""
+                result_api_mode = getattr(result, "api_mode", "") or ""
+                previous_api_mode = override.get("api_mode")
+                model_axes_changed = (
+                    str(result_model or "") != str(current_model or "")
+                    or str(result_provider or "") != str(current_provider or "")
+                    or str(result_base_url or "") != str(current_base_url or "")
+                    or (
+                        previous_api_mode is not None
+                        and str(result_api_mode) != str(previous_api_mode or "")
+                    )
+                )
+                self._session_state(
+                    session_key
+                ).conversation.model_override = {
+                    "model": result_model,
+                    "provider": result_provider,
+                    "api_key": getattr(result, "api_key", "") or "",
+                    "base_url": result_base_url,
+                    "api_mode": result_api_mode,
+                }
+                self._persist_session_runtime_override(
+                    session_key,
+                    model=result_model,
+                    provider=result_provider,
+                    include_model=True,
+                )
+                reason = str(
+                    directive.get("reason") or "pre-dispatch routing"
+                ).strip()
+                self._set_pending_runtime_route_state(
+                    session_key,
+                    self._build_pending_runtime_route_state(
+                        directive,
+                        target_model=result_model,
+                        target_provider=result_provider,
+                        target_reasoning_effort=reasoning_effort,
+                        reason=reason,
+                    ),
+                )
+                if model_axes_changed:
+                    pending = getattr(self, "_pending_model_notes", None)
+                    if pending is None:
+                        self._pending_model_notes = {}
+                        pending = self._pending_model_notes
+                    pending[session_key] = (
+                        "[Note: runtime route selected before this turn: "
+                        f"{current_model or 'default'} -> {result_model} via "
+                        f"{getattr(result, 'provider_label', '') or result_provider} "
+                        f"({reason}). Adjust your self-identification accordingly.]"
+                    )
+                    evict_needed = True
+                changed = True
+            except Exception as exc:
+                logger.warning(
+                    "pre_gateway_dispatch runtime_override raised for %s: %s",
+                    session_key,
+                    exc,
+                )
+        if reasoning_effort:
+            try:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(reasoning_effort)
+                if parsed is None:
+                    logger.warning(
+                        "Ignoring unknown reasoning_effort=%r", reasoning_effort
+                    )
+                else:
+                    self._set_session_reasoning_override(session_key, parsed)
+                    if not (model_input or explicit_provider):
+                        self._set_pending_runtime_route_state(
+                            session_key,
+                            self._build_pending_runtime_route_state(
+                                directive,
+                                target_reasoning_effort=reasoning_effort,
+                            ),
+                        )
+                    self._persist_session_runtime_override(
+                        session_key,
+                        reasoning_config=parsed,
+                        include_reasoning=True,
+                    )
+                    changed = True
+            except Exception as exc:
+                logger.warning("Reasoning runtime override failed: %s", exc)
+        if changed and evict_needed:
+            self._evict_cached_agent(session_key)
+        return changed
 
     def _apply_session_model_override(
         self, session_key: str, model: str, runtime_kwargs: dict

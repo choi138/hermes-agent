@@ -56,7 +56,18 @@ def _make_runner(platform: Platform):
     runner.pairing_store._is_rate_limited.return_value = False
     runner.session_store = MagicMock()
     runner._running_agents = {}
+    runner._pending_runtime_route_states = {}
     runner._update_prompt_pending = {}
+    runner._external_drain_active = False
+    runner._turn_started_at = {}
+    runner._claim_active_session_slot = lambda *_args, **_kwargs: (None, None)
+    runner._persist_active_agents = lambda: None
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._cache_session_source = lambda *_args, **_kwargs: None
+    runner._restore_moa_one_shot = lambda *_args, **_kwargs: None
+    runner._restore_pending_one_turn_model_override = lambda *_args, **_kwargs: None
+    runner._release_running_agent_state = lambda *_args, **_kwargs: True
+    runner._release_turn_lease = lambda *_args, **_kwargs: None
     return runner, adapter
 
 
@@ -118,3 +129,136 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_prepends_accumulate_before_dispatch(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "prepend", "text": "First context."},
+                {"action": "prepend", "text": "Second context."},
+            ]
+        return []
+
+    captured = {}
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        captured["text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture
+
+    await runner._handle_message(_make_event("original"))
+
+    assert captured["text"] == "First context.\n\nSecond context.\n\noriginal"
+
+
+@pytest.mark.asyncio
+async def test_runtime_override_applies_after_auth_before_agent(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    directive = {
+        "action": "runtime_override",
+        "model": "gpt-5.5",
+        "provider": "codex-nekos",
+    }
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **kwargs: [directive] if name == "pre_gateway_dispatch" else [],
+    )
+    order = []
+
+    def _apply(observed, source):
+        order.append(("override", observed, source))
+        return True
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        order.append(("agent", event.text, source))
+        return "ok"
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._apply_gateway_runtime_override = _apply
+    runner._handle_message_with_agent = _capture
+
+    await runner._handle_message(_make_event("review this"))
+
+    assert [item[0] for item in order] == ["override", "agent"]
+    assert order[0][1] is directive
+
+
+def test_runtime_override_normalizes_one_shot_route_state(monkeypatch):
+    directive = {
+        "action": "runtime_override",
+        "model": "gpt-5.5",
+        "provider": "codex-nekos",
+        "reasoning_effort": "high",
+        "reason": "codex-lb PR review",
+    }
+
+    def _fake_switch_model(**_kwargs):
+        return SimpleNamespace(
+            success=True,
+            new_model="gpt-5.5",
+            target_provider="codex-nekos",
+            api_key="test-key",
+            base_url="https://codex.nekos.me/v1",
+            api_mode="codex_responses",
+            provider_label="codex-nekos",
+            error_message="",
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _fake_switch_model)
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "model": {"default": "old-model", "provider": "openrouter"},
+            "providers": {},
+        },
+    )
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._get_session_model_override = lambda _key: {}
+    runner._persist_session_runtime_override = lambda *_args, **_kwargs: None
+    runner._evict_cached_agent = lambda _key: None
+    runner._pending_model_notes = {}
+    source = _make_event().source
+
+    assert runner._apply_gateway_runtime_override(directive, source) is True
+
+    session_key = runner._session_key_for_source(source)
+    expected = {
+        "label": "RUNTIME_OVERRIDE",
+        "target_provider": "codex-nekos",
+        "target_model": "gpt-5.5",
+        "target_reasoning_effort": "high",
+        "source": "pre_gateway_dispatch",
+        "strictness": "auto_reconsiderable",
+        "confidence": "unknown",
+        "reason": "codex-lb PR review",
+    }
+    assert runner._pending_runtime_route_states[session_key] == expected
+    assert runner._consume_pending_runtime_route_state(session_key) == expected
+    assert runner._consume_pending_runtime_route_state(session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_override_never_applies_for_unauthorized_sender(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    directive = {"action": "runtime_override", "model": "gpt-5.5"}
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **kwargs: [directive] if name == "pre_gateway_dispatch" else [],
+    )
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.pairing_store.generate_code.return_value = None
+    runner._apply_gateway_runtime_override = MagicMock()
+
+    assert await runner._handle_message(_make_event("review this")) is None
+    runner._apply_gateway_runtime_override.assert_not_called()
