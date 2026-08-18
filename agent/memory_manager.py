@@ -31,6 +31,7 @@ import logging
 import re
 import inspect
 import threading
+import time
 from concurrent.futures import Future, wait
 from typing import Any, Callable, Dict, List, Optional
 
@@ -787,6 +788,14 @@ class MemoryManager:
             return
         user_content = clean_user_content
 
+        # Turn-boundary timestamp, captured HERE on the foreground thread:
+        # it becomes both journals' record ts and the taint verdict's as_of
+        # bound (ADR-004 §①). If the mem-sync worker is backed up and
+        # journals this turn minutes late, injected-span registrations from
+        # LATER turns must not taint this turn's assistant span — the span
+        # was authored before they existed.
+        turn_ts = time.time()
+
         def _run() -> None:
             # ADR-004 Phase 0 (§4.2): journal the turn durably BEFORE any
             # provider ingest is attempted. Runs on the mem-sync worker (not
@@ -794,7 +803,9 @@ class MemoryManager:
             # any failure and never raises.
             wal = self._pending_wal
             wal_entry_id = (
-                wal.append_turn(session_id, user_content, assistant_content)
+                wal.append_turn(
+                    session_id, user_content, assistant_content, ts=turn_ts
+                )
                 if wal is not None else None
             )
             # ADR-004 Phase 0 (§② L0-mirror): mirror the outgoing episode
@@ -806,6 +817,7 @@ class MemoryManager:
                     assistant_content,
                     provider_names=[p.name for p in providers],
                     wal_entry_id=wal_entry_id,
+                    ts=turn_ts,
                 )
             all_synced = True
             for provider in providers:
