@@ -1943,6 +1943,33 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 
 
+def _gateway_max_workers(default: int = 12) -> int:
+    """Return the size of the shared gateway agent-turn thread pool.
+
+    Every gateway turn occupies one worker for its full lifetime, including
+    blocking process waits and long-running background work.  Resolve the
+    setting from ``gateway.max_workers`` first, then the environment carrier,
+    and keep at least two workers available.
+    """
+    value = None
+    try:
+        config = _load_gateway_config()
+        gateway_config = config.get("gateway") if isinstance(config, dict) else None
+        if isinstance(gateway_config, dict) and gateway_config.get("max_workers") is not None:
+            value = gateway_config["max_workers"]
+    except Exception:
+        pass
+
+    if value is None:
+        value = os.environ.get("HERMES_GATEWAY_MAX_WORKERS")
+
+    try:
+        workers = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        workers = default
+    return max(2, workers)
+
+
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
     _reload_runtime_env_preserving_config_authority()
@@ -23457,7 +23484,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             executor = getattr(self, "_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
                 executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10,
+                    max_workers=_gateway_max_workers(),
                     thread_name_prefix="hermes-gateway",
                 )
                 self._executor = executor
