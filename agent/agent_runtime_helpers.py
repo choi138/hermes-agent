@@ -108,6 +108,7 @@ AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
         "notes_write",
         "notes_read",
         "memory_propose",
+        "curator_verdict",
         "clarify",
         "read_terminal",
         "read_preview",
@@ -3124,6 +3125,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             from tools.notes_tool import dispatch_notes_tool_for_agent
             return _finish_agent_tool(
                 dispatch_notes_tool_for_agent(agent, "memory_propose", next_args),
+                next_args,
+            )
+    elif function_name == "curator_verdict":
+        # Ingest-curator verdict submission (ADR-004 Phase 2) — agent-scoped:
+        # only a curator fork carries the verdict sink; other agents are
+        # refused inside the handler.
+        def _execute(next_args: dict) -> Any:
+            from agent.ingest_curator import dispatch_curator_verdict_for_agent
+            return _finish_agent_tool(
+                dispatch_curator_verdict_for_agent(agent, next_args),
                 next_args,
             )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):

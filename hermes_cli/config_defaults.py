@@ -1126,6 +1126,16 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # ADR-004 ingest-curator fork. "auto" shares the main model and warm
+        # transcript; an explicit provider/model uses the cold WAL context.
+        "ingest_curator": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 300,
+            "extra_body": {},
+        },
         "moa_reference": {
             "provider": "auto",
             "model": "",
@@ -1967,6 +1977,19 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 5,  # retain last N regular snapshots
         },
+        # ADR-004 memory ingest curator. This is deliberately separate from
+        # the skill-maintenance `enabled` switch above and deploys inert.
+        "ingest_enabled": False,
+        "shadow_mode": True,
+        "salience": {
+            "threshold": 12,
+            "weight_proposal": 3,
+            "weight_tool_success": 2,
+            "weight_non_trivial": 1,
+            "fallback_turns": 10,
+        },
+        "idle_seconds": 600,
+        "session_end_min_turns": 3,
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.

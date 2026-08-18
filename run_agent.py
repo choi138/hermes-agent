@@ -4124,6 +4124,19 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        # Ingest-curator session-end boundary (ADR-004 Phase 2, SHADOW):
+        # ≥3-turn sessions with a dirty buffer get a cold curation run on a
+        # daemon thread. Observed BEFORE provider teardown so the fork's
+        # memory_search reads still work. No-op unless curator.ingest_enabled;
+        # internally skips ingest-disabled forks; fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator session-end observation failed (fail-open)",
+                exc_info=True,
+            )
         from agent.memory_manager import memory_ingest_allowed
         if self._memory_manager and not memory_ingest_allowed(self):
             # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager —
@@ -4168,6 +4181,16 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
+        # Ingest-curator session boundary (ADR-004 Phase 2, SHADOW) — same
+        # rationale as in shutdown_memory_provider. Fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator session-end observation failed (fail-open)",
+                exc_info=True,
+            )
         from agent.memory_manager import memory_ingest_allowed
         if self._memory_manager and memory_ingest_allowed(self):
             try:

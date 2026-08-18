@@ -46,6 +46,12 @@ class TestSchemas:
         assert "propose" in desc and "confirm" in desc
         assert "NOOP" in desc
         assert "skills" in desc  # procedural routing is stated
+        assert "grounding_preview" in desc
+        assert "evidence_overrides" in desc
+        override = NOTES_WRITE_SCHEMA["parameters"]["properties"][
+            "evidence_overrides"
+        ]
+        assert override["additionalProperties"] == {"type": "string"}
         assert NOTES_WRITE_SCHEMA["parameters"]["required"] == ["step"]
 
     def test_memory_propose_schema_is_fire_and_forget(self):

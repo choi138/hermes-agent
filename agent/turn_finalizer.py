@@ -970,6 +970,18 @@ def finalize_turn(
                 _r5_park_failed()
             except Exception:
                 pass
+    # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW). Pure
+    # O(turn-slice) arithmetic inline; any curator run spawns on a daemon
+    # thread. No-op unless curator.ingest_enabled; fail-open.
+    if final_response and not interrupted:
+        try:
+            from agent.ingest_curator import observe_turn_completed
+            observe_turn_completed(agent, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator turn observation failed (fail-open)",
+                exc_info=True,
+            )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.

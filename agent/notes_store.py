@@ -442,6 +442,7 @@ class NotesStore:
         *,
         body: Optional[str] = None,
         evidence_add: Sequence[str] = (),
+        evidence_remove: Sequence[str] = (),
         confidence: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -453,6 +454,9 @@ class NotesStore:
         """
         path = self.path_for(kind, topic_key)
         new_evidence = [str(e).strip() for e in (evidence_add or []) if str(e).strip()]
+        removed_evidence = {
+            str(e).strip() for e in (evidence_remove or []) if str(e).strip()
+        }
         with _file_lock(path):
             note = self.read(kind, topic_key)
             if note["status"] == "tombstoned":
@@ -490,6 +494,14 @@ class NotesStore:
                 )
             new_body = self._validate_body(body) if body is not None else note["body"]
             merged_evidence = list(dict.fromkeys(list(note["evidence"]) + new_evidence))
+            if removed_evidence:
+                merged_evidence = [
+                    evidence
+                    for evidence in merged_evidence
+                    if evidence not in removed_evidence
+                ]
+            if not merged_evidence:
+                raise NoteValidationError("A note requires at least one evidence ref.")
             frontmatter = {
                 "kind": note["kind"],
                 "topic_key": note["topic_key"],
@@ -515,6 +527,7 @@ class NotesStore:
         new_kind: Optional[str] = None,
         new_topic_key: Optional[str] = None,
         confidence: str = "supported",
+        status: str = "active",
     ) -> Dict[str, Any]:
         """Replace a note with a successor, preserving the predecessor.
 
@@ -546,6 +559,10 @@ class NotesStore:
                 f"Invalid confidence {confidence!r}: expected one of "
                 f"{list(NOTE_CONFIDENCE)}."
             )
+        if status not in NOTE_STATUSES:
+            raise NoteValidationError(
+                f"Invalid status {status!r}: expected one of {sorted(NOTE_STATUSES)}."
+            )
         new_body = self._validate_body(body)
         new_evidence = self._validate_evidence(evidence)
         successor_ref = note_ref(succ_kind, succ_key)
@@ -558,7 +575,7 @@ class NotesStore:
             "evidence": new_evidence,
             "origin": origin,
             "usage": {"search_hits": 0, "last_hit": None},
-            "status": "active",
+            "status": status,
         }
         succ_serialized = _serialize(succ_frontmatter, new_body)
 

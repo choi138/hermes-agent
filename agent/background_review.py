@@ -44,14 +44,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
-    """Resolve provider/model/credentials for the review fork.
+def _resolve_review_runtime(
+    agent: Any, aux_task: str = "background_review"
+) -> Dict[str, Any]:
+    """Resolve provider/model/credentials for a review-style fork.
 
     Default (auto / unset / same as parent): inherit the parent's live runtime
     (with codex_app_server -> codex_responses downgrade). ``routed`` is False —
     the fork uses the main model and the warm cache, exactly as before. When
-    ``auxiliary.background_review.{provider,model}`` names a concrete model
+    ``auxiliary.<aux_task>.{provider,model}`` names a concrete model
     different from the parent's, resolve that runtime and set ``routed=True``.
+
+    ``aux_task`` selects the auxiliary config block: ``background_review``
+    (default, unchanged behavior) or ``ingest_curator`` (the ADR-004 §4.4
+    curator fork, which shares this exact resolution policy by design).
     """
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
@@ -76,7 +82,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     except Exception:
         return parent
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+    task = aux.get(aux_task, {}) if isinstance(aux.get(aux_task), dict) else {}
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
@@ -107,7 +113,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "routed": True,
         }
     except Exception as e:
-        logger.debug("background-review aux routing failed (%s); using main model", e)
+        logger.debug("%s aux routing failed (%s); using main model", aux_task, e)
         return parent
 
 
@@ -168,15 +174,44 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # the user-message that the forked review agent receives.  AIAgent exposes
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
+_MEMORY_WRITE_CONTRACT = (
+    "Memory write contract (hard gate): USER.md and MEMORY.md are always-injected "
+    "scarce context, so most conversation facts must NOT be written there.\n"
+    "Only call memory(add|replace) when the fact is useful across unrelated "
+    "session types (ordinary chat, research, writing, and development) or is a "
+    "global agent/environment/routing invariant. Stable-but-scoped project, "
+    "infra, host, repo, PR, service, workflow, and task-state facts belong to "
+    "Graphiti/session history, or to a skill only if they are reusable procedures "
+    "or pitfalls.\n"
+    "If you call memory(add|replace), the `reason` argument MUST be a JSON object "
+    "string with `declared_scope` and `declared_category`, plus concrete "
+    "`evidence`, `why_always_injected`, `why_not_skill`, and `why_not_graphiti`. "
+    "For target='user', include `applies_to` covering at least three of: "
+    "ordinary_chat, research, writing, development.\n"
+    "If the candidate does not satisfy that contract, do not attempt memory; say "
+    "'Nothing to save.' for memory and move on.\n\n"
+)
+
+_SKILL_REVIEW_CALIBRATION = (
+    "Skill review calibration: be selective, not eager. Update skills only when "
+    "there is a real reusable learning signal: a user correction to approach or "
+    "style, a non-trivial proven technique/workaround/debugging path, or a loaded "
+    "skill that was wrong, missing a step, or outdated. Most ordinary turns, "
+    "one-off tasks, status checks, and transient errors should result in "
+    "'Nothing to save.' Do not create work just to satisfy the review.\n\n"
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
+    + _MEMORY_WRITE_CONTRACT
+    + "Focus on:\n"
     "1. Has the user revealed things about themselves — their persona, desires, "
-    "preferences, or personal details worth remembering?\n"
+    "preferences, or personal details worth remembering across unrelated sessions?\n"
     "2. Has the user expressed expectations about how you should behave, their work "
-    "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "style, or ways they want you to operate across unrelated sessions?\n\n"
+    "If a candidate satisfies the memory write contract, save it using the memory "
+    "tool with the required structured JSON reason. If nothing satisfies the "
+    "contract, just say 'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
@@ -185,11 +220,12 @@ _SKILL_REVIEW_PROMPT = (
     "concrete evidence for a correction or technique. Making no change is "
     "the correct outcome when there is no such evidence; do not manufacture "
     "an update from task length, reviewer count, or transient failures.\n\n"
-    "Target shape of the library: CLASS-LEVEL skills, each with a rich "
+    + _SKILL_REVIEW_CALIBRATION
+    + "Target shape of the library: CLASS-LEVEL skills, each with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries. This "
     "shapes HOW you update, not WHETHER you update.\n\n"
-    "Signals to look for (any one of these warrants action):\n"
+    "Signals to look for (these may warrant action when concrete and reusable):\n"
     "  • User corrected your style, tone, format, legibility, or "
     "verbosity. Frustration signals like 'stop doing X', 'this is too "
     "verbose', 'don't format like this', 'why are you explaining', "
@@ -205,8 +241,8 @@ _SKILL_REVIEW_PROMPT = (
     "from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out "
     "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-    "Preference order — use the earliest action that fits when a concrete "
-    "signal above fired:\n"
+    "Preference order — if a concrete reusable signal exists, use the earliest "
+    "action that fits:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
     "conversation for skills the user loaded via /skill-name or you "
     "read via skill_view. If any of them covers the territory of the "
@@ -299,25 +335,23 @@ _SKILL_REVIEW_PROMPT = (
     "command, config step, env var to set) under an existing setup or "
     "troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "If the session ran smoothly with no corrections and produced no new "
-    "reusable technique, say 'Nothing to save.' and stop. Otherwise, act "
-    "only on the evidenced improvement."
+    "'Nothing to save.' is the correct answer when the session has no concrete "
+    "reusable correction, technique, or skill defect. If the session ran smoothly "
+    "with no corrections and produced no new reusable technique, say 'Nothing to "
+    "save.' and stop. Otherwise, act only on the evidenced improvement."
 )
 
 _COMBINED_REVIEW_PROMPT = (
-    "Review the conversation above and update two things:\n\n"
-    "**Memory**: who the user is. Did the user reveal persona, "
-    "desires, preferences, personal details, or expectations about "
-    "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Update a skill only when "
-    "the transcript contains concrete evidence for a durable correction or "
-    "reusable technique. Making no change is a correct outcome; do not infer "
-    "an update from task length, reviewer count, or transient failures.\n\n"
-    "Target shape of the skill library: CLASS-LEVEL skills with a rich "
+    "Review the conversation above and update two dimensions only when each has "
+    "a real durable signal:\n\n"
+    "**Memory**: who the user is or global agent/runtime invariants.\n"
+    + _MEMORY_WRITE_CONTRACT
+    + "**Skills**: how to do a class of task for this user.\n"
+    + _SKILL_REVIEW_CALIBRATION
+    + "Target shape of the skill library: CLASS-LEVEL skills with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-    "Signals that warrant a skill update (any one is enough):\n"
+    "Signals that may warrant a skill update when concrete and reusable:\n"
     "  • User corrected your style, tone, format, legibility, "
     "verbosity, or approach. Frustration is a FIRST-CLASS skill "
     "signal, not just a memory signal. 'stop doing X', 'don't format "
@@ -401,8 +435,9 @@ _COMBINED_REVIEW_PROMPT = (
     "command, config step, env var to set) under an existing setup or "
     "troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "Act on whichever of the two dimensions has real evidence. If nothing "
-    "stands out on either, say 'Nothing to save.' and stop."
+    "Act on whichever dimension has a real concrete signal. If genuinely nothing "
+    "stands out on either, say 'Nothing to save.' and stop. Do not create memory "
+    "or skill updates for weak, scoped, or one-off signals."
 )
 
 

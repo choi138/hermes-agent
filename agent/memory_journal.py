@@ -375,12 +375,22 @@ class PendingTurnWAL:
     # -- startup scan / GC ------------------------------------------------------
 
     def scan_and_gc(self) -> Optional[Dict[str, int]]:
-        """Count unconsumed entries and GC old fully-acked files.
+        """Count unconsumed entries and GC old fully-consumed files.
 
         Returns ``{"files", "unconsumed_entries", "gc_deleted_files"}`` (or
         None when disabled/failed). Logged as the ADR-004 §⑩ buffer-hit
         metric. Phase 0 deliberately does NOT replay unconsumed entries into
         ingest — that is Phase-2 curator behavior.
+
+        Consumption has two mechanisms: per-entry ``ack`` records (the
+        provider-ingest path for turns) and the Phase-2 curator's per-session
+        watermark sidecar (``*.curator-watermark.json`` — the curator's
+        consumption marker; it never writes acks). An entry is unconsumed
+        only when NEITHER covers it — otherwise proposal-bearing files could
+        never become fully consumed and the buffer-hit metric would stay
+        permanently inflated after curation. GC of a consumed file also
+        removes its watermark sidecar, and orphaned sidecars (WAL already
+        gone) are swept so they don't accumulate forever.
         """
         if journals_disabled():
             return None
@@ -392,7 +402,7 @@ class PendingTurnWAL:
             now = time.time()
             for path in sorted(wal_dir.glob("*.jsonl")):
                 try:
-                    turn_ids: set = set()
+                    entry_ts: Dict[str, float] = {}
                     acked_ids: set = set()
                     for rec in _iter_jsonl_records(path):
                         rec_type = rec.get("type")
@@ -400,33 +410,99 @@ class PendingTurnWAL:
                         if not rec_id:
                             continue
                         if rec_type in ("turn", "proposal"):
-                            # Proposals are unconsumed until a curator ack,
-                            # exactly like turns — a proposals-only file must
-                            # not look "fully acked" and get GC'd (that would
+                            # Proposals are unconsumed until the curator
+                            # consumes them (watermark) or an ack lands —
+                            # a proposals-only file must not look "fully
+                            # consumed" and get GC'd prematurely (that would
                             # silently drop queued memory_propose records).
-                            turn_ids.add(rec_id)
+                            try:
+                                entry_ts[rec_id] = float(rec.get("ts") or 0.0)
+                            except (TypeError, ValueError):
+                                entry_ts[rec_id] = 0.0
                         elif rec_type == "ack":
                             acked_ids.add(rec_id)
-                    unconsumed = len(turn_ids - acked_ids)
-                    fully_acked = not (turn_ids - acked_ids)
+                    wm_ts, wm_ids = _load_curator_watermark(path)
+                    unconsumed = sum(
+                        1
+                        for rec_id, ts in entry_ts.items()
+                        if rec_id not in acked_ids
+                        and rec_id not in wm_ids
+                        and not (wm_ts and ts < wm_ts)
+                    )
                     age = now - path.stat().st_mtime
-                    if fully_acked and age > _PENDING_GC_MAX_AGE_S:
+                    if not unconsumed and entry_ts and age > _PENDING_GC_MAX_AGE_S:
                         path.unlink()
+                        _unlink_quiet(_curator_watermark_path(path))
+                        stats["gc_deleted_files"] += 1
+                        continue
+                    if not entry_ts and age > _PENDING_GC_MAX_AGE_S:
+                        # Degenerate ack-only/empty file — same GC posture as
+                        # the pre-watermark code (nothing to consume).
+                        path.unlink()
+                        _unlink_quiet(_curator_watermark_path(path))
                         stats["gc_deleted_files"] += 1
                         continue
                     stats["files"] += 1
                     stats["unconsumed_entries"] += unconsumed
                 except FileNotFoundError:
                     continue  # concurrent GC / operator cleanup
+            for sidecar in wal_dir.glob("*.curator-watermark.json"):
+                wal_name = sidecar.name[: -len(".curator-watermark.json")] + ".jsonl"
+                if not (wal_dir / wal_name).exists():
+                    _unlink_quiet(sidecar)
             logger.info(
                 "memory-pending scan: %d file(s), %d unconsumed turn entry(ies) "
-                "[ADR-004 buffer-hit metric], %d fully-acked file(s) GC'd",
+                "[ADR-004 buffer-hit metric], %d fully-consumed file(s) GC'd",
                 stats["files"], stats["unconsumed_entries"], stats["gc_deleted_files"],
             )
             return stats
         except Exception:
             logger.debug("memory-pending WAL scan failed (fail-open)", exc_info=True)
             return None
+
+
+def _curator_watermark_path(wal_path: Path) -> Path:
+    """The Phase-2 curator's watermark sidecar for one session WAL file.
+
+    Shape contract with ``agent.ingest_curator._watermark_path``:
+    ``{stem}.curator-watermark.json`` next to ``{stem}.jsonl`` (``.json`` so
+    the ``*.jsonl`` scan glob never parses it as a WAL).
+    """
+    return wal_path.with_name(
+        wal_path.name[: -len(".jsonl")] + ".curator-watermark.json"
+    )
+
+
+def _load_curator_watermark(wal_path: Path) -> tuple:
+    """``(last_ts, id_set)`` consumed-marker from the curator sidecar.
+
+    The curator consumes spans by advancing this watermark instead of
+    writing acks (``agent.ingest_curator.save_watermark``): an entry with
+    ``ts < last_ts`` or ``id in id_set`` has been curated. Fail-open to
+    "nothing consumed" — a corrupt sidecar can only over-count the buffer,
+    never drop an entry.
+    """
+    try:
+        sidecar = _curator_watermark_path(wal_path)
+        if not sidecar.exists():
+            return 0.0, frozenset()
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return 0.0, frozenset()
+        return (
+            float(data.get("last_ts") or 0.0),
+            frozenset(str(i) for i in (data.get("last_ids") or []) if i),
+        )
+    except Exception:
+        logger.debug("curator watermark read failed (fail-open)", exc_info=True)
+        return 0.0, frozenset()
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _iter_jsonl_records(path: Path) -> Iterable[Dict[str, Any]]:
