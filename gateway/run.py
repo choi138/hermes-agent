@@ -7483,15 +7483,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
-        if resolved_session_key:
-            self._rehydrate_session_model_override(resolved_session_key)
-        _override_state = (
-            self._peek_session_state(resolved_session_key)
+        override = (
+            self._get_session_model_override(resolved_session_key)
             if resolved_session_key
             else None
-        )
-        override = (
-            _override_state.conversation.model_override if _override_state else None
         )
         if override:
             override_model = override.get("model", model)
@@ -8953,6 +8948,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+            entry = self._get_session_entry(resolved_session_key)
+            persisted_effort = getattr(entry, "runtime_reasoning_effort", None)
+            if persisted_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                persisted = parse_reasoning_effort(persisted_effort)
+                if persisted is not None:
+                    self._session_state(
+                        resolved_session_key
+                    ).conversation.reasoning_override = dict(persisted)
+                    return persisted
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -25000,7 +25006,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             runtime_provider = None
         if not runtime_model and not runtime_provider:
             return None
-        return {"model": runtime_model or "", "provider": runtime_provider or ""}
+        resolved: Dict[str, Any] = {
+            "model": runtime_model or "",
+            "provider": runtime_provider or "",
+        }
+        if runtime_provider:
+            try:
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    runtime_provider
+                )
+                resolved.update(runtime)
+                resolved["model"] = runtime_model or runtime.get("model", "")
+                resolved["provider"] = runtime_provider
+            except Exception:
+                logger.debug(
+                    "Credential re-resolution failed for persisted runtime "
+                    "override provider=%s",
+                    runtime_provider,
+                    exc_info=True,
+                )
+        self._session_state(
+            session_key
+        ).conversation.model_override = dict(resolved)
+        return resolved
 
     def _persist_session_runtime_override(
         self,
