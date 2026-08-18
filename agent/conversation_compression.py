@@ -2257,6 +2257,7 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_compression_no_progress = False
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
     # #58630/#69853). A stale ``True``/holder value from a prior lock-skip
@@ -3057,6 +3058,30 @@ def compress_context(
         if compressed == messages_before_compression:
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
+            agent._last_compression_no_progress = True
+            _no_progress_error = (
+                "no_progress: protected tail spans the whole transcript"
+            )
+            try:
+                from agent.context_compressor import (
+                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                )
+
+                _record_cooldown = getattr(
+                    agent.context_compressor,
+                    "_record_compression_failure_cooldown",
+                    None,
+                )
+                if callable(_record_cooldown):
+                    _record_cooldown(
+                        float(_SUMMARY_FAILURE_COOLDOWN_SECONDS),
+                        _no_progress_error,
+                    )
+            except Exception:
+                logger.debug(
+                    "no-progress compression cooldown persist failed",
+                    exc_info=True,
+                )
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
