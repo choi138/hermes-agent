@@ -4086,6 +4086,137 @@ class AIAgent:
         except Exception:
             pass  # Never let header parsing break the agent loop
 
+    @staticmethod
+    def _recap_tool_label(function_name: str, arguments: Any) -> str:
+        """Render a compact semantic tool label instead of raw JSON noise."""
+        parsed = None
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            pass
+        if isinstance(parsed, dict):
+            if function_name == "terminal" and parsed.get("command"):
+                return f"terminal: {str(parsed['command'])[:70]}"
+            for key in ("path", "file_path", "file"):
+                if parsed.get(key):
+                    return f"{function_name}: {str(parsed[key])[:70]}"
+            if function_name == "search_files" and (
+                parsed.get("pattern") or parsed.get("query")
+            ):
+                query = parsed.get("pattern") or parsed.get("query")
+                return f"search: {str(query)[:60]}"
+            if parsed.get("action"):
+                return f"{function_name} {parsed['action']}"
+            if parsed.get("query"):
+                return f"{function_name}: {str(parsed['query'])[:60]}"
+        return f"{function_name}({str(arguments)[:50]})"
+
+    def get_activity_recap_context(self) -> dict:
+        """Return a read-only snapshot for gateway activity recaps.
+
+        The live message list is copied before inspection so the gateway loop
+        can request a recap while the agent turn continues in its worker.
+        """
+        messages = list(getattr(self, "_session_messages", None) or [])
+        goal = ""
+        goal_fallback = ""
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if not goal_fallback:
+                goal_fallback = text[:300]
+            stripped = re.sub(r"^(\[[^\]]*\]\s*)+", "", text).strip()
+            if stripped:
+                goal = stripped[:300]
+                break
+        if not goal:
+            goal = goal_fallback
+
+        recent_tools: list[str] = []
+        for message in reversed(messages):
+            if len(recent_tools) >= 5:
+                break
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                try:
+                    if isinstance(tool_call, dict):
+                        function = tool_call.get("function", {})
+                        function_name = function.get("name", "?")
+                        arguments = function.get("arguments", "")
+                    else:
+                        function_name = tool_call.function.name
+                        arguments = tool_call.function.arguments
+                except Exception:
+                    continue
+                recent_tools.append(
+                    self._recap_tool_label(function_name, arguments)
+                )
+                if len(recent_tools) >= 5:
+                    break
+
+        def _is_agent_utterance(text: str) -> bool:
+            lowered = text.strip().lower()
+            return bool(lowered) and not (
+                lowered.startswith("operation interrupted")
+                or lowered.startswith("(tool call")
+                or lowered.startswith("[")
+            )
+
+        voice_samples: list[str] = []
+        for message in reversed(messages):
+            if len(voice_samples) >= 3:
+                break
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and isinstance(message.get("content"), str)
+                and _is_agent_utterance(message["content"])
+            ):
+                voice_samples.append(
+                    " ".join(message["content"].strip().split())[:180]
+                )
+        voice_samples.reverse()
+
+        last_tool_result = ""
+        for message in reversed(messages):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "tool"
+                and isinstance(message.get("content"), str)
+                and message["content"].strip()
+            ):
+                last_tool_result = " ".join(
+                    message["content"].strip().split()
+                )[:150]
+                break
+
+        # A fresh session has no assistant utterances to imitate. The frozen
+        # system prompt carries its persona and style definition, so use a
+        # bounded prefix as the final voice source.
+        persona_snippet = ""
+        system_prompt = getattr(self, "_cached_system_prompt", None)
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            persona_snippet = system_prompt.strip()[:900]
+
+        summary = self.get_activity_summary()
+        return {
+            "goal": goal,
+            "recent_tools": list(reversed(recent_tools)),
+            "voice_samples": voice_samples,
+            "persona_snippet": persona_snippet,
+            "last_tool_result": last_tool_result,
+            "current_tool": summary.get("current_tool"),
+            "seconds_since_activity": summary.get("seconds_since_activity"),
+            "last_activity_desc": summary.get("last_activity_desc"),
+            "iteration": summary.get("api_call_count"),
+            "max_iterations": summary.get("max_iterations"),
+        }
+
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 

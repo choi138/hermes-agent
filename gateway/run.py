@@ -25421,6 +25421,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _llm_activity_recap(self, agent, session_key: str) -> Optional[str]:
+        """Generate a cached one-line recap for a long-running agent turn."""
+        try:
+            context = agent.get_activity_recap_context()
+        except Exception:
+            return None
+
+        cache = getattr(self, "_activity_recap_cache", None)
+        if cache is None:
+            cache = {}
+            self._activity_recap_cache = cache
+        context_key = hash(
+            (
+                context.get("goal"),
+                tuple(context.get("recent_tools") or ()),
+                context.get("current_tool") or context.get("last_activity_desc"),
+                tuple(context.get("voice_samples") or ()),
+                bool(context.get("persona_snippet")),
+            )
+        )
+        cached = cache.get(session_key)
+        if cached and cached[0] == context_key:
+            return cached[1]
+
+        def _generate() -> str:
+            from agent.auxiliary_client import call_llm
+
+            tools_text = "; ".join(context.get("recent_tools") or []) or "(none yet)"
+            current = (
+                context.get("current_tool")
+                or context.get("last_activity_desc")
+                or "thinking"
+            )
+            samples = context.get("voice_samples") or []
+            voice_block = ""
+            if samples:
+                joined = "\n".join(f"- {sample}" for sample in samples)
+                voice_block = (
+                    "Your recent messages in this conversation (this is YOUR "
+                    f"voice — match its language, tone, and persona exactly):\n{joined}\n"
+                )
+            elif context.get("persona_snippet"):
+                voice_block = (
+                    "Your persona and conversation-style definition (write in "
+                    f"this voice):\n{context['persona_snippet']}\n"
+                )
+            result_block = ""
+            if context.get("last_tool_result"):
+                result_block = (
+                    "Last tool result (truncated): "
+                    f"{context['last_tool_result']}\n"
+                )
+            prompt = (
+                "You are the AI agent in the middle of a long-running turn. "
+                "Write YOUR OWN one-line status update to the user: what you "
+                "are doing right now and what you are waiting on. ONE line, "
+                "max 100 chars, present tense, no prefix/quotes.\n"
+                + voice_block
+                + f"Goal of this turn: {context.get('goal') or '(unknown)'}\n"
+                + f"Your recent tool calls (oldest first): {tools_text}\n"
+                + result_block
+                + f"Currently: {current} "
+                + f"({int(context.get('seconds_since_activity') or 0)}s since last activity, "
+                + f"iteration {context.get('iteration')}/{context.get('max_iterations')})"
+            )
+            response = call_llm(
+                task="activity_recap",
+                main_runtime={
+                    "model": getattr(agent, "model", None),
+                    "provider": getattr(agent, "provider", None),
+                    "base_url": getattr(agent, "base_url", None),
+                    "api_key": getattr(agent, "api_key", None),
+                    "api_mode": getattr(agent, "api_mode", None),
+                },
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=80,
+                timeout=8,
+            )
+            message = response.choices[0].message
+            content = (
+                message.get("content")
+                if isinstance(message, dict)
+                else getattr(message, "content", "")
+            )
+            lines = str(content or "").strip().splitlines()
+            return lines[0][:140].strip() if lines else ""
+
+        try:
+            text = await asyncio.wait_for(asyncio.to_thread(_generate), timeout=10)
+        except Exception as exc:
+            logger.debug("activity recap generation failed: %s", exc)
+            return None
+        if not text:
+            return None
+        cache[session_key] = (context_key, text)
+        return text
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -26770,8 +26867,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default: bool = False,
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
+            allow_recap: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return the normalized visibility mode for a gateway surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
@@ -26786,6 +26884,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "recap":
+                return "recap" if allow_recap else "raw"
             return "raw" if bool(value) else "off"
 
         # Disable tool progress for webhooks - they don't support message editing,
@@ -27387,6 +27487,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "long_running_notifications",
             default=True,
             allow_generic=True,
+            allow_recap=True,
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
@@ -27438,11 +27539,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
+                _recap_line = None
+                if _long_running_mode == "recap" and agent_holder[0] is not None:
+                    _recap_line = await self._llm_activity_recap(
+                        agent_holder[0], session_key
+                    )
                 # User-facing heartbeats never copy implementation details
                 # from get_activity_summary(). Discord re-renders the same
                 # structured semantic snapshot; other platforms get localized
                 # elapsed-time copy without tool or iteration names.
-                if _long_running_mode == "generic" and _long_running_phrase_catalog:
+                if _recap_line:
+                    _heartbeat_text = f"⏳ {_elapsed_mins} min — {_recap_line}"
+                    _active_heartbeat_id = _heartbeat_msg_id
+                elif _long_running_mode == "generic" and _long_running_phrase_catalog:
                     try:
                         from gateway.status_phrases import choose_status_phrase
 
@@ -27486,6 +27595,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _active_heartbeat_id = _heartbeat_msg_id
                 try:
                     _notify_res = None
+                    # Recaps must remain visible at the bottom of a busy
+                    # thread. When deletion is supported, replace the prior
+                    # bubble instead of editing it in its old position.
+                    if (
+                        _heartbeat_msg_id
+                        and _long_running_mode == "recap"
+                        and type(_notify_adapter).delete_message
+                        is not BasePlatformAdapter.delete_message
+                    ):
+                        try:
+                            await _notify_adapter.delete_message(
+                                source.chat_id, _heartbeat_msg_id
+                            )
+                        except Exception:
+                            pass
+                        _heartbeat_msg_id = None
+                        _active_heartbeat_id = None
                     if _active_heartbeat_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
@@ -27505,7 +27631,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
                         ):
-                            if semantic_progress_enabled:
+                            if (
+                                semantic_progress_enabled
+                                and _long_running_mode != "recap"
+                            ):
                                 semantic_progress_message_id_ref[0] = str(
                                     _notify_res.message_id
                                 )
