@@ -7764,9 +7764,8 @@ class AIAgent:
         # report it without adding mutable state to the agent core.
         _tt = turn_trace.safe_get_bound(self)
         if _tt is not None:
-            turn_trace.safe_tag(
-                _tt,
-                tool_calls=_tt.tags.get("tool_calls", 0) + len(tool_calls),
+            turn_trace.safe_increment_tag(
+                _tt, "tool_calls", len(tool_calls)
             )
 
         # Allow _vprint during tool execution even with stream consumers

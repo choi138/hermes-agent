@@ -4746,8 +4746,10 @@ class TurnRunner:
 
     def run_sync(self):
         ctx = self._ctx
-        if ctx.turn_trace_obj is not None:
-            turn_trace.safe_adopt(ctx.turn_trace_obj)
+        # Always replace the worker thread's current trace, including with
+        # None. Thread-pool workers are reused across sessions; retaining an
+        # unfinished prior trace could misattribute a later untraced turn.
+        turn_trace.safe_adopt(ctx.turn_trace_obj)
         _trace_setup_started = (
             time.time() if ctx.turn_trace_obj is not None else 0.0
         )
@@ -5943,6 +5945,7 @@ class TurnRunner:
             reset_current_session_key(_approval_session_token)
             if ctx.turn_trace_obj is not None:
                 turn_trace.safe_bind(agent, None)
+            turn_trace.safe_adopt(None)
         ctx.result_holder[0] = result
 
         # Signal the stream consumer that the agent is done
@@ -26736,7 +26739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 turn_trace.safe_add_span(
                     turn_trace_obj,
                     "gateway.ingest",
-                    turn_trace_obj.started_at,
+                    turn_trace.safe_started_at(turn_trace_obj),
                     time.time(),
                     platform=source.platform.value if source.platform else "",
                     session_key=session_key,
@@ -27694,7 +27697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 turn_trace.safe_add_span(
                     turn_trace_obj,
                     "gateway.ingest",
-                    turn_trace_obj.started_at,
+                    turn_trace.safe_started_at(turn_trace_obj),
                     time.time(),
                     platform=source.platform.value if source.platform else "",
                     session_key=session_key,

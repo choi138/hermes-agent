@@ -252,6 +252,17 @@ class TestErrorTolerance:
         with turn_trace.safe_span("turn"):
             pass
 
+        broken = _Carrier()
+        broken.tags = None
+        turn_trace.safe_increment_tag(broken, "tool_calls", 1)
+
+        class _BrokenStart:
+            @property
+            def started_at(self):
+                raise RuntimeError("clock broke")
+
+        assert isinstance(turn_trace.safe_started_at(_BrokenStart()), float)
+
     def test_safe_span_exit_swallows_add_failure(self, sink, monkeypatch):
         trace = turn_trace.begin(key="k")
 
@@ -494,3 +505,13 @@ class TestCacheDiff:
         assert ci and ci["chunk"] == 4 and ci["char_offset"] == 16384
         # matched chars credit the intact head of the changed message
         assert d["matched_char_pct"] > 50.0
+
+    def test_system_tail_capture_is_explicitly_gated(self, monkeypatch):
+        payload = {
+            "messages": [{"role": "system", "content": "head\nTAIL"}],
+        }
+        monkeypatch.delenv("HERMES_TURN_TRACE_SYS_TAIL", raising=False)
+        assert "pfp_sys_tail" not in turn_trace.prefix_fingerprint(payload)
+
+        monkeypatch.setenv("HERMES_TURN_TRACE_SYS_TAIL", "1")
+        assert turn_trace.prefix_fingerprint(payload)["pfp_sys_tail"] == "head\nTAIL"

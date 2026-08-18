@@ -122,6 +122,20 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             msgs = api_kwargs.get("input")
         for msg in msgs or []:
             _add(msg)
+
+        # HERMES_TURN_TRACE_SYS_TAIL=1 additionally captures the raw tail of
+        # the system prompt (chunk hashes locate a tail-only change; this
+        # names the exact line). Debug-only: system-prompt tails are hermes
+        # runtime/context blocks, not user content, and traces stay local.
+        sys_tail = None
+        if os.environ.get("HERMES_TURN_TRACE_SYS_TAIL", "").strip().lower() in _TRUTHY:
+            _sys_obj = instructions
+            if _sys_obj is None and msgs:
+                _first = msgs[0]
+                if isinstance(_first, dict) and _first.get("role") == "system":
+                    _sys_obj = _first.get("content")
+            if isinstance(_sys_obj, str):
+                sys_tail = _sys_obj[-3000:]
         tools_digest, tools_len = _h(api_kwargs.get("tools") or [])
         rest = {
             k: v
@@ -138,6 +152,7 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             # per-key hashes so a rest change can be attributed to the field
             "pfp_rest_keys": {k: _hd(_ser(v)) for k, v in rest.items()},
             "pfp_chunks": chunk_map,
+            **({"pfp_sys_tail": sys_tail} if sys_tail is not None else {}),
         }
     except Exception:
         return None
@@ -431,6 +446,25 @@ def safe_tag(trace: Optional[TurnTrace], **tags: Any) -> None:
             trace.tag(**tags)
     except Exception:
         pass
+
+
+def safe_increment_tag(
+    trace: Optional[TurnTrace], key: str, amount: int = 1
+) -> None:
+    try:
+        if trace is not None:
+            trace.tag(**{key: int(trace.tags.get(key, 0)) + amount})
+    except Exception:
+        pass
+
+
+def safe_started_at(trace: Optional[TurnTrace]) -> float:
+    try:
+        if trace is not None:
+            return float(trace.started_at)
+    except Exception:
+        pass
+    return time.time()
 
 
 def safe_finish(
