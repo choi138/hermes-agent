@@ -448,3 +448,30 @@ class TestCacheDiff:
         new = [{"role": "system", "content": "s-v2"}, {"role": "user", "content": "a"}]
         d = diff_turn_pair(self._fp(old), self._fp(new))
         assert d["diverge_at"] == 0 and not d["system_same"]
+
+    def test_responses_api_shape(self):
+        # Responses payloads carry the system prompt in `instructions` and
+        # history in `input`; instructions must land at pfp index 0.
+        fp = turn_trace.prefix_fingerprint(
+            {
+                "model": "m",
+                "instructions": "SYS",
+                "input": [
+                    {"type": "message", "role": "user", "content": "hi"},
+                    {"type": "function_call", "name": "t", "arguments": "{}"},
+                ],
+                "store": False,
+            }
+        )
+        assert len(fp["pfp"]) == 3
+        sys_only = turn_trace.prefix_fingerprint({"instructions": "SYS", "input": []})
+        assert fp["pfp"][0] == sys_only["pfp"][0]
+        # instructions/input excluded from pfp_rest
+        assert (
+            turn_trace.prefix_fingerprint(
+                {"model": "m", "instructions": "OTHER", "input": [], "store": False}
+            )["pfp_rest"]
+            == turn_trace.prefix_fingerprint(
+                {"model": "m", "instructions": "SYS", "input": [], "store": False}
+            )["pfp_rest"]
+        )

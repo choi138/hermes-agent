@@ -65,7 +65,11 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Hashes each message (and the tools array) exactly as serialized on the
     wire — dict insertion order, no sort_keys — because a key-order-only
     change still breaks the provider's prompt-cache prefix and must show up
-    as a different hash. Returns llm.call span tags:
+    as a different hash. Handles both payload shapes: chat_completions
+    (``messages``, system prompt at index 0) and Responses API (``input``
+    items with the system prompt in ``instructions`` — hashed in as index 0
+    so the "msg[0] = system" diff semantics hold for both). Returns
+    llm.call span tags:
 
       pfp        list of 8-hex sha1 per message (index 0 = system prompt)
       pfp_lens   serialized char length per message (locates the break as a
@@ -90,13 +94,23 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         hashes: List[str] = []
         lens: List[int] = []
-        for msg in api_kwargs.get("messages") or []:
+        instructions = api_kwargs.get("instructions")
+        if instructions is not None:
+            digest, length = _h(instructions)
+            hashes.append(digest)
+            lens.append(length)
+        msgs = api_kwargs.get("messages")
+        if msgs is None:
+            msgs = api_kwargs.get("input")
+        for msg in msgs or []:
             digest, length = _h(msg)
             hashes.append(digest)
             lens.append(length)
         tools_digest, tools_len = _h(api_kwargs.get("tools") or [])
         rest = {
-            k: v for k, v in api_kwargs.items() if k not in ("messages", "tools")
+            k: v
+            for k, v in api_kwargs.items()
+            if k not in ("messages", "input", "instructions", "tools")
         }
         rest_digest, _ = _h(rest)
         return {
