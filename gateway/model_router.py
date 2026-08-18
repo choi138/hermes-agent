@@ -454,7 +454,7 @@ def _call_configured_classifier(
     )
     content = response.choices[0].message.content
     if isinstance(content, str):
-        return content.strip()
+        return _strip_code_fences(content)
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -464,8 +464,28 @@ def _call_configured_classifier(
                 value = getattr(block, "text", "") or getattr(block, "content", "")
             if value:
                 parts.append(str(value))
-        return "".join(parts).strip()
-    return str(content or "").strip()
+        return _strip_code_fences("".join(parts))
+    return _strip_code_fences(str(content or ""))
+
+
+def _strip_code_fences(text: str) -> str:
+    """Normalize a classifier reply that arrives wrapped in markdown fences.
+
+    Some chat-completions proxies ignore ``response_format`` and return the
+    JSON payload inside a ```json ... ``` block. This is transport-shape
+    normalization only: the classifier prompt, response schema, and fallback
+    regexes stay untouched, so benchmark integrity is preserved.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    # Drop the opening fence (with optional language tag) and a closing fence.
+    body = lines[1:]
+    if body and body[-1].strip().startswith("```"):
+        body = body[:-1]
+    inner = "\n".join(body).strip()
+    return inner or stripped
 
 
 def _source_dict(event: Any) -> dict[str, Any]:
