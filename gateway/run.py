@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -6529,6 +6530,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _MODEL_ROUTER_SHADOW_MAX_INFLIGHT
         )
         self._model_router_shadow_inflight: set[str] = set()
+        self._model_route_catalog_cache: OrderedDict[str, Any] = OrderedDict()
+        self._model_route_catalog_cache_lock = threading.Lock()
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -7529,6 +7532,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._model_router_shadow_inflight,
         )
 
+    @staticmethod
+    def _model_route_catalog_fingerprint(cfg: dict) -> str:
+        """Hash only config roots that affect route parsing and validation."""
+        relevant = {
+            "model_routes": cfg.get("model_routes"),
+            "providers": cfg.get("providers"),
+            "custom_providers": cfg.get("custom_providers"),
+            "router_mode_env": os.environ.get(
+                "HERMES_MODEL_ROUTER_MODE", ""
+            ).strip().lower(),
+        }
+        try:
+            serialized = json.dumps(
+                relevant,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            # Malformed hand-written YAML can contain mixed-type mapping keys,
+            # which JSON cannot sort. Validation still needs to see that input.
+            serialized = repr(relevant)
+        payload = serialized.encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _model_route_catalog(self, cfg: dict):
+        """Return the parsed route catalog until relevant config changes."""
+        from hermes_cli.model_routes import load_routes
+
+        fingerprint = self._model_route_catalog_fingerprint(cfg)
+        lock = getattr(self, "_model_route_catalog_cache_lock", None)
+        cache = getattr(self, "_model_route_catalog_cache", None)
+        if lock is None or cache is None:
+            with _MODEL_ROUTER_INIT_LOCK:
+                if getattr(self, "_model_route_catalog_cache_lock", None) is None:
+                    self._model_route_catalog_cache_lock = threading.Lock()
+                if getattr(self, "_model_route_catalog_cache", None) is None:
+                    self._model_route_catalog_cache = OrderedDict()
+            lock = self._model_route_catalog_cache_lock
+            cache = self._model_route_catalog_cache
+
+        with lock:
+            catalog = cache.get(fingerprint)
+            if catalog is not None:
+                cache.move_to_end(fingerprint)
+                return catalog
+            catalog = load_routes(cfg)
+            cache[fingerprint] = catalog
+            cache.move_to_end(fingerprint)
+            while len(cache) > 16:
+                cache.popitem(last=False)
+            return catalog
+
     def _begin_model_router_state(self, session_key: str, *, invalidate: bool):
         """Create an isolated state transaction for one routing decision."""
         lock, shared, _slots, _inflight = self._ensure_model_router_runtime_state()
@@ -7810,7 +7867,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         and carry the exact route intent with it.
         """
         from gateway import model_router
-        from hermes_cli.model_routes import load_routes
 
         mode = str(mode or "").strip().lower()
         if mode not in {"shadow", "enforce"}:
@@ -7821,7 +7877,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
-        catalog = load_routes(cfg)
+        catalog = self._model_route_catalog(cfg)
         if str(getattr(catalog.router, "mode", "") or "").lower() != mode:
             return None
         matched = model_router.match_static_rule(
@@ -8076,9 +8132,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         from gateway import model_router
-        from hermes_cli.model_routes import load_routes
 
-        catalog = load_routes(cfg)
+        catalog = self._model_route_catalog(cfg)
         if catalog.router.mode != "shadow":
             return None
         if isinstance(state_override, dict):

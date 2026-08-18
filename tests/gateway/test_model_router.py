@@ -1416,6 +1416,38 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     )
 
 
+def test_gateway_route_catalog_cache_invalidates_on_relevant_config_reload(
+    monkeypatch,
+):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    cfg = _cfg(router={"mode": "shadow"})
+    load = MagicMock(wraps=routes_mod.load_routes)
+    monkeypatch.setattr(routes_mod, "load_routes", load)
+
+    first = runner._model_route_catalog(cfg)
+    same_content = runner._model_route_catalog(copy.deepcopy(cfg))
+    irrelevant = copy.deepcopy(cfg)
+    irrelevant["display"] = {"compact": True}
+    same_routes = runner._model_route_catalog(irrelevant)
+
+    changed = copy.deepcopy(cfg)
+    changed["model_routes"]["router"]["recent_turns"] = 9
+    reloaded = runner._model_route_catalog(changed)
+
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", "off")
+    env_reloaded = runner._model_route_catalog(changed)
+
+    assert same_content is first
+    assert same_routes is first
+    assert reloaded is not first
+    assert reloaded.router.recent_turns == 9
+    assert env_reloaded is not reloaded
+    assert env_reloaded.router.mode == "off"
+    assert load.call_count == 3
+
+
 def test_gateway_shadow_turn_does_not_wait_for_hung_classifier(monkeypatch):
     from gateway.run import GatewayRunner
 
