@@ -1337,10 +1337,27 @@ def _health_cache_signature(path: Path) -> Optional[Tuple[str, int, int, int]]:
 
 def _update_unhealthy_memo_locked(path: Path, cache: Dict[str, Any]) -> None:
     _unhealthy_memo["mtime"] = _health_cache_signature(path)
+    _unhealthy_memo["cache"] = cache
     _unhealthy_memo["value"] = any(
         isinstance(verdict, dict) and not verdict.get("healthy")
         for verdict in cache.values()
     )
+
+
+def _read_health_cache_memoized_locked(path: Path) -> Dict[str, Any]:
+    """Return the cached read-only snapshot when the file is unchanged."""
+    signature = _health_cache_signature(path)
+    if signature is None:
+        _unhealthy_memo["mtime"] = None
+        _unhealthy_memo["cache"] = {}
+        _unhealthy_memo["value"] = False
+        return {}
+    cached = _unhealthy_memo.get("cache")
+    if _unhealthy_memo.get("mtime") == signature and isinstance(cached, dict):
+        return cached
+    cache = _read_health_cache(path)
+    _update_unhealthy_memo_locked(path, cache)
+    return cache
 
 
 def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> bool:
@@ -1437,7 +1454,8 @@ def provider_health(
         return True, "pytest"
 
     path = health.resolved_cache_path()
-    cache = _read_health_cache(path)
+    with _health_state_lock:
+        cache = _read_health_cache_memoized_locked(path)
 
     now = _now()
     key = str(provider or "")
@@ -1638,21 +1656,8 @@ def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
             return False
         path = health.resolved_cache_path()
         with _health_state_lock:
-            signature = _health_cache_signature(path)
-            if signature is None:
-                return False
-            if _unhealthy_memo["mtime"] == signature:
-                return bool(_unhealthy_memo["value"])
-            cache = _read_health_cache(path)
-            value = any(
-                isinstance(entry, dict) and not entry.get("healthy")
-                for entry in cache.values()
-            )
-            # The cache check and both memo fields are one atomic section. A
-            # stale scanner can no longer overwrite a newer healthy clear.
-            _unhealthy_memo["mtime"] = signature
-            _unhealthy_memo["value"] = value
-            return value
+            _read_health_cache_memoized_locked(path)
+            return bool(_unhealthy_memo.get("value"))
     except Exception as exc:
         logger.debug(
             "model_routes: unhealthy-verdict scan failed (%s)",

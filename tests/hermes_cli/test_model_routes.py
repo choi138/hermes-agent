@@ -1057,7 +1057,11 @@ def test_pytest_guard(monkeypatch, tmp_path):
 def passive_state(monkeypatch):
     """Isolate module-level passive-health state between tests."""
     monkeypatch.setattr(mr, "_last_passive_unhealthy_write", {})
-    monkeypatch.setattr(mr, "_unhealthy_memo", {"mtime": None, "value": False})
+    monkeypatch.setattr(
+        mr,
+        "_unhealthy_memo",
+        {"mtime": None, "value": False, "cache": {}},
+    )
 
 
 def _read_cache(health):
@@ -1144,6 +1148,22 @@ def test_has_unhealthy_verdicts_memo(monkeypatch, tmp_path, health_test_env, pas
 
     monkeypatch.setattr(mr, "_read_health_cache", boom)
     assert mr.has_unhealthy_verdicts(health=health) is True
+
+
+def test_provider_health_reuses_unchanged_cache_snapshot(
+    monkeypatch, tmp_path, health_test_env, passive_state,
+):
+    health = _health(tmp_path)
+    _seed_verdict(health, "p1", healthy=False, ts=1000.0)
+    monkeypatch.setattr(mr, "_now", _Clock(1000.0))
+
+    assert mr.provider_health("p1", health=health) == (False, "seeded")
+
+    def boom(path):
+        raise AssertionError("unchanged health cache must not be re-read")
+
+    monkeypatch.setattr(mr, "_read_health_cache", boom)
+    assert mr.provider_health("p1", health=health) == (False, "seeded")
 
 
 def test_unhealthy_memo_check_and_write_are_atomic_across_threads(
