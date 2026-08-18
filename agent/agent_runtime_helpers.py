@@ -99,7 +99,18 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "delegate_task"}
+    {
+        "todo",
+        "session_search",
+        "memory",
+        "notes_write",
+        "notes_read",
+        "memory_propose",
+        "clarify",
+        "read_terminal",
+        "read_preview",
+        "delegate_task",
+    }
 )
 
 
@@ -3056,12 +3067,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 content=next_args.get("content"),
                 old_text=next_args.get("old_text"),
                 operations=operations,
+                reason=next_args.get("reason", ""),
                 store=agent._memory_store,
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
-            # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager:
+            # (MemoryManager.notify_memory_tool_write). Skipped for
+            # ingest-disabled forks (ADR-004 Phase 0) — their built-in
+            # MEMORY.md writes must not fan out to the external graph.
+            from agent.memory_manager import memory_ingest_allowed
+            if agent._memory_manager and memory_ingest_allowed(agent):
                 agent._memory_manager.notify_memory_tool_write(
                     result,
                     next_args,
@@ -3071,9 +3086,54 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
+    elif function_name == "notes_write":
+        # Notes tier (ADR-004 Phase 1) — agent-state resolution (session id,
+        # ingest-allowed MemoryManager for the flag-gated backfill) lives in
+        # tools.notes_tool.dispatch_notes_tool_for_agent, shared with the
+        # sequential path.
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "notes_write", next_args),
+                next_args,
+            )
+    elif function_name == "notes_read":
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "notes_read", next_args),
+                next_args,
+            )
+    elif function_name == "memory_propose":
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "memory_propose", next_args),
+                next_args,
+            )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            result = agent._memory_manager.handle_tool_call(function_name, next_args)
+            # ADR-004 §① origin-taint (Phase 2): mirror of the sequential
+            # registration site in tool_executor — memory-provider results
+            # returned via THIS dispatch path must land in the injected-span
+            # registry too, or one _PARALLEL_SAFE_TOOLS allowlist edit would
+            # silently reopen the echo-chamber bypass. Gated on
+            # memory_ingest_allowed for the same fork-isolation reason
+            # (shared live session registry). Fail-open, never raises.
+            if result:
+                try:
+                    from agent.memory_manager import memory_ingest_allowed
+                    if memory_ingest_allowed(agent):
+                        from agent import memory_taint
+                        memory_taint.record_injected_tool_result(
+                            getattr(agent, "session_id", "") or "",
+                            str(result),
+                            source=function_name,
+                        )
+                except Exception:
+                    pass
+            return _finish_agent_tool(result, next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool

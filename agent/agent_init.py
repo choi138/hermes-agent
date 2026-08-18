@@ -1701,10 +1701,18 @@ def init_agent(
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+                from tools.memory_tool import (
+                    DEFAULT_MEMORY_CHAR_LIMIT,
+                    DEFAULT_USER_CHAR_LIMIT,
+                    MemoryStore,
+                )
                 agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_char_limit=mem_config.get(
+                        "memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT
+                    ),
+                    user_char_limit=mem_config.get(
+                        "user_char_limit", DEFAULT_USER_CHAR_LIMIT
+                    ),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1715,6 +1723,12 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
+    # ADR-004 Phase 0: per-agent memory-ingest kill switch. False for every
+    # live agent (unchanged behavior). Forks that need memory READ access but
+    # zero graph-write leakage (background review, the future ingest curator)
+    # set this True at fork construction — every write-leak call site gates on
+    # agent.memory_manager.memory_ingest_allowed(agent).
+    agent._memory_ingest_disabled = False
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""

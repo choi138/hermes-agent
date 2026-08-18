@@ -2338,6 +2338,9 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("todo", {"todos": []}),
         ("session_search", {"query": "needle"}),
         ("memory", {"action": "view", "target": "memory"}),
+        ("notes_write", {"step": "propose", "content": "gist", "kind": "fact"}),
+        ("notes_read", {"action": "list"}),
+        ("memory_propose", {"content": "worth curating"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("read_preview", {}),
@@ -2371,6 +2374,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.memory_tool.memory_tool",
             lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.notes_tool.dispatch_notes_tool_for_agent",
+            lambda *args, **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",

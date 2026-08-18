@@ -4124,13 +4124,33 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
-        if self._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and not memory_ingest_allowed(self):
+            # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager —
+            # it is rebound from the parent. on_session_end would run
+            # end-of-session extraction (a graph write) on the fork's harness
+            # transcript, and shutdown_all would tear down the parent's live
+            # provider mid-session. Skip both; the real owner cleans up.
+            pass
+        elif self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
+            except Exception:
+                pass
+            # ADR-004 §① origin-taint (Phase 2): evict this session's
+            # in-memory injected-span registry (the durable sidecar is kept
+            # for post-session readers — curator, dream — and TTLs out via
+            # its own GC). Owner-only by construction: this branch is only
+            # reached when memory_ingest_allowed(self), so an ingest-disabled
+            # fork sharing the parent's live session can never evict the
+            # parent's registry state mid-conversation.
+            try:
+                from agent import memory_taint
+                memory_taint.end_session(self.session_id or "")
             except Exception:
                 pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
@@ -4148,7 +4168,8 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if self._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and memory_ingest_allowed(self):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
@@ -4205,6 +4226,13 @@ class AIAgent:
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
+            return
+        # ADR-004 Phase 0: ingest-disabled forks (background review, ingest
+        # curator) share the parent's manager for reads only — this is the
+        # sync_all/queue_prefetch_all write chokepoint (turn_finalizer +
+        # codex_runtime both land here), so it must gate.
+        from agent.memory_manager import memory_ingest_allowed
+        if not memory_ingest_allowed(self):
             return
         # Multimodal turns carry content as a list of typed parts; providers
         # expect plain strings, so flatten to text first (newline-joined for
