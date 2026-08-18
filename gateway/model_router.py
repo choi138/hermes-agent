@@ -40,12 +40,19 @@ import logging
 import math
 import os
 import re
+import stat
+import threading
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_constants import get_hermes_home
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses the process lock only
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +84,9 @@ DEFAULT_REPROMOTE_AFTER_TURNS = 3
 
 _DECISION_LOG_ENV = "HERMES_MODEL_ROUTER_DECISION_LOG"
 _DECISION_LOG_FILENAME = "model_router_decisions.jsonl"
+_DECISION_LOG_MAX_BYTES = 10 * 1024 * 1024
+_DECISION_LOG_BACKUP_COUNT = 3
+_decision_log_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1357,89 @@ def _decision_log_path(configured: str = "") -> Any:
     return get_hermes_home() / "logs" / _DECISION_LOG_FILENAME
 
 
+def _ensure_private_log_parent(path: Path) -> None:
+    created = not path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if created:
+        os.chmod(path, 0o700)
+
+
+def _open_private_append(path: Path) -> int:
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        current_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if current_mode != 0o600:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            else:  # pragma: no cover - Windows fallback
+                os.chmod(path, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _decision_backup_path(path: Path, index: int) -> Path:
+    return path.with_name(f"{path.name}.{index}")
+
+
+def _rotate_decision_log(path: Path, incoming_size: int) -> None:
+    try:
+        current_size = path.stat().st_size
+    except OSError:
+        return
+    if current_size <= 0 or current_size + incoming_size <= _DECISION_LOG_MAX_BYTES:
+        return
+
+    oldest = _decision_backup_path(path, _DECISION_LOG_BACKUP_COUNT)
+    oldest.unlink(missing_ok=True)
+    for index in range(_DECISION_LOG_BACKUP_COUNT, 1, -1):
+        source = _decision_backup_path(path, index - 1)
+        if source.exists():
+            os.replace(source, _decision_backup_path(path, index))
+    os.replace(path, _decision_backup_path(path, 1))
+    for index in range(1, _DECISION_LOG_BACKUP_COUNT + 1):
+        backup = _decision_backup_path(path, index)
+        if backup.exists():
+            os.chmod(backup, 0o600)
+
+
+def _append_decision_line(path: Path, encoded: bytes) -> None:
+    """Rotate and append under process + POSIX cross-process locks."""
+    with _decision_log_lock:
+        lock_path = path.with_name(f"{path.name}.lock")
+        lock_fd = _open_private_append(lock_path)
+        locked = False
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    locked = True
+                except OSError as exc:
+                    logger.debug(
+                        "model router: decision log flock unavailable (%s)",
+                        type(exc).__name__,
+                    )
+            _rotate_decision_log(path, len(encoded))
+            fd = _open_private_append(path)
+            try:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("decision log write returned no progress")
+                    view = view[written:]
+            finally:
+                os.close(fd)
+        finally:
+            if locked:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
 _SENSITIVE_LOG_KEY_PARTS = (
     "api_key", "apikey", "token", "secret", "password", "authorization",
     "credential", "cookie",
@@ -1391,9 +1484,9 @@ def log_decision(record: dict[str, Any], *, decision_log: str = "") -> None:
         record = _sanitize_log_value(dict(record, ts=round(time.time(), 3)))
         if "msg_head" in record:
             record["msg_head"] = _safe_message_head(record["msg_head"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _ensure_private_log_parent(path.parent)
+        encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        _append_decision_line(path, encoded)
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "model router: decision log write failed (%s)",

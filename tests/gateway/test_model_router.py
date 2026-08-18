@@ -15,6 +15,7 @@ import asyncio
 import copy
 import io
 import json
+import os
 import threading
 import urllib.error
 from contextvars import ContextVar
@@ -1325,6 +1326,51 @@ def test_log_decision_swallows_write_errors(monkeypatch, tmp_path):
     target.write_text("file blocks parent mkdir")
     monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(target / "x.jsonl"))
     mr_mod.log_decision({"policy": "dev_routing"})  # must not raise
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_log_decision_creates_private_file_and_parent(monkeypatch, tmp_path):
+    log_path = tmp_path / "private-logs" / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+
+    mr_mod.log_decision({"sequence": 1})
+
+    assert (log_path.parent.stat().st_mode & 0o777) == 0o700
+    assert (log_path.stat().st_mode & 0o777) == 0o600
+    lock_path = log_path.with_name(f"{log_path.name}.lock")
+    assert (lock_path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_log_decision_migrates_existing_0644_file(monkeypatch, tmp_path):
+    log_path = tmp_path / "existing" / "decisions.jsonl"
+    log_path.parent.mkdir()
+    log_path.write_text('{"sequence":0}\n', encoding="utf-8")
+    log_path.chmod(0o644)
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+
+    mr_mod.log_decision({"sequence": 1})
+
+    assert (log_path.stat().st_mode & 0o777) == 0o600
+    assert [json.loads(line)["sequence"] for line in log_path.read_text().splitlines()] == [0, 1]
+
+
+def test_log_decision_rotates_by_size_and_keeps_three(monkeypatch, tmp_path):
+    log_path = tmp_path / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+    monkeypatch.setattr(mr_mod, "_DECISION_LOG_MAX_BYTES", 1)
+
+    for sequence in range(5):
+        mr_mod.log_decision({"sequence": sequence})
+
+    def sequence(path):
+        return json.loads(path.read_text(encoding="utf-8"))["sequence"]
+
+    assert sequence(log_path) == 4
+    assert sequence(log_path.with_name(f"{log_path.name}.1")) == 3
+    assert sequence(log_path.with_name(f"{log_path.name}.2")) == 2
+    assert sequence(log_path.with_name(f"{log_path.name}.3")) == 1
+    assert not log_path.with_name(f"{log_path.name}.4").exists()
 
 
 def test_configured_classifier_provider_and_model_are_forwarded(monkeypatch):
