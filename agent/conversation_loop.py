@@ -2656,6 +2656,7 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                _attempt_started = time.time()
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -4735,6 +4736,10 @@ def run_conversation(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
+                if _is_transport_failure and (time.time() - _attempt_started) < 2.0:
+                    _retry.fast_transport_failures += 1
+                else:
+                    _retry.fast_transport_failures = 0
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
@@ -4793,6 +4798,51 @@ def run_conversation(
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
+
+                # A consecutive streak of near-immediate transport failures
+                # means the active endpoint is down. Once the fallback chain
+                # has had its chance, stop extending user-visible silence with
+                # a normal multi-minute retry cycle. Zero disables the cutoff.
+                try:
+                    _fast_limit = int(
+                        os.environ.get("HERMES_FAST_CONN_FAIL_LIMIT", "3") or 3
+                    )
+                except ValueError:
+                    _fast_limit = 3
+                if (
+                    _is_transport_failure
+                    and _fast_limit > 0
+                    and _retry.fast_transport_failures >= _fast_limit
+                    and not agent._has_pending_fallback()
+                ):
+                    agent._flush_status_buffer()
+                    _fail_summary = agent._summarize_api_error(api_error)
+                    _msg = (
+                        f"Provider unreachable: {_retry.fast_transport_failures} "
+                        f"consecutive instant connection failures "
+                        f"({_fail_summary}). Giving up early — the endpoint "
+                        "appears to be down and no fallback provider is available."
+                    )
+                    agent._emit_status(f"❌ {_msg}")
+                    logger.error(
+                        "Fail-fast after %d instant transport failures %s error=%s",
+                        _retry.fast_transport_failures,
+                        agent._client_log_context(),
+                        api_error,
+                    )
+                    close_interrupted_tool_sequence(
+                        messages, f"[System: API call aborted — {_msg}]"
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _msg,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _msg,
+                        "failure_reason": classified.reason.value,
+                    }
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
