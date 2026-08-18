@@ -3471,6 +3471,42 @@ def compress_context(
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
+        # Publish a fresh runtime-state snapshot for the new session before
+        # later gates observe the rotated session_id.
+        try:
+            if _old_sid:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+                _reasoning_config = getattr(agent, "reasoning_config", None)
+                _reasoning_effort = ""
+                if isinstance(_reasoning_config, dict):
+                    if _reasoning_config.get("enabled") is False:
+                        _reasoning_effort = "none"
+                    else:
+                        _reasoning_effort = str(_reasoning_config.get("effort") or "")
+
+                _invoke_hook(
+                    "runtime_state",
+                    session_id=agent.session_id or "",
+                    task_id=_old_sid,
+                    state={
+                        "session_id": agent.session_id or "",
+                        "task_id": _old_sid,
+                        "model": getattr(agent, "model", "") or "",
+                        "provider": getattr(agent, "provider", "") or "",
+                        "base_url": getattr(agent, "base_url", "") or "",
+                        "api_mode": getattr(agent, "api_mode", "") or "",
+                        "platform": getattr(agent, "platform", "") or "",
+                        "reasoning_effort": _reasoning_effort,
+                        "parent_session_id": _old_sid,
+                        "boundary_reason": "compression",
+                    },
+                )
+        except Exception as _rt_err:
+            logger.debug(
+                "runtime_state hook after compression split failed: %s", _rt_err
+            )
+
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before
         # the rotation re-pointed agent.session_id at the child). Without a
