@@ -465,7 +465,15 @@ def render_cache_diff(traces: List[Dict[str, Any]], colors: _Colors, out=None) -
             if not d["tools_same"]:
                 flags.append("tools schema CHANGED")
             if not d["rest_same"]:
-                flags.append("non-message request fields changed")
+                ra = prev_fps[-1].get("pfp_rest_keys") or {}
+                rb = next_fps[0].get("pfp_rest_keys") or {}
+                changed = sorted(
+                    k for k in set(ra) | set(rb) if ra.get(k) != rb.get(k)
+                )
+                flags.append(
+                    "non-message request fields changed"
+                    + (f" ({', '.join(changed)})" if changed else "")
+                )
             if flags:
                 out.write(f"  {c.hot}{'; '.join(flags)}{c.reset}\n")
             ci = d.get("chunk_info")

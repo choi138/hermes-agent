@@ -135,6 +135,8 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "pfp_tools": tools_digest,
             "pfp_tools_len": tools_len,
             "pfp_rest": rest_digest,
+            # per-key hashes so a rest change can be attributed to the field
+            "pfp_rest_keys": {k: _hd(_ser(v)) for k, v in rest.items()},
             "pfp_chunks": chunk_map,
         }
     except Exception:
