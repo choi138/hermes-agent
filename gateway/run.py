@@ -4172,6 +4172,35 @@ class TurnRunner:
         except Exception:
             pass
 
+        # A completed todo call carries the authoritative task list, so the
+        # bubble can show per-item statuses instead of the count-only start
+        # line ("📋 Updating tasks planning N task(s)").  Semantic progress
+        # owns its own fixed-vocabulary snapshot and is left untouched.
+        if (
+            event_type == "tool.completed"
+            and tool_name == "todo"
+            and not kwargs.get("is_error")
+            and not ctx.semantic_progress_enabled
+        ):
+            try:
+                from agent.display import (
+                    format_todo_result_for_progress,
+                    get_tool_verb,
+                )
+
+                todo_progress = format_todo_result_for_progress(
+                    kwargs.get("result") or ""
+                )
+                if todo_progress:
+                    todo_verb = get_tool_verb("todo")
+                    todo_prefix = f"📋 {todo_verb}" if todo_verb else "📋 todo"
+                    ctx.progress_queue.put(
+                        ("__replace_last_matching__", todo_prefix, todo_progress)
+                    )
+            except Exception as todo_err:
+                logger.debug("todo progress formatting failed: %s", todo_err)
+            return
+
         if ctx.semantic_progress_enabled:
             # Discord's default all/new surface is a fixed-vocabulary
             # snapshot. Raw names, args, previews, and results never reach
@@ -4581,6 +4610,31 @@ class TurnRunner:
                     if progress_lines:
                         progress_lines[-1] = f"{base_msg} (×{count + 1})"
                     msg = progress_lines[-1] if progress_lines else base_msg
+                elif (
+                    isinstance(raw, tuple)
+                    and len(raw) == 3
+                    and raw[0] == "__replace_last_matching__"
+                ):
+                    # In-place refinement of an earlier line (todo statuses
+                    # replacing the count-only "planning N task(s)" line) so
+                    # the detail lands where the tool call was reported
+                    # instead of duplicating it at the bottom.
+                    _, prefix, replacement = raw
+                    msg = str(replacement)
+                    replace_idx = next(
+                        (
+                            idx
+                            for idx in range(len(progress_lines) - 1, -1, -1)
+                            if str(progress_lines[idx]).startswith(str(prefix))
+                        ),
+                        None,
+                    )
+                    if replace_idx is None:
+                        progress_lines.append(msg)
+                    else:
+                        progress_lines[replace_idx] = msg
+                    ctx.last_progress_msg[0] = msg
+                    ctx.repeat_count[0] = 0
                 elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                     # Content bubble just landed on the platform — close off
                     # the current tool-progress bubble so the next tool
@@ -4598,7 +4652,7 @@ class TurnRunner:
                     ctx.repeat_count[0] = 0
                     continue
                 else:
-                    msg = raw
+                    msg = str(raw)
                     progress_lines.append(msg)
 
                 if await _roll_progress_overflow_if_needed():
@@ -4615,11 +4669,11 @@ class TurnRunner:
                 _now = time.monotonic()
                 _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
                 if _remaining > 0:
-                    # Wait out the throttle interval, then loop back to
-                    # drain any additional queued messages before sending
-                    # a single batched edit.
+                    # Wait out the throttle interval and then deliver, rather
+                    # than looping back to batch: when this is the final
+                    # queued event nothing else arrives to trigger the edit
+                    # and the accumulated lines would never be flushed.
                     await asyncio.sleep(_remaining)
-                    continue
 
                 if ctx.progress_closed.is_set() or not ctx._run_still_current():
                     return
@@ -4723,6 +4777,25 @@ class TurnRunner:
                             if progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                 await _roll_progress_overflow_if_needed()
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) == 3
+                            and raw[0] == "__replace_last_matching__"
+                        ):
+                            _, prefix, replacement = raw
+                            replace_idx = next(
+                                (
+                                    idx
+                                    for idx in range(len(progress_lines) - 1, -1, -1)
+                                    if str(progress_lines[idx]).startswith(str(prefix))
+                                ),
+                                None,
+                            )
+                            if replace_idx is None:
+                                progress_lines.append(str(replacement))
+                            else:
+                                progress_lines[replace_idx] = str(replacement)
+                            await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                             # Content-bubble marker during drain: close off
                             # the current progress bubble and start a fresh
@@ -4741,7 +4814,7 @@ class TurnRunner:
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
                         else:
-                            progress_lines.append(raw)
+                            progress_lines.append(str(raw))
                             await _roll_progress_overflow_if_needed()
                     except Exception:
                         break
