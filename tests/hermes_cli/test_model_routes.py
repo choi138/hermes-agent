@@ -1457,6 +1457,25 @@ def test_router_yaml_false_mode_is_off_without_issue():
     assert catalog.router.mode == "off"
 
 
+@pytest.mark.parametrize(
+    ("configured", "override", "expected"),
+    [
+        ("shadow", "off", "off"),
+        ("off", "shadow", "shadow"),
+        ("shadow", "enforce", "enforce"),
+        ("enforce", "typo", "off"),
+    ],
+)
+def test_router_mode_env_bridge_takes_precedence(
+    monkeypatch, configured, override, expected,
+):
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", override)
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"mode": configured})
+    )
+    assert catalog.router.mode == expected
+
+
 def test_router_unknown_key_warns():
     catalog = mr.load_routes(
         _cfg(routes=_router_routes(), router={"mode": "shadow", "modle": "typo"})

@@ -37,7 +37,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover — non-POSIX; merge-on-write still applies
     fcntl = None  # type: ignore[assignment]
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +70,7 @@ _HEALTH_CACHE_FILENAME = "model_route_health.json"  # under get_hermes_home()/"s
 _CREDIT_SNIFF_KEYWORDS = ("credit", "insufficient", "quota", "billing")
 _HEALTH_ENV = "HERMES_MODEL_ROUTES_HEALTH"
 _HEALTH_TEST_ENV = "HERMES_MODEL_ROUTES_HEALTH_TEST"
+_ROUTER_MODE_ENV = "HERMES_MODEL_ROUTER_MODE"
 
 _SECTION_KEYS = {"routes", "health", "static_rules", "router"}
 _ROUTE_KEYS = {
@@ -91,6 +92,28 @@ _ROUTER_LABELS = ("SYSTEM_DEV", "FRONTEND_DEV", "DOCUMENT_WORK")
 _ROUTER_NUMERIC_KEYS = ("timeout_ms", "recent_turns", "normal_downgrade_streak")
 DEFAULT_ROUTER_MODEL = "gemini-3-flash-preview"
 DEFAULT_ROUTER_PROVIDER = "gemini"
+
+
+def _effective_router_mode(configured: Any = "off") -> str:
+    """Resolve router mode with the emergency environment bridge applied.
+
+    A non-empty environment value is authoritative. Unknown values fail safe
+    to ``off`` so a typo in an emergency override can never enable routing.
+    """
+    override = os.environ.get(_ROUTER_MODE_ENV, "").strip().lower()
+    if override:
+        return override if override in _ROUTER_MODES else "off"
+    mode = (
+        str(configured or "").strip().lower()
+        if isinstance(configured, str)
+        else "off"
+    )
+    return mode if mode in _ROUTER_MODES else "off"
+
+
+def _with_effective_router_mode(router: "RouterConfig") -> "RouterConfig":
+    mode = _effective_router_mode(router.mode)
+    return router if mode == router.mode else replace(router, mode=mode)
 
 
 # =============================================================================
@@ -734,14 +757,14 @@ def _parse_router(
     issues: List[ConfigIssue],
 ) -> RouterConfig:
     if raw is None:
-        return RouterConfig()
+        return _with_effective_router_mode(RouterConfig())
     if not isinstance(raw, dict):
         issues.append(ConfigIssue(
             "error",
             f"model_routes: 'router' must be a mapping (got {type(raw).__name__}) — router stays off",
             f"Supported router keys: {', '.join(sorted(_ROUTER_KEYS))}",
         ))
-        return RouterConfig()
+        return _with_effective_router_mode(RouterConfig())
 
     for key in sorted(set(raw) - _ROUTER_KEYS):
         issues.append(ConfigIssue(
@@ -910,7 +933,7 @@ def _parse_router(
                 'Use "" for the default <hermes home>/logs/model_router_decisions.jsonl',
             ))
 
-    router = RouterConfig(**kwargs)
+    router = _with_effective_router_mode(RouterConfig(**kwargs))
     if router.mode != "off" and not routes:
         issues.append(ConfigIssue(
             "warning",
@@ -933,8 +956,10 @@ def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
     catalog = RouteCatalog()
     section = cfg.get("model_routes")
     if not section:
+        catalog.router = _with_effective_router_mode(catalog.router)
         return catalog
     if not isinstance(section, dict):
+        catalog.router = _with_effective_router_mode(catalog.router)
         catalog.issues.append(ConfigIssue(
             "error",
             f"model_routes must be a mapping (got {type(section).__name__})",

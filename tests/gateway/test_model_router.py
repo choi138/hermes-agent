@@ -1376,6 +1376,24 @@ def test_gateway_shadow_wiring_logs_without_runtime_mutation(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("configured", "override", "expected"),
+    [
+        ("shadow", "off", "off"),
+        ("off", "shadow", "shadow"),
+        ("shadow", "enforce", "enforce"),
+        ("enforce", "invalid", "off"),
+    ],
+)
+def test_gateway_router_mode_env_bridge_takes_precedence(
+    monkeypatch, configured, override, expected,
+):
+    from gateway.run import _model_router_mode
+
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", override)
+    assert _model_router_mode(_cfg(router={"mode": configured})) == expected
+
+
 def test_gateway_enforce_apply_records_and_rebinds_exact_route_intent(monkeypatch):
     from gateway.run import GatewayRunner
     from hermes_cli.model_switch import ModelSwitchResult

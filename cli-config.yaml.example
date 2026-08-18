@@ -209,7 +209,8 @@ model:
 #         chat_type: { in: [dm] }
 #       reason: "non-owner DMs stay on the chat tier"
 #   router:                            # dynamic pre-dispatch router (gateway/model_router.py)
-#     mode: off                        # off | shadow (log-only soak) | enforce
+#     mode: off                        # off | shadow (log-only soak) | enforce;
+#                                      # env HERMES_MODEL_ROUTER_MODE wins when set
 #     provider: gemini                 # classifier provider
 #     model: gemini-3-flash-preview    # classifier model (bench winner; keep unless re-benched)
 #     timeout_ms: 8000                 # on failure a narrow regex fallback decides

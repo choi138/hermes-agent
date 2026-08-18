@@ -3298,7 +3298,14 @@ def _load_gateway_config() -> dict:
 
 
 def _model_router_mode(config: Optional[dict] = None) -> str:
-    """Return the configured dynamic-router mode without importing the router."""
+    """Return effective router mode without importing the router module.
+
+    ``HERMES_MODEL_ROUTER_MODE`` is an emergency bridge and wins when set.
+    Unknown non-empty overrides fail safe to ``off``.
+    """
+    override = os.environ.get("HERMES_MODEL_ROUTER_MODE", "").strip().lower()
+    if override:
+        return override if override in {"shadow", "enforce"} else "off"
     cfg = config if isinstance(config, dict) else _load_gateway_config()
     section = cfg.get("model_routes") if isinstance(cfg, dict) else None
     router = section.get("router") if isinstance(section, dict) else None
@@ -7821,10 +7828,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         decision log, but cannot run a recovery probe or rewrite shared health.
         """
         cfg = user_config if isinstance(user_config, dict) else {}
-        section = cfg.get("model_routes")
-        router_section = section.get("router") if isinstance(section, dict) else None
-        raw_mode = router_section.get("mode") if isinstance(router_section, dict) else None
-        mode = str(raw_mode or "").strip().lower() if isinstance(raw_mode, str) else "off"
+        mode = _model_router_mode(cfg)
         if mode != "shadow":
             return None
 
