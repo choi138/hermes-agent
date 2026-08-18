@@ -2576,6 +2576,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
+    # One-shot desired-route intent from pre_gateway_dispatch runtime routers;
+    # stale route intent must not survive a conversation reset.
+    "_pending_runtime_route_states",
     "_session_service_tier_overrides",
     "_pending_model_notes",
     "_last_resolved_model",
@@ -5365,6 +5368,11 @@ class TurnRunner:
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
+        # Assigned unconditionally so a reused cached agent cannot retain the
+        # preceding turn's DesiredRoute after the one-shot state is consumed.
+        agent._runtime_route_state = (
+            self._runner._consume_pending_runtime_route_state(ctx.session_key)
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -25074,6 +25082,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("Failed to clear session runtime override", exc_info=True)
 
+    def _build_pending_runtime_route_state(
+        self,
+        directive: dict,
+        *,
+        target_model: str = "",
+        target_provider: str = "",
+        target_reasoning_effort: str = "",
+        reason: str = "",
+    ) -> dict:
+        label = (
+            directive.get("label")
+            or directive.get("route_label")
+            or directive.get("policy_label")
+            or directive.get("policy")
+            or "RUNTIME_OVERRIDE"
+        )
+        return {
+            "label": str(label),
+            "target_provider": str(
+                target_provider or directive.get("provider") or ""
+            ).strip(),
+            "target_model": str(
+                target_model
+                or directive.get("model")
+                or directive.get("raw_input")
+                or ""
+            ).strip(),
+            "target_reasoning_effort": str(
+                target_reasoning_effort or directive.get("reasoning_effort") or ""
+            )
+            .strip()
+            .lower(),
+            "source": str(
+                directive.get("source") or "pre_gateway_dispatch"
+            ).strip(),
+            "strictness": str(
+                directive.get("strictness") or "auto_reconsiderable"
+            ).strip(),
+            "confidence": directive.get("confidence", "unknown"),
+            "reason": str(
+                reason or directive.get("reason") or "pre-dispatch routing"
+            ).strip(),
+        }
+
+    def _set_pending_runtime_route_state(
+        self, session_key: str, route_state: dict
+    ) -> None:
+        if not session_key or not isinstance(route_state, dict):
+            return
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._pending_runtime_route_states = states
+        states[session_key] = route_state
+
+    def _consume_pending_runtime_route_state(
+        self, session_key: str
+    ) -> Optional[dict]:
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not session_key or not isinstance(states, dict):
+            return None
+        state = states.pop(session_key, None)
+        return state if isinstance(state, dict) else None
+
     def _apply_gateway_runtime_override(
         self, directive: dict, source: SessionSource
     ) -> bool:
@@ -25161,6 +25233,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reason = str(
                     directive.get("reason") or "pre-dispatch routing"
                 ).strip()
+                self._set_pending_runtime_route_state(
+                    session_key,
+                    self._build_pending_runtime_route_state(
+                        directive,
+                        target_model=getattr(result, "new_model", ""),
+                        target_provider=getattr(result, "target_provider", ""),
+                        target_reasoning_effort=reasoning_effort,
+                        reason=reason,
+                    ),
+                )
                 pending[session_key] = (
                     "[Note: runtime route selected before this turn: "
                     f"{current_model or 'default'} -> {getattr(result, 'new_model', '')} via "
@@ -25185,6 +25267,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    if not (model_input or explicit_provider):
+                        self._set_pending_runtime_route_state(
+                            session_key,
+                            self._build_pending_runtime_route_state(
+                                directive,
+                                target_reasoning_effort=reasoning_effort,
+                            ),
+                        )
                     self._persist_session_runtime_override(
                         session_key,
                         reasoning_config=parsed,

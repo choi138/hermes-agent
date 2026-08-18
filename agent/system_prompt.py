@@ -627,6 +627,119 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     return joined
 
 
+def _fmt_runtime_value(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+def build_runtime_route_block(agent: Any) -> str:
+    """Return the API-call-time runtime/route awareness block.
+
+    The cached session system prompt is intentionally stable. Runtime truth is
+    not: model switches, fallback activation, and reasoning overrides can all
+    happen after the prompt cache was built. This block is appended at the API
+    boundary so the model can self-identify from authoritative live state
+    without calling ``model_status``.
+
+    This branch does not ship the optional ``model_routes`` catalog, so an
+    absent current-turn route degrades to a CurrentRuntime-only block. Trusted
+    pre-dispatch route state still renders DesiredRoute for that one turn.
+    """
+    try:
+        from agent.runtime_control import get_runtime_state
+
+        state = get_runtime_state(agent)
+    except Exception:
+        state = {
+            "model": getattr(agent, "model", ""),
+            "provider": getattr(agent, "provider", ""),
+            "api_mode": getattr(agent, "api_mode", ""),
+            "reasoning": getattr(agent, "reasoning_config", None),
+            "model_source": getattr(agent, "_runtime_model_source", None)
+            or "agent",
+        }
+
+    reasoning = state.get("reasoning") if isinstance(state, dict) else None
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort is None and reasoning.get("enabled") is False:
+            effort = "none"
+        reasoning_text = _fmt_runtime_value(effort)
+        reasoning_source = _fmt_runtime_value(reasoning.get("source"), "default")
+    else:
+        reasoning_text = _fmt_runtime_value(reasoning)
+        reasoning_source = "default"
+
+    current = (
+        "CurrentRuntime: "
+        f"provider={_fmt_runtime_value(state.get('provider') if isinstance(state, dict) else '')} "
+        f"model={_fmt_runtime_value(state.get('model') if isinstance(state, dict) else '')} "
+        f"reasoning={reasoning_text} "
+        f"api={_fmt_runtime_value(state.get('api_mode') if isinstance(state, dict) else '')} "
+        f"endpoint={_fmt_runtime_value(state.get('base_url') if isinstance(state, dict) else '')} "
+        f"source={_fmt_runtime_value(state.get('model_source') if isinstance(state, dict) else 'agent', 'agent')}"
+    )
+    if reasoning_source and reasoning_source != "default":
+        current += f" reasoning_source={reasoning_source}"
+
+    lines = ["# Runtime/Route State", current]
+    route = getattr(agent, "_runtime_route_state", None)
+    if isinstance(route, dict) and route:
+        label = _fmt_runtime_value(
+            route.get("label") or route.get("route_label"), "RUNTIME_OVERRIDE"
+        )
+        provider = _fmt_runtime_value(
+            route.get("target_provider") or route.get("provider"), "current"
+        )
+        model = _fmt_runtime_value(
+            route.get("target_model") or route.get("model"), "current"
+        )
+        effort = _fmt_runtime_value(
+            route.get("target_reasoning_effort") or route.get("reasoning_effort"),
+            "current",
+        )
+        strictness = _fmt_runtime_value(
+            route.get("strictness"), "auto_reconsiderable"
+        )
+        confidence = _fmt_runtime_value(route.get("confidence"), "unknown")
+        source = _fmt_runtime_value(route.get("source"), "pre_gateway_dispatch")
+        reason = str(route.get("reason") or "runtime routing").strip().replace('"', "'")
+        lines.append(
+            "DesiredRoute: "
+            f"label={label} target={provider}/{model}/{effort} "
+            f"strictness={strictness} confidence={confidence} source={source} "
+            f'reason="{reason}"'
+        )
+        lines.append(
+            "Policy: This block is authoritative for this LLM call; do not infer "
+            "current runtime from stale session headers, memory, or prior turns. "
+            "model_status is diagnostic fallback only. Compare CurrentRuntime and "
+            "DesiredRoute; if mismatched and not user_strict, treat as a routing "
+            "anomaly before substantive work. Routing is bidirectional and may be "
+            "re-evaluated after context discovery."
+        )
+    else:
+        lines.append(
+            "Policy: CurrentRuntime is authoritative for this LLM call; do not infer "
+            "the active runtime from stale session headers, memory, or prior turns. "
+            "model_status is diagnostic fallback only."
+        )
+    return "\n".join(lines)
+
+
+def compose_effective_system_prompt(agent: Any, base_prompt: str) -> str:
+    """Append API-call-time system prompt additions to a cached base prompt."""
+    effective_system = base_prompt or ""
+    if getattr(agent, "ephemeral_system_prompt", None):
+        effective_system = (
+            effective_system + "\n\n" + agent.ephemeral_system_prompt
+        ).strip()
+    runtime_route_block = build_runtime_route_block(agent)
+    if runtime_route_block:
+        effective_system = (effective_system + "\n\n" + runtime_route_block).strip()
+    return effective_system
+
+
 def invalidate_system_prompt(agent: Any) -> None:
     """Invalidate the cached system prompt, forcing a rebuild on the next turn.
 
@@ -720,6 +833,8 @@ def format_tools_for_system_message(agent: Any) -> str:
 __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
+    "build_runtime_route_block",
+    "compose_effective_system_prompt",
     "invalidate_system_prompt",
     "format_tools_for_system_message",
 ]
