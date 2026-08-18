@@ -57,8 +57,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
-    # Planning & memory
-    "todo", "memory",
+    # Planning, memory, and model/runtime introspection
+    "todo", "memory", "model_status", "model_switch",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -244,6 +244,12 @@ TOOLSETS = {
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],
+        "includes": []
+    },
+
+    "runtime": {
+        "description": "Inspect and switch the current model/provider/reasoning for session scope",
+        "tools": ["model_status", "model_switch"],
         "includes": []
     },
     

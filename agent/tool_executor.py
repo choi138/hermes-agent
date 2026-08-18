@@ -1847,7 +1847,34 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if function_name == "todo":
+        if function_name in {"model_status", "model_switch"}:
+            def _execute(next_args: dict) -> Any:
+                return agent._invoke_tool(
+                    function_name,
+                    next_args,
+                    effective_task_id,
+                    getattr(tool_call, "id", "") or "",
+                    messages=messages,
+                    pre_tool_block_checked=True,
+                    skip_tool_request_middleware=True,
+                    tool_request_middleware_trace=list(middleware_trace),
+                    skip_tool_execution_middleware=True,
+                )
+
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
+        elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(
