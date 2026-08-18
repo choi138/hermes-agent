@@ -669,9 +669,14 @@ def _parse_dev_json(raw: str) -> dict[str, Any] | None:
     if label not in {"NORMAL", "DOCUMENT_WORK", "FRONTEND_DEV", "SYSTEM_DEV"}:
         return None
     evidence_raw = obj.get("evidence")
-    if not isinstance(evidence_raw, str) or len(evidence_raw) > 120:
+    if not isinstance(evidence_raw, str):
         return None
-    evidence = evidence_raw.strip()
+    # The wire schema drops maxLength for OpenAI-strict compatibility
+    # (_strict_safe_response_schema), so a valid decision may carry evidence
+    # slightly over the benchmarked 120-char bound. Truncate instead of
+    # discarding the whole decision: label/confidence remain fully validated,
+    # and the authority boundary still rejects empty or non-string evidence.
+    evidence = evidence_raw.strip()[:120]
     if not evidence:
         return None
     confidence_raw = obj.get("confidence")

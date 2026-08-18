@@ -472,6 +472,36 @@ def test_non_gemini_classifier_uses_strict_safe_schema_and_parses(monkeypatch):
     assert mr_mod.DEV_RESPONSE_SCHEMA == shared_before
 
 
+def test_overlong_evidence_is_truncated_not_discarded():
+    """The wire schema drops maxLength for OpenAI-strict compat, so models
+    may legally exceed 120 chars. The decision must survive with truncated
+    evidence instead of collapsing into invalid_classifier_response."""
+    payload = json.dumps(
+        {"evidence": "S2 " + "e" * 140, "label": "NORMAL", "confidence": 0.92}
+    )
+    parsed = mr_mod._parse_dev_json(payload)
+    assert parsed is not None
+    assert parsed["label"] == "NORMAL"
+    assert parsed["confidence"] == 0.92
+    assert len(parsed["evidence"]) == 120
+    assert parsed["evidence"].startswith("S2 ")
+
+    detail = mr_mod.classify_dev_detailed(
+        mr_mod.PolicyClassificationContext(current_user_message="x"),
+        complete=lambda prompt: payload,
+    )
+    assert detail["source"] == "llm"
+    assert detail["label"] == "NORMAL"
+    # Truncated evidence stays within the authority boundary, so an
+    # over-long-but-valid LLM NORMAL still advances hysteresis normally.
+    assert mr_mod._is_authoritative_llm_decision(detail)
+
+
+def test_whitespace_only_evidence_still_rejected():
+    payload = json.dumps({"evidence": "   ", "label": "NORMAL", "confidence": 0.9})
+    assert mr_mod._parse_dev_json(payload) is None
+
+
 def test_plain_label_response_is_not_authoritative():
     assert mr_mod._parse_dev_json("FRONTEND_DEV") is None
     detail = mr_mod.classify_dev_detailed(
