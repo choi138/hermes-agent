@@ -1847,18 +1847,36 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if function_name in {"model_status", "model_switch"}:
+        if function_name == "model_status":
             def _execute(next_args: dict) -> Any:
-                return agent._invoke_tool(
-                    function_name,
-                    next_args,
-                    effective_task_id,
-                    getattr(tool_call, "id", "") or "",
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    tool_request_middleware_trace=list(middleware_trace),
-                    skip_tool_execution_middleware=True,
+                from agent.runtime_control import model_status as _model_status
+
+                return _model_status(agent)
+
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
+        elif function_name == "model_switch":
+            def _execute(next_args: dict) -> Any:
+                from agent.runtime_control import model_switch as _model_switch
+
+                return _model_switch(
+                    agent,
+                    model=next_args.get("model"),
+                    provider=next_args.get("provider"),
+                    reasoning_effort=next_args.get("reasoning_effort"),
+                    scope=next_args.get("scope", "session"),
+                    reason=next_args.get("reason"),
                 )
 
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
