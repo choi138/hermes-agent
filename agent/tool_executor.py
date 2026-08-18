@@ -2166,6 +2166,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     display_index=i,
                 ))
                 _mem_result = function_result
+                # ADR-004 §① origin-taint (Phase 2): memory-provider tool
+                # results (memory_search etc.) hand memory-derived text back
+                # to the agent — register them in the session's injected-span
+                # registry so assistant paraphrases are taint-tagged at WAL
+                # time. Gated on memory_ingest_allowed: an ingest-disabled
+                # fork (curator/background review) shares the parent's LIVE
+                # session_id, so its whitelisted reads must not mutate the
+                # shared registry — the shadow observer's reads would change
+                # live confirm-time admission outcomes. The fork's own spans
+                # are never journaled (sync_all is gated on the same flag),
+                # so skipping registration loses no taint coverage.
+                # Fail-open, never raises.
+                if _mem_result:
+                    try:
+                        from agent.memory_manager import memory_ingest_allowed
+                        if memory_ingest_allowed(agent):
+                            from agent import memory_taint
+                            memory_taint.record_injected_tool_result(
+                                getattr(agent, "session_id", "") or "",
+                                str(_mem_result),
+                                source=function_name,
+                            )
+                    except Exception:
+                        pass
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)

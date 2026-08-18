@@ -4141,6 +4141,18 @@ class AIAgent:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
+            # ADR-004 §① origin-taint (Phase 2): evict this session's
+            # in-memory injected-span registry (the durable sidecar is kept
+            # for post-session readers — curator, dream — and TTLs out via
+            # its own GC). Owner-only by construction: this branch is only
+            # reached when memory_ingest_allowed(self), so an ingest-disabled
+            # fork sharing the parent's live session can never evict the
+            # parent's registry state mid-conversation.
+            try:
+                from agent import memory_taint
+                memory_taint.end_session(self.session_id or "")
+            except Exception:
+                pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:

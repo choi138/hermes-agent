@@ -730,3 +730,66 @@ class TestForkSimulatedRun:
         assert "on_turn_start" in kinds
         assert "prefetch" in kinds
         assert "sync_turn" in kinds
+
+    def test_fork_memory_search_does_not_touch_taint_registry(
+        self, fork_run_env, tmp_path
+    ):
+        """ADR-004 §① origin-taint: an ingest-disabled fork shares the
+        parent's LIVE session_id, so its whitelisted memory_search reads must
+        not register injected spans in the shared taint registry — the
+        shadow observer's reads would otherwise mutate live confirm-time
+        admission outcomes (registry side-channel)."""
+        import agent.memory_taint as mt
+        from agent.memory_taint import TaintRegistry
+
+        make_fork, handler = fork_run_env
+        reg = TaintRegistry(base_dir=tmp_path / "taint")
+        mt.set_registry(reg)
+        try:
+            agent, mm, provider = make_fork(ingest_disabled=True)
+            handler.response_queue.append(
+                _tc_resp("memory_search", '{"query": "past work"}')
+            )
+            handler.response_queue.append(_text_resp("done"))
+
+            agent.run_conversation("simulated fork task", conversation_history=[])
+            mm.flush_pending(timeout=5)
+
+            # The read itself went through...
+            assert provider.read_calls() == [("handle_tool_call", "memory_search")]
+            # ...but nothing was registered for the (shared) session.
+            sid = getattr(agent, "session_id", "") or ""
+            assert reg.session_injected_digest(sid)["count"] == 0
+        finally:
+            mt.set_registry(None)
+
+    def test_live_agent_memory_search_registers_taint(
+        self, fork_run_env, tmp_path
+    ):
+        """Control (and dispatch-coverage regression): a live agent's
+        memory_search result MUST land in the taint registry regardless of
+        which dispatch path executed the tool — if memory tools are ever
+        added to the parallel-safe allowlist, this end-to-end assert catches
+        an unregistered path."""
+        import agent.memory_taint as mt
+        from agent.memory_taint import TaintRegistry
+
+        make_fork, handler = fork_run_env
+        reg = TaintRegistry(base_dir=tmp_path / "taint")
+        mt.set_registry(reg)
+        try:
+            agent, mm, provider = make_fork(ingest_disabled=False)
+            handler.response_queue.append(
+                _tc_resp("memory_search", '{"query": "past work"}')
+            )
+            handler.response_queue.append(_text_resp("done"))
+
+            agent.run_conversation("simulated live turn", conversation_history=[])
+            mm.flush_pending(timeout=5)
+
+            sid = getattr(agent, "session_id", "") or ""
+            digest = reg.session_injected_digest(sid)
+            assert digest["count"] >= 1, digest
+            assert "memory_search" in digest["sources"], digest
+        finally:
+            mt.set_registry(None)

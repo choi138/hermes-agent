@@ -1219,6 +1219,23 @@ def build_turn_context(
             _set_graphiti_status(_graphiti_status)
         ext_prefetch_cache = strip_graphiti_lookup_status_blocks(ext_prefetch_cache)
 
+        # ADR-004 §① origin-taint (Phase 2): the prefetch text injected into
+        # this turn's <memory-context> fence is memory-derived — register it
+        # so the WAL tagger can mark assistant paraphrases of it as tainted.
+        # Registered POST-strip: the lookup-status blocks are stripped above
+        # and never reach the model, so registering them would taint on text
+        # the agent could not have read. In-memory update + async disk
+        # append: never raises, never blocks.
+        try:
+            from agent import memory_taint
+            memory_taint.record_injected_text(
+                getattr(agent, "session_id", "") or "",
+                ext_prefetch_cache,
+                source="prefetch",
+            )
+        except Exception:
+            pass
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next

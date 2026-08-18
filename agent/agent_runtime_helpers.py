@@ -3113,7 +3113,27 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            result = agent._memory_manager.handle_tool_call(function_name, next_args)
+            # ADR-004 §① origin-taint (Phase 2): mirror of the sequential
+            # registration site in tool_executor — memory-provider results
+            # returned via THIS dispatch path must land in the injected-span
+            # registry too, or one _PARALLEL_SAFE_TOOLS allowlist edit would
+            # silently reopen the echo-chamber bypass. Gated on
+            # memory_ingest_allowed for the same fork-isolation reason
+            # (shared live session registry). Fail-open, never raises.
+            if result:
+                try:
+                    from agent.memory_manager import memory_ingest_allowed
+                    if memory_ingest_allowed(agent):
+                        from agent import memory_taint
+                        memory_taint.record_injected_tool_result(
+                            getattr(agent, "session_id", "") or "",
+                            str(result),
+                            source=function_name,
+                        )
+                except Exception:
+                    pass
+            return _finish_agent_tool(result, next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool
