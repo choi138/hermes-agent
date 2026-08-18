@@ -48,6 +48,68 @@ def sink_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".hermes", "logs", "turn_traces.jsonl")
 
 
+def prefix_fingerprint_enabled() -> bool:
+    """``HERMES_TURN_TRACE_PREFIX=1`` adds per-message request fingerprints.
+
+    Separate flag from :func:`enabled` because fingerprinting hashes the whole
+    request payload on every LLM call (~2-3ms at 150k tokens) and grows trace
+    lines by ~1KB per call — worth it only while hunting provider prompt-cache
+    prefix breaks.
+    """
+    return os.environ.get("HERMES_TURN_TRACE_PREFIX", "").strip().lower() in _TRUTHY
+
+
+def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fingerprint the request prefix for cross-turn cache-break diffing.
+
+    Hashes each message (and the tools array) exactly as serialized on the
+    wire — dict insertion order, no sort_keys — because a key-order-only
+    change still breaks the provider's prompt-cache prefix and must show up
+    as a different hash. Returns llm.call span tags:
+
+      pfp        list of 8-hex sha1 per message (index 0 = system prompt)
+      pfp_lens   serialized char length per message (locates the break as a
+                 char offset -> approximate token position)
+      pfp_tools  hash of the tools schema array (tools precede/co-key the
+                 provider cache prefix; a tools change kills 100%)
+      pfp_rest   hash of every other request field (model, temperature,
+                 reasoning knobs, ...) — some providers key the cache on
+                 these too
+    """
+    try:
+        import hashlib
+
+        def _h(obj: Any) -> tuple:
+            data = json.dumps(
+                obj, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+            return (
+                hashlib.sha1(data.encode("utf-8", "replace")).hexdigest()[:8],
+                len(data),
+            )
+
+        hashes: List[str] = []
+        lens: List[int] = []
+        for msg in api_kwargs.get("messages") or []:
+            digest, length = _h(msg)
+            hashes.append(digest)
+            lens.append(length)
+        tools_digest, tools_len = _h(api_kwargs.get("tools") or [])
+        rest = {
+            k: v for k, v in api_kwargs.items() if k not in ("messages", "tools")
+        }
+        rest_digest, _ = _h(rest)
+        return {
+            "pfp": hashes,
+            "pfp_lens": lens,
+            "pfp_tools": tools_digest,
+            "pfp_tools_len": tools_len,
+            "pfp_rest": rest_digest,
+        }
+    except Exception:
+        return None
+
+
 class Span:
     __slots__ = ("name", "start", "end", "thread", "tags")
 

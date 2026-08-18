@@ -340,6 +340,124 @@ def render_summary(traces: List[Dict[str, Any]], colors: _Colors, out=None) -> N
     )
 
 
+# --- cross-turn prefix cache diff ---------------------------------------------------
+#
+# Consumes the pfp/pfp_lens/pfp_tools/pfp_rest tags emitted on llm.call spans
+# when HERMES_TURN_TRACE_PREFIX=1 (see agent/turn_trace.py). For every pair of
+# consecutive turns in a session it diffs the LAST request of turn N against
+# the FIRST request of turn N+1 — the exact boundary where the provider prompt
+# cache dies (first-call cache p50 13% vs in-turn 97%) — and reports the first
+# divergent message index, so the cache buster can be named instead of guessed.
+
+
+def _llm_call_fingerprints(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out = []
+    for s in rec.get("spans", []):
+        if s.get("n") == "llm.call":
+            tags = s.get("tags") or {}
+            if isinstance(tags.get("pfp"), list):
+                out.append(tags)
+    return out
+
+
+def _first_cache_pct(rec: Dict[str, Any]) -> Optional[float]:
+    for s in rec.get("spans", []):
+        if s.get("n") == "llm.accounting":
+            tags = s.get("tags") or {}
+            v = tags.get("cache_pct")
+            return float(v) if v is not None else None
+    return None
+
+
+def diff_turn_pair(prev_fp: Dict[str, Any], next_fp: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare turn N's last request fingerprint with turn N+1's first."""
+    a: List[str] = prev_fp.get("pfp") or []
+    b: List[str] = next_fp.get("pfp") or []
+    b_lens: List[int] = next_fp.get("pfp_lens") or []
+    k = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        k += 1
+    total_chars = sum(b_lens) or 1
+    matched_chars = sum(b_lens[:k])
+    detail = []
+    for i in range(k, min(k + 4, min(len(a), len(b)))):
+        detail.append((i, a[i], b[i], b_lens[i] if i < len(b_lens) else -1))
+    return {
+        "prev_msgs": len(a),
+        "next_msgs": len(b),
+        "common": k,
+        # a strict-prefix pair (old request fully contained in the new one)
+        # is the cache-friendly shape; anything else broke the prefix
+        "prefix_intact": k == len(a) and len(b) >= len(a),
+        "diverge_at": None if k >= min(len(a), len(b)) else k,
+        "matched_char_pct": 100.0 * matched_chars / total_chars,
+        "tools_same": prev_fp.get("pfp_tools") == next_fp.get("pfp_tools"),
+        "rest_same": prev_fp.get("pfp_rest") == next_fp.get("pfp_rest"),
+        "system_same": k >= 1,
+        "detail": detail,
+    }
+
+
+def render_cache_diff(traces: List[Dict[str, Any]], colors: _Colors, out=None) -> None:
+    out = out or sys.stdout
+    c = colors
+    by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in traces:
+        key = (rec.get("tags") or {}).get("session_key")
+        if key:
+            by_session.setdefault(str(key), []).append(rec)
+    pairs = 0
+    skipped = 0
+    for key in sorted(by_session):
+        recs = sorted(by_session[key], key=lambda r: r.get("started_at") or 0.0)
+        for prev, nxt in zip(recs, recs[1:]):
+            prev_fps = _llm_call_fingerprints(prev)
+            next_fps = _llm_call_fingerprints(nxt)
+            if not prev_fps or not next_fps:
+                skipped += 1
+                continue
+            pairs += 1
+            d = diff_turn_pair(prev_fps[-1], next_fps[0])
+            gap_s = (nxt.get("started_at") or 0.0) - (
+                (prev.get("started_at") or 0.0) + _f(prev.get("duration_ms", 0.0)) / 1000.0
+            )
+            cache = _first_cache_pct(nxt)
+            cache_s = f"{cache:.1f}%" if cache is not None else "n/a"
+            verdict = (
+                f"{c.model}prefix intact{c.reset}"
+                if d["prefix_intact"]
+                else f"{c.hot}diverges at msg[{d['diverge_at']}]{c.reset}"
+                if d["diverge_at"] is not None
+                else f"{c.hot}next request SHORTER (history rewritten/compressed){c.reset}"
+            )
+            out.write(
+                f"{c.bold}{key}{c.reset}  {str(prev.get('trace_id'))[:12]} -> "
+                f"{str(nxt.get('trace_id'))[:12]}  gap={gap_s:.0f}s  first-call cache={cache_s}\n"
+            )
+            out.write(
+                f"  msgs {d['prev_msgs']} -> {d['next_msgs']}  common={d['common']}"
+                f" ({d['matched_char_pct']:.1f}% of next-request chars)  {verdict}\n"
+            )
+            flags = []
+            if not d["system_same"]:
+                flags.append("system prompt CHANGED (msg[0])")
+            if not d["tools_same"]:
+                flags.append("tools schema CHANGED")
+            if not d["rest_same"]:
+                flags.append("non-message request fields changed")
+            if flags:
+                out.write(f"  {c.hot}{'; '.join(flags)}{c.reset}\n")
+            for i, ha, hb, ln in d["detail"]:
+                out.write(f"    msg[{i}] {ha} -> {hb}  ({ln} chars)\n")
+    if not pairs:
+        out.write(
+            f"no consecutive-turn pairs with fingerprints found"
+            f" ({skipped} pair(s) lacked pfp tags — is HERMES_TURN_TRACE_PREFIX=1 set?)\n"
+        )
+
+
 # --- html export ------------------------------------------------------------------
 
 _HTML_CSS = """
@@ -580,6 +698,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--min-ms", type=float, default=1.0, help="hide spans shorter than this (default 1.0)")
     ap.add_argument("--width", type=int, default=0, help="output width (default: terminal width)")
     ap.add_argument("--summary", action="store_true", help="aggregate table instead of waterfalls")
+    ap.add_argument(
+        "--cache-diff",
+        action="store_true",
+        help="diff consecutive-turn request prefixes per session (needs HERMES_TURN_TRACE_PREFIX)",
+    )
     ap.add_argument("--html", default=None, metavar="PATH", help="write a self-contained interactive HTML file")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI color")
     ap.add_argument("--demo", action="store_true", help="render embedded synthetic traces (no sink needed)")
@@ -589,6 +712,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         traces = demo_traces()
     else:
         traces = load_traces(os.path.expanduser(args.file) if args.file else turn_trace.sink_path())
+    if args.cache_diff and args.last == 1 and not args.trace:
+        # pair-wise diff needs history; default to the whole sink
+        args.last = len(traces) or 1
     selected = select_traces(traces, args.trace, args.last)
     if not selected:
         sys.stderr.write("turn_trace_render: no matching traces\n")
@@ -601,9 +727,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.html:
         render_html(selected, args.min_ms, args.html)
         print(f"wrote {args.html} ({len(selected)} trace(s))")
+    if args.cache_diff:
+        render_cache_diff(selected, colors)
     if args.summary:
         render_summary(selected, colors)
-    elif not args.html:
+    elif not args.html and not args.cache_diff:
         for rec in selected:
             render_waterfall(rec, args.min_ms, width, colors)
     return 0

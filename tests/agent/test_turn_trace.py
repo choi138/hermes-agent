@@ -349,3 +349,102 @@ class TestRenderer:
         assert proc.returncode == 0, proc.stderr
         # The demo traces carry the contract's root span name.
         assert "turn" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Prefix fingerprint (HERMES_TURN_TRACE_PREFIX)
+# ---------------------------------------------------------------------------
+
+class TestPrefixFingerprint:
+    def test_flag_gates(self, monkeypatch):
+        monkeypatch.delenv("HERMES_TURN_TRACE_PREFIX", raising=False)
+        assert not turn_trace.prefix_fingerprint_enabled()
+        monkeypatch.setenv("HERMES_TURN_TRACE_PREFIX", "1")
+        assert turn_trace.prefix_fingerprint_enabled()
+
+    def test_fingerprint_shape_and_determinism(self):
+        kwargs = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "t"}}],
+        }
+        fp1 = turn_trace.prefix_fingerprint(kwargs)
+        fp2 = turn_trace.prefix_fingerprint(json.loads(json.dumps(kwargs)))
+        assert fp1 == fp2
+        assert len(fp1["pfp"]) == 2 and all(len(h) == 8 for h in fp1["pfp"])
+        assert len(fp1["pfp_lens"]) == 2 and all(n > 0 for n in fp1["pfp_lens"])
+        assert fp1["pfp_tools"] and fp1["pfp_rest"]
+
+    def test_key_order_changes_hash(self):
+        # Wire-faithful: same content, different key order must NOT collide —
+        # the provider prefix cache sees different bytes.
+        a = turn_trace.prefix_fingerprint(
+            {"messages": [{"role": "user", "content": "x"}]}
+        )
+        b = turn_trace.prefix_fingerprint(
+            {"messages": [{"content": "x", "role": "user"}]}
+        )
+        assert a["pfp"] != b["pfp"]
+
+    def test_rest_excludes_messages_and_tools(self):
+        base = {"model": "m", "temperature": 0.2, "messages": [], "tools": []}
+        changed_msgs = dict(base, messages=[{"role": "user", "content": "x"}])
+        changed_rest = dict(base, temperature=0.9)
+        assert (
+            turn_trace.prefix_fingerprint(base)["pfp_rest"]
+            == turn_trace.prefix_fingerprint(changed_msgs)["pfp_rest"]
+        )
+        assert (
+            turn_trace.prefix_fingerprint(base)["pfp_rest"]
+            != turn_trace.prefix_fingerprint(changed_rest)["pfp_rest"]
+        )
+
+    def test_unserializable_values_fall_back(self):
+        fp = turn_trace.prefix_fingerprint(
+            {"messages": [{"role": "user", "content": object()}]}
+        )
+        assert fp is not None and len(fp["pfp"]) == 1
+
+
+class TestCacheDiff:
+    def _fp(self, msgs):
+        return turn_trace.prefix_fingerprint({"messages": msgs, "tools": []})
+
+    def test_intact_prefix(self):
+        from agent.turn_trace_render import diff_turn_pair
+
+        old = [{"role": "system", "content": "s"}, {"role": "user", "content": "a"}]
+        new = old + [{"role": "assistant", "content": "r"}, {"role": "user", "content": "b"}]
+        d = diff_turn_pair(self._fp(old), self._fp(new))
+        assert d["prefix_intact"] and d["diverge_at"] is None
+        assert d["common"] == 2 and d["system_same"] and d["tools_same"]
+
+    def test_divergence_index_reported(self):
+        from agent.turn_trace_render import diff_turn_pair
+
+        old = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "r"},
+        ]
+        new = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "a-REWRITTEN"},
+            {"role": "assistant", "content": "r"},
+            {"role": "user", "content": "b"},
+        ]
+        d = diff_turn_pair(self._fp(old), self._fp(new))
+        assert not d["prefix_intact"]
+        assert d["diverge_at"] == 1 and d["common"] == 1 and d["system_same"]
+        assert d["detail"] and d["detail"][0][0] == 1
+
+    def test_system_prompt_change_flagged(self):
+        from agent.turn_trace_render import diff_turn_pair
+
+        old = [{"role": "system", "content": "s-v1"}, {"role": "user", "content": "a"}]
+        new = [{"role": "system", "content": "s-v2"}, {"role": "user", "content": "a"}]
+        d = diff_turn_pair(self._fp(old), self._fp(new))
+        assert d["diverge_at"] == 0 and not d["system_same"]
