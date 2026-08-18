@@ -2,7 +2,7 @@
 
 The hook allows plugins to intercept incoming messages before auth and
 agent dispatch. It runs in _handle_message and acts on returned action
-dicts: {"action": "skip"|"rewrite"|"allow"}.
+dicts: {"action": "skip"|"rewrite"|"prepend"|"allow"}.
 """
 
 from types import SimpleNamespace
@@ -56,6 +56,7 @@ def _make_runner(platform: Platform):
     runner.pairing_store._is_rate_limited.return_value = False
     runner.session_store = MagicMock()
     runner._running_agents = {}
+    runner._turn_started_at = {}
     runner._update_prompt_pending = {}
     return runner, adapter
 
@@ -118,3 +119,73 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_applies_to_plain_chat(monkeypatch):
+    """A plugin returning {'action': 'prepend', 'text': ...} prefixes event.text."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen_text = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("hello there"))
+
+    assert seen_text.get("value") == "[INBOX_MATTER det_key=x]\n\nhello there"
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_dropped_for_slash_command(monkeypatch):
+    """Prepends must not mutate slash commands.
+
+    is_command()/get_command() key off text.startswith("/"): a prepended
+    advisory marker would demote a recognized command (/model, /status, ...)
+    into plain chat that falls through to the agent (live incident
+    2026-07-15: /model in an inbox-matter Discord thread answered by the
+    agent's model_status tool instead of the interactive picker).
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    seen = {}
+
+    async def _capture_model(event):
+        seen["model_event_text"] = event.text
+        return "picker"
+
+    async def _capture_agent(event, source, _quick_key, _run_generation):
+        seen["agent_event_text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_model_command = _capture_model  # noqa: SLF001
+    runner._handle_message_with_agent = _capture_agent  # noqa: SLF001
+
+    result = await runner._handle_message(_make_event("/model"))
+
+    # The command must reach the /model handler with its text intact —
+    # not fall through to the agent as prepended plain chat.
+    assert seen.get("model_event_text") == "/model"
+    assert "agent_event_text" not in seen
+    assert result == "picker"

@@ -16314,9 +16314,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #   {"action": "prepend", "text":  ...}     -> prepend text to event.text, continue
+        #                                              (dropped when the event is a slash command)
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
+        _hook_prepends: list[str] = []
         if not is_internal:
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -16345,6 +16348,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.chat_id or "unknown",
                     )
                     return None
+                if _action == "prepend":
+                    _prepend_text = _result.get("text")
+                    if isinstance(_prepend_text, str) and _prepend_text.strip():
+                        _hook_prepends.append(_prepend_text.strip())
+                    continue
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
@@ -16353,6 +16361,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+
+            if _hook_prepends and event.is_command():
+                # Slash commands must reach the dispatcher unmodified:
+                # is_command()/get_command() key off text.startswith("/"),
+                # so a prepended advisory would demote /model, /status,
+                # etc. into plain chat that falls through to the agent.
+                # Command handlers can't consume hook context anyway.
+                logger.debug(
+                    "pre_gateway_dispatch prepend dropped for slash command %r",
+                    (event.text or "").split(maxsplit=1)[0],
+                )
+                _hook_prepends = []
+            if _hook_prepends:
+                _combined = "\n\n".join(_hook_prepends)
+                _original = event.text or ""
+                event = dataclasses.replace(
+                    event,
+                    text=f"{_combined}\n\n{_original}" if _original else _combined,
+                )
+                source = event.source
 
         if is_internal:
             pass
