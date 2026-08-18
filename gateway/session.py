@@ -854,6 +854,19 @@ class SessionEntry:
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
 
+    # Durable record of the at-most-one in-flight gateway turn (ADR
+    # durable-turns).  Written when a chat turn is dispatched, cleared when it
+    # finalizes; a record that survives into the next boot (stale ``boot_id``
+    # or status "interrupted") identifies a turn to resume IN PLACE — same
+    # turn_id, same transcript, no synthetic follow-up user turn.  Keys:
+    #   turn_id       str  — matches the agent-side ``_current_turn_id``
+    #   status        str  — "running" | "interrupted" | "resuming"
+    #   boot_id       str  — gateway process instance that dispatched it
+    #   started_at    str  — ISO timestamp of original dispatch
+    #   interrupted_at str — ISO timestamp, set on drain-timeout interrupt
+    #   resume_count  int  — same-turn resume attempts so far (poison cap)
+    active_turn: Optional[Dict[str, Any]] = None
+
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
@@ -906,6 +919,8 @@ class SessionEntry:
             "runtime_provider": self.runtime_provider,
             "runtime_reasoning_effort": self.runtime_reasoning_effort,
         }
+        if self.active_turn:
+            result["active_turn"] = dict(self.active_turn)
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
@@ -986,6 +1001,11 @@ class SessionEntry:
             runtime_model=data.get("runtime_model"),
             runtime_provider=data.get("runtime_provider"),
             runtime_reasoning_effort=data.get("runtime_reasoning_effort"),
+            active_turn=(
+                dict(data["active_turn"])
+                if isinstance(data.get("active_turn"), dict)
+                else None
+            ),
         )
 
 
@@ -2890,6 +2910,94 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            self._save()
+            return True
+
+    def begin_active_turn(
+        self,
+        session_key: str,
+        turn_id: str,
+        boot_id: str,
+        resume_count: int = 0,
+    ) -> bool:
+        """Record the dispatch of a gateway chat turn (ADR durable-turns).
+
+        The record survives the process: if it is still present (and not
+        cleared by ``finish_active_turn``) on the next boot, the turn was
+        killed mid-flight and is a candidate for same-turn resume.
+
+        Returns True if the session existed and the record was written.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            entry.active_turn = {
+                "turn_id": turn_id,
+                "status": "resuming" if resume_count > 0 else "running",
+                "boot_id": boot_id,
+                "started_at": _now().isoformat(),
+                "resume_count": resume_count,
+            }
+            self._save()
+            return True
+
+    def mark_active_turn_interrupted(self, session_key: str, reason: str) -> bool:
+        """Flag the in-flight turn as gateway-interrupted (drain timeout).
+
+        Distinguishes gateway-initiated interrupts (restart/shutdown — the
+        turn should resume next boot) from user-initiated ones (/stop, steer
+        — the record is simply cleared by the post-turn path).
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.active_turn:
+                return False
+            entry.active_turn["status"] = "interrupted"
+            entry.active_turn["interrupted_reason"] = reason
+            entry.active_turn["interrupted_at"] = _now().isoformat()
+            self._save()
+            return True
+
+    def finish_active_turn(
+        self,
+        session_key: str,
+        turn_id: Optional[str] = None,
+        *,
+        force: bool = False,
+        turn_interrupted: bool = False,
+    ) -> bool:
+        """Clear the in-flight turn record after the turn ends.
+
+        ``turn_interrupted`` is the agent result's ``interrupted`` flag.  A
+        turn that ended *because the gateway interrupted it for a restart*
+        (record status "interrupted") must KEEP its record so the next boot
+        resumes it — the post-turn path still runs during the drain grace
+        window.  Every other ending (normal completion, user interrupt,
+        error) clears the record.  ``force=True`` clears unconditionally
+        (abandonment); ``turn_id`` guards against clearing a newer turn's
+        record from a stale run.
+
+        Returns True if the record was cleared.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.active_turn:
+                return False
+            record = entry.active_turn
+            if turn_id and record.get("turn_id") != turn_id:
+                return False
+            if (
+                not force
+                and turn_interrupted
+                and record.get("status") == "interrupted"
+            ):
+                # Gateway-initiated interrupt: keep the record for boot resume.
+                return False
+            entry.active_turn = None
             self._save()
             return True
 

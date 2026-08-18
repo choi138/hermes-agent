@@ -1402,6 +1402,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1431,7 +1433,7 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    if moa_config is None and not resume_turn:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -1443,6 +1445,26 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # Normalize an interrupted transcript before rebuilding the turn context.
+    # A completed assistant tail is deliverable without another provider call.
+    _resume_composed_final: Optional[str] = None
+    if resume_turn:
+        from agent.turn_resume import prepare_resume_history, resume_entry_reason
+
+        conversation_history, _resume_composed_final = prepare_resume_history(
+            list(conversation_history or [])
+        )
+        user_message = ""
+        persist_user_message = None
+        persist_user_timestamp = None
+        logger.info(
+            "same-turn resume: session=%s turn_id=%s tail=%s composed_final=%s",
+            agent.session_id or "none",
+            turn_id or "(new)",
+            resume_entry_reason(conversation_history),
+            _resume_composed_final is not None,
+        )
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1488,6 +1510,8 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        resume_turn=resume_turn,
+        turn_id_override=turn_id,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1511,6 +1535,15 @@ def run_conversation(
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
+    # Same-turn resume of a turn that had already finished generating: the
+    # composed answer was persisted but never delivered/finalized.  Seed it as
+    # the final response and skip the loop entirely — the normal
+    # finalize/delivery path still runs.  The transcript already ends with
+    # that assistant row, so nothing is appended twice.
+    _resume_skip_loop = False
+    if resume_turn and _resume_composed_final is not None:
+        final_response = _resume_composed_final
+        _resume_skip_loop = True
     interrupted = False
     failed = False
     codex_ack_continuations = 0
@@ -1528,7 +1561,11 @@ def run_conversation(
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
-    _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _turn_exit_reason = (
+        "resume_composed_final"
+        if resume_turn and _resume_composed_final is not None
+        else "unknown"
+    )  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -1573,7 +1610,10 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while not _resume_skip_loop and (
+        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2687,6 +2727,7 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                _attempt_started = time.time()
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -4765,6 +4806,10 @@ def run_conversation(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
+                if _is_transport_failure and (time.time() - _attempt_started) < 2.0:
+                    _retry.fast_transport_failures += 1
+                else:
+                    _retry.fast_transport_failures = 0
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
@@ -4823,6 +4868,51 @@ def run_conversation(
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
+
+                # A consecutive streak of near-immediate transport failures
+                # means the active endpoint is down. Once the fallback chain
+                # has had its chance, stop extending user-visible silence with
+                # a normal multi-minute retry cycle. Zero disables the cutoff.
+                try:
+                    _fast_limit = int(
+                        os.environ.get("HERMES_FAST_CONN_FAIL_LIMIT", "3") or 3
+                    )
+                except ValueError:
+                    _fast_limit = 3
+                if (
+                    _is_transport_failure
+                    and _fast_limit > 0
+                    and _retry.fast_transport_failures >= _fast_limit
+                    and not agent._has_pending_fallback()
+                ):
+                    agent._flush_status_buffer()
+                    _fail_summary = agent._summarize_api_error(api_error)
+                    _msg = (
+                        f"Provider unreachable: {_retry.fast_transport_failures} "
+                        f"consecutive instant connection failures "
+                        f"({_fail_summary}). Giving up early — the endpoint "
+                        "appears to be down and no fallback provider is available."
+                    )
+                    agent._emit_status(f"❌ {_msg}")
+                    logger.error(
+                        "Fail-fast after %d instant transport failures %s error=%s",
+                        _retry.fast_transport_failures,
+                        agent._client_log_context(),
+                        api_error,
+                    )
+                    close_interrupted_tool_sequence(
+                        messages, f"[System: API call aborted — {_msg}]"
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _msg,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _msg,
+                        "failure_reason": classified.reason.value,
+                    }
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh

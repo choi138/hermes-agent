@@ -1062,6 +1062,34 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _gateway_turn_resume_enabled() -> bool:
+    """Return whether interrupted gateway turns resume in place."""
+    raw = (os.environ.get("HERMES_GATEWAY_TURN_RESUME") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+_TURN_RESUME_MAX_DEFAULT = 2
+
+
+def _turn_resume_max() -> int:
+    """Return the poison-turn retry cap for same-turn resumes."""
+    value = int(_float_env("HERMES_TURN_RESUME_MAX", _TURN_RESUME_MAX_DEFAULT))
+    return value if value >= 0 else _TURN_RESUME_MAX_DEFAULT
+
+
+def _orphaned_active_turn(entry: Any, boot_id: str) -> Optional[Dict[str, Any]]:
+    """Return an interrupted or stale-process active-turn record."""
+    record = getattr(entry, "active_turn", None)
+    if not isinstance(record, dict):
+        return None
+    status = record.get("status")
+    if status == "interrupted":
+        return record
+    if status in ("running", "resuming") and record.get("boot_id") != boot_id:
+        return record
+    return None
+
+
 def _stamp_hygiene_compression_provenance(
     agent: Any,
     desc: str,
@@ -1936,6 +1964,18 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     agent_cfg = cfg.get("agent", {})
     if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+    if isinstance(agent_cfg, dict) and "process_wait_cap" in agent_cfg:
+        os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
+    if isinstance(agent_cfg, dict) and "fast_conn_fail_limit" in agent_cfg:
+        os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(
+            agent_cfg["fast_conn_fail_limit"]
+        )
+    if isinstance(agent_cfg, dict) and "gateway_turn_resume" in agent_cfg:
+        os.environ["HERMES_GATEWAY_TURN_RESUME"] = str(
+            agent_cfg["gateway_turn_resume"]
+        )
+    if isinstance(agent_cfg, dict) and "turn_resume_max" in agent_cfg:
+        os.environ["HERMES_TURN_RESUME_MAX"] = str(agent_cfg["turn_resume_max"])
     # config-authoritative knobs for the session-search index (config.yaml
     # sessions.* wins over stale env; env stays the cross-process carrier).
     sessions_cfg = cfg.get("sessions", {})
@@ -1944,6 +1984,33 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_CJK_FTS"] = str(sessions_cfg["cjk_fts"])
         if "search_slow_ms" in sessions_cfg:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
+
+
+def _gateway_max_workers(default: int = 12) -> int:
+    """Return the size of the shared gateway agent-turn thread pool.
+
+    Every gateway turn occupies one worker for its full lifetime, including
+    blocking process waits and long-running background work.  Resolve the
+    setting from ``gateway.max_workers`` first, then the environment carrier,
+    and keep at least two workers available.
+    """
+    value = None
+    try:
+        config = _load_gateway_config()
+        gateway_config = config.get("gateway") if isinstance(config, dict) else None
+        if isinstance(gateway_config, dict) and gateway_config.get("max_workers") is not None:
+            value = gateway_config["max_workers"]
+    except Exception:
+        pass
+
+    if value is None:
+        value = os.environ.get("HERMES_GATEWAY_MAX_WORKERS")
+
+    try:
+        workers = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        workers = default
+    return max(2, workers)
 
 
 def _current_max_iterations() -> int:
@@ -2249,6 +2316,14 @@ if _config_path.exists():
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
+                )
+            if "process_wait_cap" in _agent_cfg:
+                os.environ["HERMES_PROCESS_WAIT_CAP"] = str(
+                    _agent_cfg["process_wait_cap"]
+                )
+            if "fast_conn_fail_limit" in _agent_cfg:
+                os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(
+                    _agent_cfg["fast_conn_fail_limit"]
                 )
             if "gateway_startup_restore_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
@@ -5841,11 +5916,37 @@ class TurnRunner:
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
 
+        # A restart-generated event can re-enter the interrupted transcript in
+        # place. Legacy resume markers without a durable record are trusted
+        # only when the persisted tail itself still looks interrupted.
+        _turn_resume_marker = ctx.turn_resume_marker
+        _is_turn_resume = bool(
+            isinstance(_turn_resume_marker, dict)
+            and agent_history
+            and _gateway_turn_resume_enabled()
+        )
+        if _is_turn_resume and not _turn_resume_marker.get("record_backed"):
+            from agent.turn_resume import is_interrupt_closer_message as _is_closer
+
+            _rt_tail = agent_history[-1]
+            _is_turn_resume = bool(
+                isinstance(_rt_tail, dict)
+                and (
+                    _rt_tail.get("role") == "tool"
+                    or (
+                        _rt_tail.get("role") == "assistant"
+                        and _rt_tail.get("tool_calls")
+                    )
+                    or _is_closer(_rt_tail)
+                )
+            )
+
         # Prepend pending model switch note so the model knows about the switch
         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
-        _msn = _pending_notes.pop(ctx.session_key, None) if ctx.session_key else None
-        if _msn:
-            ctx.message = _msn + "\n\n" + ctx.message
+        if not _is_turn_resume:
+            _msn = _pending_notes.pop(ctx.session_key, None) if ctx.session_key else None
+            if _msn:
+                ctx.message = _msn + "\n\n" + ctx.message
 
         # Auto-continue: if the loaded history ends with a tool result,
         # the previous agent turn was interrupted mid-work (gateway
@@ -5912,7 +6013,9 @@ class TurnRunner:
             and _interruption_is_fresh
         )
 
-        if _is_resume_pending:
+        if _is_turn_resume:
+            pass
+        elif _is_resume_pending:
             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             _persist_user_message_override = ctx.message
             # The empty-message case is the auto-resume startup turn
@@ -5946,7 +6049,12 @@ class TurnRunner:
         # clear. Nothing was written to the transcript out-of-band, so
         # message alternation stays intact.
         _pending_notes = getattr(self._runner, "_pending_skills_reload_notes", None)
-        if _pending_notes and ctx.session_key and ctx.session_key in _pending_notes:
+        if (
+            not _is_turn_resume
+            and _pending_notes
+            and ctx.session_key
+            and ctx.session_key in _pending_notes
+        ):
             _srn = _pending_notes.pop(ctx.session_key, None)
             if _srn:
                 ctx.message = _srn + "\n\n" + ctx.message
@@ -5961,7 +6069,8 @@ class TurnRunner:
         # legitimately empty user turns (e.g. an image with no caption,
         # wrapped as native content below) are untouched.
         if (
-            isinstance(ctx.message, str)
+            not _is_turn_resume
+            and isinstance(ctx.message, str)
             and not ctx.message.strip()
             and _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
@@ -6021,14 +6130,43 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
-            if _persist_user_message_override is not None:
-                _conversation_kwargs["persist_user_message"] = _persist_user_message_override
-            elif observed_group_context:
-                _conversation_kwargs["persist_user_message"] = ctx.message
-            if ctx.moa_config is not None:
-                _conversation_kwargs["moa_config"] = ctx.moa_config
-            if _persist_user_timestamp_override is not None:
-                _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if _is_turn_resume:
+                _conversation_kwargs["resume_turn"] = True
+                _conversation_kwargs["turn_id"] = _turn_resume_marker.get("turn_id")
+                _api_run_message = ""
+            else:
+                if _persist_user_message_override is not None:
+                    _conversation_kwargs["persist_user_message"] = _persist_user_message_override
+                elif observed_group_context:
+                    _conversation_kwargs["persist_user_message"] = ctx.message
+                if ctx.moa_config is not None:
+                    _conversation_kwargs["moa_config"] = ctx.moa_config
+                if _persist_user_timestamp_override is not None:
+                    _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+
+                # Record the turn immediately before dispatch so a crash at
+                # any later point leaves an orphan that the next boot can
+                # identify and resume with the same agent-side turn id.
+                if ctx.session_key and _gateway_turn_resume_enabled():
+                    import uuid as _uuid_mod
+
+                    _gateway_turn_id = (
+                        f"{ctx.session_id}:{ctx.session_id}:"
+                        f"{_uuid_mod.uuid4().hex[:8]}"
+                    )
+                    try:
+                        if self._runner.session_store.begin_active_turn(
+                            ctx.session_key,
+                            _gateway_turn_id,
+                            self._runner._boot_id,
+                        ):
+                            _conversation_kwargs["turn_id"] = _gateway_turn_id
+                    except Exception:
+                        logger.debug(
+                            "begin_active_turn failed for %s",
+                            ctx.session_key,
+                            exc_info=True,
+                        )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -6599,6 +6737,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
+        # Process identity recorded with durable turns. A different value on
+        # the next boot proves an in-flight record was orphaned.
+        import uuid as _uuid_mod
+        self._boot_id: str = _uuid_mod.uuid4().hex
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -10852,12 +10994,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
+        if self._restart_requested:
+            # Honest wording: with durable turns the interrupted turn resumes
+            # by itself after the restart; only legacy mode still needs the
+            # user to send a message.
+            hint = (
+                "Your current task will pause and resume automatically "
+                "after the restart."
+                if _gateway_turn_resume_enabled()
+                else "Your current task will be interrupted. Send any message "
+                "after restart and I'll try to resume where you left off."
+            )
+        else:
+            hint = "Your current task will be interrupted."
         msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
@@ -12080,17 +12229,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "clear_resume_pending failed for %s", session_key,
                         exc_info=True,
                     )
+                # Durable turns (ADR durable-turns): an obligation row means
+                # the turn FINISHED generating — only delivery was owed, and
+                # the ledger now owns it (delivered, or retried on later
+                # boots via the claimed row).  Retire any orphaned
+                # active_turn record so _schedule_resume_pending_sessions
+                # cannot same-turn resume the session and deliver the same
+                # composed final a second time.
+                try:
+                    await self.async_session_store.finish_active_turn(
+                        session_key, force=True
+                    )
+                except Exception:
+                    logger.debug(
+                        "finish_active_turn (obligation redelivered) failed "
+                        "for %s", session_key,
+                        exc_info=True,
+                    )
         return redelivered
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Auto-continue fresh restart-interrupted sessions after startup.
+    def _notify_turn_abandoned(
+        self,
+        adapter: Any,
+        source: Any,
+        attempts: int,
+    ) -> None:
+        """Best-effort honest notice when a poison turn hits the resume cap."""
+        try:
+            metadata = None
+            thread_id = getattr(source, "thread_id", None)
+            if thread_id:
+                metadata = {"thread_id": thread_id}
+            msg = (
+                "⚠️ I couldn't automatically resume the interrupted task "
+                f"(gave up after {attempts} attempt(s)). The conversation "
+                "history is preserved — tell me to continue if you still "
+                "want it finished."
+            )
+            coro = (
+                adapter.send(str(source.chat_id), msg, metadata=metadata)
+                if metadata
+                else adapter.send(str(source.chat_id), msg)
+            )
+            task = asyncio.ensure_future(coro)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.debug("Failed to send turn-abandoned notice", exc_info=True)
 
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+        """Resume restart-interrupted turns after startup (ADR durable-turns).
+
+        Default mode is SAME-TURN resume: an orphaned ``active_turn`` record
+        (or, for legacy sessions, a bare ``resume_pending`` flag) identifies a
+        turn that never finalized; the dispatched event carries a
+        ``_hermes_turn_resume`` marker so ``_handle_message_with_agent``
+        re-enters the conversation loop on the persisted transcript — the
+        SAME turn continues, no synthetic follow-up user turn, no recovery
+        system note.  With ``HERMES_GATEWAY_TURN_RESUME=0`` the legacy
+        behavior (empty user turn + reason-aware note) is preserved.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
@@ -12106,16 +12303,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scheduled at startup is never resumed a second time.
         """
         window = _auto_continue_freshness_window()
+        _turn_resume_on = _gateway_turn_resume_enabled()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
+                    if not entry.suspended
                     and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and (
+                        (
+                            entry.resume_pending
+                            and entry.resume_reason in self._AUTO_RESUME_REASONS
+                        )
+                        or (
+                            _turn_resume_on
+                            and _orphaned_active_turn(entry, self._boot_id)
+                            is not None
+                        )
+                    )
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -12144,9 +12351,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
-                continue
+            _turn_record = (
+                _orphaned_active_turn(entry, self._boot_id)
+                if _turn_resume_on
+                else None
+            )
+
+            # Freshness: prefer the turn record's own interruption clock;
+            # fall back to the legacy resume-marker/session clock.
+            _fresh_signal: Any = None
+            if _turn_record is not None:
+                _fresh_signal = _turn_record.get("interrupted_at") or _turn_record.get(
+                    "started_at"
+                )
+            if _fresh_signal is not None:
+                if not _is_fresh_gateway_interruption(
+                    _fresh_signal, window_secs=window
+                ):
+                    # Stale in-flight turn: abandon the record so it cannot
+                    # revive an unrelated task days later (#16802 scars).
+                    try:
+                        self.session_store.finish_active_turn(
+                            entry.session_key, force=True
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to abandon stale turn record for %s",
+                            entry.session_key,
+                            exc_info=True,
+                        )
+                    continue
+            else:
+                marker = entry.last_resume_marked_at or entry.updated_at
+                if marker is not None and (now - marker).total_seconds() > window:
+                    continue
 
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
@@ -12184,6 +12422,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            # Poison-turn cap (same-turn resume only): a turn that keeps
+            # getting interrupted — or keeps killing the gateway — must not
+            # resume-loop forever.  Abandon its record, clear the legacy
+            # marker, and tell the thread honestly instead of silently
+            # replaying it a third time.
+            _resume_marker: Optional[Dict[str, Any]] = None
+            if _turn_resume_on:
+                _max_resumes = _turn_resume_max()
+                _prior_resumes = 0
+                if _turn_record is not None:
+                    try:
+                        _prior_resumes = int(_turn_record.get("resume_count") or 0)
+                    except (TypeError, ValueError):
+                        _prior_resumes = 0
+                if _prior_resumes >= _max_resumes:
+                    try:
+                        self.session_store.finish_active_turn(
+                            entry.session_key, force=True
+                        )
+                        self.session_store.clear_resume_pending(entry.session_key)
+                    except Exception:
+                        logger.debug(
+                            "Failed to abandon poison turn for %s",
+                            entry.session_key,
+                            exc_info=True,
+                        )
+                    logger.warning(
+                        "Abandoning interrupted turn for %s after %d resume "
+                        "attempt(s) (cap %d)",
+                        entry.session_key, _prior_resumes, _max_resumes,
+                    )
+                    self._notify_turn_abandoned(
+                        adapter, source, _prior_resumes,
+                    )
+                    continue
+
+                _resume_turn_id = None
+                if _turn_record is not None:
+                    _resume_turn_id = _turn_record.get("turn_id")
+                if not _resume_turn_id:
+                    # Legacy resume_pending session (no durable record, e.g.
+                    # first boot after this patch deploys, or unclean-boot
+                    # 120s-window marking): same-turn resume still works from
+                    # the transcript alone — mint the turn id now.
+                    import uuid as _uuid_mod
+                    _resume_turn_id = (
+                        f"{entry.session_id}:{entry.session_id}:"
+                        f"{_uuid_mod.uuid4().hex[:8]}"
+                    )
+                try:
+                    self.session_store.begin_active_turn(
+                        entry.session_key,
+                        _resume_turn_id,
+                        self._boot_id,
+                        resume_count=_prior_resumes + 1,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to update turn record for resume of %s",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                _resume_marker = {
+                    "turn_id": _resume_turn_id,
+                    "resume_count": _prior_resumes + 1,
+                    # Distinguishes a durable-record resume (turn provably
+                    # in flight when the process died) from a legacy
+                    # resume_pending-only candidate (e.g. unclean-boot 120s
+                    # marking, which also catches sessions that were NOT
+                    # mid-turn).  The dispatch path only trusts a clean
+                    # assistant-text tail as a deliverable composed final
+                    # when the record vouches for an in-flight turn.
+                    "record_backed": _turn_record is not None,
+                }
+
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -12203,6 +12516,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
             )
+            if _resume_marker is not None:
+                try:
+                    setattr(event, "_hermes_turn_resume", _resume_marker)
+                except Exception:
+                    pass
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -15249,6 +15567,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
+                    # Flag the in-flight durable turn record as
+                    # gateway-interrupted (ADR durable-turns).  This both
+                    # marks it for same-turn resume on the next boot and
+                    # tells the post-turn path (which may still run inside
+                    # the 5s grace window below) to KEEP the record.
+                    try:
+                        await self.async_session_store.mark_active_turn_interrupted(
+                            _sk, _resume_reason
+                        )
+                    except Exception as _e:
+                        logger.debug(
+                            "mark_active_turn_interrupted failed for %s: %s",
+                            _sk, _e,
+                        )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -16794,7 +17126,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "prepend", "text":  ...}     -> prepend text, continue
+        #   {"action": "prepend", "text":  ...}     -> prepend text to event.text, continue
+        #                                              (dropped when the event is a slash command)
         #   {"action": "runtime_override", ...}      -> update runtime after auth
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
@@ -16846,6 +17179,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
+            if _hook_prepends and event.is_command():
+                # Slash commands must reach the dispatcher unmodified:
+                # is_command()/get_command() key off text.startswith("/"),
+                # so a prepended advisory would demote /model, /status,
+                # etc. into plain chat that falls through to the agent.
+                # Command handlers can't consume hook context anyway.
+                logger.debug(
+                    "pre_gateway_dispatch prepend dropped for slash command %r",
+                    (event.text or "").split(maxsplit=1)[0],
+                )
+                _hook_prepends = []
             if _hook_prepends:
                 _combined = "\n\n".join(_hook_prepends)
                 _original = event.text or ""
@@ -20272,6 +20616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     mention_inbox_execution_id=_mention_execution_id,
                     mention_inbox_execution_observer=_mention_execution_observer,
                     routing_event=event,
+                    turn_resume_marker=getattr(event, "_hermes_turn_resume", None),
                 )
             except BaseException:
                 if _mention_execution_observer is not None:
@@ -20402,6 +20747,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug(
                         "clear_resume_pending failed for %s: %s",
+                        session_key, _e,
+                    )
+
+            # Durable turn record: the turn ended, retire its record — UNLESS
+            # it ended because the gateway interrupted it for a restart
+            # (record status "interrupted"), in which case the record is the
+            # next boot's resume signal and finish_active_turn keeps it.
+            if session_key:
+                try:
+                    await self.async_session_store.finish_active_turn(
+                        session_key,
+                        agent_result.get("turn_id") if isinstance(agent_result, dict) else None,
+                        turn_interrupted=bool(
+                            isinstance(agent_result, dict)
+                            and agent_result.get("interrupted")
+                        ),
+                    )
+                except Exception as _e:
+                    logger.debug(
+                        "finish_active_turn failed for %s: %s",
                         session_key, _e,
                     )
 
@@ -24332,7 +24697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             executor = getattr(self, "_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
                 executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10,
+                    max_workers=_gateway_max_workers(),
                     thread_name_prefix="hermes-gateway",
                 )
                 self._executor = executor
@@ -26629,6 +26994,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _llm_activity_recap(self, agent, session_key: str) -> Optional[str]:
+        """Generate a cached one-line recap for a long-running agent turn."""
+        try:
+            context = agent.get_activity_recap_context()
+        except Exception:
+            return None
+
+        cache = getattr(self, "_activity_recap_cache", None)
+        if cache is None:
+            cache = {}
+            self._activity_recap_cache = cache
+        context_key = hash(
+            (
+                context.get("goal"),
+                tuple(context.get("recent_tools") or ()),
+                context.get("current_tool") or context.get("last_activity_desc"),
+                tuple(context.get("voice_samples") or ()),
+                bool(context.get("persona_snippet")),
+            )
+        )
+        cached = cache.get(session_key)
+        if cached and cached[0] == context_key:
+            return cached[1]
+
+        def _generate() -> str:
+            from agent.auxiliary_client import call_llm
+
+            tools_text = "; ".join(context.get("recent_tools") or []) or "(none yet)"
+            current = (
+                context.get("current_tool")
+                or context.get("last_activity_desc")
+                or "thinking"
+            )
+            samples = context.get("voice_samples") or []
+            voice_block = ""
+            if samples:
+                joined = "\n".join(f"- {sample}" for sample in samples)
+                voice_block = (
+                    "Your recent messages in this conversation (this is YOUR "
+                    f"voice — match its language, tone, and persona exactly):\n{joined}\n"
+                )
+            elif context.get("persona_snippet"):
+                voice_block = (
+                    "Your persona and conversation-style definition (write in "
+                    f"this voice):\n{context['persona_snippet']}\n"
+                )
+            result_block = ""
+            if context.get("last_tool_result"):
+                result_block = (
+                    "Last tool result (truncated): "
+                    f"{context['last_tool_result']}\n"
+                )
+            prompt = (
+                "You are the AI agent in the middle of a long-running turn. "
+                "Write YOUR OWN one-line status update to the user: what you "
+                "are doing right now and what you are waiting on. ONE line, "
+                "max 100 chars, present tense, no prefix/quotes.\n"
+                + voice_block
+                + f"Goal of this turn: {context.get('goal') or '(unknown)'}\n"
+                + f"Your recent tool calls (oldest first): {tools_text}\n"
+                + result_block
+                + f"Currently: {current} "
+                + f"({int(context.get('seconds_since_activity') or 0)}s since last activity, "
+                + f"iteration {context.get('iteration')}/{context.get('max_iterations')})"
+            )
+            response = call_llm(
+                task="activity_recap",
+                main_runtime={
+                    "model": getattr(agent, "model", None),
+                    "provider": getattr(agent, "provider", None),
+                    "base_url": getattr(agent, "base_url", None),
+                    "api_key": getattr(agent, "api_key", None),
+                    "api_mode": getattr(agent, "api_mode", None),
+                },
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=80,
+                timeout=8,
+            )
+            message = response.choices[0].message
+            content = (
+                message.get("content")
+                if isinstance(message, dict)
+                else getattr(message, "content", "")
+            )
+            lines = str(content or "").strip().splitlines()
+            return lines[0][:140].strip() if lines else ""
+
+        try:
+            text = await asyncio.wait_for(asyncio.to_thread(_generate), timeout=10)
+        except Exception as exc:
+            logger.debug("activity recap generation failed: %s", exc)
+            return None
+        if not text:
+            return None
+        cache[session_key] = (context_key, text)
+        return text
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -27713,6 +28175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
         routing_event: Optional[MessageEvent] = None,
+        turn_resume_marker: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -27737,6 +28200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
                 routing_event=routing_event,
+                turn_resume_marker=turn_resume_marker,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -27754,6 +28218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
                 routing_event=routing_event,
+                turn_resume_marker=turn_resume_marker,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -27881,6 +28346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
         routing_event: Optional[MessageEvent] = None,
+        turn_resume_marker: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -27982,8 +28448,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default: bool = False,
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
+            allow_recap: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return the normalized visibility mode for a gateway surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
@@ -27998,6 +28465,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "recap":
+                return "recap" if allow_recap else "raw"
             return "raw" if bool(value) else "off"
 
         # Disable tool progress for webhooks - they don't support message editing,
@@ -28191,6 +28660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            turn_resume_marker=turn_resume_marker,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -28600,6 +29070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "long_running_notifications",
             default=True,
             allow_generic=True,
+            allow_recap=True,
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
@@ -28651,11 +29122,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
+                _recap_line = None
+                if _long_running_mode == "recap" and agent_holder[0] is not None:
+                    _recap_line = await self._llm_activity_recap(
+                        agent_holder[0], session_key
+                    )
                 # User-facing heartbeats never copy implementation details
                 # from get_activity_summary(). Discord re-renders the same
                 # structured semantic snapshot; other platforms get localized
                 # elapsed-time copy without tool or iteration names.
-                if _long_running_mode == "generic" and _long_running_phrase_catalog:
+                if _recap_line:
+                    _heartbeat_text = f"⏳ {_elapsed_mins} min — {_recap_line}"
+                    _active_heartbeat_id = _heartbeat_msg_id
+                elif _long_running_mode == "generic" and _long_running_phrase_catalog:
                     try:
                         from gateway.status_phrases import choose_status_phrase
 
@@ -28699,6 +29178,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _active_heartbeat_id = _heartbeat_msg_id
                 try:
                     _notify_res = None
+                    # Recaps must remain visible at the bottom of a busy
+                    # thread. When deletion is supported, replace the prior
+                    # bubble instead of editing it in its old position.
+                    if (
+                        _heartbeat_msg_id
+                        and _long_running_mode == "recap"
+                        and type(_notify_adapter).delete_message
+                        is not BasePlatformAdapter.delete_message
+                    ):
+                        try:
+                            await _notify_adapter.delete_message(
+                                source.chat_id, _heartbeat_msg_id
+                            )
+                        except Exception:
+                            pass
+                        _heartbeat_msg_id = None
+                        _active_heartbeat_id = None
                     if _active_heartbeat_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
@@ -28718,7 +29214,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
                         ):
-                            if semantic_progress_enabled:
+                            if (
+                                semantic_progress_enabled
+                                and _long_running_mode != "recap"
+                            ):
                                 semantic_progress_message_id_ref[0] = str(
                                     _notify_res.message_id
                                 )

@@ -252,6 +252,10 @@ DEFAULT_CONFIG = {
         # detector instead of hanging forever. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
         "local_stream_stale_timeout": 900,
+        # Resume an interrupted gateway turn in place after restart.
+        "gateway_turn_resume": True,
+        # Maximum same-turn restart resumes before abandoning a poison turn.
+        "turn_resume_max": 2,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly
