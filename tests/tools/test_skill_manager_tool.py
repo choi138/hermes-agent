@@ -968,17 +968,29 @@ def test_skill_manage_schema_declares_structured_reason():
 
     props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
     assert "reason" in props
-    description = props["reason"]["description"]
-    for field in (
+    reason = props["reason"]
+    # Typed object, not a "JSON object string": constrained decoding then
+    # enforces the field types at generation time — a string where the
+    # neighbor array belongs (the #1 gate false-rejection) becomes
+    # unrepresentable instead of a misleading runtime block.
+    assert reason["type"] == "object"
+    rprops = reason["properties"]
+    assert rprops["claim_kind"]["enum"] == ["procedural"]
+    assert rprops["execution_evidence"]["enum"] == ["tier-A", "tier-B", "tier-C"]
+    assert rprops["evidence"]["type"] == "string"
+    assert rprops["target"]["enum"] == ["patch-existing", "new-skill"]
+    assert rprops["neighbor_skills_checked"]["type"] == "array"
+    assert rprops["neighbor_skills_checked"]["items"] == {"type": "string"}
+    assert rprops["neighbor_skills_checked"]["minItems"] == 1
+    assert rprops["verified_by"]["enum"] == ["llm-judgment"]
+    assert set(reason["required"]) == {
         "claim_kind",
         "execution_evidence",
-        "evidence_pointer",
-        "why_not_note",
+        "evidence",
         "target",
         "neighbor_skills_checked",
-    ):
-        assert field in description, field
-    # `reason` must stay OPTIONAL at the schema level: only create/edit/patch
-    # are gated, and enforcement belongs to the gate (fail-closed plugin),
-    # not to JSON-Schema `required`.
+    }
+    # `reason` itself must stay OPTIONAL at the schema level: only
+    # create/edit/patch are gated, and enforcement belongs to the gate
+    # (fail-closed plugin), not to top-level JSON-Schema `required`.
     assert SKILL_MANAGE_SCHEMA["parameters"]["required"] == ["action", "name"]

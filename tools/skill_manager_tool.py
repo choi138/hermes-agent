@@ -1752,26 +1752,76 @@ SKILL_MANAGE_SCHEMA = {
                 )
             },
             "reason": {
-                "type": "string",
+                "type": "object",
                 "description": (
                     "Structured write rationale — required for "
                     "create/edit/patch when a skills admission gate is "
                     "installed (the gate blocks those actions without it). "
-                    "Pass a JSON object string with fields: "
-                    "claim_kind ('procedural' only — declarative facts go to "
-                    "notes/graphiti, instructions go to memory), "
-                    "execution_evidence ('tier-A'|'tier-B'|'tier-C'), "
-                    "evidence_pointer (where the evidence lives — session, "
-                    "log, test run), "
-                    "why_not_note (why this is a procedure, not a note or "
-                    "memory entry), "
-                    "target ('patch-existing'|'new-skill'), and "
-                    "neighbor_skills_checked (similar skills you reviewed "
-                    "for overlap). "
-                    "tier-C (LLM-judgment) evidence must be labeled "
-                    "verified_by: 'llm-judgment'. Note: a gated 'create' is "
-                    "staged for review rather than applied to the live tree."
-                )
+                    "Note: a gated 'create' is staged for review rather "
+                    "than applied to the live tree."
+                ),
+                "properties": {
+                    "claim_kind": {
+                        "type": "string",
+                        "enum": ["procedural"],
+                        "description": (
+                            "Only procedural content is admissible — "
+                            "declarative facts go to notes/graphiti, "
+                            "standing instructions go to memory."
+                        )
+                    },
+                    "execution_evidence": {
+                        "type": "string",
+                        "enum": ["tier-A", "tier-B", "tier-C"],
+                        "description": (
+                            "tier-A: mechanical success signal in this "
+                            "session (exit 0, no later error-recovery "
+                            "turns); tier-B: explicit user confirmation; "
+                            "tier-C: LLM judgment only (must also set "
+                            "verified_by)."
+                        )
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": (
+                            "Where the execution evidence lives "
+                            "(turn/tool/result) and why this is a "
+                            "procedure rather than a note or memory entry."
+                        )
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["patch-existing", "new-skill"],
+                        "description": (
+                            "'new-skill' for create, 'patch-existing' for "
+                            "edit/patch."
+                        )
+                    },
+                    "neighbor_skills_checked": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": (
+                            "Names of existing skills reviewed for overlap "
+                            "(skills_list / skill_view) before deciding "
+                            "this write is novel."
+                        )
+                    },
+                    "verified_by": {
+                        "type": "string",
+                        "enum": ["llm-judgment"],
+                        "description": (
+                            "Required when execution_evidence is 'tier-C'."
+                        )
+                    },
+                },
+                "required": [
+                    "claim_kind",
+                    "execution_evidence",
+                    "evidence",
+                    "target",
+                    "neighbor_skills_checked",
+                ]
             },
         },
         "required": ["action", "name"],
