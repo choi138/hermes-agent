@@ -2055,7 +2055,7 @@ def list_authenticated_providers(
         fetch_models_dev,
         get_provider_info as _mdev_pinfo,
     )
-    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.auth import PROVIDER_REGISTRY, is_source_suppressed
     from hermes_cli.models import (
         OPENROUTER_MODELS, _PROVIDER_MODELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
@@ -2428,8 +2428,16 @@ def list_authenticated_providers(
                     read_claude_code_credentials,
                     read_hermes_oauth_credentials,
                 )
-                hermes_creds = read_hermes_oauth_credentials()
-                cc_creds = read_claude_code_credentials()
+                # Honour per-source suppression: a source the user disabled
+                # must not be resurrected by the discovery-oriented picker.
+                hermes_creds = (
+                    None if is_source_suppressed("anthropic", "hermes_pkce")
+                    else read_hermes_oauth_credentials()
+                )
+                cc_creds = (
+                    None if is_source_suppressed("anthropic", "claude_code")
+                    else read_claude_code_credentials()
+                )
                 if (hermes_creds and hermes_creds.get("accessToken")) or \
                    (cc_creds and cc_creds.get("accessToken")):
                     has_creds = True
