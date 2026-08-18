@@ -521,12 +521,17 @@ def _recent_turns(session_store: Any, session_id: str, limit: int) -> list[Turn]
     if db is None:
         return []
     try:
-        messages = db.get_messages_as_conversation(session_id, include_ancestors=False)
+        messages = db.get_recent_dialogue_messages(session_id, limit)
     except Exception:
         try:
-            messages = db.get_messages(session_id)
+            messages = db.get_messages_as_conversation(
+                session_id, include_ancestors=False
+            )
         except Exception:
-            return []
+            try:
+                messages = db.get_messages(session_id)
+            except Exception:
+                return []
     turns: list[Turn] = []
     for msg in messages:
         role = str(msg.get("role") or "")

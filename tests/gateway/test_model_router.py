@@ -106,6 +106,15 @@ def _event(text="hermes gateway 고장났어 디버깅해줘", **kwargs) -> Mess
 class _FakeDB:
     def __init__(self, messages):
         self.messages = list(messages)
+        self.recent_dialogue_limit = None
+
+    def get_recent_dialogue_messages(self, session_id, limit):
+        self.recent_dialogue_limit = limit
+        dialogue = [
+            message for message in self.messages
+            if message.get("role") in {"user", "assistant"}
+        ]
+        return dialogue[-limit:]
 
     def get_messages_as_conversation(self, session_id, include_ancestors=False):
         return list(self.messages)
@@ -224,6 +233,35 @@ def test_recent_turns_limit_applied():
     ])
     context = mr_mod.build_context(event=_event("hi"), session_store=store, recent_turn_limit=3)
     assert [t.content for t in context.recent_turns] == ["m7", "m8", "m9"]
+    assert store._db.recent_dialogue_limit == 3
+
+
+def test_recent_turns_real_db_limits_dialogue_tail_before_decode(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "router-state.db")
+    try:
+        db.create_session("sid-1", "gateway")
+        for index in range(12):
+            db.append_message("sid-1", "user", f"user-{index}")
+            db.append_message("sid-1", "tool", f"tool-{index}")
+            db.append_message("sid-1", "assistant", f"assistant-{index}")
+
+        store = _FakeStore()
+        store._db = db
+        context = mr_mod.build_context(
+            event=_event("hi"),
+            session_store=store,
+            recent_turn_limit=3,
+        )
+    finally:
+        db.close()
+
+    assert [(turn.role, turn.content) for turn in context.recent_turns] == [
+        ("assistant", "assistant-10"),
+        ("user", "user-11"),
+        ("assistant", "assistant-11"),
+    ]
 
 
 # ---------------------------------------------------------------------------
