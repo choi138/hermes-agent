@@ -947,3 +947,38 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+# ---------------------------------------------------------------------------
+# Schema: structured write rationale (`reason`)
+# ---------------------------------------------------------------------------
+
+
+def test_skill_manage_schema_declares_structured_reason():
+    """The tool schema must advertise the `reason` rationale contract.
+
+    The skills admission gate (ADR-004 §② — deployed as an external plugin)
+    hard-requires a structured JSON rationale on create/edit/patch. Without
+    this property, schema-following models cannot discover the contract and
+    only learn it through blocked-call retry loops. The field list here is
+    pinned so plugin-side contract drift is at least caught as a failing
+    docs expectation on the core side.
+    """
+    from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
+
+    props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
+    assert "reason" in props
+    description = props["reason"]["description"]
+    for field in (
+        "claim_kind",
+        "execution_evidence",
+        "evidence_pointer",
+        "why_not_note",
+        "target",
+        "neighbor_skills_checked",
+    ):
+        assert field in description, field
+    # `reason` must stay OPTIONAL at the schema level: only create/edit/patch
+    # are gated, and enforcement belongs to the gate (fail-closed plugin),
+    # not to JSON-Schema `required`.
+    assert SKILL_MANAGE_SCHEMA["parameters"]["required"] == ["action", "name"]

@@ -1751,6 +1751,28 @@ SKILL_MANAGE_SCHEMA = {
                     "rewriting) will have to guess at intent."
                 )
             },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Structured write rationale — required for "
+                    "create/edit/patch when a skills admission gate is "
+                    "installed (the gate blocks those actions without it). "
+                    "Pass a JSON object string with fields: "
+                    "claim_kind ('procedural' only — declarative facts go to "
+                    "notes/graphiti, instructions go to memory), "
+                    "execution_evidence ('tier-A'|'tier-B'|'tier-C'), "
+                    "evidence_pointer (where the evidence lives — session, "
+                    "log, test run), "
+                    "why_not_note (why this is a procedure, not a note or "
+                    "memory entry), "
+                    "target ('patch-existing'|'new-skill'), and "
+                    "neighbor_skills_checked (similar skills you reviewed "
+                    "for overlap). "
+                    "tier-C (LLM-judgment) evidence must be labeled "
+                    "verified_by: 'llm-judgment'. Note: a gated 'create' is "
+                    "staged for review rather than applied to the live tree."
+                )
+            },
         },
         "required": ["action", "name"],
     },
