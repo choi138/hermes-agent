@@ -74,21 +74,27 @@ def get_runtime_state(agent: Any) -> Dict[str, Any]:
 
 
 def model_status(agent: Any) -> str:
-    """Tool-facing JSON wrapper for :func:`get_runtime_state`.
+    """Tool-facing runtime status in route language (ADR-003 Phase 3c).
 
-    When the config declares model_routes (ADR-003 Phase 3b), a ``routes``
-    block is appended: which declared route (if any) the current runtime
-    satisfies, plus the available route catalog. With no declared routes —
-    or on builds without the model_routes subsystem — the output is
-    byte-identical to the historical shape.
+    The LLM-facing payload identifies the runtime as route + model +
+    reasoning state.  Raw provider/endpoint/api-mode identifiers are
+    operator data, not model inputs — they stay in the full telemetry
+    event and logs.  With no declared routes the ``routes`` block is
+    simply absent.
     """
     state = get_runtime_state(agent)
-    state["success"] = True
+    _emit_runtime_state_event(agent, event="status", state={**state, "success": True})
+    public = {
+        "success": True,
+        "model": state["model"],
+        "reasoning": state["reasoning"],
+        "model_source": state["model_source"],
+        "turn_override_active": state["turn_override_active"],
+    }
     routes = _route_status_info(agent)
     if routes is not None:
-        state["routes"] = routes
-    _emit_runtime_state_event(agent, event="status", state=state)
-    return json.dumps(state, ensure_ascii=False)
+        public["routes"] = routes
+    return json.dumps(public, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +612,65 @@ def _notify_runtime_update(
     except Exception as exc:  # pragma: no cover - defensive surface callback guard
         logger.warning("runtime_update_callback failed: %s", exc)
         return str(exc) or exc.__class__.__name__
+
+
+# Tool-dispatch contract (ADR-003 Phase 3c). Forwarding is defined ONCE here
+# so a schema/executor drift (the Phase 3b `route` omission shipped because
+# two executors each hand-listed the kwargs) cannot recur; a parity test
+# pins these tuples against the registered tool schema.
+_MODEL_SWITCH_FORWARD_KEYS = ("route", "reason")
+_MODEL_SWITCH_REJECTED_KEYS = ("model", "provider", "reasoning_effort")
+
+
+def dispatch_model_switch(agent: Any, function_args: Any) -> str:
+    """Single ``model_switch`` entry point for every tool executor.
+
+    Enforces the route-only LLM boundary: provider ids, model ids, and
+    reasoning effort are catalog (config SoT) decisions.  Tool calls
+    carrying them get a teaching error instead of a silent drop, actively
+    steering models away from legacy free-form switching.  Internal callers
+    (gateway router, slash commands, tests) keep the full
+    :func:`model_switch` keyword surface.
+    """
+    if not isinstance(function_args, dict):
+        function_args = {}
+    rejected = [
+        key
+        for key in _MODEL_SWITCH_REJECTED_KEYS
+        if str(function_args.get(key) or "").strip()
+    ]
+    if rejected:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "This install switches models by route (purpose category), "
+                    f"not by {'/'.join(rejected)}. The route picks the "
+                    "provider, model, and reasoning effort from the declared "
+                    "catalog. Pass route=<declared route> instead."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    if not str(function_args.get("route") or "").strip():
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "No route requested. Pass route=<declared route> — see the "
+                    "route catalog in the model_switch schema or model_status."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return model_switch(
+        agent,
+        **{
+            key: function_args[key]
+            for key in _MODEL_SWITCH_FORWARD_KEYS
+            if key in function_args
+        },
+    )
 
 
 def model_switch(

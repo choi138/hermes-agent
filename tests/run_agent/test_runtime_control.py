@@ -65,7 +65,11 @@ def _switch_result(model="new-model", provider="new-provider"):
     )
 
 
-def test_model_status_reports_effective_state_without_secrets():
+def test_model_status_reports_route_language_without_operator_ids():
+    """ADR-003 Phase 3c: the LLM-facing status is route + model + reasoning.
+
+    Raw provider/endpoint/api-mode identifiers are operator data — they stay
+    in the telemetry event, never in the tool payload."""
     agent = DummyAgent()
     agent.base_url = "https://user:pass@example.com/v1?api_key=secret-old&x=1#frag"
 
@@ -73,10 +77,10 @@ def test_model_status_reports_effective_state_without_secrets():
 
     assert data["success"] is True
     assert data["model"] == "old-model"
-    assert data["provider"] == "old-provider"
-    assert data["api_mode"] == "chat_completions"
-    assert data["base_url"] == "https://example.com/v1"
-    assert data["has_gateway_session"] is True
+    assert "provider" not in data
+    assert "api_mode" not in data
+    assert "base_url" not in data
+    assert "has_gateway_session" not in data
     assert "gateway_session_key" not in data
     assert data["reasoning"] == {
         "enabled": True,

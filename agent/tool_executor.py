@@ -1868,17 +1868,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif function_name == "model_switch":
             def _execute(next_args: dict) -> Any:
-                from agent.runtime_control import model_switch as _model_switch
+                from agent.runtime_control import dispatch_model_switch
 
-                return _model_switch(
-                    agent,
-                    model=next_args.get("model"),
-                    provider=next_args.get("provider"),
-                    reasoning_effort=next_args.get("reasoning_effort"),
-                    route=next_args.get("route"),
-                    scope=next_args.get("scope", "session"),
-                    reason=next_args.get("reason"),
-                )
+                return dispatch_model_switch(agent, next_args)
 
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,

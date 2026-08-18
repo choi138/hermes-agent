@@ -3030,18 +3030,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(_model_status(agent), next_args)
     elif function_name == "model_switch":
         def _execute(next_args: dict) -> Any:
-            from agent.runtime_control import model_switch as _model_switch
+            from agent.runtime_control import dispatch_model_switch
 
             return _finish_agent_tool(
-                _model_switch(
-                    agent,
-                    model=next_args.get("model"),
-                    provider=next_args.get("provider"),
-                    reasoning_effort=next_args.get("reasoning_effort"),
-                    route=next_args.get("route"),
-                    scope=next_args.get("scope", "session"),
-                    reason=next_args.get("reason"),
-                ),
+                dispatch_model_switch(agent, next_args),
                 next_args,
             )
     elif function_name == "todo":
