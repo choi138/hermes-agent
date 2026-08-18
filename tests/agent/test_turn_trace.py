@@ -475,3 +475,22 @@ class TestCacheDiff:
                 {"model": "m", "instructions": "SYS", "input": [], "store": False}
             )["pfp_rest"]
         )
+
+    def test_chunk_hashes_locate_tail_edit(self):
+        from agent.turn_trace_render import diff_turn_pair
+
+        big = "A" * 20000
+        old = [{"role": "system", "content": big + "TAIL-V1"},
+               {"role": "user", "content": "u"}]
+        new = [{"role": "system", "content": big + "TAIL-V2-DIFFERENT"},
+               {"role": "user", "content": "u"}]
+        fp_old = turn_trace.prefix_fingerprint({"messages": old, "tools": []})
+        fp_new = turn_trace.prefix_fingerprint({"messages": new, "tools": []})
+        assert "0" in fp_old["pfp_chunks"] and len(fp_old["pfp_chunks"]["0"]) >= 4
+        d = diff_turn_pair(fp_old, fp_new)
+        assert d["diverge_at"] == 0
+        ci = d["chunk_info"]
+        # 20k identical chars -> first differing 4KB chunk is the 5th (index 4)
+        assert ci and ci["chunk"] == 4 and ci["char_offset"] == 16384
+        # matched chars credit the intact head of the changed message
+        assert d["matched_char_pct"] > 50.0

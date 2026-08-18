@@ -79,33 +79,49 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
       pfp_rest   hash of every other request field (model, temperature,
                  reasoning knobs, ...) — some providers key the cache on
                  these too
+      pfp_chunks {"0": [...], "1": [...]} — 4KB-chunk hashes of the first
+                 two entries, locating WHERE inside a changed system
+                 prompt / head message the divergence starts (a tail-only
+                 change means most of the prefix still cache-hits)
     """
     try:
         import hashlib
 
-        def _h(obj: Any) -> tuple:
-            data = json.dumps(
+        def _ser(obj: Any) -> str:
+            return json.dumps(
                 obj, ensure_ascii=False, separators=(",", ":"), default=str
             )
-            return (
-                hashlib.sha1(data.encode("utf-8", "replace")).hexdigest()[:8],
-                len(data),
-            )
 
+        def _hd(data: str) -> str:
+            return hashlib.sha1(data.encode("utf-8", "replace")).hexdigest()[:8]
+
+        def _h(obj: Any) -> tuple:
+            data = _ser(obj)
+            return _hd(data), len(data)
+
+        _CHUNK = 4096
         hashes: List[str] = []
         lens: List[int] = []
+        chunk_map: Dict[str, List[str]] = {}
+
+        def _add(obj: Any) -> None:
+            data = _ser(obj)
+            idx = len(hashes)
+            hashes.append(_hd(data))
+            lens.append(len(data))
+            if idx < 2:
+                chunk_map[str(idx)] = [
+                    _hd(data[i : i + _CHUNK]) for i in range(0, len(data), _CHUNK)
+                ]
+
         instructions = api_kwargs.get("instructions")
         if instructions is not None:
-            digest, length = _h(instructions)
-            hashes.append(digest)
-            lens.append(length)
+            _add(instructions)
         msgs = api_kwargs.get("messages")
         if msgs is None:
             msgs = api_kwargs.get("input")
         for msg in msgs or []:
-            digest, length = _h(msg)
-            hashes.append(digest)
-            lens.append(length)
+            _add(msg)
         tools_digest, tools_len = _h(api_kwargs.get("tools") or [])
         rest = {
             k: v
@@ -119,6 +135,7 @@ def prefix_fingerprint(api_kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "pfp_tools": tools_digest,
             "pfp_tools_len": tools_len,
             "pfp_rest": rest_digest,
+            "pfp_chunks": chunk_map,
         }
     except Exception:
         return None

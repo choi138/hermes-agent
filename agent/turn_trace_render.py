@@ -384,7 +384,26 @@ def diff_turn_pair(prev_fp: Dict[str, Any], next_fp: Dict[str, Any]) -> Dict[str
     detail = []
     for i in range(k, min(k + 4, min(len(a), len(b)))):
         detail.append((i, a[i], b[i], b_lens[i] if i < len(b_lens) else -1))
+    # When the diverging message has 4KB-chunk hashes on both sides, locate
+    # the change inside it: a tail-only edit means the head of the message
+    # still extends the cacheable prefix.
+    chunk_info = None
+    a_chunks = (prev_fp.get("pfp_chunks") or {}).get(str(k))
+    b_chunks = (next_fp.get("pfp_chunks") or {}).get(str(k))
+    if k < min(len(a), len(b)) and a_chunks and b_chunks:
+        ck = 0
+        for x, y in zip(a_chunks, b_chunks):
+            if x != y:
+                break
+            ck += 1
+        chunk_info = {
+            "chunk": ck,
+            "chunks_total": len(b_chunks),
+            "char_offset": ck * 4096,
+        }
+        matched_chars += min(ck * 4096, b_lens[k] if k < len(b_lens) else 0)
     return {
+        "chunk_info": chunk_info,
         "prev_msgs": len(a),
         "next_msgs": len(b),
         "common": k,
@@ -449,6 +468,13 @@ def render_cache_diff(traces: List[Dict[str, Any]], colors: _Colors, out=None) -
                 flags.append("non-message request fields changed")
             if flags:
                 out.write(f"  {c.hot}{'; '.join(flags)}{c.reset}\n")
+            ci = d.get("chunk_info")
+            if ci:
+                out.write(
+                    f"  inside msg[{d['diverge_at']}]: first change at chunk "
+                    f"{ci['chunk']}/{ci['chunks_total']} (~char {ci['char_offset']}"
+                    f" — {'tail-only edit, head still cacheable' if ci['chunk'] > 0 else 'changes from the very start'})\n"
+                )
             for i, ha, hb, ln in d["detail"]:
                 out.write(f"    msg[{i}] {ha} -> {hb}  ({ln} chars)\n")
     if not pairs:
