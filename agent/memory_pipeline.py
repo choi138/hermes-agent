@@ -4,8 +4,11 @@ Every durable *notes* write flows through here::
 
     candidate(content, kind_hint, evidence_refs, origin)
      0. deterministic scrub + injection-pattern hard reject
-     1. origin-taint check (Phase-1 interface: caller-marked taint refused;
-        full n-gram tainting is Phase 2 — see evidence_ref_is_tainted)
+     1. origin-taint check — caller-marked taint refused at propose
+        (evidence_ref_is_tainted); mechanical span tainting enforced at
+        confirm grounding (Phase 2: agent/memory_taint.py — quotes whose
+        only occurrences lie in memory-tainted assistant spans are
+        rejected with check='taint')
      2. kind routing   instruction→memory tool | declarative→notes |
                        procedural→REJECT (skills are gated separately) |
                        evidence→existing graph ingest path
@@ -199,11 +202,14 @@ def evidence_ref_is_tainted(ref: Dict[str, Any]) -> bool:
     fences, ``memory_search`` results) or an assistant paraphrase of one —
     such spans are quote-ineligible: memory citing itself is not evidence.
 
-    Documented Phase-2 seam: caller marking is replaced by mechanical
-    span tainting — the WAL writer records taint spans per turn (n-gram
-    overlap with the injected text) and this predicate consults the stored
-    span tags instead of trusting the caller. The signature is stable so
-    grounding call sites do not change.
+    Phase 2 completed the seam this predicate documented: the WAL writer now
+    records mechanical taint spans per turn (char-shingle containment
+    against the session's injected-span registry — agent/memory_taint.py)
+    and confirm-time grounding consults those spans via
+    ``memory_taint.matched_quote_taint`` regardless of what the caller
+    marked. This caller-marked check is KEPT as the cheap propose-time fast
+    path: an honest caller gets refused before a token is minted instead of
+    at confirm.
     """
     return bool(ref.get("tainted"))
 
@@ -785,20 +791,45 @@ class MemoryWritePipeline:
                 for rec in _iter_jsonl_records(path):
                     if rec.get("id") != ref["entry_id"]:
                         continue
+                    # Role-aware span list so the origin-taint check (ADR-004
+                    # §①, Phase 2) knows WHICH span the quote grounds in:
+                    # user spans always admit; assistant/proposal spans are
+                    # checked against the session's injected registry. The
+                    # record ts rides along to bound registry recomputes and
+                    # the quote self-check — injections registered after the
+                    # span was journaled cannot retroactively taint it.
                     if rec.get("type") == "turn":
-                        haystacks = [
-                            str(m.get("content") or "")
+                        spans = [
+                            (
+                                str(m.get("role") or ""),
+                                str(m.get("content") or ""),
+                                m.get("taint") if isinstance(m.get("taint"), dict) else None,
+                                rec.get("ts"),
+                            )
                             for m in rec.get("records") or []
                         ]
                     else:
-                        haystacks = [str(rec.get("content") or "")]
-                    if any(quote in h for h in haystacks):
-                        return {"ref": serialize_evidence_ref(ref), "ok": True,
-                                "checked": "wal-quote", "detail": "quote matched"}
-                    return {"ref": serialize_evidence_ref(ref), "ok": False,
-                            "checked": "wal-quote",
-                            "detail": "quote is not a substring of the WAL "
-                                      "record — citations must be verbatim"}
+                        spans = [(
+                            "proposal",
+                            str(rec.get("content") or ""),
+                            rec.get("taint") if isinstance(rec.get("taint"), dict) else None,
+                            rec.get("ts"),
+                        )]
+                    matched = [s for s in spans if quote in s[1]]
+                    if not matched:
+                        return {"ref": serialize_evidence_ref(ref), "ok": False,
+                                "checked": "wal-quote",
+                                "detail": "quote is not a substring of the WAL "
+                                          "record — citations must be verbatim"}
+                    from agent.memory_taint import matched_quote_taint
+                    taint_detail = matched_quote_taint(
+                        str(ref["session_id"]), matched, quote
+                    )
+                    if taint_detail:
+                        return {"ref": serialize_evidence_ref(ref), "ok": False,
+                                "checked": "taint", "detail": taint_detail}
+                    return {"ref": serialize_evidence_ref(ref), "ok": True,
+                            "checked": "wal-quote", "detail": "quote matched"}
                 return {"ref": serialize_evidence_ref(ref), "ok": False,
                         "checked": "wal",
                         "detail": f"WAL entry {ref['entry_id']!r} not found"}
@@ -813,15 +844,46 @@ class MemoryWritePipeline:
                     "checked": "l0", "detail": f"no L0-mirror file for "
                     f"{ref['month']}"}
         try:
+            from agent.memory_taint import matched_quote_taint
             want_entry = ref.get("wal_entry_id")
+            found_match = False
+            taint_detail: Optional[str] = None
             for rec in _iter_jsonl_records(path):
                 if want_entry and rec.get("wal_entry_id") != want_entry:
                     continue
                 body = rec.get("body") or {}
-                haystacks = [str(v) for v in body.values()] if isinstance(body, dict) else [str(body)]
-                if any(quote in h for h in haystacks):
+                rec_taint = rec.get("taint") if isinstance(rec.get("taint"), dict) else {}
+                if isinstance(body, dict):
+                    # Mirror body keys ARE the roles ("user"/"assistant") —
+                    # reuse them for the origin-taint check; record ts bounds
+                    # the recompute/quote self-check (see the WAL branch).
+                    spans = [
+                        (
+                            str(role),
+                            str(content),
+                            rec_taint.get(role) if isinstance(rec_taint.get(role), dict) else None,
+                            rec.get("ts"),
+                        )
+                        for role, content in body.items()
+                    ]
+                else:
+                    spans = [("", str(body), None, rec.get("ts"))]
+                matched = [s for s in spans if quote in s[1]]
+                if not matched:
+                    continue
+                found_match = True
+                detail = matched_quote_taint(
+                    str(rec.get("session_id") or ""), matched, quote
+                )
+                if detail is None:
                     return {"ref": serialize_evidence_ref(ref), "ok": True,
                             "checked": "l0-quote", "detail": "quote matched"}
+                # Keep scanning: a later record may ground the quote in a
+                # clean (e.g. user) span; reject only if none does.
+                taint_detail = detail
+            if found_match:
+                return {"ref": serialize_evidence_ref(ref), "ok": False,
+                        "checked": "taint", "detail": taint_detail or ""}
             return {"ref": serialize_evidence_ref(ref), "ok": False,
                     "checked": "l0-quote",
                     "detail": "quote is not a substring of any matching "

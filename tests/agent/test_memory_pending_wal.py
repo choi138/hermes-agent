@@ -61,10 +61,13 @@ class TestAppendAck:
         assert rec["id"] == entry_id
         assert rec["session_id"] == "sess-1"
         assert rec["seq"] == 1
-        assert rec["records"] == [
-            {"role": "user", "content": "user says hi"},
-            {"role": "assistant", "content": "assistant replies"},
-        ]
+        assert rec["records"][0] == {"role": "user", "content": "user says hi"}
+        assistant_rec = rec["records"][1]
+        assert assistant_rec["role"] == "assistant"
+        assert assistant_rec["content"] == "assistant replies"
+        # ADR-004 §① (Phase 2): assistant spans always carry an explicit
+        # write-time taint verdict — clean here (no injections registered).
+        assert assistant_rec["taint"]["tainted"] is False
         assert isinstance(rec["ts"], float)
 
     def test_ack_marks_entry_consumed(self, wal, tmp_path):

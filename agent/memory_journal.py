@@ -256,18 +256,31 @@ class PendingTurnWAL:
         session_id: str,
         user_content: str,
         assistant_content: str,
+        *,
+        ts: Optional[float] = None,
     ) -> Optional[str]:
         """Durably record a turn BEFORE ingest dispatch. Returns the entry id,
-        or None when disabled/failed (callers treat None as "no ack needed")."""
+        or None when disabled/failed (callers treat None as "no ack needed").
+
+        ``ts`` is the turn-boundary timestamp captured on the FOREGROUND
+        thread (sync_all entry). It becomes the record's ``ts`` and bounds
+        the taint verdict: this method runs on the mem-sync worker, and a
+        backed-up worker journaling minutes late must not let later turns'
+        injected-span registrations taint this turn's assistant span
+        (ADR-004 §① retroactive-taint guard). Falls back to now."""
         if journals_disabled():
             return None
         try:
+            try:
+                turn_ts = float(ts) if ts else time.time()
+            except (TypeError, ValueError):
+                turn_ts = time.time()
             path = self._path_for(session_id)
             entry_id = uuid.uuid4().hex[:12]
             record = {
                 "type": "turn",
                 "id": entry_id,
-                "ts": round(time.time(), 3),
+                "ts": round(turn_ts, 3),
                 "session_id": session_id or "",
                 "seq": self._next_seq(session_id, path),
                 "records": [
@@ -275,6 +288,20 @@ class PendingTurnWAL:
                     {"role": "assistant", "content": _scrub(assistant_content)},
                 ],
             }
+            # ADR-004 §① origin-taint (Phase 2): stamp assistant spans with
+            # their write-time taint verdict — ALWAYS, clean verdicts
+            # included, so enforcement never recomputes a post-patch span
+            # against a registry that has since grown. Runs on the same
+            # scrubbed content the record persists, so span offsets always
+            # align; bounded at the turn-boundary ts (see above). Lazy import
+            # breaks the journal↔taint module cycle; fail-open.
+            try:
+                from agent import memory_taint
+                memory_taint.tag_wal_turn_records(
+                    session_id, record["records"], as_of=turn_ts
+                )
+            except Exception:
+                logger.debug("WAL taint tagging failed (fail-open)", exc_info=True)
             _append_jsonl(path, record)
             return entry_id
         except Exception:
@@ -299,10 +326,11 @@ class PendingTurnWAL:
         try:
             path = self._path_for(session_id)
             entry_id = uuid.uuid4().hex[:12]
+            proposal_ts = time.time()
             record = {
                 "type": "proposal",
                 "id": entry_id,
-                "ts": round(time.time(), 3),
+                "ts": round(proposal_ts, 3),
                 "session_id": session_id or "",
                 "kind": "proposal",
                 "content": _scrub(content),
@@ -310,6 +338,19 @@ class PendingTurnWAL:
                 "evidence_refs": _scrub_evidence_refs(evidence_refs),
                 "origin": str(origin or "user"),
             }
+            # ADR-004 §① origin-taint (Phase 2): proposal content is
+            # agent-authored — tag it like an assistant span (always-stamped,
+            # fail-open; see memory_taint.tag_wal_proposal_record). This call
+            # is inline at propose time, so the record's own ts is the bound.
+            try:
+                from agent import memory_taint
+                memory_taint.tag_wal_proposal_record(
+                    session_id, record, as_of=proposal_ts
+                )
+            except Exception:
+                logger.debug(
+                    "WAL proposal taint tagging failed (fail-open)", exc_info=True
+                )
             _append_jsonl(path, record)
             return entry_id
         except Exception:
@@ -462,13 +503,21 @@ class L0Mirror:
         *,
         provider_names: Iterable[str] = (),
         wal_entry_id: Optional[str] = None,
+        ts: Optional[float] = None,
     ) -> None:
-        """Mirror a per-turn sync payload just before ingest dispatch."""
+        """Mirror a per-turn sync payload just before ingest dispatch.
+
+        ``ts`` is the same foreground-captured turn-boundary timestamp
+        ``PendingTurnWAL.append_turn`` receives — see there for why it (not
+        journal time on the mem-sync worker) bounds the taint verdict."""
         if journals_disabled():
             return
         try:
-            ts = time.time()
-            _append_jsonl(self._path_for(ts), {
+            try:
+                ts = float(ts) if ts else time.time()
+            except (TypeError, ValueError):
+                ts = time.time()
+            record: Dict[str, Any] = {
                 "ts": round(ts, 3),
                 "kind": "sync_turn",
                 "session_id": session_id or "",
@@ -478,7 +527,27 @@ class L0Mirror:
                     "assistant": _scrub(assistant_content),
                 },
                 "meta": {"providers": list(provider_names)},
-            })
+            }
+            # ADR-004 §① origin-taint (Phase 2): the mirror is the long-lived
+            # journal (monthly files, no GC), so the assistant span's taint is
+            # stamped here too — the taint sidecar TTLs out after 7 days and
+            # a stored tag is then the only durable signal. Always-stamped
+            # (explicit clean verdicts included) and bounded at the
+            # turn-boundary ts, same contract as the WAL tagger: the stored
+            # write-time verdict is authoritative, so enforcement never
+            # recomputes a post-patch mirror span against a registry that has
+            # since grown. Fail-open.
+            try:
+                from agent import memory_taint
+                taint = memory_taint.get_registry().assistant_taint(
+                    session_id, record["body"]["assistant"], as_of=ts
+                )
+                record["taint"] = {"assistant": taint}
+            except Exception:
+                logger.debug(
+                    "l0-mirror taint tagging failed (fail-open)", exc_info=True
+                )
+            _append_jsonl(self._path_for(ts), record)
         except Exception:
             logger.debug("l0-mirror append_turn failed (fail-open)", exc_info=True)
 
