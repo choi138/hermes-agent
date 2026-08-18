@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent import turn_trace
 from agent.background_review_policy import is_primary_foreground_agent
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -368,6 +369,9 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    _tt = turn_trace.safe_get_bound(agent)
+    _prologue_started = time.time() if _tt is not None else None
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -631,8 +635,14 @@ def build_turn_context(
         )
 
     # ── System prompt (cached per session for prefix caching) ──
-    if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+    _sp_rebuilt = agent._cached_system_prompt is None
+    with turn_trace.safe_span(
+        "prologue.system_prompt", trace=_tt, rebuilt=_sp_rebuilt
+    ):
+        if _sp_rebuilt:
+            restore_or_build_system_prompt(
+                agent, system_message, conversation_history
+            )
 
     active_system_prompt = agent._cached_system_prompt
 
@@ -648,6 +658,7 @@ def build_turn_context(
     # once with its final api_content — both steps take the same per-agent
     # persist lock as CLI close persistence.
     persist_lock = getattr(agent, "_session_persist_lock", None)
+    _persist_early_started = time.time() if _tt is not None else None
     try:
         if persist_lock is None:
             agent._ensure_db_session()
@@ -668,8 +679,16 @@ def build_turn_context(
         # fresh staged input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
+    if _persist_early_started is not None:
+        turn_trace.safe_add_span(
+            _tt,
+            "prologue.persist_early",
+            _persist_early_started,
+            time.time(),
+        )
 
     # ── Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``) ──
+    _cpf_started = time.time() if _tt is not None else None
     # When a session resumes after a long idle gap, compact the accumulated
     # history up front so the rest of the conversation does not keep re-reading
     # a large stale context on every turn. This fires on elapsed wall-clock time
@@ -1085,8 +1104,18 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
+    if _cpf_started is not None:
+        turn_trace.safe_add_span(
+            _tt,
+            "prologue.compression_preflight",
+            _cpf_started,
+            time.time(),
+            compressed=_preflight_compressed,
+        )
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
+    _hook_started = time.time() if _tt is not None else None
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -1138,6 +1167,10 @@ def build_turn_context(
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+    if _hook_started is not None:
+        turn_trace.safe_add_span(
+            _tt, "prologue.pre_llm_hook", _hook_started, time.time()
+        )
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
@@ -1194,6 +1227,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
+    _memory_prefetch_started = time.time() if _tt is not None else None
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
@@ -1201,6 +1235,14 @@ def build_turn_context(
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
+    if _memory_prefetch_started is not None:
+        turn_trace.safe_add_span(
+            _tt,
+            "prologue.memory_prefetch",
+            _memory_prefetch_started,
+            time.time(),
+            decision="hit" if ext_prefetch_cache else "empty",
+        )
     if ext_prefetch_cache:
         from agent.memory_manager import (
             graphiti_first_status_from_context,
@@ -1282,24 +1324,30 @@ def build_turn_context(
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
 
-    try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
+    with turn_trace.safe_span("prologue.persist_user_turn", trace=_tt):
+        try:
+            if persist_lock is None:
                 _ensure_and_persist()
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
+            else:
+                with persist_lock:
+                    _ensure_and_persist()
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+        finally:
+            # Keep an unmarked staged input available to a later close retry if the
+            # normal persistence attempt failed. Once the marker is present, the
+            # close path must no longer treat it as a pre-worker UI input.
+            if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+                agent._pending_cli_user_message = None
+
+    if _prologue_started is not None:
+        turn_trace.safe_add_span(
+            _tt, "turn.prologue", _prologue_started, time.time()
         )
-    finally:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
 
     return TurnContext(
         user_message=user_message,

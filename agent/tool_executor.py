@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from agent import turn_trace
 from agent.display import (
     KawaiiSpinner,
     build_tool_preview as _build_tool_preview,
@@ -1040,6 +1041,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     agent._current_tool = tool_names_str
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
+    _tt_batch = turn_trace.safe_get_bound(agent)
+
     def _run_tool(
         index,
         tool_call,
@@ -1169,6 +1172,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     False,
                     middleware_trace,
                 )
+                turn_trace.safe_add_span(
+                    _tt_batch,
+                    "tools.call",
+                    start,
+                    time.time(),
+                    tool=function_name,
+                    execute_ms=round(duration * 1000.0, 1),
+                    error="cancelled",
+                )
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
@@ -1198,6 +1210,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 is_error,
                 blocked,
                 middleware_trace,
+            )
+            turn_trace.safe_add_span(
+                _tt_batch,
+                "tools.call",
+                start,
+                time.time(),
+                tool=function_name,
+                execute_ms=round(duration * 1000.0, 1),
+                **({"error": "tool_failed"} if is_error else {}),
             )
         finally:
             # Teardown advance: keep the counter moving for any later-ordered
@@ -1728,6 +1749,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    _tt = turn_trace.safe_get_bound(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if _tool_persistence_failed(agent):
             _append_persistence_failed_tool_results(
@@ -1773,6 +1795,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
         function_name = tool_call.function.name
+        _call_started = time.time() if _tt is not None else None
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -1845,6 +1868,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_blocked = False
         _execution_dispatched = False
 
+        _ckpt_started = time.time() if _tt is not None else None
         tool_start_time = time.time()
 
         if function_name == "todo":
@@ -2385,12 +2409,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
+        _flush_started = time.time() if _tt is not None else None
         if not _flush_session_db_after_tool_progress(
             agent,
             messages,
             stage=f"tool result {function_name}",
         ):
             return
+        _flush_ms = (
+            round((time.time() - _flush_started) * 1000.0, 1)
+            if _flush_started is not None
+            else None
+        )
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
@@ -2435,6 +2465,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
+
+        if _call_started is not None:
+            turn_trace.safe_add_span(
+                _tt,
+                "tools.call",
+                _call_started,
+                time.time(),
+                tool=function_name,
+                checkpoint_ms=round(
+                    (tool_start_time - _ckpt_started) * 1000.0, 1
+                ),
+                execute_ms=round(tool_duration * 1000.0, 1),
+                flush_ms=_flush_ms,
+            )
 
         terminal_marker = raw_terminal_marker
         if terminal_marker is not None:

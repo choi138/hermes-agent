@@ -46,6 +46,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Iterable, Optional, Any, List, Tuple, Union, cast
 
+from agent import turn_trace
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
@@ -4745,6 +4746,11 @@ class TurnRunner:
 
     def run_sync(self):
         ctx = self._ctx
+        if ctx.turn_trace_obj is not None:
+            turn_trace.safe_adopt(ctx.turn_trace_obj)
+        _trace_setup_started = (
+            time.time() if ctx.turn_trace_obj is not None else 0.0
+        )
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
         # (prepending model-switch / resume-recovery notes) would otherwise
@@ -5553,6 +5559,14 @@ class TurnRunner:
         agent.thinking_progress = ctx._thinking_enabled
         # Store agent reference for interrupt support
         ctx.agent_holder[0] = agent
+        if ctx.turn_trace_obj is not None:
+            turn_trace.safe_add_span(
+                ctx.turn_trace_obj,
+                "gateway.agent_setup",
+                _trace_setup_started,
+                time.time(),
+                rebuild=not reused_cached_agent,
+            )
         # Publish turn ownership for explicit /stop, /new, disconnect, and
         # shutdown interrupts. Older session processes are outside this
         # baseline and remain alive.
@@ -5866,6 +5880,8 @@ class TurnRunner:
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
+            if ctx.turn_trace_obj is not None:
+                turn_trace.safe_bind(agent, ctx.turn_trace_obj)
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
@@ -5925,6 +5941,8 @@ class TurnRunner:
             except Exception:
                 pass
             reset_current_session_key(_approval_session_token)
+            if ctx.turn_trace_obj is not None:
+                turn_trace.safe_bind(agent, None)
         ctx.result_holder[0] = result
 
         # Signal the stream consumer that the agent is done
@@ -12813,7 +12831,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # adapter.handle_message would spawn a background task and we'd
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
-        response_text = await self._handle_message(synthetic_event)
+        try:
+            response_text = await self._handle_message(synthetic_event)
+        finally:
+            _handoff_trace = turn_trace.safe_get_bound(synthetic_event)
+            turn_trace.safe_finish(_handoff_trace, status="ok")
         if not response_text:
             # Streaming may have already delivered the response inline.
             # Either way, agent ran without raising — count as success.
@@ -18054,6 +18076,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
+        _trace = turn_trace.safe_begin(
+            key=_quick_key,
+            started_at=_msg_start_time,
+            platform=_platform_name,
+        )
+        if _trace is not None:
+            turn_trace.safe_bind(event, _trace)
+            try:
+                _debounce_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
+                if _debounce_ts:
+                    turn_trace.safe_mark(
+                        "transport.inbound_debounce",
+                        trace=_trace,
+                        at=float(_debounce_ts),
+                    )
+                    turn_trace.safe_tag(
+                        _trace,
+                        debounce_ms=round(
+                            (_msg_start_time - float(_debounce_ts)) * 1000.0,
+                            1,
+                        ),
+                    )
+            except Exception:
+                pass
+        _t_span = time.time() if _trace is not None else 0.0
+
         # Discord's first progress acknowledgment is gateway-owned and must not
         # wait for session I/O, prompt construction, the model, or a first tool
         # call. Internal completion injections stay silent here; their parent
@@ -18166,6 +18214,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        if _trace is not None:
+            turn_trace.safe_add_span(
+                _trace, "gateway.session_resolve", _t_span, time.time()
+            )
+            turn_trace.safe_tag(_trace, session_key=session_key)
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -18396,7 +18449,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state.lease_generation = run_generation
 
         # Load conversation history from transcript
+        _t_span = time.time() if _trace is not None else 0.0
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+        if _trace is not None:
+            turn_trace.safe_add_span(
+                _trace, "gateway.transcript_load", _t_span, time.time()
+            )
+            _t_span = time.time()
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -19148,6 +19207,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
+        if _trace is not None:
+            turn_trace.safe_add_span(
+                _trace, "gateway.hygiene", _t_span, time.time()
+            )
+
         # First-message onboarding -- only on the very first interaction ever.
         # Delivered on the current user message (sidecar), NOT the ephemeral
         # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
@@ -19393,6 +19457,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     persist_user_message=persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     message_type=event.message_type,
+                    turn_trace_obj=_trace,
                     semantic_progress_message_id=_semantic_progress_message_id,
                     semantic_progress_text=_semantic_progress_text,
                     mention_inbox_execution_id=_mention_execution_id,
@@ -19409,6 +19474,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "mention-inbox execution failure receipt failed"
                         )
                 raise
+            _t_persist = time.time() if _trace is not None else 0.0
             if _mention_execution_observer is not None:
                 try:
                     await _mention_execution_observer.run_completed(
@@ -19983,6 +20049,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            if _trace is not None:
+                turn_trace.safe_add_span(
+                    _trace, "gateway.persist", _t_persist, time.time()
+                )
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -20067,6 +20138,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            turn_trace.safe_tag(_trace, gateway_error=type(e).__name__)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current
@@ -26463,6 +26535,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_text: Optional[str] = None,
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
+        turn_trace_obj: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -26486,6 +26559,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 semantic_progress_text=semantic_progress_text,
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
+                turn_trace_obj=turn_trace_obj,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -26502,6 +26576,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 semantic_progress_text=semantic_progress_text,
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
+                turn_trace_obj=turn_trace_obj,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -26628,6 +26703,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_text: Optional[str] = None,
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
+        turn_trace_obj: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -26646,6 +26722,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if mention_inbox_execution_id is not None:
                 raise RuntimeError(
                     "approved mention-inbox execution requires local tool receipts"
+                )
+            if turn_trace_obj is not None:
+                turn_trace.safe_add_span(
+                    turn_trace_obj,
+                    "gateway.ingest",
+                    turn_trace_obj.started_at,
+                    time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
                 )
             return await self._run_agent_via_proxy(
                 message=message,
@@ -26937,6 +27022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            turn_trace_obj=turn_trace_obj,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -27595,6 +27681,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
                 ).start()
+            if turn_trace_obj is not None:
+                turn_trace.safe_add_span(
+                    turn_trace_obj,
+                    "gateway.ingest",
+                    turn_trace_obj.started_at,
+                    time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
@@ -28245,6 +28340,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    turn_trace_obj=turn_trace_obj,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
