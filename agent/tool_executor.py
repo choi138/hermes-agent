@@ -45,6 +45,7 @@ from tools.terminal_tool import (
     get_active_env,
 )
 from tools.thread_context import propagate_context_to_thread
+from tools.perf_advisor import perf_advisory
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -1598,6 +1599,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             else:
                 function_result += subdir_hints
 
+        perf_hint = perf_advisory(name, args, tool_duration)
+        if perf_hint:
+            if _is_multimodal_tool_result(function_result):
+                _append_subdir_hint_to_multimodal(function_result, perf_hint)
+            elif isinstance(function_result, str):
+                function_result += perf_hint
+
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
         # rather than a raw Python dict.  The Anthropic adapter already
@@ -2373,6 +2381,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)
             else:
                 function_result += subdir_hints
+
+        perf_hint = perf_advisory(function_name, function_args, tool_duration)
+        if perf_hint:
+            if _is_multimodal_tool_result(function_result):
+                _append_subdir_hint_to_multimodal(function_result, perf_hint)
+            elif isinstance(function_result, str):
+                function_result += perf_hint
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
