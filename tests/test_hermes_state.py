@@ -2333,8 +2333,8 @@ class TestOptimizeFts:
 
 
 
-    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
-        """Routine writes use bounded merge and never full optimize."""
+    def test_maintenance_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """The maintenance tick uses bounded merge, never full optimize."""
         db._FTS_MERGE_EVERY_N_WRITES = 5
         calls = []
 
@@ -2352,11 +2352,14 @@ class TestOptimizeFts:
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
         assert calls == []  # Four successful writes are below the boundary.
         db.append_message(session_id="s1", role="user", content="needle 3")
+        assert calls == []  # The write hot path only advances the counter.
+        db._db_maintenance_tick()
         assert calls == [500]  # The fifth write gets the production page budget.
         for i in range(4, 8):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
         assert calls == [500]
         db.append_message(session_id="s1", role="user", content="needle 8")
+        db._db_maintenance_tick()
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 
