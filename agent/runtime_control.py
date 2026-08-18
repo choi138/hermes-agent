@@ -74,11 +74,163 @@ def get_runtime_state(agent: Any) -> Dict[str, Any]:
 
 
 def model_status(agent: Any) -> str:
-    """Tool-facing JSON wrapper for :func:`get_runtime_state`."""
+    """Tool-facing JSON wrapper for :func:`get_runtime_state`.
+
+    When the config declares model_routes (ADR-003 Phase 3b), a ``routes``
+    block is appended: which declared route (if any) the current runtime
+    satisfies, plus the available route catalog. With no declared routes —
+    or on builds without the model_routes subsystem — the output is
+    byte-identical to the historical shape.
+    """
     state = get_runtime_state(agent)
     state["success"] = True
+    routes = _route_status_info(agent)
+    if routes is not None:
+        state["routes"] = routes
     _emit_runtime_state_event(agent, event="status", state=state)
     return json.dumps(state, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Model-route selection (ADR-003 Phase 3b)
+# ---------------------------------------------------------------------------
+#
+# ``hermes_cli.model_routes`` is OPTIONAL at runtime: the runtime-control
+# patch must run unchanged on builds that do not carry the model_routes
+# subsystem.  Every reference below is therefore a deferred import wrapped so
+# that when the module is absent (or the catalog is empty/dormant) the tool
+# degrades exactly to the historical free-form model/provider behavior.
+
+
+def _route_catalog_pairs() -> list[tuple[str, str]]:
+    """(name, description) pairs for declared model_routes; [] when absent/dormant."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routes import route_catalog_for_schema
+
+        return list(route_catalog_for_schema(load_config()))
+    except Exception:
+        logger.debug("runtime_control: route catalog unavailable", exc_info=True)
+        return []
+
+
+def _agent_route_runtime(agent: Any) -> Dict[str, Any]:
+    """Non-secret runtime snapshot in ``runtime_satisfies_route``'s shape.
+
+    Mirrors the gateway router's snapshot semantics
+    (``GatewayRunner._model_router_runtime_snapshot``): disabled reasoning
+    maps to effort ``"none"``; an unset effort stays absent.
+    """
+    snapshot: Dict[str, Any] = {}
+    model = _safe_str(getattr(agent, "model", "")).strip()
+    provider = _safe_str(getattr(agent, "provider", "")).strip()
+    if model:
+        snapshot["model"] = model
+    if provider:
+        snapshot["provider"] = provider
+    reasoning = _reasoning_state(agent)
+    if reasoning.get("enabled") is False:
+        snapshot["reasoning_effort"] = "none"
+    elif reasoning.get("effort"):
+        snapshot["reasoning_effort"] = reasoning["effort"]
+    return snapshot
+
+
+def _route_status_info(agent: Any) -> Optional[Dict[str, Any]]:
+    """Route block for :func:`model_status`; None when routes are absent/dormant."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routes import (
+            load_routes,
+            route_catalog_for_schema,
+            runtime_satisfies_route,
+        )
+    except Exception:
+        return None
+    try:
+        cfg = load_config()
+        catalog = load_routes(cfg)
+        pairs = route_catalog_for_schema(cfg, catalog=catalog)
+        if not pairs:
+            return None
+        runtime = _agent_route_runtime(agent)
+        current = next(
+            (
+                name
+                for name, _ in pairs
+                if runtime_satisfies_route(runtime, name, cfg, catalog=catalog)
+            ),
+            None,
+        )
+        return {
+            "current": current,
+            "available": [
+                {"name": name, "description": description}
+                for name, description in pairs
+            ],
+        }
+    except Exception:
+        logger.debug("runtime_control: route status unavailable", exc_info=True)
+        return None
+
+
+def _resolve_route_switch_target(agent: Any, route_name: str) -> tuple[str, Dict[str, Any]]:
+    """Resolve a ``model_switch`` route request against the declared catalog.
+
+    Returns ``(status, payload)``:
+
+    - ``("error", <tool error payload>)`` — model_routes unavailable, unknown
+      route, or the whole fallback chain unhealthy.  The payload names the
+      declared routes so the model can retry with a valid one.
+    - ``("noop", {"route": <name>})`` — the current runtime already satisfies
+      the route (mirrors the gateway router's ``noop_satisfied`` outcome).
+    - ``("resolved", <resolve_route dict>)`` — first healthy
+      provider/model/reasoning_effort along the route's chain.
+    """
+    name = str(route_name or "").strip()
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routes import (
+            load_routes,
+            resolve_route,
+            runtime_satisfies_route,
+        )
+    except Exception:
+        # Branch-alone build: the schema never offers `route`, so this is a
+        # defensive, model-visible degradation to free-form behavior.
+        return "error", {
+            "success": False,
+            "error": (
+                f"Route-based switching is unavailable on this build; unknown parameter "
+                f"route={name!r}. Request an explicit model/provider instead."
+            ),
+        }
+
+    cfg = load_config()
+    catalog = load_routes(cfg)
+    declared = [spec.name for spec in catalog.routes.values()]
+    declared_text = ", ".join(declared) or "(none declared)"
+    matched = next((n for n in declared if n.strip().lower() == name.lower()), None)
+    if matched is None:
+        return "error", {
+            "success": False,
+            "error": f"Unknown route '{name}'. Declared routes: {declared_text}.",
+            "declared_routes": declared,
+        }
+    if runtime_satisfies_route(_agent_route_runtime(agent), matched, cfg, catalog=catalog):
+        return "noop", {"route": matched}
+    resolved = resolve_route(matched, cfg, catalog=catalog)
+    if resolved is None:
+        return "error", {
+            "success": False,
+            "error": (
+                f"Route '{matched}' has no healthy runtime (its default and every "
+                f"fallback failed the provider health check). Declared routes: "
+                f"{declared_text}. Retry with a different route."
+            ),
+            "declared_routes": declared,
+        }
+    return "resolved", resolved
 
 
 def _emit_runtime_state_event(agent: Any, *, event: str, state: Optional[Dict[str, Any]] = None) -> None:
@@ -462,6 +614,7 @@ def model_switch(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    route: Optional[str] = None,
     scope: str = "turn",
     reason: Optional[str] = None,
 ) -> str:
@@ -470,6 +623,12 @@ def model_switch(
     ``global`` scope is deliberately unsupported.  Persisting to config.yaml is
     user-command territory; this tool can only affect the current turn or
     current session.
+
+    ``route`` (ADR-003 Phase 3b) selects a config-declared model_routes route
+    by purpose; its health-checked resolution feeds the same apply path as a
+    free-form model/provider switch.  When both ``route`` and an explicit
+    ``reasoning_effort`` are given, the explicit effort wins over the route's
+    default effort.
     """
     # Always force session scope — turn scope was removed (May 2026) because
     # LLMs omit the parameter ~29% of the time, and the default "turn" caused
@@ -479,9 +638,23 @@ def model_switch(
     requested_model = str(model or "").strip()
     requested_provider = str(provider or "").strip()
     requested_reasoning = str(reasoning_effort or "").strip().lower()
-    if not requested_model and not requested_provider and not requested_reasoning:
+    requested_route = str(route or "").strip()
+    if (
+        not requested_model
+        and not requested_provider
+        and not requested_reasoning
+        and not requested_route
+    ):
         return json.dumps(
             {"success": False, "error": "No runtime change requested."},
+            ensure_ascii=False,
+        )
+    if requested_route and (requested_model or requested_provider):
+        return json.dumps(
+            {
+                "success": False,
+                "error": "Pass either 'route' or explicit 'model'/'provider', not both.",
+            },
             ensure_ascii=False,
         )
 
@@ -500,29 +673,77 @@ def model_switch(
     model_override = None
     changed = []
     persistence_error = None
+    route_info: Optional[Dict[str, Any]] = None
 
-    if requested_model or requested_provider:
-        current_provider = str(getattr(agent, "provider", "") or "")
-        current_model = str(getattr(agent, "model", "") or "")
-        ok, strict_provider, strict_model, strict_error = resolve_agent_model_target_strict(
+    # Resolve the switch target: a declared route (health-checked walk) or the
+    # strict config-declared free-form model/provider.  Both feed the SAME
+    # apply path below (shared resolver -> agent.switch_model -> callback).
+    target_provider = ""
+    target_model = ""
+
+    if requested_route:
+        route_status, route_payload = _resolve_route_switch_target(agent, requested_route)
+        if route_status == "error":
+            return json.dumps(route_payload, ensure_ascii=False)
+        if route_status == "noop":
+            matched_route = route_payload["route"]
+            if parsed_reasoning is None:
+                # Pure no-op: the current runtime is already a member of the
+                # route — do not re-apply or fire the gateway callback.
+                state = get_runtime_state(agent)
+                return json.dumps(
+                    {
+                        "success": True,
+                        "scope": scope,
+                        "changed": [],
+                        "noop": True,
+                        "route": {"name": matched_route, "already_satisfied": True},
+                        "message": f"Already on route '{matched_route}'; no switch applied.",
+                        "reason": str(reason or ""),
+                        "runtime": state,
+                    },
+                    ensure_ascii=False,
+                )
+            # Explicit reasoning_effort alongside an already-satisfied route:
+            # skip the model re-apply and fall through to the effort-only path.
+            route_info = {"name": matched_route, "already_satisfied": True}
+        else:
+            target_provider = str(route_payload.get("provider") or "")
+            target_model = str(route_payload.get("model") or "")
+            route_info = {"name": str(route_payload.get("route") or requested_route)}
+            if str(route_payload.get("source") or "default") != "default":
+                route_info["source"] = str(route_payload.get("source") or "")
+            failover_reason = str(route_payload.get("reason") or "")
+            if failover_reason:
+                route_info["failover"] = failover_reason
+            # Route default effort applies only when no explicit effort was
+            # requested (explicit reasoning_effort wins).
+            route_effort = str(route_payload.get("reasoning_effort") or "").strip().lower()
+            if parsed_reasoning is None and route_effort:
+                parsed_reasoning = parse_reasoning_effort(route_effort)
+    elif requested_model or requested_provider:
+        ok, target_provider, target_model, strict_error = resolve_agent_model_target_strict(
             requested_provider=requested_provider,
             requested_model=requested_model,
-            current_provider=current_provider,
-            current_model=current_model,
+            current_provider=str(getattr(agent, "provider", "") or ""),
+            current_model=str(getattr(agent, "model", "") or ""),
         )
         if not ok:
             return json.dumps(strict_error, ensure_ascii=False)
 
+    if target_model or target_provider:
+        current_provider = str(getattr(agent, "provider", "") or "")
+        current_model = str(getattr(agent, "model", "") or "")
         current_api_key = getattr(agent, "api_key", "")
         if not isinstance(current_api_key, str):
             current_api_key = ""
         result = resolve_model_switch(
-            raw_input=strict_model,
+            raw_input=target_model,
             current_provider=current_provider,
             current_model=current_model,
             current_base_url=str(getattr(agent, "base_url", "") or ""),
             current_api_key=current_api_key,
-            explicit_provider=strict_provider,
+            explicit_provider=target_provider,
         )
         if not getattr(result, "success", False):
             return json.dumps(
@@ -532,13 +753,17 @@ def model_switch(
                 },
                 ensure_ascii=False,
             )
-        if getattr(result, "target_provider", "") != strict_provider or getattr(result, "new_model", "") != strict_model:
+        if getattr(result, "target_provider", "") != target_provider or getattr(result, "new_model", "") != target_model:
             return json.dumps(
                 {
                     "success": False,
                     "error": "Shared model resolver resolved outside configured agent target; refusing to apply free-form/fuzzy model switch.",
-                    "requested": {"provider": requested_provider, "model": requested_model},
-                    "expected": {"provider": strict_provider, "model": strict_model},
+                    "requested": {
+                        "provider": requested_provider,
+                        "model": requested_model,
+                        **({"route": requested_route} if requested_route else {}),
+                    },
+                    "expected": {"provider": target_provider, "model": target_model},
                     "resolved": {
                         "provider": getattr(result, "target_provider", ""),
                         "model": getattr(result, "new_model", ""),
@@ -610,6 +835,8 @@ def model_switch(
         "reason": str(reason or ""),
         "runtime": state,
     }
+    if route_info is not None:
+        response["route"] = route_info
     warning = getattr(locals().get("result", None), "warning_message", "") if "result" in locals() else ""
     if warning:
         response["warning"] = warning

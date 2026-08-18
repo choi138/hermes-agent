@@ -1875,6 +1875,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     model=next_args.get("model"),
                     provider=next_args.get("provider"),
                     reasoning_effort=next_args.get("reasoning_effort"),
+                    route=next_args.get("route"),
                     scope=next_args.get("scope", "session"),
                     reason=next_args.get("reason"),
                 )
