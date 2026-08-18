@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -71,6 +72,7 @@ _CREDIT_SNIFF_KEYWORDS = ("credit", "insufficient", "quota", "billing")
 _HEALTH_ENV = "HERMES_MODEL_ROUTES_HEALTH"
 _HEALTH_TEST_ENV = "HERMES_MODEL_ROUTES_HEALTH_TEST"
 _ROUTER_MODE_ENV = "HERMES_MODEL_ROUTER_MODE"
+_health_state_lock = threading.RLock()
 
 _SECTION_KEYS = {"routes", "health", "static_rules", "router"}
 _ROUTE_KEYS = {
@@ -1311,7 +1313,37 @@ def _read_health_cache(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> None:
+def _health_entry_timestamp(entry: Any) -> float:
+    if not isinstance(entry, dict):
+        return float("-inf")
+    try:
+        return float(entry.get("ts"))
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _health_cache_signature(path: Path) -> Optional[Tuple[str, int, int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        str(path),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        int(getattr(stat, "st_ino", 0) or 0),
+    )
+
+
+def _update_unhealthy_memo_locked(path: Path, cache: Dict[str, Any]) -> None:
+    _unhealthy_memo["mtime"] = _health_cache_signature(path)
+    _unhealthy_memo["value"] = any(
+        isinstance(verdict, dict) and not verdict.get("healthy")
+        for verdict in cache.values()
+    )
+
+
+def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> bool:
     """Merge one verdict into the shared cache under an exclusive flock.
 
     Concurrent hermes processes (gateway + interactive CLI) share this file;
@@ -1319,39 +1351,57 @@ def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> None:
     process clobber the other's fresh verdict (lost update), dropping its
     fail_ttl suppression and re-blocking on a dead provider.  Re-reading
     inside the lock means every merge starts from the latest snapshot.
-    Best-effort: any failure is logged and the verdict is simply not cached.
+    Older observations never replace newer ones. At equal timestamps a healthy
+    verdict wins, preventing a delayed stale failure from undoing recovery.
+    Best-effort: returns ``False`` when rejected or not cached.
     """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = path.with_name(path.name + ".lock")
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
-            locked = False
-            if fcntl is not None:
+    with _health_state_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = path.with_name(path.name + ".lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_file:
+                locked = False
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                        locked = True
+                    except OSError as exc:
+                        # e.g. ENOLCK on NFS without lockd, or FUSE mounts that
+                        # reject flock — degrade to the lock-less re-read+merge
+                        # rather than skipping the cache write entirely.
+                        logger.debug(
+                            "model_routes: flock unavailable for %s; writing lock-less (%s)",
+                            lock_path,
+                            type(exc).__name__,
+                        )
                 try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                    locked = True
-                except OSError as exc:
-                    # e.g. ENOLCK on NFS without lockd, or FUSE mounts that
-                    # reject flock — degrade to the lock-less re-read+merge
-                    # rather than skipping the cache write entirely.
-                    logger.debug(
-                        "model_routes: flock unavailable for %s; writing lock-less (%s)",
-                        lock_path,
-                        type(exc).__name__,
+                    cache = _read_health_cache(path)
+                    existing = cache.get(key)
+                    existing_ts = _health_entry_timestamp(existing)
+                    incoming_ts = _health_entry_timestamp(entry)
+                    stale = existing_ts > incoming_ts or (
+                        existing_ts == incoming_ts
+                        and isinstance(existing, dict)
+                        and bool(existing.get("healthy"))
+                        and not bool(entry.get("healthy"))
                     )
-            try:
-                cache = _read_health_cache(path)
-                cache[key] = entry
-                atomic_json_write(path, cache)
-            finally:
-                if locked:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    except Exception as exc:
-        logger.debug(
-            "model_routes: health cache write failed for %s (%s)",
-            path,
-            type(exc).__name__,
-        )
+                    if stale:
+                        _update_unhealthy_memo_locked(path, cache)
+                        return False
+                    cache[key] = entry
+                    atomic_json_write(path, cache)
+                    _update_unhealthy_memo_locked(path, cache)
+                    return True
+                finally:
+                    if locked:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception as exc:
+            logger.debug(
+                "model_routes: health cache write failed for %s (%s)",
+                path,
+                type(exc).__name__,
+            )
+            return False
 
 
 def provider_health(
@@ -1423,7 +1473,17 @@ def provider_health(
         )
 
     healthy, reason = _probe_provider(key, str(model or ""), cfg, health)
-    _store_health_verdict(path, key, {"healthy": healthy, "reason": f"recovery probe: {reason}", "ts": now})
+    stored = _store_health_verdict(
+        path,
+        key,
+        {"healthy": healthy, "reason": f"recovery probe: {reason}", "ts": now},
+    )
+    if not stored:
+        latest = _read_health_cache(path).get(key)
+        if isinstance(latest, dict) and _health_entry_timestamp(latest) >= now:
+            return bool(latest.get("healthy")), str(
+                latest.get("reason") or "newer cached verdict"
+            )
     return healthy, reason
 
 
@@ -1529,22 +1589,30 @@ def record_provider_outcome(
         if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
             return  # same seam as provider_health — agent-path unit tests must not touch the real cache
         path = health.resolved_cache_path()
-        now = _now()
-        if healthy:
-            entry = _read_health_cache(path).get(key)
-            if not (isinstance(entry, dict) and not entry.get("healthy")):
-                return  # nothing to clear
-            _last_passive_unhealthy_write.pop(key, None)
-        else:
-            last = _last_passive_unhealthy_write.get(key, 0.0)
-            if now - last < _PASSIVE_WRITE_SUPPRESS_SECONDS:
-                return
-            _last_passive_unhealthy_write[key] = now
-        _store_health_verdict(
-            path,
-            key,
-            {"healthy": bool(healthy), "reason": f"passive: {reason}", "ts": now},
-        )
+        observed_at = _now()
+        with _health_state_lock:
+            if healthy:
+                entry = _read_health_cache(path).get(key)
+                if not (isinstance(entry, dict) and not entry.get("healthy")):
+                    return  # nothing to clear
+            else:
+                last = _last_passive_unhealthy_write.get(key, 0.0)
+                if observed_at - last < _PASSIVE_WRITE_SUPPRESS_SECONDS:
+                    return
+            stored = _store_health_verdict(
+                path,
+                key,
+                {
+                    "healthy": bool(healthy),
+                    "reason": f"passive: {reason}",
+                    "ts": observed_at,
+                },
+            )
+            if stored:
+                if healthy:
+                    _last_passive_unhealthy_write.pop(key, None)
+                else:
+                    _last_passive_unhealthy_write[key] = observed_at
     except Exception as exc:
         logger.debug(
             "model_routes: passive health record failed for %r (%s)",
@@ -1569,20 +1637,22 @@ def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
         if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
             return False
         path = health.resolved_cache_path()
-        try:
-            mtime = path.stat().st_mtime_ns
-        except OSError:
-            return False
-        if _unhealthy_memo["mtime"] == (str(path), mtime):
-            return bool(_unhealthy_memo["value"])
-        cache = _read_health_cache(path)
-        value = any(
-            isinstance(entry, dict) and not entry.get("healthy")
-            for entry in cache.values()
-        )
-        _unhealthy_memo["mtime"] = (str(path), mtime)
-        _unhealthy_memo["value"] = value
-        return value
+        with _health_state_lock:
+            signature = _health_cache_signature(path)
+            if signature is None:
+                return False
+            if _unhealthy_memo["mtime"] == signature:
+                return bool(_unhealthy_memo["value"])
+            cache = _read_health_cache(path)
+            value = any(
+                isinstance(entry, dict) and not entry.get("healthy")
+                for entry in cache.values()
+            )
+            # The cache check and both memo fields are one atomic section. A
+            # stale scanner can no longer overwrite a newer healthy clear.
+            _unhealthy_memo["mtime"] = signature
+            _unhealthy_memo["value"] = value
+            return value
     except Exception as exc:
         logger.debug(
             "model_routes: unhealthy-verdict scan failed (%s)",

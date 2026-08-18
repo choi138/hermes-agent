@@ -10,6 +10,7 @@ import errno
 import io
 import json
 import os
+import threading
 import urllib.error
 from pathlib import Path
 
@@ -1143,6 +1144,89 @@ def test_has_unhealthy_verdicts_memo(monkeypatch, tmp_path, health_test_env, pas
 
     monkeypatch.setattr(mr, "_read_health_cache", boom)
     assert mr.has_unhealthy_verdicts(health=health) is True
+
+
+def test_unhealthy_memo_check_and_write_are_atomic_across_threads(
+    monkeypatch, tmp_path, health_test_env, passive_state,
+):
+    health = _health(tmp_path)
+    _seed_verdict(health, "p1", healthy=False, ts=100.0)
+    monkeypatch.setattr(mr, "_now", _Clock(200.0))
+    original_read = mr._read_health_cache
+    scan_read = threading.Event()
+    release_scan = threading.Event()
+    scan_done = threading.Event()
+    clear_done = threading.Event()
+
+    def slow_scanner_read(path):
+        cache = original_read(path)
+        if threading.current_thread().name == "memo-scan":
+            scan_read.set()
+            release_scan.wait(2)
+        return cache
+
+    monkeypatch.setattr(mr, "_read_health_cache", slow_scanner_read)
+
+    def scan():
+        mr.has_unhealthy_verdicts(health=health)
+        scan_done.set()
+
+    def clear():
+        mr.record_provider_outcome("p1", True, "recovered", health=health)
+        clear_done.set()
+
+    threading.Thread(target=scan, name="memo-scan", daemon=True).start()
+    assert scan_read.wait(2)
+    threading.Thread(target=clear, name="memo-clear", daemon=True).start()
+
+    acquired = mr._health_state_lock.acquire(blocking=False)
+    if acquired:
+        mr._health_state_lock.release()
+    try:
+        assert acquired is False, "memo scan did not hold the atomic state lock"
+    finally:
+        release_scan.set()
+
+    assert scan_done.wait(2)
+    assert clear_done.wait(2)
+    assert mr.has_unhealthy_verdicts(health=health) is False
+    assert mr._unhealthy_memo["value"] is False
+
+
+def test_healthy_clear_rejects_threaded_stale_unhealthy_write(
+    monkeypatch, tmp_path, health_test_env, passive_state,
+):
+    health = _health(tmp_path)
+    path = health.resolved_cache_path()
+    _seed_verdict(health, "p1", healthy=False, ts=50.0)
+    monkeypatch.setattr(mr, "_now", _Clock(200.0))
+    clear_done = threading.Event()
+    stale_done = threading.Event()
+    stale_result = {}
+
+    def clear():
+        mr.record_provider_outcome("p1", True, "recovered", health=health)
+        clear_done.set()
+
+    def stale_failure():
+        clear_done.wait(2)
+        stale_result["stored"] = mr._store_health_verdict(
+            path,
+            "p1",
+            {"healthy": False, "reason": "passive: stale", "ts": 100.0},
+        )
+        stale_done.set()
+
+    threading.Thread(target=stale_failure, daemon=True).start()
+    threading.Thread(target=clear, daemon=True).start()
+    assert clear_done.wait(2)
+    assert stale_done.wait(2)
+
+    entry = _read_cache(health)["p1"]
+    assert stale_result["stored"] is False
+    assert entry["healthy"] is True
+    assert entry["ts"] == 200.0
+    assert mr.has_unhealthy_verdicts(health=health) is False
 
 
 def test_has_unhealthy_verdicts_skips_full_catalog_parse(
