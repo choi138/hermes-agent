@@ -1897,3 +1897,16 @@ def test_gateway_non_shadow_modes_are_not_wired(monkeypatch, mode):
         user_config=_cfg(router={"mode": mode}),
     ) is None
     evaluate.assert_not_called()
+
+
+def test_strip_code_fences_normalizes_markdown_wrapped_classifier_reply():
+    from gateway.model_router import _strip_code_fences
+
+    fenced = "```json\n{\"label\": \"NORMAL\"}\n```"
+    assert _strip_code_fences(fenced) == "{\"label\": \"NORMAL\"}"
+    # No fences: untouched apart from whitespace.
+    assert _strip_code_fences("  {\"label\": \"SYSTEM_DEV\"}\n") == "{\"label\": \"SYSTEM_DEV\"}"
+    # Unterminated fence: keep the body rather than returning empty.
+    assert _strip_code_fences("```json\n{\"label\": \"NORMAL\"}") == "{\"label\": \"NORMAL\"}"
+    # Fence with no body degrades to the original stripped text.
+    assert _strip_code_fences("```\n```") == "```\n```"
