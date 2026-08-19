@@ -195,11 +195,11 @@ class RefusalConfig:
 
 @dataclass(frozen=True)
 class MoodsConfig:
-    """``model_routes.moods`` — orthogonal mood routing (M1: parsed only).
+    """``model_routes.moods`` — orthogonal mood tone and routing settings.
 
-    Nothing consumes this yet; M1 ships the classifier's mood as a shadow
-    field only. ``routes`` maps a mood name to a route name and may never
-    reference a PERMISSIVE route (see :func:`_parse_moods`).
+    M2 consumes the tone-file fields; ``apply_model_routing`` and ``routes``
+    remain reserved for M3. The route map may never reference a PERMISSIVE
+    route (see :func:`_parse_moods`).
     """
 
     enabled: bool = False
@@ -977,7 +977,7 @@ def _parse_moods(
     routes: Dict[str, RouteSpec],
     issues: List[ConfigIssue],
 ) -> MoodsConfig:
-    """Parse ``model_routes.moods``. M1 validates only; nothing consumes it."""
+    """Parse ``model_routes.moods`` for tone injection and future routing."""
     if raw is None:
         return MoodsConfig()
     if not isinstance(raw, dict):

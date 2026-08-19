@@ -32,6 +32,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -2833,6 +2834,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
+    # Call-time-only mood suffixes are consumed by the next turn builder and
+    # must never survive a reset if that turn aborts before consumption.
+    "_pending_mood_prompts",
 )
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
@@ -3765,6 +3769,45 @@ def _model_router_mode(config: Optional[dict] = None) -> str:
     raw_mode = router.get("mode") if isinstance(router, dict) else None
     mode = str(raw_mode or "").strip().lower() if isinstance(raw_mode, str) else "off"
     return mode if mode in {"shadow", "enforce"} else "off"
+
+
+def _mood_injection_enabled(config: Optional[dict]) -> bool:
+    """Fast raw-config gate matching ``MoodsConfig.enabled`` parse semantics."""
+    section = config.get("model_routes") if isinstance(config, dict) else None
+    moods = section.get("moods") if isinstance(section, dict) else None
+    return isinstance(moods, dict) and moods.get("enabled") is True
+
+
+def _mood_prompt_suffix(record: dict, moods: Any) -> str:
+    """Return this decision's call-time mood suffix and update its audit field."""
+    if not bool(getattr(moods, "enabled", False)):
+        record["mood_applied"] = "shadow"
+        return ""
+
+    record["mood_applied"] = "none"
+    mood = record.get("mood")
+    from gateway.model_router import MOOD_VALUES
+
+    if not isinstance(mood, str) or mood not in MOOD_VALUES:
+        return ""
+
+    confidence = record.get("mood_confidence")
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(float(confidence))
+        or float(confidence) < float(getattr(moods, "confidence_threshold", 0.7))
+    ):
+        return ""
+
+    from gateway.mood_loader import load_mood_file
+
+    content = load_mood_file(moods, mood)
+    if content is None:
+        return ""
+
+    record["mood_applied"] = "injection"
+    return f"\n\n# Current Mood: {mood}\n{content}"
 
 
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
@@ -5772,6 +5815,12 @@ class TurnRunner:
         )
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+        # Mood text is staged by the pre-dispatch router decision and consumed
+        # once. Keep it out of ``combined_ephemeral``: that value participates
+        # in the cached-agent signature, while mood is deliberately a volatile
+        # API-call-time suffix that may change every turn.
+        mood_suffix = self._runner._consume_pending_mood_prompt(ctx.session_key)
+        turn_ephemeral = combined_ephemeral + mood_suffix
 
         max_iterations = _current_max_iterations()
 
@@ -6306,6 +6355,10 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
+        # The mood suffix follows the existing ephemeral-system-prompt rail:
+        # compose_effective_system_prompt sends it on the wire, while the
+        # cached/persisted base prompt remains byte-for-byte untouched.
+        agent.ephemeral_system_prompt = turn_ephemeral or None
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on
@@ -7619,6 +7672,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._model_router_shadow_inflight: set[str] = set()
         self._model_route_catalog_cache: OrderedDict[str, Any] = OrderedDict()
         self._model_route_catalog_cache_lock = threading.Lock()
+        self._pending_mood_prompts: Dict[str, str] = {}
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -8843,6 +8897,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cfg = user_config if isinstance(user_config, dict) else {}
         if _model_router_mode(cfg) != "shadow":
             return False
+        # Enabled mood injection needs this turn's decision before its API
+        # call. The pre-dispatch stage owns that synchronous path; leaving the
+        # detached observer active would duplicate classification and could
+        # stage a suffix too late for the turn it describes.
+        if _mood_injection_enabled(cfg):
+            return False
 
         lock, shared, slots, inflight = self._ensure_model_router_runtime_state()
         if not slots.acquire(blocking=False):
@@ -9152,6 +9212,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             state_identity,
             local_state,
         )
+        self._set_pending_mood_prompt(session_key, "")
+        if state_committed:
+            mood_suffix = _mood_prompt_suffix(decision.record, catalog.moods)
+            self._set_pending_mood_prompt(session_key, mood_suffix)
+        else:
+            decision.record["mood_applied"] = (
+                "none" if bool(getattr(catalog.moods, "enabled", False)) else "shadow"
+            )
         directive = decision.directive
         if mode == "enforce":
             decision.record["applied"] = False
@@ -21996,10 +22064,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Apply enforce-mode routing only after the canonical session key and
         # any auto-reset boundary are final, but before this turn builds or
-        # reuses an agent.  That makes recorded route intent follow the same
-        # session identity as the agent itself (including topic/inbox aliases)
-        # and lets the freshly selected override feed this turn's runtime.
-        # Shadow evaluation remains observational in TurnRunner.run_sync.
+        # reuses an agent. Enabled mood injection also promotes shadow
+        # classification onto this pre-dispatch rail: model selection remains
+        # observational, while the mood result is available for THIS turn's
+        # API-call-only prompt suffix. With moods disabled, shadow retains its
+        # detached, zero-latency M1 behavior in TurnRunner.run_sync.
+        self._set_pending_mood_prompt(session_key, "")
         if not getattr(event, "internal", False):
             try:
                 if getattr(getattr(self, "config", None), "multiplex_profiles", False):
@@ -22007,22 +22077,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._resolve_profile_home_for_source(source)
                     ):
                         router_cfg = _load_gateway_config()
-                        if _model_router_mode(router_cfg) == "enforce":
+                        router_mode = _model_router_mode(router_cfg)
+                        moods_enabled = _mood_injection_enabled(router_cfg)
+                        if router_mode == "enforce" or (
+                            router_mode == "shadow" and moods_enabled
+                        ):
                             await self._model_router_stage(
                                 event,
                                 source,
                                 session_key,
-                                mode="enforce",
+                                mode=router_mode,
                                 user_config=router_cfg,
                             )
                 else:
                     router_cfg = _load_gateway_config()
-                    if _model_router_mode(router_cfg) == "enforce":
+                    router_mode = _model_router_mode(router_cfg)
+                    moods_enabled = _mood_injection_enabled(router_cfg)
+                    if router_mode == "enforce" or (
+                        router_mode == "shadow" and moods_enabled
+                    ):
                         await self._model_router_stage(
                             event,
                             source,
                             session_key,
-                            mode="enforce",
+                            mode=router_mode,
                             user_config=router_cfg,
                         )
             except Exception:
@@ -29981,6 +30059,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         state = states.pop(session_key, None)
         return state if isinstance(state, dict) else None
+
+    def _set_pending_mood_prompt(self, session_key: str, prompt: str) -> None:
+        """Stage one call-time mood suffix, or clear a stale staged suffix."""
+        if not session_key:
+            return
+        prompts = getattr(self, "_pending_mood_prompts", None)
+        if not isinstance(prompts, dict):
+            prompts = {}
+            self._pending_mood_prompts = prompts
+        if prompt:
+            prompts[session_key] = prompt
+        else:
+            prompts.pop(session_key, None)
+
+    def _consume_pending_mood_prompt(self, session_key: str) -> str:
+        """Consume the current turn's mood suffix exactly once."""
+        prompts = getattr(self, "_pending_mood_prompts", None)
+        if not session_key or not isinstance(prompts, dict):
+            return ""
+        prompt = prompts.pop(session_key, "")
+        return prompt if isinstance(prompt, str) else ""
 
     def _apply_gateway_runtime_override(
         self, directive: dict, source: SessionSource
