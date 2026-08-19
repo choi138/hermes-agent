@@ -284,6 +284,10 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
+        # Run non-PTY local background commands in transient user scopes and
+        # persist their output so they can survive a gateway service restart.
+        # Falls back to ordinary local spawning when systemd scopes are unavailable.
+        "durable_background": False,
         # Terminal font family for the desktop app's embedded xterm.js terminal.
         # When set (e.g. "'CaskaydiaCoveNerdFont', 'JetBrains Mono', monospace"),
         # the desktop terminal uses this as the CSS font-family value, with the
