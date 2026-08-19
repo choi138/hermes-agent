@@ -74,7 +74,15 @@ _HEALTH_TEST_ENV = "HERMES_MODEL_ROUTES_HEALTH_TEST"
 _ROUTER_MODE_ENV = "HERMES_MODEL_ROUTER_MODE"
 _health_state_lock = threading.RLock()
 
-_SECTION_KEYS = {"routes", "health", "static_rules", "router"}
+_SECTION_KEYS = {"routes", "health", "static_rules", "router", "moods"}
+_MOODS_KEYS = {
+    "enabled", "dir", "confidence_threshold", "apply_model_routing", "routes",
+}
+# The classifier's mood vocabulary (mirrors gateway/model_router.MOOD_VALUES).
+_MOOD_NAMES = ("focused", "casual", "playful", "cute", "care")
+# Permissive routes exist to bypass refusal; a mood must never be able to
+# select one. Enforced by prefix so future PERMISSIVE_* routes are covered.
+_PERMISSIVE_ROUTE_PREFIX = "PERMISSIVE"
 _ROUTE_KEYS = {
     "description", "provider", "model", "reasoning_effort", "accepted", "fallbacks",
     "repromote_after_turns",
@@ -186,6 +194,30 @@ class RefusalConfig:
 
 
 @dataclass(frozen=True)
+class MoodsConfig:
+    """``model_routes.moods`` — orthogonal mood routing (M1: parsed only).
+
+    Nothing consumes this yet; M1 ships the classifier's mood as a shadow
+    field only. ``routes`` maps a mood name to a route name and may never
+    reference a PERMISSIVE route (see :func:`_parse_moods`).
+    """
+
+    enabled: bool = False
+    dir: str = ""  # "" → get_hermes_home()/"moods"
+    confidence_threshold: float = 0.7
+    apply_model_routing: bool = False
+    routes: Tuple[Tuple[str, str], ...] = ()  # (mood-name, route-name) pairs
+
+    def route_map(self) -> Dict[str, str]:
+        return dict(self.routes)
+
+    def resolved_dir(self) -> Path:
+        if self.dir:
+            return Path(self.dir).expanduser()
+        return get_hermes_home() / "moods"
+
+
+@dataclass(frozen=True)
 class RouterConfig:
     """``model_routes.router`` — the gateway pre-dispatch dynamic router."""
 
@@ -213,6 +245,7 @@ class RouteCatalog:
     health: HealthConfig = field(default_factory=HealthConfig)
     static_rules: List[Dict[str, Any]] = field(default_factory=list)  # matched in gateway/model_router.py
     router: RouterConfig = field(default_factory=RouterConfig)
+    moods: MoodsConfig = field(default_factory=MoodsConfig)
     issues: List[ConfigIssue] = field(default_factory=list)
 
 
@@ -877,6 +910,143 @@ def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
     return RefusalConfig(**kwargs)
 
 
+def _is_permissive_route(route_name: str) -> bool:
+    return route_name.strip().upper().startswith(_PERMISSIVE_ROUTE_PREFIX)
+
+
+def _parse_mood_routes(
+    raw: Any,
+    routes: Dict[str, RouteSpec],
+    issues: List[ConfigIssue],
+) -> Tuple[Tuple[str, str], ...]:
+    """Validate the mood -> route map, dropping anything unsafe or unusable."""
+    if not isinstance(raw, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"model_routes: moods.routes must be a mapping "
+            f"(got {type(raw).__name__}) — mood routes ignored",
+            "Change to:\n  moods:\n    routes:\n      <mood-name>: <route-name>",
+        ))
+        return ()
+
+    pairs: List[Tuple[str, str]] = []
+    for mood, route in raw.items():
+        mood_name = str(mood).strip().lower()
+        if mood_name not in _MOOD_NAMES:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: moods.routes has unknown mood '{mood}' — ignored",
+                f"Supported moods: {', '.join(_MOOD_NAMES)}",
+            ))
+            continue
+        if not isinstance(route, str) or not route.strip():
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: moods.routes.{mood_name} must be a non-empty "
+                f"route name (got {route!r}) — ignored",
+                "Example: moods:\n    routes:\n      care: GENTLE_CHAT",
+            ))
+            continue
+        route_name = route.strip()
+        # Hard product rule, checked before existence so an undeclared
+        # PERMISSIVE_* name is rejected just as loudly as a declared one.
+        if _is_permissive_route(route_name):
+            issues.append(ConfigIssue(
+                "error",
+                f"model_routes: moods.routes.{mood_name} may not target the "
+                f"permissive route '{route_name}' — mood routing must never "
+                f"select a refusal-bypass route",
+                "Permissive routes are reserved for refusal handling under "
+                "model_routes.router.refusal. Point this mood at a normal route.",
+            ))
+            continue
+        if route_name not in routes:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: moods.routes.{mood_name} references unknown "
+                f"route '{route_name}' — ignored",
+                f"Declared routes: {', '.join(routes) or '(none)'}",
+            ))
+            continue
+        pairs.append((mood_name, route_name))
+    return tuple(pairs)
+
+
+def _parse_moods(
+    raw: Any,
+    routes: Dict[str, RouteSpec],
+    issues: List[ConfigIssue],
+) -> MoodsConfig:
+    """Parse ``model_routes.moods``. M1 validates only; nothing consumes it."""
+    if raw is None:
+        return MoodsConfig()
+    if not isinstance(raw, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"model_routes: 'moods' must be a mapping (got {type(raw).__name__}) "
+            f"— mood routing stays disabled",
+            f"Supported moods keys: {', '.join(sorted(_MOODS_KEYS))}",
+        ))
+        return MoodsConfig()
+
+    for key in sorted(set(raw) - _MOODS_KEYS):
+        issues.append(ConfigIssue(
+            "warning",
+            f"model_routes: unknown key '{key}' under moods ignored",
+            f"Supported moods keys: {', '.join(sorted(_MOODS_KEYS))}",
+        ))
+
+    kwargs: Dict[str, Any] = {}
+    for key in ("enabled", "apply_model_routing"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool):
+            kwargs[key] = value
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: moods.{key} must be a boolean "
+                f"(got {value!r}) — default used",
+                f"Use an unquoted YAML boolean: {key}: "
+                f"{'true' if getattr(MoodsConfig(), key) else 'false'}",
+            ))
+
+    if "dir" in raw:
+        value = raw["dir"]
+        if isinstance(value, str):
+            kwargs["dir"] = value.strip()
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: moods.dir must be a string "
+                f"(got {type(value).__name__}) — default used",
+                "Example: dir: ~/.hermes/moods",
+            ))
+
+    if "confidence_threshold" in raw:
+        value = raw["confidence_threshold"]
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and 0 <= float(value) <= 1
+        ):
+            kwargs["confidence_threshold"] = float(value)
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: moods.confidence_threshold must be a number "
+                f"from 0 to 1 ({value!r}) — default used",
+                f"Example: confidence_threshold: "
+                f"{MoodsConfig().confidence_threshold}",
+            ))
+
+    if "routes" in raw:
+        kwargs["routes"] = _parse_mood_routes(raw["routes"], routes, issues)
+
+    return MoodsConfig(**kwargs)
+
+
 def _parse_router(
     raw: Any,
     routes: Dict[str, RouteSpec],
@@ -1112,6 +1282,7 @@ def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
     catalog.health = _parse_health(section.get("health"), catalog.issues)
     catalog.static_rules = _parse_static_rules(section.get("static_rules"), catalog.routes, catalog.issues)
     catalog.router = _parse_router(section.get("router"), catalog.routes, cfg, catalog.issues)
+    catalog.moods = _parse_moods(section.get("moods"), catalog.routes, catalog.issues)
     return catalog
 
 
