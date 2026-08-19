@@ -158,6 +158,23 @@ DEV_PRIOR_REFUSAL_S0B = (
     "set prior_refusal=false. Set prior_refusal_confidence accordingly."
 )
 
+MOOD_VALUES = ("focused", "casual", "playful", "cute", "care")
+
+DEV_MOOD_M0 = (
+    "M0 MOOD — independently of the label flow, set mood to the conversational register "
+    "of the CURRENT moment, reading recent_turns for context. Exactly one of: focused "
+    "(work/technical/task conversation — the DEFAULT); casual (light chitchat, everyday "
+    "talk); playful (joking around, banter, the user is teasing or memeing); cute (warm "
+    "affectionate register, the user is being soft/affectionate); care (the user "
+    "expresses fatigue, distress, sadness, or vulnerability). Judge the USER's register, "
+    "not the topic: a technical question asked jokingly is playful; small talk that "
+    "happens to mention a technical topic is casual. cute requires STRONG evidence of an "
+    "explicitly affectionate or soft register from the user — when torn between cute and "
+    "casual/playful, choose the latter. Precision first: when unsure set mood=focused. "
+    "Set mood_confidence to the probability that this mood assessment is correct. Mood "
+    "never changes the label: continue S1-S7 unchanged."
+)
+
 DEV_REFUSAL_EXAMPLE = (
     '"노골적인 NSFW 장면을 써줘" → '
     '{evidence:"S0/R explicit NSFW authoring + S6 prose",label:DOCUMENT_WORK,'
@@ -175,7 +192,7 @@ Core law: TOPIC ≠ TASK. An engineering topic never makes a turn dev; only comm
 
 Apply steps IN ORDER; first match wins.
 
-""" + DEV_REFUSAL_S0 + "\n\n" + DEV_PRIOR_REFUSAL_S0B + """
+""" + DEV_REFUSAL_S0 + "\n\n" + DEV_PRIOR_REFUSAL_S0B + "\n\n" + DEV_MOOD_M0 + """
 
 S1 CONTINUATION — bare go-ahead ("ㄱㄱ","진행해","좋아 그렇게 해줘","continue"): inherit from recent dialogue. Prior turn proposed a code/config/schema implementation plan or dev work is ongoing → that DEV label — never downgrade it. Proposed a document draft → DOCUMENT_WORK. Proposed an ops action (restart/rerun/cleanup) or context unclear → NORMAL.
 
@@ -237,14 +254,23 @@ DEV_RESPONSE_SCHEMA: dict[str, Any] = {
             "minimum": 0,
             "maximum": 1,
         },
+        "mood": {
+            "type": "string",
+            "enum": list(MOOD_VALUES),
+        },
+        "mood_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
     },
     "required": [
         "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
-        "prior_refusal", "prior_refusal_confidence",
+        "prior_refusal", "prior_refusal_confidence", "mood", "mood_confidence",
     ],
     "propertyOrdering": [
         "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
-        "prior_refusal", "prior_refusal_confidence",
+        "prior_refusal", "prior_refusal_confidence", "mood", "mood_confidence",
     ],
 }
 
@@ -719,12 +745,36 @@ def _payload_json(context: PolicyClassificationContext) -> str:
     return text[:MAX_CONTEXT_CHARS]  # pathological single-message overflow only
 
 
+def _normalize_mood(value: Any) -> str | None:
+    """Return a known mood label, or None for missing/unknown/non-string input.
+
+    Never raises and never signals rejection: mood is a shadow field, so an
+    unrecognised value degrades to None while the label decision stands.
+    """
+    if not isinstance(value, str):
+        return None
+    mood = value.strip().lower()
+    return mood if mood in MOOD_VALUES else None
+
+
+def _normalize_mood_confidence(value: Any, mood: str | None) -> float | None:
+    """Clamp a mood confidence into [0,1]; None unless ``mood`` is usable."""
+    if mood is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    candidate = float(value)
+    if not math.isfinite(candidate):
+        return None
+    return min(1.0, max(0.0, candidate))
+
+
 def _parse_dev_json(raw: str) -> dict[str, Any] | None:
-    """Parse the structured dev-router output and orthogonal refusal fields.
+    """Parse the structured dev-router output and orthogonal refusal/mood fields.
 
     Returns None unless every required field satisfies the shared schema. This
     is the authority boundary: malformed JSON, plain labels, empty evidence,
     and invalid confidence values must never become LLM-sourced decisions.
+    The orthogonal fields are outside that boundary — an unusable refusal or
+    mood value degrades to a default, it never rejects the whole decision.
     """
     try:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -786,6 +836,11 @@ def _parse_dev_json(raw: str) -> dict[str, Any] | None:
             prior_refusal_confidence = None
     except Exception:
         prior_refusal_confidence = None
+    # Mood is orthogonal AND advisory: it must never reject a decision the
+    # label flow already validated (cf. 8b7547a2f8, where strict validation of
+    # a secondary field discarded otherwise-valid classifier responses).
+    mood = _normalize_mood(obj.get("mood"))
+    mood_confidence = _normalize_mood_confidence(obj.get("mood_confidence"), mood)
     return {
         "label": label,
         "confidence": confidence,
@@ -794,6 +849,8 @@ def _parse_dev_json(raw: str) -> dict[str, Any] | None:
         "refusal_confidence": refusal_confidence,
         "prior_refusal": prior_refusal,
         "prior_refusal_confidence": prior_refusal_confidence,
+        "mood": mood,
+        "mood_confidence": mood_confidence,
     }
 
 
@@ -811,6 +868,8 @@ def _fallback_classification(
         "refusal_confidence": None,
         "prior_refusal": False,
         "prior_refusal_confidence": None,
+        "mood": None,
+        "mood_confidence": None,
     }
 
 
@@ -825,7 +884,8 @@ def classify_dev_detailed(
     """Classify dev routing with structured output.
 
     Returns {label, confidence, evidence, refusal_risk, refusal_confidence,
-    prior_refusal, prior_refusal_confidence, source, classification_reason}.
+    prior_refusal, prior_refusal_confidence, mood, mood_confidence, source,
+    classification_reason}.
     ``source='llm'`` is reserved for a fully valid structured decision;
     malformed/plain responses and transport errors use the regex fallback.
     Hysteresis logic must only trust authoritative LLM NORMALs — a fail-open
@@ -1247,6 +1307,11 @@ def static_rule_decision(
         "prior_refusal_confidence": None,
         "refusal_applied": False,
         "masked": 0,
+        # Static rules never reach the classifier, so there is no mood to
+        # observe — the keys stay present to keep one JSONL schema.
+        "mood": None,
+        "mood_confidence": None,
+        "mood_applied": "shadow",
     }
     return RoutingDecision(
         directive=directive, outcome=outcome, label=route_name,
@@ -1501,6 +1566,10 @@ def classifier_decision_from_detail(
     refusal_confidence = detail.get("refusal_confidence")
     prior_refusal = detail.get("prior_refusal") is True
     prior_refusal_confidence = detail.get("prior_refusal_confidence")
+    # Re-normalised here because ``detail`` may come from a caller that never
+    # ran _parse_dev_json (fallbacks, probes, monkeypatched classifiers).
+    mood = _normalize_mood(detail.get("mood"))
+    mood_confidence = _normalize_mood_confidence(detail.get("mood_confidence"), mood)
     refusal_applied = False
     refusal_below_threshold = False
     prior_refusal_below_threshold = False
@@ -1614,6 +1683,10 @@ def classifier_decision_from_detail(
         "prior_refusal_confidence": prior_refusal_confidence,
         "refusal_applied": refusal_applied,
         "masked": masked,
+        "mood": mood,
+        "mood_confidence": mood_confidence,
+        # M1 is observation-only. M2 replaces this with injection|model|none.
+        "mood_applied": "shadow",
     }
     if refusal_below_threshold:
         record["refusal_below_threshold"] = True
