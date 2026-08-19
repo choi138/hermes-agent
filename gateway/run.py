@@ -14198,27 +14198,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 """
                 try:
                     from tools.process_registry import process_registry
-                    _killed = process_registry.kill_all()
+                    _skipped_durable = process_registry.count_durable_running()
+                    _killed = process_registry.kill_all(exclude_durable=True)
                     if _killed:
                         logger.info(
                             "Shutdown (%s): killed %d tool subprocess(es)",
                             phase, _killed,
                         )
+                    if _skipped_durable:
+                        logger.info(
+                            "Shutdown (%s): skipped %d durable tool subprocess(es)",
+                            phase, _skipped_durable,
+                        )
                 except Exception as _e:
                     logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
                 try:
-                    # Any cron job still dispatched at this instant just had
-                    # its tool subprocess killed above (kill_all() has no
-                    # per-job-ID targeting — it's a global sweep). Its agent
-                    # thread is still alive in this process and may go on to
-                    # produce a plausible-looking final response from the
-                    # now-truncated tool output; mark the run interrupted so
-                    # the scheduler can never report that as success (#60432).
+                    # Any cron job still dispatched at this instant is dying
+                    # with this process regardless of what kill_all() did: the
+                    # job's AGENT is a thread inside this gateway process
+                    # (cron/scheduler.py ThreadPoolExecutor), so even when its
+                    # tool subprocess survived as a durable systemd scope, the
+                    # run itself is interrupted. Mark it so the scheduler can
+                    # never report that run as success (#60432). Gating this
+                    # on _killed>0 would regress #60432 for cron jobs whose
+                    # only live subprocess was durable, or that held no
+                    # registered subprocess at the kill instant at all.
                     # No-op when no cron job is in flight.
                     from cron.scheduler import mark_running_jobs_interrupted
                     _interrupted = mark_running_jobs_interrupted(
-                        f"Gateway shutdown ({phase}) killed the job's tool "
-                        "subprocess before the run finished."
+                        f"Gateway shutdown ({phase}) interrupted the run "
+                        "before it finished (the job's agent dies with the "
+                        "gateway process; non-durable tool subprocesses were "
+                        "killed)."
                     )
                     if _interrupted:
                         logger.warning(
