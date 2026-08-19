@@ -41,6 +41,7 @@ EXPECTED_RECORD_FIELDS = {
     "provider", "model", "outcome", "directive_route", "runtime_model", "msg_head",
     "mode", "rule", "refusal_risk", "refusal_confidence", "prior_refusal",
     "prior_refusal_confidence", "refusal_applied", "masked",
+    "mood", "mood_confidence", "mood_applied",
 }
 
 
@@ -208,6 +209,8 @@ def _complete(
     refusal_confidence=None,
     prior_refusal=None,
     prior_refusal_confidence=None,
+    mood=None,
+    mood_confidence=None,
 ):
     def _fn(prompt):
         result = {"evidence": evidence, "label": label, "confidence": confidence}
@@ -217,6 +220,9 @@ def _complete(
         if prior_refusal is not None:
             result["prior_refusal"] = prior_refusal
             result["prior_refusal_confidence"] = prior_refusal_confidence
+        if mood is not None:
+            result["mood"] = mood
+            result["mood_confidence"] = mood_confidence
         return json.dumps(result)
     return _fn
 
@@ -280,6 +286,8 @@ def test_verbatim_parity_with_skill_gate_plugin():
             mr_mod.DEV_REFUSAL_S0 + "\n\n", "", 1,
         ).replace(
             mr_mod.DEV_PRIOR_REFUSAL_S0B + "\n\n", "", 1,
+        ).replace(
+            mr_mod.DEV_MOOD_M0 + "\n\n", "", 1,
         ).replace("\n" + mr_mod.DEV_REFUSAL_EXAMPLE, "", 1)
         assert old_prompt == sg.DEV_SYSTEM_PROMPT
         old_schema = json.loads(json.dumps(mr_mod.DEV_RESPONSE_SCHEMA))
@@ -287,6 +295,8 @@ def test_verbatim_parity_with_skill_gate_plugin():
         old_schema["properties"].pop("refusal_confidence")
         old_schema["properties"].pop("prior_refusal")
         old_schema["properties"].pop("prior_refusal_confidence")
+        old_schema["properties"].pop("mood")
+        old_schema["properties"].pop("mood_confidence")
         old_schema["required"] = ["evidence", "label", "confidence"]
         old_schema["propertyOrdering"] = ["evidence", "label", "confidence"]
         assert old_schema == sg.DEV_RESPONSE_SCHEMA
@@ -409,6 +419,7 @@ def test_classifier_llm_json_parsed():
         "label": "SYSTEM_DEV", "confidence": 0.83, "evidence": "S5 debug",
         "refusal_risk": False, "refusal_confidence": None,
         "prior_refusal": False, "prior_refusal_confidence": None,
+        "mood": None, "mood_confidence": None,
         "source": "llm", "classification_reason": "",
     }
 
@@ -447,6 +458,7 @@ def test_classifier_failure_falls_back_to_regex():
         "label": "NORMAL", "confidence": None, "evidence": "",
         "refusal_risk": False, "refusal_confidence": None,
         "prior_refusal": False, "prior_refusal_confidence": None,
+        "mood": None, "mood_confidence": None,
         "source": "fallback", "classification_reason": "classifier_error:TimeoutError",
     }
 
@@ -659,6 +671,7 @@ def test_plain_label_response_is_not_authoritative():
         "label": "NORMAL", "confidence": None, "evidence": "",
         "refusal_risk": False, "refusal_confidence": None,
         "prior_refusal": False, "prior_refusal_confidence": None,
+        "mood": None, "mood_confidence": None,
         "source": "fallback", "classification_reason": "invalid_classifier_response",
     }
 
@@ -667,7 +680,7 @@ def test_dev_schema_refusal_fields_are_required_and_ordered():
     schema = mr_mod.DEV_RESPONSE_SCHEMA
     assert schema["required"] == [
         "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
-        "prior_refusal", "prior_refusal_confidence",
+        "prior_refusal", "prior_refusal_confidence", "mood", "mood_confidence",
     ]
     assert schema["propertyOrdering"] == schema["required"]
     assert schema["properties"]["refusal_risk"] == {"type": "boolean"}
@@ -2829,3 +2842,260 @@ def test_strip_code_fences_normalizes_markdown_wrapped_classifier_reply():
     assert _strip_code_fences("```json\n{\"label\": \"NORMAL\"}") == "{\"label\": \"NORMAL\"}"
     # Fence with no body degrades to the original stripped text.
     assert _strip_code_fences("```\n```") == "```\n```"
+
+
+# ---------------------------------------------------------------------------
+# M0 MOOD — orthogonal shadow field (M1: classified and logged, never applied)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mood", ["focused", "casual", "playful", "cute", "care"])
+def test_mood_happy_path_each_value(mood):
+    parsed = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S5 code work",
+        "label": "SYSTEM_DEV",
+        "confidence": 0.9,
+        "mood": mood,
+        "mood_confidence": 0.81,
+    }))
+    assert parsed["mood"] == mood
+    assert parsed["mood_confidence"] == 0.81
+    # Orthogonality: the label flow is untouched by the mood value.
+    assert parsed["label"] == "SYSTEM_DEV"
+    assert parsed["confidence"] == 0.9
+
+
+def test_mood_enum_matches_schema_and_prompt():
+    assert mr_mod.MOOD_VALUES == ("focused", "casual", "playful", "cute", "care")
+    assert mr_mod.DEV_RESPONSE_SCHEMA["properties"]["mood"] == {
+        "type": "string", "enum": list(mr_mod.MOOD_VALUES),
+    }
+    assert mr_mod.DEV_RESPONSE_SCHEMA["properties"]["mood_confidence"] == {
+        "type": "number", "minimum": 0, "maximum": 1,
+    }
+    assert "M0 MOOD" in mr_mod.DEV_SYSTEM_PROMPT
+    for mood in mr_mod.MOOD_VALUES:
+        assert mood in mr_mod.DEV_MOOD_M0
+
+
+@pytest.mark.parametrize(
+    "bad_mood",
+    ["grumpy", "", "FOCUSED_", 3, None, True, ["cute"], {"mood": "cute"}],
+)
+def test_invalid_mood_degrades_to_none_without_rejecting_the_response(bad_mood):
+    """Regression guard for 8b7547a2f8: an unusable secondary field must never
+    discard an otherwise-valid classifier decision."""
+    payload = json.dumps({
+        "evidence": "S5 code work",
+        "label": "FRONTEND_DEV",
+        "confidence": 0.88,
+        "mood": bad_mood,
+        "mood_confidence": 0.9,
+    })
+    parsed = mr_mod._parse_dev_json(payload)
+    assert parsed is not None
+    assert parsed["label"] == "FRONTEND_DEV"
+    assert parsed["confidence"] == 0.88
+    assert parsed["mood"] is None
+    assert parsed["mood_confidence"] is None
+
+    detail = mr_mod.classify_dev_detailed(
+        mr_mod.PolicyClassificationContext(current_user_message="x"),
+        complete=lambda prompt: payload,
+    )
+    assert detail["source"] == "llm"
+    assert detail["classification_reason"] == ""
+    assert detail["mood"] is None
+
+
+def test_missing_mood_defaults_to_none():
+    parsed = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S2 status Q", "label": "NORMAL", "confidence": 0.95,
+    }))
+    assert parsed["mood"] is None
+    assert parsed["mood_confidence"] is None
+    # A mood-less response is still fully authoritative for the label flow.
+    parsed["source"] = "llm"
+    assert mr_mod._is_authoritative_llm_decision(parsed)
+
+
+def test_mood_case_and_whitespace_normalized():
+    parsed = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S7", "label": "NORMAL", "confidence": 0.7,
+        "mood": "  Care  ", "mood_confidence": 0.6,
+    }))
+    assert parsed["mood"] == "care"
+    assert parsed["mood_confidence"] == 0.6
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (1.5, 1.0),
+        (2, 1.0),
+        (-0.3, 0.0),
+        (0.0, 0.0),
+        (1.0, 1.0),
+        (0.42, 0.42),
+        ("0.9", None),
+        (True, None),
+        (None, None),
+        (float("nan"), None),
+        (float("inf"), None),
+    ],
+)
+def test_mood_confidence_clamped_and_type_guarded(raw, expected):
+    parsed = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S7", "label": "NORMAL", "confidence": 0.7,
+        "mood": "playful", "mood_confidence": raw,
+    }))
+    assert parsed["mood"] == "playful"
+    assert parsed["mood_confidence"] == expected
+
+
+def test_mood_confidence_dropped_when_mood_invalid():
+    parsed = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S7", "label": "NORMAL", "confidence": 0.7,
+        "mood": "grumpy", "mood_confidence": 0.99,
+    }))
+    assert parsed["mood"] is None
+    assert parsed["mood_confidence"] is None
+
+
+def test_mood_carried_into_decision_record_as_shadow():
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV", mood="care", mood_confidence=0.77),
+        mode="shadow",
+    )
+    assert set(decision.record) == EXPECTED_RECORD_FIELDS
+    assert decision.record["mood"] == "care"
+    assert decision.record["mood_confidence"] == 0.77
+    assert decision.record["mood_applied"] == "shadow"
+
+
+def test_mood_never_changes_routing_in_m1():
+    """M1 is observation-only: identical routing with and without a mood."""
+    baseline = _evaluate(complete_dev=_complete("SYSTEM_DEV"), mode="enforce")
+    for mood in mr_mod.MOOD_VALUES:
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV", mood=mood, mood_confidence=0.99),
+            mode="enforce",
+        )
+        assert decision.outcome == baseline.outcome
+        assert decision.directive == baseline.directive
+        assert decision.label == baseline.label
+        assert decision.record["mood_applied"] == "shadow"
+
+
+def test_mood_fields_written_to_decision_jsonl(monkeypatch, tmp_path):
+    log_path = tmp_path / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+    decision = _evaluate(
+        complete_dev=_complete("FRONTEND_DEV", mood="playful", mood_confidence=0.64),
+        mode="shadow",
+    )
+    mr_mod.log_decision(decision.record)
+    record = json.loads(log_path.read_text().splitlines()[0])
+    assert record["mood"] == "playful"
+    assert record["mood_confidence"] == 0.64
+    assert record["mood_applied"] == "shadow"
+
+
+@pytest.mark.parametrize(
+    "complete, reason",
+    [
+        (lambda prompt: (_ for _ in ()).throw(TimeoutError("down")),
+         "classifier_error:TimeoutError"),
+        (lambda prompt: "Service Unavailable", "invalid_classifier_response"),
+        (lambda prompt: '{"error":"quota exceeded"}', "invalid_classifier_response"),
+    ],
+)
+def test_fallback_paths_record_mood_none(complete, reason):
+    detail = mr_mod.classify_dev_detailed(
+        mr_mod.PolicyClassificationContext(current_user_message="오늘 날씨 어때?"),
+        complete=complete,
+    )
+    assert detail["source"] == "fallback"
+    assert detail["classification_reason"] == reason
+    assert detail["mood"] is None
+    assert detail["mood_confidence"] is None
+
+    decision = _evaluate(complete_dev=complete, mode="shadow")
+    assert decision.record["source"] == "fallback"
+    assert decision.record["mood"] is None
+    assert decision.record["mood_confidence"] is None
+    assert decision.record["mood_applied"] == "shadow"
+
+
+def test_static_rule_record_carries_null_mood():
+    """Static rules bypass the classifier, but the JSONL schema stays uniform."""
+    cfg = _cfg(static_rules=[
+        {"name": "pr-rule", "route": "dev", "when": {"text_matches_any": [r"codex-lb"]}},
+    ])
+    decision = _evaluate(
+        text="codex-lb 리뷰해줘",
+        cfg=cfg,
+        runtime={"model": "model-b", "provider": "p2"},
+        mode="shadow",
+    )
+    assert decision.record["policy"] == "static_rule"
+    assert set(decision.record) == EXPECTED_RECORD_FIELDS
+    assert decision.record["mood"] is None
+    assert decision.record["mood_confidence"] is None
+    assert decision.record["mood_applied"] == "shadow"
+
+
+def test_mood_absent_from_detail_does_not_break_record(monkeypatch):
+    """A caller that predates the mood field must still produce a valid record."""
+    monkeypatch.setattr(mr_mod, "classify_dev_detailed", lambda *a, **k: {
+        "label": "SYSTEM_DEV",
+        "confidence": 0.9,
+        "evidence": "S5 code",
+        "source": "llm",
+    })
+    decision = _evaluate(mode="shadow")
+    assert set(decision.record) == EXPECTED_RECORD_FIELDS
+    assert decision.record["mood"] is None
+    assert decision.record["mood_confidence"] is None
+
+
+def test_refusal_and_mood_are_independent():
+    detail = mr_mod.classify_dev_detailed(
+        mr_mod.PolicyClassificationContext(current_user_message="힘들다 도와줘"),
+        complete=_complete(
+            "DOCUMENT_WORK",
+            evidence="S0 hard cue + S6 prose",
+            refusal_risk=True,
+            refusal_confidence=0.95,
+        ),
+    )
+    assert detail["refusal_risk"] is True
+    assert detail["mood"] is None
+
+    both = mr_mod._parse_dev_json(json.dumps({
+        "evidence": "S0/R + M0 care", "label": "DOCUMENT_WORK", "confidence": 0.9,
+        "refusal_risk": True, "refusal_confidence": 0.95,
+        "prior_refusal": True, "prior_refusal_confidence": 0.9,
+        "mood": "care", "mood_confidence": 0.8,
+    }))
+    assert both["refusal_risk"] is True
+    assert both["refusal_confidence"] == 0.95
+    assert both["prior_refusal"] is True
+    assert both["mood"] == "care"
+    assert both["mood_confidence"] == 0.8
+
+
+def test_record_mood_confidence_normalized_from_untrusted_detail(monkeypatch):
+    """The record invariant (mood_confidence in [0,1] or None) holds even when
+    ``detail`` never passed through _parse_dev_json."""
+    monkeypatch.setattr(mr_mod, "classify_dev_detailed", lambda *a, **k: {
+        "label": "SYSTEM_DEV",
+        "confidence": 0.9,
+        "evidence": "S5 code",
+        "source": "llm",
+        "mood": "CARE",
+        "mood_confidence": 4.2,
+    })
+    decision = _evaluate(mode="shadow")
+    assert decision.record["mood"] == "care"
+    assert decision.record["mood_confidence"] == 1.0
