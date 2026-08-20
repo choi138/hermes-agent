@@ -406,6 +406,7 @@ async def test_startup_reconciliation_repairs_only_active_threads(
         store=store,
         discord=discord,
         bot_mention=BOT_MENTION,
+        trusted_repositories=frozenset({"silviahealth/content"}),
         participant_user_ids=frozenset({"789391209067446323"}),
         participant_parent_channel_id=PARENT_CHANNEL,
     )
@@ -462,6 +463,7 @@ async def test_startup_reconciliation_reports_sessions_beyond_limit(
         store=store,
         discord=discord,
         bot_mention=BOT_MENTION,
+        trusted_repositories=frozenset({"silviahealth/content"}),
         participant_user_ids=frozenset({"789391209067446323"}),
     )
 
@@ -1328,3 +1330,31 @@ async def test_no_advisor_configured_changes_nothing(tmp_path: Path) -> None:
 
     assert len(discord.messages["thread-1"]) == 1
     assert "참고 분석" not in discord.messages["thread-1"][0][1]
+
+
+def test_thread_coordinator_requires_explicit_trusted_repositories() -> None:
+    """No hardcoded tenant default: the trust boundary must come from config."""
+    import inspect
+
+    signature = inspect.signature(MentionInboxThreadCoordinator.__init__)
+    default = signature.parameters["trusted_repositories"].default
+
+    assert default is inspect.Parameter.empty, (
+        "trusted_repositories must be a required keyword so a deployment "
+        "cannot silently inherit a hardcoded repository allowlist"
+    )
+
+
+def test_subject_state_resolver_requires_explicit_allowed_repositories() -> None:
+    """Approval-time repository trust must also be injected, never defaulted."""
+    import inspect
+
+    from plugins.mention_inbox.approval import GitHubSubjectStateResolver
+
+    signature = inspect.signature(GitHubSubjectStateResolver.__init__)
+    default = signature.parameters["allowed_repositories"].default
+
+    assert default is inspect.Parameter.empty, (
+        "allowed_repositories must be a required keyword so approval cannot "
+        "silently inherit a hardcoded repository allowlist"
+    )

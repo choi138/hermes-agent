@@ -348,7 +348,7 @@ class MentionInboxThreadCoordinator:
         executor_hint: str = "direct",
         auto_archive_duration: int = 1440,
         approval_available: bool = False,
-        trusted_repositories: frozenset[str] = frozenset({"silviahealth/content"}),
+        trusted_repositories: frozenset[str],
         external_repository_actions: str = "disabled",
         participant_user_ids: frozenset[str] = _NO_PARTICIPANT_USER_IDS,
         participant_parent_channel_id: str | None = None,

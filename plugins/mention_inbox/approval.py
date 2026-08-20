@@ -335,7 +335,7 @@ class GitHubSubjectStateResolver:
         *,
         store: MentionInboxStore,
         client: GitHubSubjectClient,
-        allowed_repositories: frozenset[str] = frozenset({"silviahealth/content"}),
+        allowed_repositories: frozenset[str],
         include_public_actionable_activity: bool = False,
         external_repository_actions: str = "disabled",
     ) -> None:
