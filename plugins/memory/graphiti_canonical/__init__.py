@@ -1874,7 +1874,11 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             "directs a live, browser, or web source, follow that source instead. Label "
             "answers as based on Graphiti records, not live state. Treat returned_count "
             "as rows returned after filtering, not the total number of matching records; "
-            "total_unknown and fetch_limit control any total-count claim."
+            "total_unknown and fetch_limit control any total-count claim. "
+            "When a status=ok recall is clearly unrelated to the question, say so "
+            "explicitly and, if the configured escape hatch is enabled, call "
+            "session_search once with graphiti_irrelevant=true; use this only for "
+            "genuine irrelevance, never to skip Graphiti."
         )
 
 

@@ -1,20 +1,24 @@
-"""Pure tool-call loop guardrail primitives.
+"""Tool-call loop guardrail primitives.
 
-The controller in this module is intentionally side-effect free: it tracks
-per-turn tool-call observations and returns decisions. Runtime code owns whether
-those decisions become warning guidance, synthetic tool results, or controlled
-turn halts.
+The controller tracks per-turn tool-call observations and returns decisions.
+Runtime code owns whether those decisions become warning guidance, synthetic
+tool results, or controlled turn halts. The explicit Graphiti irrelevance escape
+hatch also emits an audit log when it is used.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+
+
+logger = logging.getLogger(__name__)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -117,15 +121,27 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    allow_graphiti_irrelevant_fallback: bool = False
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
-        """Build config from the `tool_loop_guardrails` config.yaml section."""
+    def from_mapping(
+        cls,
+        data: Mapping[str, Any] | None,
+        *,
+        memory_config: Mapping[str, Any] | None = None,
+    ) -> "ToolCallGuardrailConfig":
+        """Build config from the guardrail and memory config.yaml sections."""
         if not isinstance(data, Mapping):
-            return cls()
+            data = {}
+
+        graphiti_config: Mapping[str, Any] = {}
+        if isinstance(memory_config, Mapping):
+            candidate = memory_config.get("graphiti")
+            if isinstance(candidate, Mapping):
+                graphiti_config = candidate
 
         warn_after = data.get("warn_after")
         if not isinstance(warn_after, Mapping):
@@ -161,6 +177,10 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            allow_graphiti_irrelevant_fallback=_as_bool(
+                graphiti_config.get("allow_irrelevant_fallback"),
+                defaults.allow_graphiti_irrelevant_fallback,
             ),
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
@@ -336,6 +356,7 @@ class ToolCallGuardrailController:
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
         self._graphiti_routing_status: str | None = None
+        self._graphiti_irrelevant_fallback_used = False
 
     def set_graphiti_routing_status(self, status: str | None) -> None:
         """Set the current turn's Graphiti-first fallback decision."""
@@ -359,19 +380,34 @@ class ToolCallGuardrailController:
             or tool_name.startswith("browser_")
         )
         if is_fallback_tool and graphiti_status == "ok":
-            return ToolGuardrailDecision(
-                action="deny",
-                code="graphiti_fallback_not_allowed",
-                message=(
-                    f"Blocked {tool_name}: Graphiti-first routing permits another "
-                    "source only after a confirmed status=empty result. The current "
-                    f"Graphiti status is {graphiti_status}. Report that status instead "
-                    "of silently falling back, unless the user explicitly directs a "
-                    "different source."
-                ),
-                tool_name=tool_name,
-                signature=signature,
+            graphiti_irrelevant_bypass = (
+                tool_name == "session_search"
+                and bool(_coerce_args(args).get("graphiti_irrelevant"))
+                and self.config.allow_graphiti_irrelevant_fallback
+                and not self._graphiti_irrelevant_fallback_used
             )
+            if graphiti_irrelevant_bypass:
+                self._graphiti_irrelevant_fallback_used = True
+                logger.info(
+                    "Graphiti irrelevant-fallback escape hatch used: "
+                    "tool=%s Graphiti status=%s",
+                    tool_name,
+                    graphiti_status,
+                )
+            else:
+                return ToolGuardrailDecision(
+                    action="deny",
+                    code="graphiti_fallback_not_allowed",
+                    message=(
+                        f"Blocked {tool_name}: Graphiti-first routing permits another "
+                        "source only after a confirmed status=empty result. The current "
+                        f"Graphiti status is {graphiti_status}. Report that status instead "
+                        "of silently falling back, unless the user explicitly directs a "
+                        "different source."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may

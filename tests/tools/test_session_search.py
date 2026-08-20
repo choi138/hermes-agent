@@ -82,6 +82,10 @@ class TestSchema:
         assert "window" in params
         # Shared
         assert "role_filter" in params
+        assert params["graphiti_irrelevant"]["type"] == "boolean"
+        assert params["graphiti_irrelevant"]["default"] is False
+        assert "status=ok" in params["graphiti_irrelevant"]["description"]
+        assert "one call" in params["graphiti_irrelevant"]["description"]
         # Mode is inferred from which args are set — no explicit mode param
         assert "mode" not in params
 
@@ -99,7 +103,13 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        # The historical positional prefix must stay byte-for-byte stable, and
+        # ``detail`` must remain the first parameter appended after it — callers
+        # that pass these positionally must never be re-bound to a new argument.
+        # Parameters added later (guardrail-only flags, etc.) are appended after
+        # ``detail``, so assert the prefix rather than the whole list.
+        assert parameters[:len(historical_prefix)] == historical_prefix
+        assert parameters[len(historical_prefix)] == "detail"
 
 
 class TestFormatTimestamp:

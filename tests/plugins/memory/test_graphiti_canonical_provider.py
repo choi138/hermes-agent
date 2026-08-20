@@ -2602,6 +2602,8 @@ def test_provider_prompt_declares_recall_non_authoritative_and_read_only():
     assert "graphiti records" in block
     assert "returned_count" in block
     assert "not the total" in block
+    assert "graphiti_irrelevant=true" in block
+    assert "genuine irrelevance" in block
 
 
 def test_memory_context_fence_treats_recall_as_informational():

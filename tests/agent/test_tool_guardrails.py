@@ -1,6 +1,7 @@
 """Pure tool-call guardrail primitive tests."""
 
 import json
+import logging
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -9,6 +10,7 @@ from agent.tool_guardrails import (
     canonical_tool_args,
     classify_tool_failure,
 )
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
@@ -206,6 +208,95 @@ def test_graphiti_ok_blocks_external_fallback_but_non_ok_statuses_allow_it():
 
     controller.reset_for_turn()
     assert controller.before_call("web_search", {"query": "new turn"}).action == "allow"
+
+
+def test_graphiti_irrelevant_fallback_config_defaults_off_and_reads_memory_key():
+    default_cfg = ToolCallGuardrailConfig.from_mapping(
+        DEFAULT_CONFIG["tool_loop_guardrails"],
+        memory_config=DEFAULT_CONFIG["memory"],
+    )
+    enabled_cfg = ToolCallGuardrailConfig.from_mapping(
+        {},
+        memory_config={"graphiti": {"allow_irrelevant_fallback": True}},
+    )
+
+    assert default_cfg.allow_graphiti_irrelevant_fallback is False
+    assert enabled_cfg.allow_graphiti_irrelevant_fallback is True
+
+
+def test_graphiti_ok_allows_flagged_session_search_when_escape_hatch_enabled(caplog):
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    with caplog.at_level(logging.INFO, logger="agent.tool_guardrails"):
+        decision = controller.before_call(
+            "session_search",
+            {"query": "actual preference", "graphiti_irrelevant": True},
+        )
+
+    assert decision.action == "allow"
+    assert "tool=session_search" in caplog.text
+    assert "Graphiti status=ok" in caplog.text
+
+
+def test_graphiti_ok_denies_flagged_session_search_when_escape_hatch_disabled():
+    controller = ToolCallGuardrailController()
+    controller.set_graphiti_routing_status("ok")
+
+    decision = controller.before_call(
+        "session_search",
+        {"query": "actual preference", "graphiti_irrelevant": True},
+    )
+
+    assert decision.action == "deny"
+    assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_irrelevant_flag_does_not_bypass_other_fallback_tools():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    decision = controller.before_call(
+        "web_search",
+        {"query": "actual preference", "graphiti_irrelevant": True},
+    )
+
+    assert decision.action == "deny"
+    assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_irrelevant_fallback_is_one_shot_per_turn():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    args = {"query": "actual preference", "graphiti_irrelevant": True}
+    controller.set_graphiti_routing_status("ok")
+
+    assert controller.before_call("session_search", args).action == "allow"
+    second = controller.before_call("session_search", args)
+    assert second.action == "deny"
+    assert second.code == "graphiti_fallback_not_allowed"
+
+    controller.reset_for_turn()
+    controller.set_graphiti_routing_status("ok")
+    assert controller.before_call("session_search", args).action == "allow"
+
+
+def test_graphiti_empty_allows_flagged_session_search_without_consuming_bypass():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    args = {"query": "actual preference", "graphiti_irrelevant": True}
+    controller.set_graphiti_routing_status("empty")
+
+    assert controller.before_call("session_search", args).action == "allow"
+
+    controller.set_graphiti_routing_status("ok")
+    assert controller.before_call("session_search", args).action == "allow"
 
 
 def test_model_visible_graphiti_result_blocks_fallback_only_for_ok_recall():

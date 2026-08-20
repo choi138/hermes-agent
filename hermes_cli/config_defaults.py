@@ -1951,6 +1951,13 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        "graphiti": {
+            # Narrow, auditable escape hatch when a successful Graphiti recall
+            # returned facts clearly unrelated to the user's question. The
+            # runtime still requires Graphiti first and permits only one flagged
+            # session_search call per turn. False preserves the strict default.
+            "allow_irrelevant_fallback": False,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

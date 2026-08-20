@@ -1210,8 +1210,15 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    # Guardrail-only signal; never changes query construction or results.
+    graphiti_irrelevant: bool = False,
 ) -> str:
-    """Run session search and close databases opened by this invocation."""
+    """Run session search and close databases opened by this invocation.
+
+    ``graphiti_irrelevant`` is consumed by the pre-call guardrail. It is
+    accepted here only to keep the registered handler shape explicit and has no
+    effect on search behavior.
+    """
     owned_dbs: List[Any] = []
     if db is None:
         try:
@@ -1426,9 +1433,10 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "Set true ONLY when a Graphiti recall in this turn returned "
-                    "status=ok but its facts were clearly unrelated to the user's "
-                    "question. This permits one logged session-search fallback. "
-                    "Never set it when Graphiti was not consulted."
+                    "status=ok but the returned facts were clearly unrelated to the "
+                    "user's question. This bypasses Graphiti-first routing for this "
+                    "one call and is logged. Never set it to skip checking Graphiti, "
+                    "and never set it when Graphiti was not consulted."
                 ),
                 "default": False,
             },
@@ -1455,6 +1463,7 @@ registry.register(
         sort=args.get("sort"),
         detail=args.get("detail", "adaptive"),
         profile=args.get("profile"),
+        graphiti_irrelevant=bool(args.get("graphiti_irrelevant", False)),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),
