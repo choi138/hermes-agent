@@ -4903,14 +4903,30 @@ def set_config_value(key: str, value: str, force: bool = False):
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
     if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
-            coerced_value = True
-        elif value.lower() in {'false', 'no', 'off'}:
-            coerced_value = False
-        elif value.isdigit():
-            coerced_value = int(value)
-        elif value.replace('.', '', 1).isdigit():
-            coerced_value = float(value)
+        stripped = value.strip()
+        # #issue: list/dict-typed keys were unwritable — a JSON array arrived as
+        # literal bracket text, so consumers that validate the key as a list
+        # failed closed.  Only well-formed JSON *containers* are parsed; prose
+        # like "3 items: [a, b]" and JSON scalars keep the historical path.
+        if (
+            stripped.startswith(("[", "{"))
+            and stripped.endswith(("]", "}"))
+        ):
+            try:
+                parsed = json.loads(stripped)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, (list, dict)):
+                coerced_value = parsed
+        if coerced_value is value:
+            if value.lower() in {'true', 'yes', 'on'}:
+                coerced_value = True
+            elif value.lower() in {'false', 'no', 'off'}:
+                coerced_value = False
+            elif value.isdigit():
+                coerced_value = int(value)
+            elif value.replace('.', '', 1).isdigit():
+                coerced_value = float(value)
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that

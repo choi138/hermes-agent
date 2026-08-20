@@ -723,3 +723,91 @@ class TestMalformedYAMLConfigPreservation:
         assert "Cannot parse" in captured.out or "Cannot parse" in captured.err
         raw = _read_config(_isolated_hermes_home)
         assert raw == self.BROKEN_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# JSON list/dict values (#issue: config set could not write list-typed keys)
+# ---------------------------------------------------------------------------
+
+class TestJsonStructuredValues:
+    """A JSON array must become a real YAML list, not a quoted string.
+
+    Before this, `hermes config set mention_inbox.repositories '["a/b","c/d"]'`
+    stored the literal bracket text, so every consumer that validated the key as
+    a list failed closed and the whole feature stopped loading.
+    """
+
+    def test_json_array_is_stored_as_yaml_list(self, tmp_path):
+        import yaml
+
+        set_config_value("mention_inbox.repositories", '["owner/one","owner/two"]')
+
+        data = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        stored = data["mention_inbox"]["repositories"]
+
+        assert stored == ["owner/one", "owner/two"]
+        assert isinstance(stored, list)
+
+    def test_json_object_is_stored_as_yaml_mapping(self, tmp_path):
+        import yaml
+
+        set_config_value("custom_section.limits", '{"max": 5, "min": 1}')
+
+        data = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        stored = data["custom_section"]["limits"]
+
+        assert stored == {"max": 5, "min": 1}
+        assert isinstance(stored, dict)
+
+    def test_empty_json_array_is_preserved(self, tmp_path):
+        import yaml
+
+        set_config_value("custom_section.items", "[]")
+
+        data = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+        assert data["custom_section"]["items"] == []
+
+    @pytest.mark.parametrize("value", [
+        "not json at all",
+        "[unclosed",
+        "{unclosed",
+        "hello [world]",
+        "3 items: [a, b]",
+    ])
+    def test_non_json_text_stays_a_plain_string(self, tmp_path, value):
+        """Only well-formed JSON containers are parsed; prose is left alone."""
+        import yaml
+
+        set_config_value("custom_section.note", value)
+
+        data = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+        assert data["custom_section"]["note"] == value
+
+    @pytest.mark.parametrize("value,expected", [
+        ("true", True),
+        ("false", False),
+        ("42", 42),
+        ("3.5", 3.5),
+        ("plain-text", "plain-text"),
+    ])
+    def test_existing_scalar_coercion_is_unchanged(self, tmp_path, value, expected):
+        """JSON support must not disturb the historical scalar behaviour."""
+        import yaml
+
+        set_config_value("custom_section.scalar", value)
+
+        data = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+        assert data["custom_section"]["scalar"] == expected
+
+    def test_json_scalar_string_does_not_become_bare_text(self, tmp_path):
+        """A quoted JSON scalar is not a container; keep the historical path."""
+        import yaml
+
+        set_config_value("custom_section.quoted", '"already-a-string"')
+
+        data = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+        assert data["custom_section"]["quoted"] == '"already-a-string"'
