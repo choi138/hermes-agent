@@ -1873,3 +1873,139 @@ def test_resolve_route_runtime_uses_canonical_resolver_without_secrets(monkeypat
     }
     assert "api_key" not in runtime
     assert "base_url" not in runtime
+
+
+# =============================================================================
+# model_routes.moods — M1 placeholder (parsed and validated, not yet consumed)
+# =============================================================================
+
+
+def _moods_cfg(moods, routes=None):
+    section = {"routes": routes if routes is not None else {"dev": _route()}}
+    section["moods"] = moods
+    return {"providers": _providers(), "model_routes": section}
+
+
+def test_moods_defaults_when_section_absent():
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}))
+    assert catalog.moods == mr.MoodsConfig()
+    assert catalog.moods.enabled is False
+    assert catalog.moods.dir == ""
+    assert catalog.moods.confidence_threshold == 0.7
+    assert catalog.moods.apply_model_routing is False
+    assert catalog.moods.routes == ()
+    assert catalog.moods.route_map() == {}
+    assert not [i for i in catalog.issues if i.severity == "error"]
+
+
+def test_moods_default_dir_under_hermes_home():
+    assert mr.MoodsConfig().resolved_dir() == get_hermes_home() / "moods"
+    assert mr.MoodsConfig(dir="~/custom/moods").resolved_dir() == (
+        Path("~/custom/moods").expanduser()
+    )
+
+
+def test_moods_full_block_parsed():
+    catalog = mr.load_routes(_moods_cfg(
+        {
+            "enabled": True,
+            "dir": "~/.hermes/moods",
+            "confidence_threshold": 0.55,
+            "apply_model_routing": True,
+            "routes": {"care": "gentle", "playful": "dev"},
+        },
+        routes={"dev": _route(), "gentle": _route(provider="p2")},
+    ))
+    moods = catalog.moods
+    assert moods.enabled is True
+    assert moods.dir == "~/.hermes/moods"
+    assert moods.confidence_threshold == 0.55
+    assert moods.apply_model_routing is True
+    assert moods.route_map() == {"care": "gentle", "playful": "dev"}
+    assert not [i for i in catalog.issues if i.severity == "error"]
+
+
+def test_moods_partial_block_inherits_defaults():
+    catalog = mr.load_routes(_moods_cfg({"enabled": True}))
+    assert catalog.moods.enabled is True
+    assert catalog.moods.confidence_threshold == 0.7
+    assert catalog.moods.apply_model_routing is False
+    assert catalog.moods.routes == ()
+
+
+def test_moods_permissive_route_is_rejected_with_error():
+    """Hard product rule: a mood must never select a refusal-bypass route."""
+    catalog = mr.load_routes(_moods_cfg(
+        {"enabled": True, "routes": {"care": "PERMISSIVE_CHAT"}},
+        routes={"dev": _route(), "PERMISSIVE_CHAT": _route(provider="p2")},
+    ))
+    errors = [i for i in catalog.issues if i.severity == "error"]
+    assert len(errors) == 1
+    assert "moods.routes.care" in errors[0].message
+    assert "PERMISSIVE_CHAT" in errors[0].message
+    assert "refusal-bypass" in errors[0].message
+    # Rejected outright — never reachable by any later consumer.
+    assert catalog.moods.route_map() == {}
+
+
+@pytest.mark.parametrize(
+    "route_name", ["PERMISSIVE_DEV", "PERMISSIVE_CHAT", "permissive_dev", "PERMISSIVE_X"]
+)
+def test_moods_permissive_rejected_by_prefix_even_when_undeclared(route_name):
+    catalog = mr.load_routes(_moods_cfg({"routes": {"cute": route_name}}))
+    errors = [i for i in catalog.issues if i.severity == "error"]
+    assert len(errors) == 1
+    assert route_name in errors[0].message
+    assert catalog.moods.routes == ()
+
+
+def test_moods_unknown_route_and_unknown_mood_are_warnings():
+    catalog = mr.load_routes(_moods_cfg(
+        {"routes": {"care": "nonexistent", "grumpy": "dev", "focused": "dev"}}
+    ))
+    assert catalog.moods.route_map() == {"focused": "dev"}
+    assert not [i for i in catalog.issues if i.severity == "error"]
+    messages = " | ".join(i.message for i in catalog.issues)
+    assert "unknown route 'nonexistent'" in messages
+    assert "unknown mood 'grumpy'" in messages
+
+
+def test_moods_bad_scalar_types_fall_back_to_defaults():
+    catalog = mr.load_routes(_moods_cfg({
+        "enabled": "yes",
+        "dir": 5,
+        "confidence_threshold": 1.5,
+        "apply_model_routing": "true",
+    }))
+    assert catalog.moods == mr.MoodsConfig()
+    assert len([i for i in catalog.issues if i.severity == "warning"]) >= 4
+
+
+def test_moods_non_mapping_section_disables_and_errors():
+    catalog = mr.load_routes(_moods_cfg(["enabled"]))
+    assert catalog.moods == mr.MoodsConfig()
+    errors = [i for i in catalog.issues if i.severity == "error"]
+    assert len(errors) == 1
+    assert "'moods' must be a mapping" in errors[0].message
+
+
+def test_moods_non_mapping_routes_errors():
+    catalog = mr.load_routes(_moods_cfg({"routes": ["care"]}))
+    assert catalog.moods.routes == ()
+    errors = [i for i in catalog.issues if i.severity == "error"]
+    assert len(errors) == 1
+    assert "moods.routes must be a mapping" in errors[0].message
+
+
+def test_moods_unknown_key_warns_but_keeps_parsing():
+    catalog = mr.load_routes(_moods_cfg({"enabled": True, "nope": 1}))
+    assert catalog.moods.enabled is True
+    assert any("unknown key 'nope' under moods" in i.message for i in catalog.issues)
+
+
+def test_moods_is_a_recognized_top_level_section():
+    """`moods` must not trip the unknown-top-level-key warning."""
+    catalog = mr.load_routes(_moods_cfg({"enabled": False}))
+    assert not any(
+        "unknown key 'moods' under model_routes" in i.message for i in catalog.issues
+    )

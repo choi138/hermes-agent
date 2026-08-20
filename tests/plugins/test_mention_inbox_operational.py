@@ -95,7 +95,6 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     for invalid in (
         {"enabled": "true"},
         {"enabled": True, "credential_env": "TOKEN"},
-        {"enabled": True, "repositories": ["other/repo"]},
         {"enabled": True, "destination": "discord:not-a-channel"},
         {"enabled": True, "retention_days": 0},
         {"enabled": True, "read_replay_lookback_minutes": 10081},
@@ -107,6 +106,47 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
     ):
         with pytest.raises(ValueError):
             parse_mention_inbox_config({"mention_inbox": invalid})
+
+
+def test_config_accepts_multiple_trusted_repositories() -> None:
+    """The allowlist is operator-controlled config, not a hardcoded constant."""
+    config = parse_mention_inbox_config({"mention_inbox": {
+        "enabled": True,
+        "repositories": [
+            "silviahealth/content",
+            "silviahealth/library",
+            "choi138/stock-research-agent",
+        ],
+    }})
+
+    assert config.repositories == (
+        "silviahealth/content",
+        "silviahealth/library",
+        "choi138/stock-research-agent",
+    )
+
+
+@pytest.mark.parametrize(
+    "repositories",
+    (
+        [],
+        ["silviahealth/content", "silviahealth/content"],
+        ["not-a-repo"],
+        ["owner/repo/extra"],
+        ["/repo"],
+        ["owner/"],
+        ["owner/re po"],
+        ["owner/repo", 7],
+    ),
+)
+def test_config_rejects_malformed_repository_allowlists(
+    repositories: list[object],
+) -> None:
+    """Widening the allowlist must not weaken its shape or duplicate checks."""
+    with pytest.raises(ValueError, match="repositories"):
+        parse_mention_inbox_config({
+            "mention_inbox": {"enabled": True, "repositories": repositories}
+        })
 
 
 @pytest.mark.parametrize(

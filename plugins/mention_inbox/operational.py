@@ -127,8 +127,13 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         not isinstance(item, str) for item in repositories
     ):
         raise ValueError("mention_inbox.repositories must be a non-empty string list")
-    if set(repositories) != {_ALLOWED_REPOSITORY}:
-        raise ValueError("mention_inbox.repositories contains a repository outside the allowlist")
+    if any(
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", item) is None
+        for item in repositories
+    ):
+        raise ValueError("mention_inbox.repositories entries must be owner/repo")
+    if len(set(repositories)) != len(repositories):
+        raise ValueError("mention_inbox.repositories must not contain duplicates")
     include_public_actionable_activity = raw.get(
         "include_public_actionable_activity", False
     )

@@ -1125,3 +1125,37 @@ def test_poller_skips_contract_invalid_notification_and_continues(
     assert result.skipped == 1
     assert store.count() == 1
     assert store.get_cursor("github.notifications") == ("Tue, 28 Jul 2026 11:20:30 GMT")
+
+
+def test_collector_selects_every_configured_repository() -> None:
+    """A multi-repository allowlist must admit each entry, private included."""
+    collector = GitHubNotificationCollector(
+        target_id="U_kgDORecentWon",
+        allowed_repositories={
+            "silviahealth/content",
+            "silviahealth/library",
+            "choi138/stock-research-agent",
+        },
+    )
+
+    for repository in (
+        "silviahealth/content",
+        "silviahealth/library",
+        "choi138/stock-research-agent",
+    ):
+        notification = _notification(repository=repository)
+        notification["repository"]["private"] = True
+        assert collector.accepts(notification) is True, repository
+
+
+def test_collector_still_rejects_repositories_outside_the_allowlist() -> None:
+    """Widening the allowlist must not turn it into an allow-all filter."""
+    collector = GitHubNotificationCollector(
+        target_id="U_kgDORecentWon",
+        allowed_repositories={"silviahealth/content", "silviahealth/library"},
+    )
+
+    notification = _notification(repository="someone-else/private-repo")
+    notification["repository"]["private"] = True
+
+    assert collector.accepts(notification) is False

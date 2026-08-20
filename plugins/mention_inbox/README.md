@@ -390,6 +390,9 @@ terminal:
 mention_inbox:
   enabled: false
   credential_env: GITHUB_PAT_TOKEN
+  # Operator-controlled allowlist. Every entry is BOTH a collection filter and a
+  # write/code-execution trust boundary, so only add repositories the approver is
+  # willing to let approved sessions modify.
   repositories: [silviahealth/content]
   include_public_actionable_activity: false
   external_repository_actions: disabled
