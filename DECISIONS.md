@@ -270,3 +270,37 @@ git worktree list
 기존 변경과 독립적으로 포함·제외할 수 있게 한다. 대가로 manifest와 trailer를
 정확히 유지해야 하며, production은 언제나 재생성 가능한 파생물로 취급해야 한다.
 현재 branch 구조와 live deployment는 이 문서만으로 바뀌지 않는다.
+
+## ADR-002 — 포크 기준점 재고정
+
+- **상태:** 채택(Accepted)
+- **결정일:** 2026-08-20
+- **범위:** 레거시 포크 이력의 통합과 `PATCHES.md` pinned base 재정의
+
+### 맥락
+
+기존 manifest는 `hermes/all-work@6715ceafa6c87f300900a6d58d39ae011c9c3adb`를
+pinned base로 삼고 그 위에 포크 변경을 독립 topic으로 재생할 수 있다고 전제했다.
+그 사이 upstream은 약 2,996개 커밋 앞서 갔고, 기존 topic들은 실제로 서로 독립적이지
+않았다. 예를 들어 `hermes/patches/refusal-chain`은 runtime-control ancestry에
+의존하면서 merge commit 16개를 포함한 117개 커밋을 운반했다. 따라서 기존 topic을
+각각 pinned base 위에 replay하는 방식으로는 같은 포크 상태를 재구성할 수 없었다.
+
+### 결정
+
+`upstream/main@4511ba49dd5830062ffbcfbdb3f2a4fc7f278ccb` 위에 레거시 포크
+이력 전체를 하나의 squash integration commit으로 통합하고, 그 통합과 후속 결함
+수정을 담은 `hermes/patches/legacy-integration`을 새 기준 브랜치로 사용한다.
+manifest의 pinned base를
+`hermes/all-work@6715ceafa6c87f300900a6d58d39ae011c9c3adb`에서
+`hermes/patches/legacy-integration@fd6e8fb67bb0588708cb2979a53437cdfd2e3b5c`로
+재고정한다. 앞으로는 이 기준점에 포함되지 않으면서 독립적으로 replay 가능한 신규
+작업만 별도 topic으로 관리한다.
+
+### 결과
+
+동기화 이전 레거시 이력은 하나의 통합 단위가 되므로 그 안에 있던 변경을 과거 topic
+단위로 rollback하는 능력은 잃는다. 대신 최신 upstream 위에서 재현·replay 가능한
+명확한 기준점을 얻고, 이미 흡수된 topic의 상호 의존성과 merge ancestry를 매번 다시
+해석할 필요가 없어진다. 이후 upstream sync에서는 legacy integration 기준점과 소수의
+outstanding 독립 topic만 검토·replay하면 된다.

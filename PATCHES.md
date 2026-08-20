@@ -7,26 +7,27 @@
 `hermes/production`에는 직접 포함하지 않는다. `hermes/production`은 pinned base와
 아래의 활성 topic branch만으로 재구성한다.
 
-> **전환 메모(2026-08-14):** 기존 `hermes/all-work`에는 이미 148개 로컬 고유 커밋이
-> 누적되어 있다. 이번 첫 적용에서는 기존 동작 보존을 우선해 `hermes/all-work` 현재 HEAD를
-> 전환용 pinned base로 삼고, 새 변경(M1)부터 topic으로 관리한다. 이후 upstream sync 전에
-> 기존 148개 커밋을 별도 topic 경계로 분해할지 결정한다.
+> **전환 메모(2026-08-20):** 레거시 포크 이력은
+> `upstream/main@4511ba49dd5830062ffbcfbdb3f2a4fc7f278ccb` 위의 단일 squash
+> integration commit으로 통합했다. 그 통합과 후속 결함 수정을 포함하는
+> `hermes/patches/legacy-integration`을 새 pinned base로 삼는다. 기존에 별도 패치로
+> 기록했던 6개 topic은 모두 이 기준점 안에 포함되므로 더 이상 독립 entry로 관리하지 않는다.
 
 ## Pinned Base
 
 - **upstream:** `NousResearch/hermes-agent`
-- **base_ref:** `hermes/all-work`
-- **base_commit:** `6715ceafa6c87f300900a6d58d39ae011c9c3adb`
-- **pinned_at:** `2026-08-14T12:32:00+09:00`
+- **base_ref:** `hermes/patches/legacy-integration`
+- **base_commit:** `fd6e8fb67bb0588708cb2979a53437cdfd2e3b5c`
+- **pinned_at:** `2026-08-20T14:30:00+09:00`
 
-`base_commit`은 M2 실제 적용 시점의 라이브 동일 SHA다.
+`base_commit`은 레거시 통합과 그 후속 결함 수정을 함께 고정한 exact SHA다.
 
 ```bash
-git rev-parse hermes/all-work
-# 6715ceafa6c87f300900a6d58d39ae011c9c3adb
+git rev-parse hermes/patches/legacy-integration
+# fd6e8fb67bb0588708cb2979a53437cdfd2e3b5c
 ```
 
-`base_ref`는 전환용 기준이며, moving ref가 전진해도 manifest 검토 없이
+`base_ref`는 통합 기준이며, moving ref가 전진해도 manifest 검토 없이
 `base_commit`을 바꾸지 않는다.
 
 ## Patch entry format
@@ -49,90 +50,78 @@ git rev-parse hermes/all-work
   - `path/to/file.py`
 ```
 
-필수 필드는 `branch`, `origin`, `upstream_pr`, `state`, `rationale`, `commits`,
-`touches`다. `state` 허용값은 정확히 `local-only | pending-upstream |
-merged-upstream | vendored`다.
+필수 필드는 `branch`, `origin`, `upstream_pr`, `state`, `enabled`, `example`,
+`rationale`, `commits`, `touches`다. `state` 허용값은 정확히 `local-only |
+pending-upstream | merged-upstream | vendored`다.
 
 ## Patches
 
-### 1. anthropic-proxy-compat
+### 1. mood-routing
 
-- **branch:** `hermes/patches/anthropic-proxy-compat`
+- **branch:** `hermes/patches/mood-routing`
 - **origin:** `local:codex`
 - **upstream_pr:** `none`
 - **state:** `local-only`
 - **enabled:** `true`
 - **example:** `false`
-- **rationale:** private Anthropic-compatible proxy(`claude.nekos.me`)를 안전하게 primary/fallback 런타임으로 사용한다. opt-in signature passthrough, OpenAI `response_format`의 Anthropic `output_config.format` 변환, fallback chain의 명시적 `api_mode` 우선순위를 각각 이식한다. `claude-fable-5` dev primary 전환과 이후 model routing 이식의 선행 호환 계층이다.
+- **rationale:** `model_routes.moods` 설정을 바탕으로 매 turn의 mood classification field를 만들고, 분류 결과에 맞는 tone을 gateway system prompt에 주입한다. 요청마다 말투와 persona를 명시적으로 조정해야 하는 운영 경로를 보존하며, upstream이 동등한 per-turn tone/persona routing hook을 제공하면 제거한다.
 - **commits:**
-  - `af09003c8104111f1b98c19f0298913333c0d7e8` feat(anthropic): trust configured signature passthrough proxies
-  - `3f35fb0b7e101ef95728f0bd95ef79dded169469` fix(aux): translate structured output for Anthropic
-  - `6eb58de2307e07a030bb4ceb772ec0d76e33fc08` fix(fallback): honor declared API modes
+  - `313f313dd095b276af26223e08a7d948a8da7ddd` feat(gateway): mood classification shadow field (M1)
+  - `94e7c0caf4fcd8b5bc9a74273f2f969714bbdc7d` feat(config): parse model_routes.moods placeholder (M1)
+  - `009775a1670c59f6785d504fcbc1f8afbb5a6215` feat(gateway): mood tone injection (M2)
 - **touches:**
-  - `agent/anthropic_adapter.py`
-  - `agent/auxiliary_client.py`
-  - `agent/chat_completion_helpers.py`
-  - `agent/conversation_loop.py`
-  - `hermes_cli/config.py`
-  - `tests/agent/test_anthropic_signature_passthrough.py`
-  - `tests/agent/test_auxiliary_client.py`
-  - `tests/hermes_cli/test_provider_config_validation.py`
-  - `tests/run_agent/test_provider_fallback.py`
-  - `tests/run_agent/test_thinking_sig_recovery_persistence.py`
-
-### 2. model-routing
-
-- **branch:** `hermes/patches/model-routing`
-- **origin:** `cherry-pick:986ffd775cdfe88028e7cabcc9af554067569fe7`
-- **upstream_pr:** `none`
-- **state:** `local-only`
-- **enabled:** `true`
-- **example:** `false`
-- **rationale:** 목적별 model route 해석, passive provider health, gateway의 fail-open shadow decision logging을 운영에 유지한다. topic 자체는 pinned base에 독립적으로 replay하고, private Anthropic proxy를 route 대상으로 쓰는 운영 구성 때문에 production에서는 `anthropic-proxy-compat` 뒤에 조립한다. upstream에 동등한 routing/health 기능이 반영되고 현재 fail-open 및 설정 호환 계약이 검증되면 제거한다.
-- **commits:**
-  - `6b0eaf75302b019424dd9dcf7bb4985b4ee8221f` feat(routing): add shadow model routing
-  - `8b7547a2f8ec6ba23b1da2ebbfc4fcb6f3c3cfff` fix(routing): make shadow evaluation observational
-- **touches:**
-  - `agent/chat_completion_helpers.py`
   - `gateway/model_router.py`
+  - `gateway/mood_loader.py`
   - `gateway/run.py`
-  - `gateway/turn_context.py`
-  - `hermes_cli/config.py`
-  - `hermes_cli/config_defaults.py`
   - `hermes_cli/model_routes.py`
   - `tests/gateway/test_model_router.py`
+  - `tests/gateway/test_mood_injection.py`
   - `tests/hermes_cli/test_model_routes.py`
-  - `tests/run_agent/test_passive_provider_health.py`
 
-### 3. per-tool-disable
+### 2. mention-inbox-multi-repo
 
-- **branch:** `hermes/patches/per-tool-disable`
-- **origin:** `Soju06/hermes-agent soju/patches/per-tool-disable`
+- **branch:** `hermes/patches/mention-inbox-multi-repo`
+- **origin:** `local:codex`
 - **upstream_pr:** `none`
 - **state:** `local-only`
 - **enabled:** `true`
 - **example:** `false`
-- **rationale:** `agent.disabled_toolsets`가 toolset 이름뿐 아니라 개별 tool 이름도 제외할 수 있게 확장하고, denylist를 Codex hermes-tools MCP sidecar까지 전파해 비활성 tool이 그 경로로도 노출·호출되지 않게 한다. upstream이 동등한 tool 단위 denylist와 sidecar 전파를 제공하면 제거한다.
+- **rationale:** mention-inbox plugin의 단일 신뢰 저장소 제한을 명시적인 다중 저장소 allowlist로 확장한다. trust gate를 비활성화하지 않고도 여러 GitHub 저장소의 mention intake를 안전하게 처리해야 하는 운영 요구를 충족하며, upstream이 동등한 다중 저장소 신뢰 목록을 제공하면 제거한다.
 - **commits:**
-  - `aecd117c85d10988fbec71020f2e5f91d4bfcf7c` feat(toolsets): allow disabling individual tools
+  - `b4abf922a674cc5c82879626a7fe930473a393b7` feat(mention-inbox): allow a multi-repository trust allowlist
 - **touches:**
-  - `agent/transports/hermes_tools_mcp_server.py`
-  - `cli-config.yaml.example`
-  - `model_tools.py`
-  - `tests/agent/transports/test_hermes_tools_mcp_server.py`
-  - `tests/test_model_tools.py`
+  - `plugins/mention_inbox/README.md`
+  - `plugins/mention_inbox/approval.py`
+  - `plugins/mention_inbox/operational.py`
+  - `plugins/mention_inbox/thread_session.py`
+  - `tests/plugins/test_github_mention_collector.py`
+  - `tests/plugins/test_mention_inbox_approval.py`
+  - `tests/plugins/test_mention_inbox_delivery_thread.py`
+  - `tests/plugins/test_mention_inbox_operational.py`
+  - `tests/plugins/test_mention_inbox_thread_session.py`
 
-### 4. strict-chat-reasoning-details
+### 3. config-set-json
 
-- **branch:** `hermes/patches/strict-chat-reasoning-details`
-- **origin:** `Soju06/hermes-agent soju/patches/strict-chat-reasoning-details`
+- **branch:** `hermes/patches/config-set-json`
+- **origin:** `local:codex`
 - **upstream_pr:** `none`
 - **state:** `local-only`
 - **enabled:** `true`
 - **example:** `false`
-- **rationale:** 엄격한 OpenAI 호환 `chat_completions` 프로바이더가 assistant replay의 `reasoning`/`reasoning_details` 필드를 400으로 거부하는 문제를 해결한다. 세션 히스토리에는 보존하고 wire payload에서만 제거한다. 현재 fallback 체인이 `anthropic_messages` 프로바이더와 codex-lb를 한 세션에서 섞기 때문에 실제 운영 경로다. upstream이 strict 엔드포인트에서 reasoning replay를 스스로 정리하면 제거한다.
+- **rationale:** `hermes config set`이 JSON array/object 인자를 구조화된 값이 아닌 bracket literal text로 저장해, 해당 key를 list/dict로 검증하는 consumer가 fail-closed한 뒤 기본값으로 조용히 되돌아가는 문제를 고친다. upstream이 같은 함수에 `_looks_structured_value` + `yaml.safe_load` 기반 처리 경로를 추가했고, 그 구현이 우리 `json.loads` 경로의 상위집합(JSON flow style + multi-line YAML block)임을 확인해 upstream 구현을 채택하고 우리 회귀 테스트를 남겨 그 경로를 검증한다. upstream 동작이 이 테스트로 계속 보증되면 제거를 검토한다.
 - **commits:**
-  - `1a880f39b8a0382afa2a8353ce1e66515decebd6` fix(chat): sanitize reasoning replay for strict providers
+  - `ca1c4d055ac78679ef71f8474b78a192f6150af0` fix(cli): reconcile config set structured values with upstream
 - **touches:**
-  - `agent/transports/chat_completions.py`
-  - `tests/run_agent/test_strict_api_validation.py`
+  - `tests/hermes_cli/test_set_config_value.py`
+
+## Contained in the pinned base
+
+다음 6개 기존 topic은 그 내용이 모두 `base_commit` 안에 포함되어 있으므로 의도적으로
+별도 patch entry를 두지 않는다.
+
+- `anthropic-proxy-compat`
+- `model-routing`
+- `per-tool-disable`
+- `strict-chat-reasoning-details`
+- `refusal-chain`
+- `durable-bg-processes`
