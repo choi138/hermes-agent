@@ -373,6 +373,7 @@ async def test_partial_session_rebinds_parent_before_thread_creation(
         store=store,
         discord=thread_discord,
         bot_mention="<@777>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         approval_available=False,
         participant_parent_channel_id=DESTINATION.split(":", 1)[1],
     )
@@ -507,6 +508,7 @@ async def test_participant_sync_retry_reuses_parent_thread_and_proposal(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         participant_user_ids=frozenset({"789391209067446323"}),
     )
     delivery = DiscordMentionDelivery(
@@ -553,6 +555,7 @@ async def test_participant_sync_retry_reuses_parent_thread_and_proposal(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         participant_user_ids=frozenset({"789391209067446323"}),
     )
     delivery = DiscordMentionDelivery(
@@ -591,6 +594,7 @@ async def test_participant_sync_retry_reuses_parent_thread_and_proposal(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         participant_user_ids=frozenset({"789391209067446323"}),
     )
     delivery = DiscordMentionDelivery(
@@ -631,6 +635,7 @@ async def test_thread_activation_failure_uses_participant_error_category(
             store=store,
             discord=thread_discord,
             bot_mention="<@1525050460166426694>",
+            trusted_repositories=frozenset({"silviahealth/content"}),
             participant_user_ids=frozenset({"789391209067446323"}),
         ),
     )
@@ -663,6 +668,7 @@ async def test_participant_sync_renews_lease_before_competing_claim(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         participant_user_ids=frozenset({"789391209067446323"}),
     )
     delivery = DiscordMentionDelivery(
@@ -691,6 +697,7 @@ async def test_participant_sync_renews_lease_before_competing_claim(
             store=store,
             discord=thread_discord,
             bot_mention="<@1525050460166426694>",
+            trusted_repositories=frozenset({"silviahealth/content"}),
             participant_user_ids=frozenset({"789391209067446323"}),
         ),
     )
@@ -724,6 +731,7 @@ async def test_stale_participant_worker_stops_after_lease_reclaim(
             store=store,
             discord=thread_discord,
             bot_mention="<@1525050460166426694>",
+            trusted_repositories=frozenset({"silviahealth/content"}),
             participant_user_ids=frozenset({"789391209067446323"}),
         ),
     )
@@ -815,6 +823,7 @@ async def test_stale_attempt_checkpoint_prevents_duplicate_proposal_send(
                 store=store,
                 discord=thread_discord,
                 bot_mention="<@1525050460166426694>",
+                trusted_repositories=frozenset({"silviahealth/content"}),
                 participant_user_ids=frozenset({"789391209067446323"}),
             ),
         )
@@ -882,6 +891,7 @@ async def test_concurrent_same_pr_rows_share_one_parent_alert(
                 store=store,
                 discord=thread_discord,
                 bot_mention="<@1525050460166426694>",
+                trusted_repositories=frozenset({"silviahealth/content"}),
                 participant_user_ids=frozenset({"789391209067446323"}),
             ),
         )
@@ -922,6 +932,7 @@ async def test_cancelled_participant_worker_leaves_reconcilable_delivery(
                 store=store,
                 discord=thread_discord,
                 bot_mention="<@1525050460166426694>",
+                trusted_repositories=frozenset({"silviahealth/content"}),
                 participant_user_ids=frozenset({"789391209067446323"}),
             ),
         )
@@ -1051,6 +1062,7 @@ async def test_delivery_uses_exact_outbox_source_revision_for_thread_bootstrap(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
     )
     delivery = DiscordMentionDelivery(
         store=store,
@@ -1086,6 +1098,7 @@ async def test_later_pr_event_uses_existing_thread_without_second_parent_card(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         approval_available=True,
     )
     delivery = DiscordMentionDelivery(
@@ -1125,6 +1138,7 @@ async def test_same_finding_and_head_do_not_advance_proposal_revision(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         approval_available=True,
     )
     delivery = DiscordMentionDelivery(
@@ -1165,6 +1179,7 @@ async def test_informational_event_is_threaded_without_replacing_actionable_prop
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         approval_available=True,
     )
     delivery = DiscordMentionDelivery(
@@ -1206,6 +1221,7 @@ async def test_terminal_work_item_reuses_original_parent_and_thread(
         store=store,
         discord=thread_discord,
         bot_mention="<@1525050460166426694>",
+        trusted_repositories=frozenset({"silviahealth/content"}),
         approval_available=True,
     )
     delivery = DiscordMentionDelivery(
