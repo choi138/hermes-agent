@@ -154,6 +154,9 @@ class _SecondaryRecoveryAdapter:
     def set_busy_session_handler(self, handler):
         self.busy_session_handler = handler
 
+    def set_completion_admission_validator(self, handler):
+        self.completion_admission_validator = handler
+
     def set_topic_recovery_fn(self, handler):
         self.topic_recovery_fn = handler
 

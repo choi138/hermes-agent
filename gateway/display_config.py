@@ -33,6 +33,9 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # Discord opts into secret-safe semantic snapshots below. Other platforms
+    # keep their existing raw/friendly progress rendering unless configured.
+    "semantic_progress": False,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -52,7 +55,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Disable when the platform should steer silently (the text still lands in
     # the active run; only the confirmation echo is suppressed).
     "busy_steer_ack_enabled": True,
-    # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
+    # When true, delete tool-progress / long-running semantic / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
     # live, just cleaned up after success so the chat doesn't fill up with
@@ -135,7 +138,14 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Discord has a native "subtext" primitive (-# small grey text) that reads
     # as metadata rather than content, so reasoning summaries default to it
     # here instead of the fenced code block used elsewhere.
-    "discord":     {**_TIER_HIGH, "reasoning_style": "subtext"},
+    "discord":     {
+        **_TIER_HIGH,
+        "reasoning_style": "subtext",
+        "semantic_progress": True,
+        # Internal iteration/tool names are diagnostic data, not user-facing
+        # progress. Operators can still inspect them in logs.
+        "busy_ack_detail": False,
+    },
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
@@ -273,12 +283,13 @@ def _normalise(setting: str, value: Any) -> Any:
         "long_running_notifications",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
+        "semantic_progress",
         "thinking_progress",
     }:
         if isinstance(value, str):
             val = value.strip().lower()
-            if val == "generic" and setting == "long_running_notifications":
-                return "generic"
+            if val in {"generic", "recap"} and setting == "long_running_notifications":
+                return val
             return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
     if setting == "cleanup_progress":

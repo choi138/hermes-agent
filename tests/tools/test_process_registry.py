@@ -12,12 +12,24 @@ from unittest.mock import MagicMock, patch
 
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
+    PROCESS_SCHEMA,
     ProcessRegistry,
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
 )
+
+
+def test_process_schema_steers_bounded_jobs_away_from_short_wait_loops():
+    description = PROCESS_SCHEMA["description"].lower()
+    timeout_description = PROCESS_SCHEMA["parameters"]["properties"]["timeout"][
+        "description"
+    ].lower()
+
+    assert "instead of repeatedly polling" in description
+    assert "call 'wait' once with timeout omitted" in description
+    assert "180s by default" in timeout_description
 
 
 @pytest.fixture()
@@ -27,16 +39,24 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
-    """Reset the cached ``systemd-run --user --scope`` availability flag
-    before each test so a probe run on a real systemd host (where
-    ``INVOCATION_ID`` is set) doesn't leak into tests that mock
-    ``subprocess.Popen``. Tests that exercise the probe directly reset the
-    cache themselves."""
+def _reset_systemd_scope_cache(monkeypatch):
+    """Reset systemd-scope state and keep durable mode opt-in for tests.
+
+    A probe run on a real systemd host (where ``INVOCATION_ID`` is set) must not
+    leak into tests that mock ``subprocess.Popen``.  Likewise, the user's real
+    ``terminal.durable_background`` config must not silently route ordinary
+    spawn tests through the durable launcher; durable-specific tests opt in with
+    an explicit ``patch.object(registry, "_durable_background_enabled", ...)``.
+    """
     import tools.process_registry as _pr
 
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False
+    monkeypatch.setattr(
+        _pr.ProcessRegistry,
+        "_durable_background_enabled",
+        staticmethod(lambda: False),
+    )
     yield
     _pr._SYSTEMD_SCOPE_AVAILABLE = original
 
@@ -49,6 +69,7 @@ def _make_session(
     exit_code=None,
     output="",
     started_at=None,
+    durable=False,
 ) -> ProcessSession:
     """Helper to create a ProcessSession for testing."""
     s = ProcessSession(
@@ -59,6 +80,7 @@ def _make_session(
         exited=exited,
         exit_code=exit_code,
         output_buffer=output,
+        durable=durable,
     )
     return s
 
@@ -132,6 +154,26 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     calls.clear()
     assert registry.kill_all("session-a") == 2
     assert sorted(c[0] for c in calls) == ["proc_a", "proc_b"]
+
+
+def test_kill_all_can_exclude_durable_without_changing_default(registry):
+    durable = _make_session(sid="proc_durable", durable=True)
+    ordinary = _make_session(sid="proc_ordinary")
+    registry._running = {durable.id: durable, ordinary.id: ordinary}
+    calls = []
+
+    def fake_kill(session_id, **kwargs):
+        calls.append(session_id)
+        return {"status": "killed"}
+
+    registry.kill_process = fake_kill
+
+    assert registry.kill_all(exclude_durable=True) == 1
+    assert calls == ["proc_ordinary"]
+
+    calls.clear()
+    assert registry.kill_all() == 2
+    assert sorted(calls) == ["proc_durable", "proc_ordinary"]
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
@@ -886,9 +928,11 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("cd /app && node server.js &>/tmp/srv.log &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0]
+        # The shell command is the LAST argv element; a nice(1) prefix may
+        # precede the shell itself (see _nice_argv).
+        shell_cmd = captured_cmd[0][-1]
         # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd
 
     def test_simple_background_preserved(self, registry):
         """Simple cmd & (no &&) must NOT be rewritten — no subshell bug."""
@@ -911,7 +955,7 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("sleep 5 &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0][2]
+        shell_cmd = captured_cmd[0][-1]
         # Simple background must remain as-is
         assert "sleep 5 &" in shell_cmd
 
@@ -939,9 +983,218 @@ class TestSpawnRewriteCompoundBackground:
         assert mock_pty_module.PtyProcess.spawn.called, \
             "PTY spawn should have been attempted"
         pty_args = mock_pty_module.PtyProcess.spawn.call_args[0][0]
-        assert "&& { node server.js & }" in pty_args[2], \
-            f"PTY path should use rewritten command, got: {pty_args[2]}"
+        assert "&& { node server.js & }" in pty_args[-1], \
+            f"PTY path should use rewritten command, got: {pty_args[-1]}"
         assert session.command == "cd /app && node server.js &"
+
+
+class TestDurableLocalSpawn:
+    def _fake_process(self, pid=4321):
+        proc = MagicMock()
+        proc.pid = pid
+        proc.stdout = MagicMock()
+        proc.poll.return_value = None
+        return proc
+
+    def test_disabled_uses_original_direct_argv(self, registry):
+        captured = []
+
+        def fake_popen(args, **kwargs):
+            captured.append((args, kwargs))
+            return self._fake_process()
+
+        fake_thread = MagicMock()
+        with patch.object(registry, "_durable_background_enabled", return_value=False), \
+             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry.subprocess.Popen", side_effect=fake_popen), \
+             patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert len(captured) == 1
+        argv, kwargs = captured[0]
+        assert "systemd-run" not in argv
+        assert argv[-3:] == ["/bin/bash", "-lic", "set +m; echo hello"]
+        assert kwargs["stdout"] is subprocess.PIPE
+        assert session.durable is False
+
+    def test_enabled_wraps_preserved_shell_invocation_in_scope(self, registry, tmp_path):
+        captured = []
+        log_path = tmp_path / "durable.log"
+        log_path.write_text("")
+
+        def fake_popen(args, **kwargs):
+            captured.append((args, kwargs))
+            return self._fake_process()
+
+        fake_thread = MagicMock()
+        with patch.object(registry, "_durable_background_enabled", return_value=True), \
+             patch.object(registry, "_durable_scope_launcher", return_value="/usr/bin/systemd-run"), \
+             patch.object(registry, "_prepare_durable_log", return_value=str(log_path)), \
+             patch.object(registry, "_await_scope_ready", return_value=(True, "")), \
+             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry.subprocess.Popen", side_effect=fake_popen), \
+             patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert len(captured) == 1
+        argv, _kwargs = captured[0]
+        assert argv[:5] == [
+            "/usr/bin/systemd-run", "--user", "--scope", "--quiet",
+            f"--unit=hermes-bg-{session.id}",
+        ]
+        separator = argv.index("--")
+        inner = argv[separator + 1:]
+        assert inner[-3:-1] == ["/bin/bash", "-lic"]
+        assert inner[-1].endswith("set +m; echo hello")
+        assert f"exec >> {log_path}" in inner[-1]
+        assert session.durable is True
+        assert session.pid == 4321
+
+    def test_enabled_without_systemd_run_falls_back(self, registry, monkeypatch):
+        captured = []
+
+        def fake_popen(args, **kwargs):
+            captured.append(args)
+            return self._fake_process()
+
+        fake_thread = MagicMock()
+        monkeypatch.setattr("tools.process_registry._DURABLE_WARNING_EMITTED", False)
+        with patch.object(registry, "_durable_background_enabled", return_value=True), \
+             patch("tools.process_registry.platform.system", return_value="Linux"), \
+             patch("tools.process_registry.shutil.which", return_value=None), \
+             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry.subprocess.Popen", side_effect=fake_popen), \
+             patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo fallback", cwd="/tmp")
+
+        assert len(captured) == 1
+        assert "systemd-run" not in captured[0]
+        assert captured[0][-1] == "set +m; echo fallback"
+        assert session.durable is False
+
+    def test_scope_launch_failure_falls_back_without_failing_spawn(
+        self, registry, tmp_path, monkeypatch
+    ):
+        captured = []
+        log_path = tmp_path / "failed-scope.log"
+        log_path.write_text("")
+
+        def fake_popen(args, **kwargs):
+            captured.append(args)
+            return self._fake_process(pid=5000 + len(captured))
+
+        fake_thread = MagicMock()
+        monkeypatch.setattr("tools.process_registry._DURABLE_WARNING_EMITTED", False)
+        with patch.object(registry, "_durable_background_enabled", return_value=True), \
+             patch.object(registry, "_durable_scope_launcher", return_value="/usr/bin/systemd-run"), \
+             patch.object(registry, "_prepare_durable_log", return_value=str(log_path)), \
+             patch.object(registry, "_await_scope_ready", return_value=(False, "user bus unavailable")), \
+             patch.object(registry, "_discard_failed_scope") as discard_scope, \
+             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry.subprocess.Popen", side_effect=fake_popen), \
+             patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo direct", cwd="/tmp")
+
+        assert len(captured) == 2
+        assert captured[0][0] == "/usr/bin/systemd-run"
+        assert "systemd-run" not in captured[1]
+        assert captured[1][-1] == "set +m; echo direct"
+        assert session.pid == 5002
+        assert session.durable is False
+        discard_scope.assert_called_once()
+
+
+# =========================================================================
+# Session-scoped cancellation
+# =========================================================================
+
+class TestSessionCancellation:
+    def test_kill_failure_still_suppresses_all_notifications(
+        self, registry, monkeypatch
+    ):
+        session = _make_session(sid="proc_stop_failure")
+        session.session_key = "session-a"
+        session.process = MagicMock(pid=4242)
+        session.notify_on_complete = True
+        session.watcher_interval = 5
+        session.watch_patterns = ["READY"]
+        registry._running[session.id] = session
+        registry.pending_watchers = [
+            {"session_id": session.id, "session_key": "session-a"},
+            {"session_id": "proc_other", "session_key": "session-b"},
+        ]
+        registry.completion_queue.put(
+            {
+                "type": "watch_match",
+                "session_id": session.id,
+                "session_key": "session-a",
+            }
+        )
+        other_event = {
+            "type": "completion",
+            "session_id": "proc_other",
+            "session_key": "session-b",
+        }
+        registry.completion_queue.put(other_event)
+        monkeypatch.setattr(
+            registry,
+            "_terminate_host_pid",
+            MagicMock(side_effect=OSError("permission denied")),
+        )
+
+        with patch.object(registry, "_write_checkpoint"):
+            affected = registry.cancel_for_session(
+                "session-a",
+                reason="stop_command",
+            )
+
+            assert affected == 1
+            assert session.exited is False
+            assert session.completion_suppressed is True
+            assert session.notify_on_complete is False
+            assert session.watcher_interval == 0
+            assert session.watch_patterns == []
+            assert registry.pending_watchers == [
+                {"session_id": "proc_other", "session_key": "session-b"}
+            ]
+            assert registry.completion_queue.get_nowait() == other_event
+            assert registry.completion_queue.empty()
+
+            # Even if the backend exits later and a stale code path restores
+            # notify_on_complete, the authoritative suppression fence wins.
+            session.notify_on_complete = True
+            session.exited = True
+            session.exit_code = 1
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
+
+    def test_finished_process_with_pending_completion_counts_once(self, registry):
+        session = _make_session(
+            sid="proc_finished_pending",
+            exited=True,
+            exit_code=0,
+        )
+        session.session_key = "session-a"
+        session.notify_on_complete = True
+        registry._finished[session.id] = session
+        registry.completion_queue.put(
+            {
+                "type": "completion",
+                "session_id": session.id,
+                "session_key": "session-a",
+            }
+        )
+
+        with patch.object(registry, "_write_checkpoint"):
+            assert registry.cancel_for_session("session-a") == 1
+            assert registry.cancel_for_session("session-a") == 0
+
+        assert session.completion_suppressed is True
+        assert registry.completion_queue.empty()
 
 
 # =========================================================================
@@ -1054,12 +1307,142 @@ class TestCheckpoint:
 # =========================================================================
 
 class TestKillProcess:
+    def test_recovered_durable_session_reads_file_log(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        log_path = tmp_path / "proc_durable.log"
+        log_path.write_text("before restart\nafter restart\n")
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_durable",
+            "command": "long-running-command",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "task_id": "t1",
+            "durable": True,
+            "log_path": str(log_path),
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch("tools.process_registry.threading.Thread"):
+            assert registry.recover_from_checkpoint() == 1
+            result = registry.read_log("proc_durable")
+
+        session = registry.get("proc_durable")
+        assert session.detached is True
+        assert session.durable is True
+        assert result["output"] == "before restart\nafter restart"
+        assert result["total_lines"] == 2
+        assert "unavailable" not in registry.poll("proc_durable").get("note", "")
+
+    def test_legacy_checkpoint_defaults_durable_false(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_legacy",
+            "command": "legacy-command",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "task_id": "t1",
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+
+        session = registry.get("proc_legacy")
+        assert session.durable is False
+        assert session.log_path is None
+
+    def test_recovered_durable_session_resumes_watch_patterns(
+        self, registry, tmp_path
+    ):
+        proc = _spawn_python_sleep(30)
+        checkpoint = tmp_path / "procs.json"
+        log_path = tmp_path / "watched.log"
+        log_path.write_text("historical output\n")
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_watched",
+            "command": "watched-command",
+            "pid": proc.pid,
+            "pid_scope": "host",
+            "host_start_time": ProcessRegistry._safe_host_start_time(proc.pid),
+            "task_id": "t1",
+            "durable": True,
+            "log_path": str(log_path),
+            "watch_patterns": ["READY"],
+        }]))
+
+        try:
+            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+                assert registry.recover_from_checkpoint() == 1
+                with log_path.open("a", encoding="utf-8") as stream:
+                    stream.write("READY after restart\n")
+                    stream.flush()
+                assert _wait_until(
+                    lambda: not registry.completion_queue.empty(), timeout=5.0
+                )
+
+            event = registry.completion_queue.get_nowait()
+            assert event["type"] == "watch_match"
+            assert event["session_id"] == "proc_watched"
+            assert "READY after restart" in event["output"]
+        finally:
+            with patch.object(
+                ProcessRegistry,
+                "_daemon_term_grace_seconds",
+                staticmethod(lambda: 0.0),
+            ):
+                registry.kill_process("proc_watched")
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def test_durable_file_refresh_cannot_duplicate_reader_output(registry, tmp_path):
+    log_path = tmp_path / "durable.log"
+    log_path.write_text("abc")
+    session = _make_session(sid="proc_sync", durable=True)
+    session.log_path = str(log_path)
+
+    assert registry._read_durable_output(session) == "abc"
+    registry._record_durable_chunk(session, "abc", expected_generation=0)
+
+    assert session.output_buffer == "abc"
+
+# =========================================================================
+# Kill process
+# =========================================================================
+
+class TestKillProcess:
     def test_kill_already_exited(self, registry):
         s = _make_session(exited=True, exit_code=0)
         registry._finished[s.id] = s
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
+
+    def test_kill_sandbox_process_uses_environment_tree_terminator(
+        self, registry, monkeypatch
+    ):
+        class FakeEnvironment:
+            def __init__(self):
+                self.calls = []
+
+            def terminate_process_tree(self, pid, *, timeout):
+                self.calls.append((pid, timeout))
+                return {"output": "", "returncode": 0}
+
+        env = FakeEnvironment()
+        s = _make_session(sid="proc_remote", command="sleep 999")
+        s.pid = 82477
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert env.calls == [(82477, 5)]
 
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
@@ -1097,6 +1480,32 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+    def test_explicit_kill_still_terminates_durable_session(self, registry, tmp_path):
+        proc = _spawn_python_sleep(30)
+        log_path = tmp_path / "durable.log"
+        log_path.write_text("still running\n")
+        session = _make_session(sid="proc_durable_kill", durable=True)
+        session.process = proc
+        session.pid = proc.pid
+        session.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        session.log_path = str(log_path)
+        registry._running[session.id] = session
+
+        try:
+            with patch.object(
+                ProcessRegistry,
+                "_daemon_term_grace_seconds",
+                staticmethod(lambda: 0.0),
+            ), patch.object(registry, "_write_checkpoint"):
+                result = registry.kill_process(session.id)
+
+            assert result["status"] == "killed"
+            assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 # =========================================================================
@@ -1714,6 +2123,11 @@ class TestSystemdCgroupIsolation:
     cgroup, so an OOM in a memory-heavy worker lets systemd-oomd kill the
     ENTIRE gateway cgroup, taking down the messaging control plane.
     """
+
+    @pytest.fixture(autouse=True)
+    def _stable_argv_without_nice(self, monkeypatch):
+        """Keep these tests focused on systemd wrapping, not nice availability."""
+        monkeypatch.setattr("tools.process_registry._nice_argv", lambda argv: argv)
 
     @pytest.fixture()
     def _gateway_identity(self, monkeypatch):

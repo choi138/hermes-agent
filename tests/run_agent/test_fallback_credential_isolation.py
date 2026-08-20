@@ -262,3 +262,151 @@ class TestBaseUrlLeak:
         # and _swap_credential is never called
         pool = agent._credential_pool
         assert pool is None, "Pool should be None — _swap_credential won't be reached"
+
+
+# ── Test: fallback observation metric cannot burn the chain ────────────
+
+
+class TestFallbackActivationObservation:
+    """The local fallback_activation emit must never change failover behaviour.
+
+    Regression guard: the emit used to sit inside the try whose handler
+    blacklists the nous credential, logs "Failed to activate fallback", and
+    RECURSES to the next chain entry — after _fallback_index and the whole
+    runtime swap were already applied. A transient sqlite error would therefore
+    have burned a healthy fallback.
+    """
+
+    @staticmethod
+    def _ready_agent():
+        agent = _make_agent(
+            provider="ollama-cloud",
+            model="glm-5.2",
+            base_url="https://ollama.com/v1",
+            api_mode="chat_completions",
+        )
+        agent._fallback_chain = [
+            {"provider": "openai-codex", "model": "gpt-5.5"},
+            {"provider": "openrouter", "model": "openrouter/auto"},
+        ]
+        agent._credential_pool = _make_pool("ollama-cloud")
+        agent._unavailable_fallback_keys = set()
+        agent._rate_limit_backoff_count = 0
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent._replace_primary_openai_client = MagicMock()
+        agent.context_compressor = None
+        agent.session_id = "session-fallback"
+        agent.platform = "cli"
+        agent._work_lane = "direct"
+        return agent
+
+    def test_metric_failure_does_not_burn_the_chain(self, caplog):
+        import logging
+        import sqlite3
+
+        from agent.chat_completion_helpers import try_activate_fallback
+        from hermes_cli.observability import local_observations
+
+        agent = self._ready_agent()
+        fallback_client = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            _custom_headers={},
+        )
+
+        def exploding(**_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "gpt-5.5"),
+        ), patch(
+            "agent.credential_pool.load_pool",
+                return_value=_make_pool("openai-codex"),
+        ), patch.object(
+            local_observations, "record_fallback_activation", exploding
+        ):
+            with caplog.at_level(logging.ERROR):
+                assert try_activate_fallback(agent) is True
+
+        # Advanced exactly once: the first chain entry, not the second.
+        assert agent._fallback_index == 1
+        assert agent.model == "gpt-5.5"
+        assert "Failed to activate fallback" not in caplog.text
+        assert agent._unavailable_fallback_keys == set()
+
+    def test_one_activation_records_one_row(self, tmp_path, monkeypatch):
+        from agent.chat_completion_helpers import try_activate_fallback
+        from agent.error_classifier import FailoverReason
+        from hermes_cli.observability import local_observations
+        from hermes_cli.observability.shared_metrics import SharedMetricsStore
+        from hermes_cli.observability.shared_metrics_contract import (
+            FALLBACK_ACTIVATION_METRIC,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config_readonly",
+            lambda: {"telemetry": {"shared_metrics": {"enabled": True}}},
+        )
+        local_observations._reset_for_tests()
+
+        agent = self._ready_agent()
+        fallback_client = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            _custom_headers={},
+        )
+
+        try:
+            with patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "gpt-5.5"),
+            ), patch(
+                "agent.credential_pool.load_pool",
+                return_value=_make_pool("openai-codex"),
+            ):
+                assert (
+                    try_activate_fallback(agent, FailoverReason.rate_limit) is True
+                )
+
+            rows = SharedMetricsStore().observation_samples(
+                metric_name=FALLBACK_ACTIVATION_METRIC
+            )
+        finally:
+            local_observations._reset_for_tests()
+
+        assert len(rows) == 1
+        assert rows[0]["value"] == 1.0
+        assert rows[0]["dimensions"]["fallback_reason"] == "rate_limit"
+        assert rows[0]["dimensions"]["call_role"] == "fallback"
+        assert rows[0]["dimensions"]["work_lane"] == "direct"
+
+    def test_exhausted_chain_records_nothing(self, tmp_path, monkeypatch):
+        from agent.chat_completion_helpers import try_activate_fallback
+        from hermes_cli.observability import local_observations
+        from hermes_cli.observability.shared_metrics import SharedMetricsStore
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config_readonly",
+            lambda: {"telemetry": {"shared_metrics": {"enabled": True}}},
+        )
+        local_observations._reset_for_tests()
+
+        agent = self._ready_agent()
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+
+        try:
+            assert try_activate_fallback(agent) is False
+            rows = SharedMetricsStore().observation_samples()
+        finally:
+            local_observations._reset_for_tests()
+
+        assert rows == []

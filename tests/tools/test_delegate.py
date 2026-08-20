@@ -9,12 +9,17 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+import copy
 import json
+import logging
 import os
+import re
+import sys
 import threading
 import time
 import types
 import unittest
+from contextvars import ContextVar
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -27,9 +32,11 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _build_dynamic_schema_overrides,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_route_override,
 )
 from hermes_state import SessionDB
 
@@ -667,6 +674,65 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
 
+    def test_failed_child_with_explanation_is_not_marked_completed(self):
+        """A failure explanation is useful output, but it is not success."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 100
+            mock_child.session_completion_tokens = 20
+            mock_child.run_conversation.return_value = {
+                "final_response": "Provider retries were exhausted.",
+                "completed": False,
+                "failed": True,
+                "interrupted": False,
+                "turn_exit_reason": "all_retries_exhausted_no_response",
+                "api_calls": 4,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test failed explanation", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(
+            entry["exit_reason"], "all_retries_exhausted_no_response"
+        )
+        self.assertEqual(entry["error"], "Provider retries were exhausted.")
+
+    def test_max_iterations_summary_remains_usable_completion(self):
+        """A normal budget stop with useful output keeps legacy semantics."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 100
+            mock_child.session_completion_tokens = 20
+            mock_child.run_conversation.return_value = {
+                "final_response": "Useful partial findings.",
+                "completed": False,
+                "failed": False,
+                "interrupted": False,
+                "turn_exit_reason": "max_iterations_reached(4/4)",
+                "api_calls": 4,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test normal budget stop", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "max_iterations")
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd
@@ -785,6 +851,38 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_key"])
         self.assertIsNone(creds["api_mode"])
         self.assertIsNone(creds["model"])
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_explicit_model_provider_override_config_runtime(self, mock_resolve):
+        mock_resolve.return_value = {
+            "model": "explicit-model",
+            "provider": "explicit-provider",
+            "base_url": "https://explicit.example/v1",
+            "api_key": "explicit-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "configured-model",
+            "provider": "configured-provider",
+            "base_url": "https://configured.example/v1",
+            "api_key": "configured-key",
+        }
+
+        creds = _resolve_delegation_credentials(
+            cfg,
+            parent,
+            model_override="explicit-model",
+            provider_override="explicit-provider",
+        )
+
+        mock_resolve.assert_called_once_with(
+            requested="explicit-provider", target_model="explicit-model"
+        )
+        self.assertEqual(creds["model"], "explicit-model")
+        self.assertEqual(creds["provider"], "explicit-provider")
+        self.assertEqual(creds["base_url"], "https://explicit.example/v1")
+        self.assertEqual(creds["api_key"], "explicit-key")
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
@@ -1038,6 +1136,40 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_child_conversation_worker_inherits_contextvars(self):
+        from tools.delegate_tool import _run_single_child
+
+        marker = ContextVar("delegate_child_marker", default="missing")
+        token = marker.set("profile-a")
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_saved_tool_names = []
+        child.tool_progress_callback = None
+        child.get_activity_summary.return_value = {
+            "api_call_count": 0,
+            "max_iterations": 1,
+        }
+        child.run_conversation.side_effect = lambda **kwargs: {
+            "final_response": marker.get(),
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 0,
+            "messages": [],
+        }
+
+        try:
+            result = _run_single_child(
+                task_index=0,
+                goal="Keep profile context",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+        finally:
+            marker.reset(token)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "profile-a")
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 
@@ -1343,6 +1475,363 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
+
+# =========================================================================
+# Model-route delegation (ADR-003 Phase 3a)
+# =========================================================================
+
+
+def _route_credentials(route_name):
+    return {
+        "model": f"model-{route_name}",
+        "provider": f"provider-{route_name}",
+        "base_url": f"https://{route_name}.example/v1",
+        "api_key": f"key-{route_name}",
+        "api_mode": "chat_completions",
+        "request_overrides": {},
+        "max_output_tokens": None,
+        "command": None,
+        "args": [],
+    }
+
+
+class TestDelegateRouteSchema(unittest.TestCase):
+    """Route names are config-derived and dormant without the catalog."""
+
+    @patch("tools.delegate_tool._route_catalog_pairs", return_value=[])
+    def test_schema_hides_route_when_catalog_is_dormant(self, _mock_pairs):
+        static_before = copy.deepcopy(DELEGATE_TASK_SCHEMA)
+
+        overrides = _build_dynamic_schema_overrides()
+        props = overrides["parameters"]["properties"]
+        static_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+
+        self.assertNotIn("route", props)
+        self.assertNotIn("route", props["tasks"]["items"]["properties"])
+        self.assertEqual(set(props), set(static_props))
+        self.assertIs(props["tasks"]["items"], static_props["tasks"]["items"])
+        self.assertEqual(DELEGATE_TASK_SCHEMA, static_before)
+
+    @patch(
+        "tools.delegate_tool._route_catalog_pairs",
+        return_value=[
+            ("dev", "Deep coding and debugging"),
+            ("chat", "Quick conversation"),
+        ],
+    )
+    def test_schema_injects_route_enum_without_raw_model_surface(self, _mock_pairs):
+        static_before = copy.deepcopy(DELEGATE_TASK_SCHEMA)
+
+        overrides = _build_dynamic_schema_overrides()
+        props = overrides["parameters"]["properties"]
+
+        self.assertEqual(props["route"]["enum"], ["dev", "chat"])
+        self.assertIn("dev: Deep coding and debugging", props["route"]["description"])
+        self.assertIn("chat: Quick conversation", props["route"]["description"])
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["route"]["enum"],
+            ["dev", "chat"],
+        )
+        self.assertNotIn("model", props)
+        self.assertNotIn("provider", props)
+        self.assertNotIn("route", DELEGATE_TASK_SCHEMA["parameters"]["properties"])
+        self.assertEqual(DELEGATE_TASK_SCHEMA, static_before)
+
+    def test_schema_enum_tracks_catalog_changes(self):
+        with patch(
+            "tools.delegate_tool._route_catalog_pairs", return_value=[("dev", "d")]
+        ):
+            first = _build_dynamic_schema_overrides()
+        with patch(
+            "tools.delegate_tool._route_catalog_pairs",
+            return_value=[("dev", "d"), ("docs", "documents")],
+        ):
+            second = _build_dynamic_schema_overrides()
+
+        self.assertEqual(
+            first["parameters"]["properties"]["route"]["enum"], ["dev"]
+        )
+        self.assertEqual(
+            second["parameters"]["properties"]["route"]["enum"],
+            ["dev", "docs"],
+        )
+
+
+class TestDelegateRouteResolution(unittest.TestCase):
+    """Catalog lookup errors and resolved runtime plumbing."""
+
+    @staticmethod
+    def _fake_routes_module(resolve_result):
+        module = types.ModuleType("hermes_cli.model_routes")
+        catalog = types.SimpleNamespace(
+            routes={
+                "dev": types.SimpleNamespace(name="dev"),
+                "chat": types.SimpleNamespace(name="chat"),
+            }
+        )
+        module.load_routes = MagicMock(return_value=catalog)
+        module.resolve_route = MagicMock(return_value=resolve_result)
+        return module
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("run_agent.AIAgent")
+    def test_requested_route_gets_teaching_error_without_catalog(
+        self, MockAgent, mock_credentials, _mock_cfg
+    ):
+        parent = _make_mock_parent()
+        with patch.dict(sys.modules, {"hermes_cli.model_routes": None}):
+            result = delegate_task(
+                goal="dormant route seam",
+                route="dev",
+                background=False,
+                parent_agent=parent,
+            )
+
+        self.assertIn("Route-based delegation is unavailable", result)
+        self.assertIn("omit 'route'", result.lower())
+        mock_credentials.assert_not_called()
+        MockAgent.assert_not_called()
+
+    def test_resolver_is_case_insensitive_and_passes_route_runtime_as_overrides(self):
+        resolved = {
+            "route": "dev",
+            "provider": "p1",
+            "model": "model-a",
+            "reasoning_effort": "xhigh",
+        }
+        module = self._fake_routes_module(resolved)
+        expected_creds = _route_credentials("dev")
+        parent = _make_mock_parent()
+        full_cfg = {"model_routes": {"routes": {"dev": {}}}}
+
+        with patch.dict(sys.modules, {"hermes_cli.model_routes": module}), patch(
+            "tools.delegate_tool._load_full_config", return_value=full_cfg
+        ), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=expected_creds,
+        ) as mock_credentials:
+            creds, effort = _resolve_route_override("  DEV  ", {}, parent)
+
+        self.assertIs(creds, expected_creds)
+        self.assertEqual(effort, "xhigh")
+        module.resolve_route.assert_called_once_with(
+            "dev", full_cfg, catalog=module.load_routes.return_value
+        )
+        mock_credentials.assert_called_once_with(
+            {},
+            parent,
+            model_override="model-a",
+            provider_override="p1",
+        )
+
+    def test_unknown_and_unhealthy_routes_name_declared_catalog(self):
+        module = self._fake_routes_module(None)
+        parent = _make_mock_parent()
+
+        with patch.dict(sys.modules, {"hermes_cli.model_routes": module}), patch(
+            "tools.delegate_tool._load_full_config", return_value={}
+        ):
+            with self.assertRaisesRegex(ValueError, "Declared routes: dev, chat"):
+                _resolve_route_override("docs", {}, parent)
+            with self.assertRaisesRegex(ValueError, "no healthy runtime"):
+                _resolve_route_override("dev", {}, parent)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_route_override")
+    @patch("run_agent.AIAgent")
+    def test_route_runtime_and_reasoning_reach_child(
+        self, MockAgent, mock_route, mock_default_credentials, mock_cfg
+    ):
+        cfg = {
+            "max_iterations": 5,
+            "provider": "broken-config-provider",
+            "reasoning_effort": "low",
+        }
+        mock_cfg.return_value = cfg
+        mock_route.return_value = (_route_credentials("dev"), "xhigh")
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = child
+        parent = _make_mock_parent()
+
+        delegate_task(
+            goal="route runtime reaches child",
+            route="dev",
+            background=False,
+            parent_agent=parent,
+        )
+
+        mock_route.assert_called_once_with("dev", cfg, parent)
+        mock_default_credentials.assert_not_called()
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["model"], "model-dev")
+        self.assertEqual(kwargs["provider"], "provider-dev")
+        self.assertEqual(kwargs["base_url"], "https://dev.example/v1")
+        self.assertEqual(kwargs["api_key"], "key-dev")
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"}
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_route_override")
+    @patch("run_agent.AIAgent")
+    def test_delegation_default_route_applies_without_call_selector(
+        self, MockAgent, mock_route, mock_default_credentials, mock_cfg
+    ):
+        cfg = {"max_iterations": 5, "default_route": "docs"}
+        mock_cfg.return_value = cfg
+        mock_route.return_value = (_route_credentials("docs"), "")
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = child
+        parent = _make_mock_parent()
+
+        delegate_task(
+            goal="default route child",
+            background=False,
+            parent_agent=parent,
+        )
+
+        mock_route.assert_called_once_with("docs", cfg, parent)
+        mock_default_credentials.assert_not_called()
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "model-docs")
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_route_override")
+    @patch("run_agent.AIAgent")
+    def test_mixed_batch_resolves_config_credentials_only_for_unrouted_task(
+        self, MockAgent, mock_route, mock_default_credentials, _mock_cfg
+    ):
+        mock_route.return_value = (_route_credentials("dev"), "")
+        mock_default_credentials.return_value = _route_credentials("configured")
+        children = []
+        for label in ("dev", "configured"):
+            child = MagicMock(name=label)
+            child.run_conversation.return_value = {
+                "final_response": label,
+                "completed": True,
+                "api_calls": 1,
+            }
+            children.append(child)
+        MockAgent.side_effect = children
+        parent = _make_mock_parent()
+
+        delegate_task(
+            tasks=[
+                {"goal": "routed child", "route": "dev"},
+                {"goal": "configured child"},
+            ],
+            background=False,
+            parent_agent=parent,
+        )
+
+        mock_route.assert_called_once()
+        mock_default_credentials.assert_called_once_with(
+            {"max_iterations": 5}, parent
+        )
+        self.assertEqual(
+            [call.kwargs["model"] for call in MockAgent.call_args_list],
+            ["model-dev", "model-configured"],
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_route_override")
+    @patch("run_agent.AIAgent")
+    def test_per_task_route_wins_and_each_distinct_route_resolves_once(
+        self, MockAgent, mock_route, mock_default_credentials, _mock_cfg
+    ):
+        def resolve(name, _cfg, _parent):
+            canonical = name.casefold()
+            return _route_credentials(canonical), ""
+
+        mock_route.side_effect = resolve
+        children = []
+        for label in ("chat", "dev-a", "dev-b"):
+            child = MagicMock(name=label)
+            child.run_conversation.return_value = {
+                "final_response": label,
+                "completed": True,
+                "api_calls": 1,
+            }
+            children.append(child)
+        MockAgent.side_effect = children
+        parent = _make_mock_parent()
+
+        delegate_task(
+            tasks=[
+                {"goal": "top route child"},
+                {"goal": "per-task dev child", "route": "dev"},
+                {"goal": "same route casefold child", "route": "DEV"},
+            ],
+            route="chat",
+            background=False,
+            parent_agent=parent,
+        )
+
+        self.assertEqual(
+            [call.args[0] for call in mock_route.call_args_list], ["chat", "dev"]
+        )
+        self.assertEqual(
+            [call.kwargs["model"] for call in MockAgent.call_args_list],
+            ["model-chat", "model-dev", "model-dev"],
+        )
+        mock_default_credentials.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_route_override")
+    @patch("run_agent.AIAgent")
+    def test_explicit_model_provider_remain_compatible_and_beat_default_route(
+        self, MockAgent, mock_route, mock_credentials, mock_cfg
+    ):
+        cfg = {
+            "max_iterations": 5,
+            "default_route": "dev",
+            "model": "configured-model",
+            "provider": "configured-provider",
+        }
+        mock_cfg.return_value = cfg
+        mock_credentials.return_value = _route_credentials("explicit")
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = child
+        parent = _make_mock_parent()
+
+        delegate_task(
+            goal="explicit override compatibility",
+            model="explicit-model",
+            provider="explicit-provider",
+            background=False,
+            parent_agent=parent,
+        )
+
+        mock_route.assert_not_called()
+        mock_credentials.assert_called_once_with(
+            cfg,
+            parent,
+            model_override="explicit-model",
+            provider_override="explicit-provider",
+        )
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "model-explicit")
+
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================
@@ -1383,6 +1872,33 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_route_and_explicit_compatibility_fields_are_forwarded(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "route a child",
+                    "route": "dev",
+                    "model": "legacy-model",
+                    "provider": "legacy-provider",
+                },
+            )
+
+        self.assertEqual(captured["route"], "dev")
+        self.assertEqual(captured["model"], "legacy-model")
+        self.assertEqual(captured["provider"], "legacy-provider")
+        self.assertIs(captured["parent_agent"], parent)
+
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -1947,6 +2463,1077 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# Active-delegation fingerprint dedup
+# ---------------------------------------------------------------------------
+
+import tools.delegate_tool as _delegate_mod
+
+_DEDUP_CREDS = {
+    "provider": None,
+    "base_url": None,
+    "api_key": None,
+    "api_mode": None,
+    "model": None,
+}
+
+
+def _dedup_parent(
+    session_id="sess-dedup",
+    turn_id="turn-dedup",
+    workspace="/tmp/hermes-dedup-ws",
+):
+    """Parent whose fingerprint inputs are real strings, not MagicMock stubs."""
+    parent = _make_mock_parent(depth=0)
+    parent.session_id = session_id
+    parent._current_turn_id = turn_id
+    parent.terminal_cwd = workspace
+    parent._memory_manager = None
+    return parent
+
+
+class TestActiveDelegationDedup(unittest.TestCase):
+    """A byte-identical delegation must not run twice concurrently.
+
+    The incident: the same expensive review was delegated again while an
+    equivalent child was still in flight, doubling model/API queue contention.
+    Only a *truly* identical concurrent delegation is suppressed — sequential
+    reruns and intentionally different comparison/QA work still spawn.
+    """
+
+    def tearDown(self):
+        """No test may leave a fingerprint claimed.
+
+        A stranded reservation would suppress that exact delegation for the
+        rest of the process, so every test here doubles as a leak detector.
+        """
+        with _delegate_mod._active_delegation_lock:
+            leaked = dict(_delegate_mod._active_delegations)
+            _delegate_mod._active_delegations.clear()
+        self.assertEqual(leaked, {}, "delegation reservation was never released")
+
+    def _concurrent_delegate(self, first_kwargs, second_kwargs, second_creds=None):
+        """Start `first_kwargs`, hold its child inside ``_run_single_child``,
+        then issue `second_kwargs` from this thread while the first is live.
+
+        `second_creds` overrides the resolved provider/model for the second
+        delegation only — those are not model-facing kwargs, so varying them
+        is the only way to exercise their slot in the fingerprint.
+
+        Returns ``(built, run_goals, second_result)``.  Only the first child to
+        reach ``_run_single_child`` blocks, so a second delegation that is
+        *allowed* to run returns immediately instead of stalling the test.
+        """
+        main_ident = threading.get_ident()
+
+        def _creds(*args, **kwargs):
+            # The second delegation is the one issued from this thread; the
+            # first runs on the worker thread below.
+            if second_creds is not None and threading.get_ident() == main_ident:
+                return dict(second_creds)
+            return dict(_DEDUP_CREDS)
+
+        built = []
+        run_goals = []
+        state_lock = threading.Lock()
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def _build(*args, **kwargs):
+            child = MagicMock()
+            with state_lock:
+                child._subagent_id = f"sa-{len(built)}-dedup"
+                built.append(kwargs)
+            return child
+
+        def _run(task_index, goal, child=None, parent_agent=None, **kwargs):
+            with state_lock:
+                run_goals.append(goal)
+                is_first = len(run_goals) == 1
+            first_started.set()
+            if is_first:
+                release_first.wait(timeout=5)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+
+        holder = {}
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            side_effect=_creds,
+        ), patch(
+            "tools.delegate_tool._build_child_agent", side_effect=_build
+        ), patch(
+            "tools.delegate_tool._run_single_child", side_effect=_run
+        ):
+
+            def _first():
+                holder["first"] = delegate_task(**first_kwargs)
+
+            thread = threading.Thread(target=_first, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(
+                    first_started.wait(timeout=5), "first child never started"
+                )
+                holder["second"] = delegate_task(**second_kwargs)
+            finally:
+                release_first.set()
+                thread.join(timeout=10)
+
+        self.assertFalse(thread.is_alive(), "first delegation never finished")
+        return built, run_goals, json.loads(holder["second"])
+
+    def test_concurrent_identical_delegation_suppressed(self):
+        parent = _dedup_parent()
+        call = {
+            "goal": "Review the payment module for concurrency bugs",
+            "context": "focus on the refund path",
+            "parent_agent": parent,
+        }
+
+        built, run_goals, second = self._concurrent_delegate(dict(call), dict(call))
+
+        self.assertEqual(len(built), 1, "duplicate delegation built a second child")
+        self.assertEqual(len(run_goals), 1, "duplicate delegation ran a second child")
+
+        entry = second["results"][0]
+        self.assertEqual(entry["status"], "duplicate")
+        self.assertEqual(entry["api_calls"], 0)
+        self.assertTrue(entry.get("fingerprint"), "duplicate entry lacks fingerprint")
+        self.assertTrue(
+            entry.get("existing_subagent_id"),
+            "duplicate entry lacks the in-flight owner id",
+        )
+
+    def _sequential_delegate(self, calls, build_side_effect=None):
+        """Run each kwargs dict in `calls` to completion, in order.
+
+        Nothing blocks, so every reservation is released before the next call —
+        this is the control for "only *concurrent* duplicates are suppressed".
+        Returns ``(built, run_goals, [parsed results])``.
+        """
+        built = []
+        run_goals = []
+
+        def _build(*args, **kwargs):
+            if build_side_effect is not None:
+                build_side_effect(len(built))
+            child = MagicMock()
+            child._subagent_id = f"sa-{len(built)}-dedup"
+            built.append(kwargs)
+            return child
+
+        def _run(task_index, goal, child=None, parent_agent=None, **kwargs):
+            run_goals.append(goal)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+
+        results = []
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=dict(_DEDUP_CREDS),
+        ), patch(
+            "tools.delegate_tool._build_child_agent", side_effect=_build
+        ), patch(
+            "tools.delegate_tool._run_single_child", side_effect=_run
+        ):
+            for call in calls:
+                results.append(json.loads(delegate_task(**call)))
+
+        return built, run_goals, results
+
+    def test_sequential_rerun_after_completion_is_not_suppressed(self):
+        """Once the first child finishes, the identical task must run again."""
+        parent = _dedup_parent()
+        call = {
+            "goal": "Review the payment module for concurrency bugs",
+            "context": "focus on the refund path",
+            "parent_agent": parent,
+        }
+
+        built, run_goals, results = self._sequential_delegate(
+            [dict(call), dict(call)]
+        )
+
+        self.assertEqual(len(built), 2, "sequential rerun was wrongly suppressed")
+        self.assertEqual(len(run_goals), 2, "sequential rerun never ran")
+        for i, result in enumerate(results):
+            self.assertEqual(
+                result["results"][0]["status"],
+                "completed",
+                f"run {i} did not complete",
+            )
+
+    def test_child_build_exception_releases_reservation(self):
+        """A crash between reserve and run must not strand the fingerprint."""
+        parent = _dedup_parent()
+        call = {
+            "goal": "Review the payment module for concurrency bugs",
+            "context": "focus on the refund path",
+            "parent_agent": parent,
+        }
+
+        def _explode_on_first(build_count):
+            if build_count == 0:
+                raise RuntimeError("child build blew up")
+
+        with self.assertRaises(RuntimeError):
+            self._sequential_delegate(
+                [dict(call)], build_side_effect=_explode_on_first
+            )
+
+        with _delegate_mod._active_delegation_lock:
+            self.assertEqual(
+                dict(_delegate_mod._active_delegations),
+                {},
+                "failed build left the fingerprint claimed forever",
+            )
+
+        # ...and the very same task is delegable again.
+        built, run_goals, _results = self._sequential_delegate([dict(call)])
+        self.assertEqual(len(built), 1)
+        self.assertEqual(len(run_goals), 1)
+
+    def test_release_requires_owner_match(self):
+        """One caller must never drop another caller's reservation."""
+        reserve = _delegate_mod._reserve_active_delegation
+        release = _delegate_mod._release_active_delegation
+        fingerprint = "f" * 64
+
+        self.assertIsNone(reserve(fingerprint, owner_id="owner-a", task_index=0))
+
+        # A stale/foreign owner id is refused, and the claim survives it.
+        self.assertFalse(release(fingerprint, "owner-b"))
+        self.assertIsNotNone(
+            reserve(fingerprint, owner_id="owner-c", task_index=0),
+            "foreign release freed owner-a's reservation",
+        )
+
+        # The real owner releases it exactly once.
+        self.assertTrue(release(fingerprint, "owner-a"))
+        self.assertFalse(release(fingerprint, "owner-a"), "double release accepted")
+
+        # Now free for the next caller.
+        self.assertIsNone(reserve(fingerprint, owner_id="owner-d", task_index=0))
+        self.assertTrue(release(fingerprint, "owner-d"))
+
+    def test_exact_duplicate_within_one_batch_runs_as_explicit_n_sample(self):
+        """Explicit batch entries are distinct requests, even with equal text.
+
+        Dedup suppresses an equivalent request from another concurrent
+        ``delegate_task`` call.  It must not silently reduce a caller-requested
+        N-sample batch before any child has started.
+        """
+        parent = _dedup_parent()
+        task = {
+            "goal": "Audit the retry policy",
+            "context": "focus on exponential backoff",
+        }
+
+        built, run_goals, results = self._sequential_delegate(
+            [{"tasks": [dict(task), dict(task)], "parent_agent": parent}]
+        )
+
+        self.assertEqual(len(built), 2, "explicit N-sample batch was collapsed")
+        self.assertEqual(len(run_goals), 2, "one explicit batch entry never ran")
+
+        entries = results[0]["results"]
+        self.assertEqual(len(entries), 2, "a batch result entry went missing")
+        self.assertEqual(
+            [e["task_index"] for e in entries],
+            [0, 1],
+            "batch result ordering was not preserved",
+        )
+        self.assertEqual([e["status"] for e in entries], ["completed", "completed"])
+
+    def test_finished_child_stops_suppressing_while_sibling_still_runs(self):
+        """A reservation belongs to one child, not to the batch around it.
+
+        Two children run in one batch: A completes, B stays blocked.  While B
+        is genuinely still in flight, an identical delegation to A must RUN
+        (its request is over, so nothing is being duplicated) while an
+        identical delegation to B must still be SUPPRESSED.  Releasing only
+        when the whole batch drained would falsely suppress A here.
+
+        Fully event-driven — no sleeps.  ``_release_active_delegation`` is
+        spied on so the probes are issued only once A's claim has actually been
+        dropped; B's blocking run guarantees the batch has not finished.
+
+        This covers the background path too: ``background=true`` hands this
+        exact ``_execute_and_aggregate`` closure to the async scheduler as its
+        runner (see ``_batch_runner``), so the per-child release lives on the
+        one code path both modes share.
+        """
+        parent = _dedup_parent()
+        goal_a = "Audit the retry policy"
+        goal_b = "Audit the refund ledger"
+        shared_context = "focus on exponential backoff"
+
+        built = []
+        run_goals = []
+        state_lock = threading.Lock()
+        b_started = threading.Event()
+        release_b = threading.Event()
+        a_claim_dropped = threading.Event()
+
+        real_release = _delegate_mod._release_active_delegation
+
+        def _spy_release(fingerprint, owner_id):
+            dropped = real_release(fingerprint, owner_id)
+            # B is blocked and every probe below is issued after this fires, so
+            # the first successful release in this test is A's and only A's.
+            if dropped:
+                a_claim_dropped.set()
+            return dropped
+
+        def _build(*args, **kwargs):
+            child = MagicMock()
+            with state_lock:
+                child._subagent_id = f"sa-{len(built)}-dedup"
+                built.append(kwargs)
+            return child
+
+        def _run(task_index, goal, child=None, parent_agent=None, **kwargs):
+            with state_lock:
+                run_goals.append(goal)
+            if goal == goal_b:
+                b_started.set()
+                release_b.wait(timeout=5)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+
+        holder = {}
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "tools.delegate_tool._get_max_concurrent_children", return_value=2
+        ), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=dict(_DEDUP_CREDS),
+        ), patch(
+            "tools.delegate_tool._build_child_agent", side_effect=_build
+        ), patch(
+            "tools.delegate_tool._run_single_child", side_effect=_run
+        ), patch(
+            "tools.delegate_tool._release_active_delegation",
+            side_effect=_spy_release,
+        ):
+
+            def _batch():
+                holder["batch"] = delegate_task(
+                    tasks=[
+                        {"goal": goal_a, "context": shared_context},
+                        {"goal": goal_b, "context": shared_context},
+                    ],
+                    parent_agent=parent,
+                )
+
+            thread = threading.Thread(target=_batch, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(b_started.wait(timeout=5), "child B never started")
+                self.assertTrue(
+                    a_claim_dropped.wait(timeout=5),
+                    "child A finished but its reservation was never released",
+                )
+                # B is provably mid-run (it is parked on release_b), so the
+                # batch cannot have reached its batch-wide sweep yet.
+                self.assertFalse(release_b.is_set())
+                holder["probe_a"] = delegate_task(
+                    goal=goal_a, context=shared_context, parent_agent=parent
+                )
+                holder["probe_b"] = delegate_task(
+                    goal=goal_b, context=shared_context, parent_agent=parent
+                )
+            finally:
+                release_b.set()
+                thread.join(timeout=10)
+
+        self.assertFalse(thread.is_alive(), "batch never finished")
+
+        probe_a = json.loads(holder["probe_a"])["results"][0]
+        probe_b = json.loads(holder["probe_b"])["results"][0]
+
+        self.assertEqual(
+            probe_a["status"],
+            "completed",
+            "a finished child kept suppressing its own task while a sibling ran",
+        )
+        self.assertEqual(
+            probe_b["status"],
+            "duplicate",
+            "the still-running child stopped suppressing its duplicate",
+        )
+        self.assertEqual(probe_b["api_calls"], 0)
+        self.assertTrue(probe_b.get("existing_subagent_id"))
+
+        # A ran twice (batch + probe), B exactly once — the probe never
+        # double-ran the child that was actually in flight.
+        self.assertEqual(run_goals.count(goal_a), 2)
+        self.assertEqual(run_goals.count(goal_b), 1)
+        self.assertEqual(len(built), 3, "probe B built a child it should not have")
+
+        batch = json.loads(holder["batch"])["results"]
+        self.assertEqual([e["status"] for e in batch], ["completed", "completed"])
+
+    def test_distinct_delegations_are_never_suppressed(self):
+        """Each identity component alone must keep two delegations independent."""
+        base_parent = _dedup_parent()
+        base = {
+            "goal": "Review the payment module for concurrency bugs",
+            "context": "focus on the refund path",
+            "parent_agent": base_parent,
+        }
+
+        # (label, second-call kwargs, second-call resolved creds)
+        variants = [
+            ("goal", {**base, "goal": "Review the payout module instead"}, None),
+            ("context", {**base, "context": "focus on the capture path"}, None),
+            ("role", {**base, "role": "orchestrator"}, None),
+            ("model", dict(base), {**_DEDUP_CREDS, "model": "some-other-model"}),
+            ("provider", dict(base), {**_DEDUP_CREDS, "provider": "other-provider"}),
+            (
+                "base_url",
+                dict(base),
+                {**_DEDUP_CREDS, "base_url": "https://other-endpoint.invalid/v1"},
+            ),
+            (
+                "api_key",
+                dict(base),
+                {**_DEDUP_CREDS, "api_key": "synthetic-second-credential"},
+            ),
+            (
+                "turn_id",
+                {**base, "parent_agent": _dedup_parent(turn_id="turn-OTHER")},
+                None,
+            ),
+            (
+                "session_id",
+                {**base, "parent_agent": _dedup_parent(session_id="sess-OTHER")},
+                None,
+            ),
+            (
+                "workspace",
+                {
+                    **base,
+                    "parent_agent": _dedup_parent(workspace="/tmp/hermes-other-ws"),
+                },
+                None,
+            ),
+        ]
+
+        for label, variant, creds in variants:
+            with self.subTest(differs_by=label):
+                built, run_goals, second = self._concurrent_delegate(
+                    dict(base), dict(variant), second_creds=creds
+                )
+                self.assertEqual(
+                    len(built), 2, f"differing {label} was wrongly deduped"
+                )
+                self.assertEqual(
+                    len(run_goals), 2, f"differing {label} never ran its child"
+                )
+                self.assertEqual(second["results"][0]["status"], "completed")
+
+    def _background_delegate(
+        self, dispatch_result, run_exc=None, after=None, **call_kwargs
+    ):
+        """Dispatch a background batch with the async scheduler stubbed out.
+
+        `dispatch_result` is what the fake ``dispatch_async_delegation_batch``
+        returns, or an exception instance to raise instead.  The real runner /
+        interrupt closures are captured and handed to ``after(captured,
+        run_goals)``, which runs while the patches are still active so the test
+        can drive the batch's terminal paths itself — no daemon threads, no
+        timing.
+
+        Returns ``(built, run_goals, captured, result)`` where `captured` holds
+        the ``runner`` and ``interrupt_fn`` handed to the scheduler.
+        """
+        built = []
+        run_goals = []
+        captured = {}
+
+        def _build(*args, **kwargs):
+            child = MagicMock()
+            child._subagent_id = f"sa-{len(built)}-dedup"
+            built.append(kwargs)
+            return child
+
+        def _run(task_index, goal, child=None, parent_agent=None, **kwargs):
+            run_goals.append(goal)
+            if run_exc is not None:
+                raise run_exc
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+
+        def _dispatch(**kwargs):
+            captured.update(kwargs)
+            if isinstance(dispatch_result, BaseException):
+                raise dispatch_result
+            return dict(dispatch_result)
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=dict(_DEDUP_CREDS),
+        ), patch(
+            "tools.delegate_tool._build_child_agent", side_effect=_build
+        ), patch(
+            "tools.delegate_tool._run_single_child", side_effect=_run
+        ), patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            side_effect=_dispatch,
+        ), patch(
+            "gateway.session_context.async_delivery_supported", return_value=True
+        ):
+            raw = delegate_task(background=True, **call_kwargs)
+            if after is not None:
+                after(captured, run_goals)
+
+        return built, run_goals, captured, json.loads(raw)
+
+    def _held_fingerprints(self):
+        with _delegate_mod._active_delegation_lock:
+            return dict(_delegate_mod._active_delegations)
+
+    def test_background_reservation_is_held_until_the_runner_finishes(self):
+        """Hand-off keeps the claim; the runner's completion drops it."""
+        parent = _dedup_parent()
+        goal = "Review the payment module for concurrency bugs"
+        seen = {}
+
+        def _after(captured, run_goals):
+            # Dispatch has returned but the daemon executor has not started the
+            # batch yet: the claim must still stand, so a second identical
+            # delegation issued right now is still suppressed.
+            seen["queued_goals"] = list(run_goals)
+            seen["queued_holds"] = self._held_fingerprints()
+            seen["batch"] = captured["runner"]()
+
+        built, run_goals, _captured, result = self._background_delegate(
+            {"status": "dispatched", "delegation_id": "deleg-1"},
+            after=_after,
+            goal=goal,
+            context="focus on the refund path",
+            parent_agent=parent,
+        )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(len(built), 1)
+        self.assertEqual(
+            seen["queued_goals"], [], "dispatch ran the child instead of queueing it"
+        )
+        self.assertEqual(
+            len(seen["queued_holds"]),
+            1,
+            "dispatch dropped the reservation while the batch was still queued",
+        )
+
+        # The runner has now completed, as the daemon executor would have.
+        self.assertEqual(run_goals, [goal])
+        self.assertEqual(seen["batch"]["results"][0]["status"], "completed")
+        self.assertEqual(
+            self._held_fingerprints(),
+            {},
+            "background runner completion never released the reservation",
+        )
+
+    def test_background_runner_exception_releases_reservation(self):
+        """Runner error and the post-cancel unwind share this release path."""
+        parent = _dedup_parent()
+
+        def _after(captured, run_goals):
+            # A cancelled batch interrupts its children and then unwinds
+            # through the very same runner frame, so this covers both the
+            # error and the cancellation terminal paths.
+            captured["interrupt_fn"]()
+            with self.assertRaises(RuntimeError):
+                captured["runner"]()
+
+        _built, _run_goals, _captured, result = self._background_delegate(
+            {"status": "dispatched", "delegation_id": "deleg-2"},
+            run_exc=RuntimeError("batch runner blew up"),
+            after=_after,
+            goal="Review the payment module for concurrency bugs",
+            parent_agent=parent,
+        )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(
+            self._held_fingerprints(),
+            {},
+            "a failed background runner stranded the reservation",
+        )
+
+    def test_background_dispatch_rejection_releases_reservation(self):
+        """Pool at capacity runs inline, and inline completion releases."""
+        parent = _dedup_parent()
+        _built, run_goals, _captured, result = self._background_delegate(
+            {"status": "rejected", "error": "async pool at capacity"},
+            goal="Review the payment module for concurrency bugs",
+            parent_agent=parent,
+        )
+
+        self.assertEqual(len(run_goals), 1, "rejected dispatch never ran inline")
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertIn("capacity", result.get("note", ""))
+        self.assertEqual(
+            self._held_fingerprints(),
+            {},
+            "pool-at-capacity fallback stranded the reservation",
+        )
+
+    def test_background_dispatch_exception_releases_reservation(self):
+        """A scheduler that raises must not leave the fingerprint claimed."""
+        parent = _dedup_parent()
+        with self.assertRaises(RuntimeError):
+            self._background_delegate(
+                RuntimeError("scheduler exploded"),
+                goal="Review the payment module for concurrency bugs",
+                parent_agent=parent,
+            )
+
+        self.assertEqual(
+            self._held_fingerprints(),
+            {},
+            "a raising scheduler stranded the reservation",
+        )
+
+    def test_background_post_dispatch_failure_keeps_runner_owned_reservation(self):
+        """Once accepted, only the background runner may release its claim."""
+        parent = _dedup_parent()
+        captured = {}
+
+        def _build(*args, **kwargs):
+            child = MagicMock()
+            child._subagent_id = "sa-owned-by-runner"
+            return child
+
+        def _run(task_index, goal, child=None, parent_agent=None, **kwargs):
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+
+        def _dispatch(**kwargs):
+            captured.update(kwargs)
+            # Accepted by the scheduler, but deliberately not JSON serialisable:
+            # the parent-frame response construction fails after ownership moved.
+            return {"status": "dispatched", "delegation_id": object()}
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=dict(_DEDUP_CREDS),
+        ), patch(
+            "tools.delegate_tool._build_child_agent", side_effect=_build
+        ), patch(
+            "tools.delegate_tool._run_single_child", side_effect=_run
+        ), patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            side_effect=_dispatch,
+        ), patch(
+            "gateway.session_context.async_delivery_supported", return_value=True
+        ):
+            with self.assertRaises(TypeError):
+                delegate_task(
+                    background=True,
+                    goal="Review ownership transfer",
+                    parent_agent=parent,
+                )
+
+            self.assertEqual(
+                len(self._held_fingerprints()),
+                1,
+                "parent frame released a reservation already owned by runner",
+            )
+            captured["runner"]()
+
+        self.assertEqual(
+            self._held_fingerprints(),
+            {},
+            "background runner completion did not release its reservation",
+        )
+
+    def test_malformed_result_index_sorts_after_valid_entries(self):
+        """Internal malformed results cannot jump ahead of caller task order."""
+        parent = _dedup_parent()
+
+        def _build(*args, **kwargs):
+            child = MagicMock()
+            child._subagent_id = f"sa-sort-{kwargs['task_index']}"
+            return child
+
+        def _run(task_index, goal, child=None, parent_agent=None, **kwargs):
+            return {
+                "task_index": "malformed" if task_index == 0 else task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=dict(_DEDUP_CREDS),
+        ), patch(
+            "tools.delegate_tool._build_child_agent", side_effect=_build
+        ), patch(
+            "tools.delegate_tool._run_single_child", side_effect=_run
+        ):
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "bad index"}, {"goal": "valid index"}],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(
+            [entry["task_index"] for entry in result["results"]],
+            [1, "malformed"],
+        )
+
+    def test_background_explicit_n_sample_batch_dispatches_every_entry(self):
+        """Equal entries in one explicit background batch are separate requests."""
+        parent = _dedup_parent()
+        task = {"goal": "Audit the retry policy", "context": "backoff only"}
+        _built, run_goals, captured, result = self._background_delegate(
+            {"status": "dispatched", "delegation_id": "deleg-3"},
+            after=lambda captured, run_goals: captured["runner"](),
+            tasks=[dict(task), dict(task)],
+            parent_agent=parent,
+        )
+
+        self.assertEqual(
+            captured["goals"],
+            ["Audit the retry policy", "Audit the retry policy"],
+        )
+        self.assertEqual(result["count"], 2)
+        self.assertNotIn("duplicates", result)
+        self.assertEqual(len(run_goals), 2)
+        self.assertEqual(self._held_fingerprints(), {})
+
+
+# =========================================================================
+# Request-size instrumentation on normal (non-timeout) child runs
+# =========================================================================
+
+# One numeric key=value pair per field, nothing else. Anchored on both ends so
+# a stray path, URL, repr or prompt fragment cannot slip in unnoticed.
+_SIZE_LINE_RE = re.compile(r"^subagent_request_size(?: [a-z_]+=\d+)+$")
+
+_SIZE_FIELDS = (
+    "task_index",
+    "goal_chars",
+    "goal_tokens",
+    "context_chars",
+    "context_tokens",
+    "system_chars",
+    "system_tokens",
+    "tool_schema_bytes",
+    "message_count",
+    "approx_tokens",
+)
+
+# Values that must never reach the log line. Distinctive enough that a
+# substring search cannot false-negative.
+_SIZE_SENTINELS = (
+    "GOALSENTINELalpha",
+    "CONTEXTSENTINELbravo",
+    "SYSTEMSENTINELcharlie",
+    "TOOLSENTINELdelta",
+    "sk-CREDSENTINELecho",
+    "https://sentinel.invalid/v1",
+    "/tmp/sentinel-workspace",
+)
+
+
+def _size_child(
+    *,
+    system=None,
+    tools=None,
+    context_chars=None,
+    session_messages=None,
+    prefill_messages=None,
+):
+    """Child double carrying real (non-Mock) size-bearing attributes.
+
+    ``_subagent_id`` is left None so ``_run_single_child`` skips the live
+    subagent registry — these tests are about the log line, not the TUI.
+    """
+    child = MagicMock()
+    child._subagent_id = None
+    child._credential_pool = None
+    child.tool_progress_callback = None
+    child.ephemeral_system_prompt = system
+    child.tools = tools
+    child._session_messages = [] if session_messages is None else session_messages
+    child.prefill_messages = [] if prefill_messages is None else prefill_messages
+    if context_chars is not None:
+        child._delegate_context_chars = context_chars
+    child.get_activity_summary.return_value = {
+        "current_tool": None,
+        "api_call_count": 0,
+        "max_iterations": 50,
+        "last_activity_desc": "",
+    }
+    child.run_conversation.return_value = {
+        "final_response": "ok",
+        "completed": True,
+        "api_calls": 1,
+    }
+    return child
+
+
+class TestSubagentRequestSizeInstrumentation(unittest.TestCase):
+    """Every normal child run emits one numeric request-size line.
+
+    Request-size evidence used to exist only in the timeout-only diagnostic
+    dump (#14726) and the summary-trim log, so a subagent that was merely
+    slow — never timing out — left no record of how large its first request
+    was. This line closes that gap, and it is numbers only: no goal,
+    context, system-prompt or tool-schema text, no credential, no URL, no
+    path, no repr.
+    """
+
+    def _run_and_capture(self, child, goal="do the thing", task_index=3):
+        """Run a real ``_run_single_child`` and return (result, size_lines)."""
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        parent._touch_activity = lambda desc: None
+
+        with self.assertLogs("tools.delegate_tool", level=logging.DEBUG) as cm:
+            result = _run_single_child(
+                task_index=task_index,
+                goal=goal,
+                child=child,
+                parent_agent=parent,
+            )
+        size_lines = [
+            r.getMessage()
+            for r in cm.records
+            if r.getMessage().startswith("subagent_request_size")
+        ]
+        return result, size_lines
+
+    def _parse(self, line):
+        """``subagent_request_size a=1 b=2`` -> {'a': 1, 'b': 2}."""
+        self.assertRegex(line, _SIZE_LINE_RE)
+        pairs = line.split(" ")[1:]
+        return {k: int(v) for k, v in (p.split("=", 1) for p in pairs)}
+
+    def test_normal_run_emits_one_request_size_line(self):
+        """A healthy child logs the line exactly once, with every field."""
+        child = _size_child(system="s" * 100, tools=[{"name": "t"}], context_chars=20)
+
+        result, size_lines = self._run_and_capture(child)
+
+        self.assertEqual(
+            len(size_lines),
+            1,
+            f"expected exactly one subagent_request_size line, got {size_lines}",
+        )
+        fields = self._parse(size_lines[0])
+        self.assertEqual(
+            tuple(fields), _SIZE_FIELDS,
+            "field set/order drifted from the documented contract",
+        )
+        self.assertEqual(fields["task_index"], 3)
+        # Instrumentation must not disturb the run itself.
+        self.assertEqual(result["status"], "completed")
+        child.run_conversation.assert_called_once()
+
+    def test_fields_are_exact_for_known_inputs(self):
+        """Pin the numbers, not just the shape.
+
+        goal 40 chars, context 20 chars, system 100 chars,
+        json.dumps([{"name": "t"}]) == 15 bytes, no staged messages.
+        """
+        from tools.delegate_tool import _subagent_request_size_fields
+
+        child = _size_child(system="s" * 100, tools=[{"name": "t"}], context_chars=20)
+
+        fields = _subagent_request_size_fields(
+            child=child, task_index=7, goal="g" * 40
+        )
+
+        self.assertEqual(
+            fields,
+            {
+                "task_index": 7,
+                "goal_chars": 40,
+                "goal_tokens": 10,
+                "context_chars": 20,
+                "context_tokens": 5,
+                "system_chars": 100,
+                "system_tokens": 25,
+                "tool_schema_bytes": 15,
+                "message_count": 0,
+                # 10 + 5 + 25 + ceil(15/4)=4
+                "approx_tokens": 44,
+            },
+        )
+
+    def test_token_estimate_is_ceiling_of_chars_over_four(self):
+        """The documented formula: tokens = ceil(chars / 4), no tokenizer."""
+        from tools.delegate_tool import _approx_tokens_from_chars
+
+        for chars, expected in ((0, 0), (1, 1), (3, 1), (4, 1), (5, 2), (400, 100)):
+            with self.subTest(chars=chars):
+                self.assertEqual(_approx_tokens_from_chars(chars), expected)
+        # Garbage in -> 0, never a crash and never a repr.
+        for bad in (None, "40", object(), True):
+            with self.subTest(bad=bad):
+                self.assertEqual(_approx_tokens_from_chars(bad), 0)
+
+    def test_line_carries_numbers_only_no_content_or_secrets(self):
+        """No prompt text, tool text, credential, URL or path in the line."""
+        child = _size_child(
+            system="SYSTEMSENTINELcharlie " * 10,
+            tools=[{"name": "TOOLSENTINELdelta", "description": "x"}],
+            context_chars=len("CONTEXTSENTINELbravo"),
+        )
+        child.api_key = "sk-CREDSENTINELecho"
+        child.base_url = "https://sentinel.invalid/v1"
+        child.workspace_path = "/tmp/sentinel-workspace"
+
+        _result, size_lines = self._run_and_capture(
+            child, goal="GOALSENTINELalpha " * 3
+        )
+
+        self.assertEqual(len(size_lines), 1)
+        line = size_lines[0]
+        # Structural proof: the whole line is `key=<int>` pairs and nothing else.
+        self.assertRegex(line, _SIZE_LINE_RE)
+        for sentinel in _SIZE_SENTINELS:
+            self.assertNotIn(sentinel, line)
+        for banned in ("http", "sk-", "/", "'", '"', "<", ">", "Mock"):
+            self.assertNotIn(banned, line, f"{banned!r} leaked into {line!r}")
+
+    def test_malformed_child_attributes_degrade_to_zero(self):
+        """Mock/garbage attrs yield zeros — never a repr, never a crash."""
+        child = MagicMock()  # every size attribute is a Mock, not str/list/int
+        child._subagent_id = None
+        child._credential_pool = None
+        child.tool_progress_callback = None
+        child.get_activity_summary.return_value = {
+            "current_tool": None,
+            "api_call_count": 0,
+            "max_iterations": 50,
+            "last_activity_desc": "",
+        }
+        child.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+            "api_calls": 1,
+        }
+
+        result, size_lines = self._run_and_capture(child, goal="hi", task_index=0)
+
+        self.assertEqual(len(size_lines), 1)
+        fields = self._parse(size_lines[0])
+        self.assertEqual(fields["context_chars"], 0)
+        self.assertEqual(fields["system_chars"], 0)
+        self.assertEqual(fields["tool_schema_bytes"], 0)
+        self.assertEqual(fields["message_count"], 0)
+        # The real goal string is still measurable.
+        self.assertEqual(fields["goal_chars"], 2)
+        self.assertEqual(fields["approx_tokens"], 1)
+        self.assertEqual(result["status"], "completed")
+
+    def test_message_count_reflects_staged_messages(self):
+        """Staged prefill/session turns are counted; 0 only when truly empty."""
+        from tools.delegate_tool import _subagent_request_size_fields
+
+        child = _size_child(
+            session_messages=[{"role": "user"}],
+            prefill_messages=[{"role": "system"}, {"role": "assistant"}],
+        )
+
+        fields = _subagent_request_size_fields(child=child, task_index=0, goal="x")
+
+        self.assertEqual(fields["message_count"], 3)
+
+    def test_child_runs_even_when_metric_calculation_raises(self):
+        """Instrumentation is best-effort: a broken metric must not block work."""
+        from tools.delegate_tool import _run_single_child
+
+        child = _size_child(system="s" * 8, tools=[{"name": "t"}], context_chars=4)
+        parent = _make_mock_parent()
+        parent._touch_activity = lambda desc: None
+
+        with patch(
+            "tools.delegate_tool._subagent_request_size_fields",
+            side_effect=RuntimeError("metric boom"),
+        ):
+            result = _run_single_child(
+                task_index=1, goal="still must run", child=child, parent_agent=parent
+            )
+
+        child.run_conversation.assert_called_once()
+        self.assertEqual(result["status"], "completed")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_build_child_agent_stashes_only_numeric_context_size(
+        self, MockAgent, mock_cfg
+    ):
+        """The child carries the context *length*, never the context text."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        context = "CONTEXTSENTINELbravo details"
+
+        child = _build_child_agent(
+            task_index=0, goal="test", context=context, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent, task_count=1,
+        )
+
+        self.assertIsInstance(child._delegate_context_chars, int)
+        self.assertEqual(child._delegate_context_chars, len(context))
+        self.assertNotIsInstance(child._delegate_context_chars, str)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_build_child_agent_records_zero_context_when_absent(
+        self, MockAgent, mock_cfg
+    ):
+        """No context -> 0, so the field is always present and numeric."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+
+        child = _build_child_agent(
+            task_index=0, goal="test", context=None, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent, task_count=1,
+        )
+
+        self.assertEqual(child._delegate_context_chars, 0)
 
 
 if __name__ == "__main__":

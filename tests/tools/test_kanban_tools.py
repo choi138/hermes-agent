@@ -8,8 +8,10 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -18,6 +20,22 @@ import pytest
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
+
+def test_heartbeat_schema_guides_meaningful_notes_without_changing_silent_liveness():
+    from tools import kanban_tools as kt
+
+    description = kt.KANBAN_HEARTBEAT_SCHEMA["description"]
+    note_description = kt.KANBAN_HEARTBEAT_SCHEMA["parameters"]["properties"]["note"][
+        "description"
+    ]
+
+    assert "2–3 concise fields" in description
+    assert "user's language" in description
+    assert "current stage" in note_description
+    assert "verified evidence/result" in note_description
+    assert "next action" in note_description
+    assert "Empty automatic heartbeats remain silent" in description
+
 
 def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
@@ -63,10 +81,91 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
     return tid
+
+
+def test_create_goal_mode_requires_explicit_positive_turn_budget(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(kt._handle_create({
+        "title": "unbounded goal",
+        "assignee": "peer",
+        "goal_mode": True,
+    }))
+    assert rejected.get("ok") is not True
+    assert "goal_max_turns must be >= 1" in rejected["error"]
+
+    created = json.loads(kt._handle_create({
+        "title": "bounded goal",
+        "assignee": "peer",
+        "goal_mode": True,
+        "goal_max_turns": 4,
+    }))
+    assert created["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, created["task_id"])
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 4
+
+
+def _terminal_evidence(
+    task,
+    *,
+    intent_id: str,
+    action: str,
+    block_kind: str | None,
+    failure_class: str,
+    decision: str,
+) -> dict:
+    from hermes_cli import kanban_db as kb
+
+    assert task.current_run_id is not None
+
+    def digest(label: str) -> str:
+        return hashlib.sha256(label.encode()).hexdigest()
+
+    manifest = {
+        "schema_version": 1,
+        "task_id": task.id,
+        "run_id": task.current_run_id,
+        "terminal_intent_id": intent_id,
+        "action": action,
+        "block_kind": block_kind,
+        "source_commit": hashlib.sha1(b"commit").hexdigest(),
+        "source_tree": hashlib.sha1(b"tree").hexdigest(),
+        "config_digest": digest("config"),
+        "lockfile_digest": digest("lock"),
+        "toolchain_digest": digest("toolchain"),
+        "backend_kind": "ssh",
+        "backend_digest": digest("backend"),
+        "command_digest": digest("command"),
+        "test_plan_digest": digest("test-plan"),
+        "fixture_digest": digest("fixture"),
+        "seed_digest": digest("seed"),
+        "policy_version": "evidence-v1",
+        "evidence_at": int(time.time()),
+        "freshness_seconds": 3600,
+        "failure_class": failure_class,
+        "checkpoint_digest": digest("checkpoint"),
+        "side_effect": "none",
+    }
+    return {
+        "terminal_intent_id": intent_id,
+        "decision": decision,
+        "failure_class": failure_class,
+        "manifest": manifest,
+        "provenance_digest": kb.evidence_manifest_digest(manifest),
+    }
 
 
 def test_show_defaults_to_env_task_id(worker_env):
@@ -77,7 +176,8 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
-    assert "runs" in d
+    assert "runs" not in d
+    assert "events" not in d
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -120,6 +220,7 @@ def test_complete_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"] == worker_env
+    assert d["terminal_intent_id"].startswith("ti_")
     # Verify via kernel
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -128,6 +229,322 @@ def test_complete_happy_path(worker_env):
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
         assert run.metadata == {"files": 2}
+        intent = conn.execute(
+            "SELECT status, producer_attestation FROM terminal_intents "
+            "WHERE terminal_intent_id=?",
+            (d["terminal_intent_id"],),
+        ).fetchone()
+        assert intent["status"] == "acknowledged"
+        assert len(intent["producer_attestation"]) == 64
+    finally:
+        conn.close()
+
+
+def test_complete_with_terminal_evidence_uses_durable_intent_and_preserves_handoff(
+    worker_env,
+):
+    """Evidence-aware completion must stage a replayable intent before terminalizing."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None and task.claim_lock
+        intent_id = "ti_0123456789abcdef"
+        terminal_evidence = _terminal_evidence(
+            task,
+            intent_id=intent_id,
+            action="complete",
+            block_kind=None,
+            failure_class="none",
+            decision="verified",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({
+        "summary": "verified completion with durable handoff",
+        "metadata": {"checks": 3},
+        "artifacts": ["/tmp/report.pdf"],
+        "terminal_evidence": terminal_evidence,
+    })
+    response = json.loads(out)
+    assert response["ok"] is True
+    assert response["terminal_intent_id"] == intent_id
+
+    conn = kb.connect()
+    try:
+        intent = conn.execute(
+            "SELECT status, applied_event_id FROM terminal_intents "
+            "WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        assert intent is not None and intent["status"] == "acknowledged"
+        run = kb.latest_run(conn, worker_env)
+        assert run.summary == "verified completion with durable handoff"
+        assert run.metadata == {"checks": 3, "artifacts": ["/tmp/report.pdf"]}
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE id=?",
+            (intent["applied_event_id"],),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload["terminal_intent_id"] == intent_id
+        assert payload["summary"] == "verified completion with durable handoff"
+        assert payload["artifacts"] == ["/tmp/report.pdf"]
+    finally:
+        conn.close()
+
+
+def test_complete_terminal_evidence_requires_dispatcher_capability(
+    monkeypatch,
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        intent_id = "ti_bbbbbbbbbbbbbbbb"
+        terminal_evidence = _terminal_evidence(
+            task,
+            intent_id=intent_id,
+            action="complete",
+            block_kind=None,
+            failure_class="none",
+            decision="verified",
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK")
+    out = json.loads(kt._handle_complete({
+        "summary": "must not use the claim read back from the database",
+        "terminal_evidence": terminal_evidence,
+    }))
+    assert "dispatcher run/claim capability" in out["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert conn.execute(
+            "SELECT 1 FROM terminal_intents WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_complete_terminal_evidence_rejects_wrong_claim_capability(
+    monkeypatch,
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        intent_id = "ti_cccccccccccccccc"
+        terminal_evidence = _terminal_evidence(
+            task,
+            intent_id=intent_id,
+            action="complete",
+            block_kind=None,
+            failure_class="none",
+            decision="verified",
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "wrong-claim-capability")
+    out = json.loads(kt._handle_complete({
+        "summary": "wrong claim must fail closed",
+        "terminal_evidence": terminal_evidence,
+    }))
+    assert "exact active run and claim" in out["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert conn.execute(
+            "SELECT 1 FROM terminal_intents WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_complete_terminal_evidence_exact_retry_is_idempotent(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        intent_id = "ti_dddddddddddddddd"
+        terminal_evidence = _terminal_evidence(
+            task,
+            intent_id=intent_id,
+            action="complete",
+            block_kind=None,
+            failure_class="none",
+            decision="verified",
+        )
+    finally:
+        conn.close()
+
+    request = {
+        "summary": "response-loss-safe completion",
+        "metadata": {"checks": 7},
+        "terminal_evidence": terminal_evidence,
+    }
+    first = json.loads(kt._handle_complete(request))
+    second = json.loads(kt._handle_complete(request))
+    assert first["ok"] is True
+    assert second == first
+
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT status, producer_attestation FROM terminal_intents "
+            "WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        assert row["status"] == "acknowledged"
+        assert len(row["producer_attestation"]) == 64
+        events = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id=? AND kind='completed'",
+            (worker_env,),
+        ).fetchone()
+        assert events["n"] == 1
+    finally:
+        conn.close()
+
+
+def test_complete_runtime_producer_exact_retry_is_idempotent(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    request = {
+        "summary": "runtime-produced response-loss-safe completion",
+        "metadata": {"checks": 9},
+    }
+    first = json.loads(kt._handle_complete(request))
+    second = json.loads(kt._handle_complete(request))
+    assert first["ok"] is True
+    assert second == first
+    assert first["terminal_intent_id"].startswith("ti_")
+
+    with kb.connect() as conn:
+        events = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id=? AND kind='completed'",
+            (worker_env,),
+        ).fetchone()
+        assert events["n"] == 1
+
+
+def test_terminal_intent_db_enforces_action_decision_invariants(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        intent_id = "ti_eeeeeeeeeeeeeeee"
+        terminal_evidence = _terminal_evidence(
+            task,
+            intent_id=intent_id,
+            action="complete",
+            block_kind=None,
+            failure_class="none",
+            decision="stable_block",
+        )
+        with pytest.raises(ValueError, match="completion decision"):
+            kb.create_completion_terminal_intent(
+                conn,
+                terminal_intent_id=intent_id,
+                task_id=task.id,
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+                decision="stable_block",
+                failure_class="none",
+                manifest=terminal_evidence["manifest"],
+                provenance_digest=terminal_evidence["provenance_digest"],
+                summary="must not stage",
+            )
+    finally:
+        conn.close()
+
+
+def test_complete_crash_after_staging_replays_exact_handoff(
+    monkeypatch,
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None and task.claim_lock
+        intent_id = "ti_aaaaaaaaaaaaaaaa"
+        terminal_evidence = _terminal_evidence(
+            task,
+            intent_id=intent_id,
+            action="complete",
+            block_kind=None,
+            failure_class="none",
+            decision="verified",
+        )
+    finally:
+        conn.close()
+
+    original_apply = kb.apply_terminal_intent
+
+    def crash_after_staging(*args, **kwargs):
+        raise RuntimeError("simulated crash after intent staging")
+
+    monkeypatch.setattr(kb, "apply_terminal_intent", crash_after_staging)
+    out = kt._handle_complete({
+        "summary": "crash-safe summary",
+        "metadata": {"checks": 5},
+        "terminal_evidence": terminal_evidence,
+    })
+    assert "simulated crash after intent staging" in json.loads(out)["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+        intent = conn.execute(
+            "SELECT status FROM terminal_intents WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        assert intent is not None and intent["status"] == "pending"
+        handoff = conn.execute(
+            "SELECT handoff_digest FROM terminal_handoffs "
+            "WHERE terminal_intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        assert handoff is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kb, "apply_terminal_intent", original_apply)
+    conn = kb.connect()
+    try:
+        assert kb.replay_terminal_intents(conn) == {
+            "replayed": [intent_id],
+            "failed": [],
+        }
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+        assert task.status == "done"
+        assert run.summary == "crash-safe summary"
+        assert run.metadata == {"checks": 5}
     finally:
         conn.close()
 
@@ -181,12 +598,19 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True,
+            goal_max_turns=5,
         )
         kb.claim_task(conn, goal_task_id)
+        task = kb.get_task(conn, goal_task_id)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -220,6 +644,8 @@ def test_block_happy_path(worker_env):
     out = kt._handle_block({"reason": "need clarification"})
     d = json.loads(out)
     assert d["ok"] is True
+    assert d["block_kind"] == "needs_input"
+    assert d["terminal_intent_id"].startswith("ti_")
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -247,12 +673,18 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
+            body="Must achieve X.", goal_mode=True, goal_max_turns=5,
         )
         kb.claim_task(conn, goal_task_id)
+        task = kb.get_task(conn, goal_task_id)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
     return goal_task_id
 
 
@@ -577,6 +1009,36 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
     assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
+
+
+def test_kanban_model_schema_footprint_is_bounded():
+    """Keep the always-sent worker tool surface materially below the old
+    17k-character schema payload without snapshotting individual prose."""
+    from tools import kanban_tools as kt
+
+    all_schemas = [
+        value
+        for name, value in vars(kt).items()
+        if name.startswith("KANBAN_") and name.endswith("_SCHEMA")
+    ]
+    worker_schemas = [
+        kt.KANBAN_SHOW_SCHEMA,
+        kt.KANBAN_COMPLETE_SCHEMA,
+        kt.KANBAN_BLOCK_SCHEMA,
+        kt.KANBAN_HEARTBEAT_SCHEMA,
+        kt.KANBAN_COMMENT_SCHEMA,
+        kt.KANBAN_CREATE_SCHEMA,
+        kt.KANBAN_LINK_SCHEMA,
+    ]
+
+    def _size(schemas):
+        return sum(
+            len(json.dumps(schema, sort_keys=True, separators=(",", ":")))
+            for schema in schemas
+        )
+
+    assert _size(all_schemas) < 12_000
+    assert _size(worker_schemas) < 10_000
 
 
 # ---------------------------------------------------------------------------

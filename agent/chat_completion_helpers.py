@@ -27,6 +27,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
+from hermes_cli.provider_config import get_provider_backend_family
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
@@ -34,6 +35,10 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
+from agent.failover_domain import (
+    INFRASTRUCTURE_FAILOVER_REASONS,
+    endpoint_origin,
+)
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -64,6 +69,14 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+
+# A cross-thread socket shutdown normally releases the request worker almost
+# immediately.  Some transports cannot find/shutdown the active socket,
+# however, and the daemon worker then outlives the timed-out call.  Give the
+# owner a short unwind window, then remember it so a retry cannot overlap the
+# same endpoint while the old request is still pending upstream.
+_ABORTED_REQUEST_WORKER_JOIN_SECONDS = 2.0
+_ABORTED_REQUEST_WORKER_DRAIN_SECONDS = 30.0
 
 
 def _context_thread_target(callback):
@@ -99,6 +112,64 @@ def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
             "scopes (#81521).",
             label,
         )
+
+
+def begin_wire_attempt(agent, api_mode_family: str, stream_mode: str = "streaming"):
+    """Stamp the instant ONE physical provider request goes out on the wire.
+
+    Called from inside each provider's stream factory, never at the
+    ``relay_llm.stream()`` call site: under Relay-managed execution the factory
+    runs lazily on the first pull while Relay-disabled it runs eagerly at
+    construction, and — the point of the whole design — being inside the factory
+    makes it re-run per INNER stream retry so each physical socket gets its own
+    TTFT denominator.
+
+    Swallows everything and returns None on any failure. That is mandatory, not
+    advisory: every caller is a bare-bodied factory whose raise would land in the
+    managed stream's ``result["error"]`` and push the turn onto the
+    classified-API-error path (and the bedrock caller's handler can additionally
+    set ``agent._disable_streaming`` and print an IAM warning).
+    """
+    try:
+        from agent import model_call_timing
+
+        return model_call_timing.begin_wire_attempt(
+            getattr(agent, "_current_api_request_id", "") or "",
+            api_mode_family=api_mode_family,
+            stream_mode=stream_mode,
+            call_role=(
+                "delegated"
+                if getattr(agent, "is_subagent", False)
+                else "fallback"
+                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                else "primary"
+            ),
+            work_lane=str(getattr(agent, "_work_lane", "") or "unknown"),
+            provider=str(getattr(agent, "provider", "") or ""),
+            model=str(getattr(agent, "model", "") or ""),
+        )
+    except Exception:
+        return None
+
+
+def _stamp_first_frame(token) -> None:
+    """Record the first wire frame of one physical attempt. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.stamp_first_frame(token)
+    except Exception:
+        pass
+
+
+def _finish_wire_attempt(token, outcome: str) -> None:
+    """Record one physical attempt's terminal instant. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.finish_wire_attempt(token, outcome)
+    except Exception:
+        pass
 
 
 def _ra():
@@ -515,8 +586,22 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
 def _is_openai_codex_backend(agent) -> bool:
     base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
     base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    requested_provider = str(
+        getattr(agent, "requested_provider", "") or ""
+    ).strip().lower()
+    runtime_ids = {
+        value.split(":", 1)[1] if value.startswith("custom:") else value
+        for value in (provider, requested_provider)
+        if value
+    }
+    backend_family = get_provider_backend_family(
+        provider,
+        requested_provider=requested_provider,
+    )
     return (
-        getattr(agent, "provider", None) == "openai-codex"
+        "openai-codex" in runtime_ids
+        or backend_family == "openai-codex"
         or (
             base_url_hostname == "chatgpt.com"
             and "/backend-api/codex" in base_url_lower
@@ -541,6 +626,77 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     if est_tokens > 10_000:
         return 600.0
     return 0.0
+
+
+def apply_openai_codex_stale_timeout_floor(
+    agent,
+    api_payload: Any,
+    stale_timeout: float,
+) -> float:
+    """Apply Codex context floors when the resolved backend has that capability."""
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return stale_timeout
+    if not _is_openai_codex_backend(agent):
+        return stale_timeout
+    floor = openai_codex_stale_timeout_floor(
+        estimate_request_context_tokens(api_payload)
+    )
+    return max(stale_timeout, floor) if floor else stale_timeout
+
+
+def _request_endpoint_key(agent) -> tuple[str, str]:
+    """Return a model-independent identity for overlap prevention."""
+    api_mode = str(getattr(agent, "api_mode", "") or "").strip().lower()
+    base_url = str(
+        getattr(agent, "_base_url", None)
+        or getattr(agent, "base_url", None)
+        or ""
+    ).strip().rstrip("/").lower()
+    if not base_url:
+        base_url = str(getattr(agent, "provider", "") or "").strip().lower()
+    return api_mode, base_url
+
+
+def _draining_request_workers(agent) -> dict[tuple[str, str], threading.Thread]:
+    workers = getattr(agent, "_draining_request_workers", None)
+    if not isinstance(workers, dict):
+        workers = {}
+        agent._draining_request_workers = workers
+    return workers
+
+
+def _remember_draining_request_worker(agent, worker: threading.Thread) -> None:
+    """Remember an aborted owner thread only while it is genuinely alive."""
+    if worker.is_alive():
+        _draining_request_workers(agent)[_request_endpoint_key(agent)] = worker
+
+
+def _wait_for_previous_request_worker(agent) -> None:
+    """Prevent an overlapping retry while an aborted endpoint worker drains.
+
+    A retry issued while the previous request is still live can be coalesced by
+    a proxy/load-balancer with the old ``pending=1`` bridge entry.  That makes a
+    fresh model attempt inherit the hung request and repeats the timeout loop.
+    Wait for the owning worker to unwind; if it still cannot drain, fail this
+    attempt without opening another socket to the same endpoint.
+    """
+    workers = _draining_request_workers(agent)
+    for key, worker in list(workers.items()):
+        if not worker.is_alive():
+            workers.pop(key, None)
+
+    endpoint_key = _request_endpoint_key(agent)
+    worker = workers.get(endpoint_key)
+    if worker is None:
+        return
+
+    worker.join(timeout=_ABORTED_REQUEST_WORKER_DRAIN_SECONDS)
+    if worker.is_alive():
+        raise TimeoutError(
+            "Previous timed-out provider request is still draining; refusing "
+            "an overlapping retry to the same endpoint."
+        )
+    workers.pop(endpoint_key, None)
 
 
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
@@ -686,16 +842,27 @@ def _codex_wait_notice_recovery(
     idle_enabled: bool,
     idle_timeout: float,
     elapsed: float,
+    hard_timeout: Optional[float] = None,
 ) -> str:
     """Describe the earliest enabled Codex watchdog on the call timeline."""
     deadlines: list[float] = []
-    if math.isfinite(stale_timeout):
-        deadlines.append(stale_timeout)
+    hard_timeout_enabled = (
+        isinstance(hard_timeout, (int, float))
+        and hard_timeout > 0
+        and math.isfinite(hard_timeout)
+    )
     if last_event_ts is None:
+        if math.isfinite(stale_timeout):
+            deadlines.append(stale_timeout)
         if ttfb_enabled and math.isfinite(ttfb_timeout):
             deadlines.append(ttfb_timeout)
-    elif idle_enabled and math.isfinite(idle_timeout):
-        deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
+    else:
+        if idle_enabled and math.isfinite(idle_timeout):
+            deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
+        elif not hard_timeout_enabled and math.isfinite(stale_timeout):
+            deadlines.append(stale_timeout)
+    if hard_timeout_enabled:
+        deadlines.append(float(hard_timeout))
     if not deadlines or min(deadlines) <= elapsed:
         return ""
     return f"; auto-reconnect at {int(min(deadlines))}s"
@@ -759,6 +926,56 @@ def _record_interrupted_provider_wait(
         _stale_streak(agent),
     )
     return True
+
+
+# ── Passive provider health (model_routes) ──────────────────────────────────
+# Real completion traffic is the signal: route resolution never probes a
+# healthy/unknown provider and only uses active I/O to re-check a stale
+# unhealthy verdict.
+_PASSIVE_UNHEALTHY_REASONS = frozenset({
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def _record_passive_provider_outcome(agent, healthy: bool, reason: str) -> None:
+    """Best-effort verdict for the agent's current runtime; never raises."""
+    try:
+        from hermes_cli.model_routes import (
+            provider_key_for_runtime,
+            record_provider_outcome,
+        )
+
+        key = provider_key_for_runtime(
+            provider=getattr(agent, "provider", "") or "",
+            base_url=getattr(agent, "base_url", "") or "",
+        )
+        if key:
+            record_provider_outcome(key, healthy, reason)
+    except Exception as exc:
+        logger.debug(
+            "passive provider health record failed (%s)",
+            type(exc).__name__,
+        )
+
+
+def _note_provider_success(agent) -> None:
+    """Clear a matching unhealthy verdict after a real completion succeeds."""
+    try:
+        from hermes_cli.model_routes import has_unhealthy_verdicts
+
+        if not has_unhealthy_verdicts():
+            return
+    except Exception:
+        return
+    _record_passive_provider_outcome(
+        agent,
+        True,
+        "recovered (live completion succeeded)",
+    )
 
 
 def _report_stale_nonstream_kill(
@@ -830,7 +1047,11 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider,
+        agent.model,
+        requested_provider=getattr(agent, "requested_provider", None),
+    )
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -1311,6 +1532,7 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_state["done"] = True
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1346,6 +1568,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    # A socket abort can leave its owning daemon worker alive when the
+    # transport cannot locate/shutdown the active connection.  Never issue a
+    # new request to that same endpoint until the old owner has drained.
+    _wait_for_previous_request_worker(agent)
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -1481,7 +1708,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
+    _stale_timeout = apply_openai_codex_stale_timeout_floor(
+        agent,
+        api_kwargs,
+        agent._compute_non_stream_stale_timeout(api_kwargs),
+    )
 
     # ── Codex Responses stream watchdogs ────────────────────────────────
     # The chatgpt.com/backend-api/codex endpoint has an intermittent failure
@@ -1502,11 +1733,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _codex_watchdog_enabled = agent.api_mode == "codex_responses"
     _openai_codex_backend = _is_openai_codex_backend(agent)
     _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
-    if _codex_watchdog_enabled and _openai_codex_backend:
-        _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
-        if _codex_floor:
-            _stale_timeout = max(_stale_timeout, _codex_floor)
-
     # ── Codex absolute hard ceiling (#64507) ──────────────────────────
     # ``openai_codex_stale_timeout_floor`` *raises* the stale timeout (up to
     # 1200s at >100k tokens) so healthy gateway-scale payloads aren't aborted.
@@ -1523,12 +1749,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # limit. Tunable via HERMES_CODEX_HARD_TIMEOUT_SECONDS (set to 0 to
     # disable the ceiling entirely; that restores the pre-fix behavior).
     _codex_hard_timeout = _env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
-    if (
+    _codex_hard_timeout_enabled = (
         _codex_watchdog_enabled
         and _openai_codex_backend
         and _codex_hard_timeout > 0
-    ):
-        _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
+        and math.isfinite(_codex_hard_timeout)
+    )
 
     if _est_tokens_for_codex_watchdog > 100_000:
         _codex_idle_timeout_default = 180.0
@@ -1626,6 +1852,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     idle_enabled=_codex_idle_enabled,
                     idle_timeout=_codex_idle_timeout,
                     elapsed=_elapsed,
+                    hard_timeout=(
+                        _codex_hard_timeout
+                        if _codex_hard_timeout_enabled
+                        else None
+                    ),
                 )
                 agent._emit_wait_notice(
                     f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
@@ -1685,7 +1916,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
             )
             # Wait briefly for the worker to notice the closed connection.
-            t.join(timeout=2.0)
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -1730,7 +1962,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
-            t.join(timeout=2.0)
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
@@ -1738,9 +1971,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # General wall-clock stale detection is a time-to-response guard. Once
+        # a Codex request is actively emitting SSE events, liveness is governed
+        # by the event-idle watchdog above instead; killing a healthy stream at
+        # the original wall-clock deadline truncates long reasoning/tool turns.
+        # The separate hard ceiling remains absolute and still bounds an
+        # endlessly-active/open stream.
+        _codex_stream_started = (
+            _codex_watchdog_enabled
+            and _last_codex_event_ts is not None
+            and (_codex_idle_enabled or _codex_hard_timeout_enabled)
+        )
+        _hard_timeout_exceeded = (
+            _codex_hard_timeout_enabled
+            and _elapsed > _codex_hard_timeout
+        )
+        _stale_timeout_exceeded = (
+            _elapsed > _stale_timeout and not _codex_stream_started
+        )
+        if _hard_timeout_exceeded or _stale_timeout_exceeded:
+            _kill_timeout = (
+                _codex_hard_timeout
+                if _hard_timeout_exceeded
+                else _stale_timeout
+            )
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1749,7 +2003,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 except Exception:
                     _silent_hint = None
             _report_stale_nonstream_kill(
-                agent, api_kwargs, _elapsed, _stale_timeout, hint=_silent_hint
+                agent, api_kwargs, _elapsed, _kill_timeout, hint=_silent_hint
             )
             try:
                 # #67142: routes by client kind — anthropic now aborts the
@@ -1763,18 +2017,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _bump_stale_streak(agent)
             _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
-            t.join(timeout=2.0)
+            t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
+                        f"with no response (threshold: {int(_kill_timeout)}s). "
                         f"{_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                        f"with no response (threshold: {int(_kill_timeout)}s)"
                     )
             break
 
@@ -1811,6 +2066,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # physical scope and corrupt the LIFO stack. No-op when Relay
             # managed execution is not live.
             _join_worker_for_relay_teardown(t, label="Non-streaming")
+            if t.is_alive():
+                t.join(timeout=_ABORTED_REQUEST_WORKER_JOIN_SECONDS)
+            _remember_draining_request_worker(agent, t)
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
@@ -1818,6 +2076,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 
@@ -2403,6 +2662,97 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+_VALID_FALLBACK_API_MODES = frozenset({
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+})
+
+
+def _parse_fallback_api_mode(raw: Any) -> str:
+    """Validate modes that can be activated inside the current tool loop."""
+    value = str(raw or "").strip()
+    return value if value in _VALID_FALLBACK_API_MODES else ""
+
+
+def _declared_fallback_api_mode(fb: dict) -> str:
+    """Return a valid explicitly declared transport for a fallback entry.
+
+    The chain entry wins.  If it has no valid declaration, consult the named
+    ``providers.<name>.api_mode`` entry.  An empty return value tells the caller
+    to preserve the existing URL/provider/model heuristics.
+    """
+    declared = _parse_fallback_api_mode(fb.get("api_mode"))
+    if declared:
+        return declared
+
+    provider_name = str(fb.get("provider") or "").strip().lower()
+    if not provider_name:
+        return ""
+
+    try:
+        from hermes_cli.config import load_config
+
+        providers = (load_config().get("providers") or {})
+    except Exception:
+        return ""
+    if not isinstance(providers, dict):
+        return ""
+
+    provider_config = providers.get(provider_name)
+    if not isinstance(provider_config, dict):
+        # Provider ids are normalized at runtime, while hand-written mapping
+        # keys may retain case.  Match identity without making values mutable.
+        provider_config = next(
+            (
+                config
+                for name, config in providers.items()
+                if str(name).strip().lower() == provider_name
+                and isinstance(config, dict)
+            ),
+            None,
+        )
+    if not isinstance(provider_config, dict):
+        return ""
+    return _parse_fallback_api_mode(provider_config.get("api_mode"))
+
+
+def _close_unused_fallback_client(client, live_client=None) -> None:
+    """Close a candidate client that was built but will not be activated.
+
+    Ownership proof — this only ever closes a client nobody else holds:
+    ``try_activate_fallback`` calls ``resolve_provider_client``
+    synchronously with ``async_mode=False`` / ``raw_codex=True``, and that
+    call normally returns a *newly constructed* candidate for this
+    activation attempt, which the live runtime does not reference: the
+    live client is only replaced further down, after the domain guard has
+    passed.  A caching or aliasing resolver can hand back the object that
+    already *is* ``agent.client`` though, and closing that would kill the
+    very request we are failing over — so callers pass the live client as
+    *live_client* and an identical object is left open.  Because
+    ``async_mode`` is false here the candidate is a sync client — there is
+    no ``aclose()`` to await, and none is attempted.
+
+    Called exactly once per skipped candidate, and only when the client
+    exposes ``close()`` — the router hands back whatever the provider needs
+    (OpenAI SDK client, adapter shim), and not every shim is closeable.
+    A failure to close must not abort the walk to the next chain entry.
+    """
+    if client is None or client is live_client:
+        return
+    closer = getattr(client, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception as exc:
+        logger.debug(
+            "Fallback skip: could not close unused candidate client (%s)",
+            type(exc).__name__,
+        )
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -2423,6 +2773,308 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+def _is_content_policy_blocked(reason: Any) -> bool:
+    """Accept the local enum and compatible reason objects from adapters."""
+    reason_value = getattr(reason, "value", None)
+    return (
+        reason == FailoverReason.content_policy_blocked
+        or reason_value == FailoverReason.content_policy_blocked
+        or reason_value == FailoverReason.content_policy_blocked.value
+    )
+
+
+def _current_runtime_is_dev_route(agent: Any, cfg: dict, catalog: Any) -> bool:
+    """Whether refusal recovery should prefer the configured dev route."""
+    # Prefer the pre-fallback primary identity so order stays stable across
+    # generic→PERMISSIVE hops (after opus activates, current provider is no
+    # longer claude-lb but the turn was still a dev refusal).
+    primary = getattr(agent, "_primary_runtime", None) or {}
+    provider = str(
+        primary.get("provider") or getattr(agent, "provider", "") or ""
+    ).strip().lower()
+    model = str(
+        primary.get("model") or getattr(agent, "model", "") or ""
+    ).strip().lower()
+    if provider == "claude-lb" and (
+        "claude-fable" in model or "claude-opus" in model
+    ):
+        return True
+
+    try:
+        from hermes_cli.model_routes import runtime_satisfies_route
+
+        label_routes = catalog.router.label_route_map()
+        runtime = {
+            "provider": provider,
+            "model": model,
+            "base_url": str(
+                primary.get("base_url") or getattr(agent, "base_url", "") or ""
+            ),
+        }
+        for label in ("SYSTEM_DEV", "FRONTEND_DEV"):
+            route_name = str(label_routes.get(label) or "")
+            if route_name and runtime_satisfies_route(
+                runtime, route_name, cfg, catalog=catalog
+            ):
+                return True
+    except Exception:
+        logger.debug(
+            "Refusal fallback: dev-route membership check failed", exc_info=True
+        )
+    return False
+
+
+def _build_refusal_fallback_chain(agent: Any) -> list[dict]:
+    """Resolve the short PERMISSIVE route chain for API-level refusals."""
+    try:
+        from agent.backend_identity import BackendIdentity, should_skip_candidate
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routes import (
+            _cfg_runtime_fallback,
+            load_routes,
+            resolve_route,
+        )
+
+        cfg = load_config() or {}
+        catalog = load_routes(cfg)
+        refusal = catalog.router.refusal
+        if not (refusal.enabled and refusal.api_fallback):
+            logger.warning(
+                "Refusal fallback chain empty: refusal routing is disabled "
+                "(enabled=%s api_fallback=%s)",
+                refusal.enabled,
+                refusal.api_fallback,
+            )
+            return []
+
+        if _current_runtime_is_dev_route(agent, cfg, catalog):
+            route_names = (refusal.dev_route, refusal.chat_route)
+        else:
+            route_names = (refusal.chat_route, refusal.dev_route)
+
+        current_ident = BackendIdentity.build(
+            provider=getattr(agent, "provider", ""),
+            model=getattr(agent, "model", ""),
+            base_url=str(getattr(agent, "base_url", "") or ""),
+        )
+        chain = []
+        for route_name in route_names:
+            if not str(route_name or "").strip():
+                continue
+            entry = resolve_route(route_name, cfg, catalog=catalog)
+            if not entry:
+                continue
+            entry = dict(entry)
+            entry["base_url"] = str(
+                _cfg_runtime_fallback(entry.get("provider", ""), cfg).get(
+                    "base_url", ""
+                )
+                or ""
+            )
+            candidate_ident = BackendIdentity.build(
+                provider=entry.get("provider", ""),
+                model=entry.get("model", ""),
+                base_url=entry.get("base_url", ""),
+            )
+            if should_skip_candidate(candidate_ident, current_ident):
+                logger.warning(
+                    "Refusal fallback skip: route %s resolves to the current backend",
+                    route_name,
+                )
+                continue
+            chain.append(entry)
+        if not chain:
+            logger.warning(
+                "Refusal fallback chain empty: no usable PERMISSIVE routes "
+                "resolved from %s",
+                [name for name in route_names if str(name or "").strip()],
+            )
+        else:
+            logger.info(
+                "Refusal fallback chain built: %s",
+                " -> ".join(
+                    f"{entry.get('provider')}/{entry.get('model')}"
+                    for entry in chain
+                ),
+            )
+        return chain
+    except Exception:
+        # Refusal routing is an optional preference. Config or route-resolution
+        # failures must leave the established fallback chain available.
+        logger.warning(
+            "Refusal fallback chain empty: route resolution failed",
+            exc_info=True,
+        )
+        return []
+
+
+_OUTAGE_ROUTE_FALLBACK_REASONS = frozenset({
+    FailoverReason.rate_limit,
+    FailoverReason.billing,
+    FailoverReason.upstream_rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+})
+
+
+def _build_outage_route_fallback_chain(agent: Any) -> tuple[str, list[dict]]:
+    """Return the recorded route's healthy fallbacks in declaration order.
+
+    Route membership is intentionally not used to discover intent: one model
+    can be accepted by several routes.  The gateway records the route it
+    actually applied on ``agent._active_route_name``; without that record this
+    additive prefix is disabled and the established global chain is left
+    untouched.
+    """
+    active_route_name = str(
+        getattr(agent, "_active_route_name", "") or ""
+    ).strip()
+    if not active_route_name:
+        return "", []
+
+    try:
+        from agent.backend_identity import BackendIdentity, should_skip_candidate
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routes import (
+            _cfg_runtime_fallback,
+            _lookup_route,
+            load_routes,
+            provider_health,
+            resolve_route,
+            runtime_satisfies_route,
+        )
+
+        cfg = load_config() or {}
+        catalog = load_routes(cfg)
+        spec = _lookup_route(catalog, active_route_name)
+        if spec is None:
+            return "", []
+
+        runtime = {
+            "provider": str(getattr(agent, "provider", "") or ""),
+            "model": str(getattr(agent, "model", "") or ""),
+            "base_url": str(getattr(agent, "base_url", "") or ""),
+        }
+        reasoning = getattr(agent, "reasoning_config", None)
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                runtime["reasoning_effort"] = "none"
+            elif reasoning.get("effort"):
+                runtime["reasoning_effort"] = str(reasoning["effort"])
+        if not runtime_satisfies_route(
+            runtime, spec.name, cfg, catalog=catalog
+        ):
+            # The recorded intent is stale (for example, a later manual model
+            # switch moved the session out of the route).  Never replace it by
+            # a first-match membership scan: membership is ambiguous.
+            return "", []
+
+        # resolve_route owns the route-health ordering.  Its source identifies
+        # the earliest eligible fallback, so entries already rejected as
+        # unhealthy are not retried by the live fallback walk.
+        resolved = resolve_route(spec.name, cfg, catalog=catalog)
+        if not resolved:
+            return spec.name, []
+        first_index = 0
+        source = str(resolved.get("source") or "")
+        if source.startswith("fallback:"):
+            try:
+                first_index = max(int(source.split(":", 1)[1]) - 1, 0)
+            except (TypeError, ValueError):
+                first_index = 0
+
+        current_ident = BackendIdentity.build(
+            provider=runtime["provider"],
+            model=runtime["model"],
+            base_url=runtime["base_url"],
+        )
+        chain: list[dict] = []
+        for index, fallback in enumerate(spec.fallbacks):
+            if index < first_index:
+                continue
+            healthy, _ = provider_health(
+                fallback.provider,
+                fallback.model,
+                cfg=cfg,
+                health=catalog.health,
+            )
+            if not healthy:
+                continue
+            runtime_cfg = _cfg_runtime_fallback(fallback.provider, cfg)
+            entry = {
+                "provider": fallback.provider,
+                "model": fallback.model,
+                "reasoning_effort": fallback.reasoning_effort or "",
+                "base_url": str(runtime_cfg.get("base_url") or ""),
+                "api_mode": str(runtime_cfg.get("api_mode") or ""),
+            }
+            candidate_ident = BackendIdentity.build(
+                provider=entry["provider"],
+                model=entry["model"],
+                base_url=entry["base_url"],
+            )
+            if should_skip_candidate(candidate_ident, current_ident):
+                logger.warning(
+                    "Route fallback skip: route %s entry %s/%s resolves to "
+                    "the current backend",
+                    spec.name,
+                    entry["provider"],
+                    entry["model"],
+                )
+                continue
+            chain.append(entry)
+        return spec.name, chain
+    except Exception:
+        # Route-aware fallback is additive. Any config/import/resolution
+        # failure leaves the established global fallback chain untouched.
+        logger.debug("Route fallback unavailable; using global chain", exc_info=True)
+        return "", []
+
+
+def _reset_outage_route_fallback_walk(agent: Any) -> None:
+    """Forget the transient route prefix without touching the global cursor."""
+    agent._outage_route_fallback_walk_active = False
+    agent._outage_route_fallback_name = ""
+    agent._outage_route_fallback_chain = []
+    agent._outage_route_fallback_index = 0
+
+
+def _next_outage_route_fallback(agent: Any) -> Optional[dict]:
+    """Advance the route-prefixed cursor for one outage fallback walk."""
+    if getattr(agent, "_outage_route_fallback_walk_active", False):
+        chain = getattr(agent, "_outage_route_fallback_chain", [])
+        index = int(getattr(agent, "_outage_route_fallback_index", 0) or 0)
+    else:
+        active_route_name = str(
+            getattr(agent, "_active_route_name", "") or ""
+        ).strip()
+        continuing = (
+            bool(getattr(agent, "_fallback_activated", False))
+            and bool(active_route_name)
+            and active_route_name.lower()
+            == str(
+                getattr(agent, "_outage_route_fallback_name", "") or ""
+            ).lower()
+        )
+        if continuing:
+            chain = getattr(agent, "_outage_route_fallback_chain", [])
+            index = int(getattr(agent, "_outage_route_fallback_index", 0) or 0)
+        else:
+            route_name, chain = _build_outage_route_fallback_chain(agent)
+            index = 0
+            agent._outage_route_fallback_name = route_name
+            agent._outage_route_fallback_chain = chain
+            agent._outage_route_fallback_index = 0
+        # Keep this true through recursive skip/unresolvable calls so an
+        # exhausted route prefix falls into the global chain exactly once.
+        agent._outage_route_fallback_walk_active = True
+
+    if index >= len(chain):
+        return None
+    agent._outage_route_fallback_index = index + 1
+    return chain[index]
+
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -2436,6 +3088,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if _is_content_policy_blocked(reason):
+        # Canonicalize compatible enum-like values before the established
+        # activation path stores ``reason.value``.
+        reason = FailoverReason.content_policy_blocked
+
+    if reason in _PASSIVE_UNHEALTHY_REASONS:
+        _record_passive_provider_outcome(
+            agent,
+            False,
+            reason.value if reason is not None else "unknown",
+        )
+    if reason not in _OUTAGE_ROUTE_FALLBACK_REASONS:
+        _reset_outage_route_fallback_walk(agent)
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2458,7 +3123,59 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
-    if agent._fallback_index >= len(agent._fallback_chain):
+    fb = None
+    if reason in _OUTAGE_ROUTE_FALLBACK_REASONS:
+        fb = _next_outage_route_fallback(agent)
+    if fb is None and agent._fallback_index >= len(agent._fallback_chain):
+        # Generic chain exhausted. For content-policy refusals only, walk the
+        # configured PERMISSIVE routes AFTER the normal fallback_providers
+        # (typically opus). Owner intent: keep fable→opus as the first hop so
+        # intelligence is preserved; PERMISSIVE (k3/grok) is the last resort
+        # when frontier models refuse the same prompt.
+        if (
+            reason == FailoverReason.content_policy_blocked
+            and not getattr(agent, "_refusal_fallback_walk_active", False)
+        ):
+            continuing_refusal = (
+                bool(getattr(agent, "_fallback_activated", False))
+                and getattr(agent, "_fallback_reason", None)
+                == FailoverReason.content_policy_blocked.value
+            )
+            if continuing_refusal:
+                refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
+                refusal_index = int(
+                    getattr(agent, "_refusal_fallback_index", 0) or 0
+                )
+                # First successful hop may have been generic only — build the
+                # PERMISSIVE tail lazily when we first exhaust fallback_providers.
+                if not refusal_chain:
+                    refusal_chain = _build_refusal_fallback_chain(agent)
+                    refusal_index = 0
+                    agent._refusal_fallback_chain = refusal_chain
+                    agent._refusal_fallback_index = 0
+            else:
+                refusal_chain = _build_refusal_fallback_chain(agent)
+                refusal_index = 0
+                agent._refusal_fallback_chain = refusal_chain
+                agent._refusal_fallback_index = 0
+
+            if refusal_index < len(refusal_chain):
+                normal_chain = agent._fallback_chain
+                normal_index = agent._fallback_index
+                cooldown_before = getattr(agent, "_rate_limited_until", 0)
+                agent._fallback_chain = refusal_chain
+                agent._fallback_index = refusal_index
+                agent._refusal_fallback_walk_active = True
+                try:
+                    if agent._try_activate_fallback(reason):
+                        return True
+                    agent._rate_limited_until = cooldown_before
+                finally:
+                    agent._refusal_fallback_index = agent._fallback_index
+                    agent._fallback_chain = normal_chain
+                    agent._fallback_index = normal_index
+                    agent._refusal_fallback_walk_active = False
+
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next
@@ -2474,9 +3191,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
+        agent._outage_route_fallback_walk_active = False
         return False
-    fb = agent._fallback_chain[agent._fallback_index]
-    agent._fallback_index += 1
+    if fb is None:
+        fb = agent._fallback_chain[agent._fallback_index]
+        agent._fallback_index += 1
     fb_key = _fallback_entry_key(fb)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
     if unavailable is None:
@@ -2546,17 +3265,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         #
         # An explicit ``api_mode`` on the fallback entry always wins — including
         # an explicit "chat_completions" — and suppresses all re-detection below.
-        fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
-        fb_api_mode = "chat_completions"
-        if fb_api_mode_explicit:
-            fb_api_mode = str(fb.get("api_mode")).strip()
-        elif fb_provider == "anthropic":
+        declared_fb_api_mode = _declared_fallback_api_mode(fb)
+        fb_api_mode_explicit = bool(declared_fb_api_mode)
+        fb_api_mode = declared_fb_api_mode or "chat_completions"
+        if not fb_api_mode_explicit and fb_provider == "anthropic":
             # Provider-name check must not be gated on fb_base_url_hint:
             # an entry that names provider: anthropic without an explicit
             # base_url uses the provider's default endpoint and must still
             # resolve to anthropic_messages, not chat_completions.
             fb_api_mode = "anthropic_messages"
-        elif fb_base_url_hint:
+        elif not fb_api_mode_explicit and fb_base_url_hint:
             _orig_url = fb_base_url_hint.rstrip("/").lower()
             if (
                 _orig_url.endswith("/anthropic")
@@ -2582,6 +3300,69 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_provider)
             unavailable.add(fb_key)
             return agent._try_activate_fallback(reason)  # try next in chain
+
+        # The config-level dedup above only sees configured names/URLs.  A
+        # chain entry with a different provider AND model and no explicit
+        # base_url can still resolve to the endpoint that just failed (a
+        # load-balancer alias in front of the same shim).  For endpoint-level
+        # failures that candidate is the dead capacity pool under a new name,
+        # so compare the resolved origins now — after the client exists, but
+        # before any agent state is mutated.  Model-specific failures
+        # (model_not_found, content_policy_blocked, …) are NOT in this set:
+        # a different model on the same endpoint is a legitimate recovery.
+        #
+        # Origin equality alone would over-block: a public provider hostname
+        # serves many models from independent capacity, so a different model
+        # there is a genuine recovery path too.  The candidate is rejected
+        # only when it replays the same model, or when the shared origin is a
+        # private / loopback address — one local process, every alias of it
+        # dead at once.
+        if reason in INFRASTRUCTURE_FAILOVER_REASONS:
+            from agent.failover_domain import (
+                is_private_or_loopback_origin,
+                normalize_model_identity,
+            )
+
+            # The live client knows where it actually ended up; ``base_url``
+            # may still hold the configured value.  Fall back to that only
+            # when the client yields no determinable origin (adapter shims,
+            # test doubles).
+            current_origin = endpoint_origin(
+                getattr(getattr(agent, "client", None), "base_url", "")
+            ) or endpoint_origin(getattr(agent, "base_url", ""))
+            candidate_base_url = getattr(fb_client, "base_url", "")
+            candidate_origin = endpoint_origin(candidate_base_url)
+            current_model = normalize_model_identity(
+                getattr(agent, "model", ""))
+            same_model = bool(current_model) and current_model in {
+                normalize_model_identity(fb_model),
+                normalize_model_identity(_resolved_fb_model),
+            }
+            if (
+                current_origin
+                and current_origin == candidate_origin
+                and (same_model
+                     or is_private_or_loopback_origin(current_origin))
+            ):
+                # Both sides are already canonical ``scheme://host:port``, so
+                # only the two origins are logged — never the full URLs, which
+                # can carry userinfo or query-string credentials.  An
+                # undeterminable origin on either side (empty string) fails
+                # open: the guard cannot prove a shared pool, so the candidate
+                # stays eligible.
+                logger.warning(
+                    "Fallback skip: %s/%s resolves to the same failure domain "
+                    "as the current endpoint (current=%s candidate=%s) on %s",
+                    fb_provider, fb_model, current_origin, candidate_origin,
+                    getattr(reason, "value", reason),
+                )
+                _close_unused_fallback_client(
+                    fb_client, live_client=getattr(agent, "client", None))
+                # Deliberately NOT added to ``unavailable``: the entry is only
+                # unusable for THIS failure reason, and stays a valid target
+                # for model-specific failures or once the primary moves.
+                return agent._try_activate_fallback(reason)
+
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2611,14 +3392,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
                 fb_api_mode = nous_api_mode(fb_model)
             elif (
-                fb_base_url.rstrip("/").lower().endswith("/anthropic")
+                fb_provider == "anthropic"
+                or fb_base_url.rstrip("/").lower().endswith("/anthropic")
                 or base_url_hostname(fb_base_url) == "api.anthropic.com"
             ):
-                # Named custom providers (e.g. cron-anthropic) resolve their
-                # base_url from config rather than the fallback entry, so the
-                # pre-resolve hint check above never sees it. Match the host
-                # the same way determine_api_mode() and _detect_api_mode_for_url()
-                # do on the primary path. (#32243, #49247)
+                # Custom providers (e.g. cron-anthropic) point at the native
+                # api.anthropic.com host with no "/anthropic" path suffix, so the
+                # name/suffix checks above miss them and they default to
+                # chat_completions → POST /v1/chat/completions → 404. Match the
+                # host the same way determine_api_mode() and
+                # _detect_api_mode_for_url() do on the primary path.
+                # (#32243, #49247)
                 fb_api_mode = "anthropic_messages"
             elif _fb_is_azure:
                 # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
@@ -2659,6 +3443,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        # Record WHY the fallback activated so plugins (e.g. capability
+        # gates) can distinguish a refusal-driven temporary swap from any
+        # other fallback state.  Only set on the success path — exhaustion
+        # and skip paths must not leave a stale reason behind.
+        agent._fallback_reason = getattr(reason, "value", None)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2701,7 +3490,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        _fb_timeout = get_provider_request_timeout(
+            fb_provider,
+            fb_model,
+            requested_provider=fb_provider,
+        )
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
@@ -2837,12 +3630,57 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
-        return True
+        # Publish the mid-turn swap on the runtime_state hook so guardrail
+        # plugins (skill-gate) see the new model/provider + fallback_reason
+        # immediately.  Best-effort: activation must never fail because a
+        # plugin hook failed.  Local import — runtime_control is core-owned
+        # and pulling it at module scope risks an import cycle.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state fallback event failed: %s", _hook_err)
+        activated = True
     except Exception as e:
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback(reason)  # try next in chain
+
+    # Local observation: one real fallback chain advance. Emitted AFTER the
+    # try/except above and behind its own swallow-all guard, NOT at the former
+    # ``return True`` inside the try: that handler blacklists the nous
+    # credential, logs "Failed to activate fallback", and RECURSES to the next
+    # chain entry — so a transient sqlite error from a metrics write would have
+    # burned a healthy fallback, i.e. a metrics write changing user-facing
+    # failover.
+    #
+    # Exactly-once per real activation: the recursive skip paths and the
+    # exception retry above all re-enter through the _fallback_index increment,
+    # so stamping there would over-count, and the exhausted-chain early return
+    # correctly records nothing.
+    try:
+        from hermes_cli.observability import local_observations
+
+        local_observations.record_fallback_activation(
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            fallback_ordinal=int(getattr(agent, "_fallback_index", 0) or 0),
+            reason=reason,
+            platform=str(getattr(agent, "platform", "") or ""),
+            provider=fb_provider,
+            model=fb_model,
+            api_mode=str(getattr(agent, "api_mode", "") or ""),
+            call_role="fallback",
+            lane=str(getattr(agent, "_work_lane", "") or ""),
+        )
+    except Exception as _fallback_metric_error:
+        logger.debug(
+            "local observation fallback_activation emit failed: %s",
+            _fallback_metric_error,
+        )
+    agent._outage_route_fallback_walk_active = False
+    return activated
 
 
 
@@ -2927,9 +3765,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
             api_messages.append(api_msg)
 
-        effective_system = agent._cached_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        from agent.system_prompt import compose_effective_system_prompt
+
+        effective_system = compose_effective_system_prompt(
+            agent, agent._cached_system_prompt or ""
+        )
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
         if agent.prefill_messages:
@@ -3401,6 +4241,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 intercepted_events = []
                 writer_token = {"value": None}
+                # NOTE bedrock TTFT is botocore-retry-INCLUSIVE: the runtime
+                # client is built without Config(retries=...), unlike the
+                # OpenAI-wire and Anthropic clients which pin max_retries=0. See
+                # agent/model_call_timing.py.
+                _wire = {"token": None}
+
+                def _bedrock_on_event() -> None:
+                    # Fires at the very top of ``for event in event_stream``
+                    # before any branching, i.e. on the FIRST wire frame —
+                    # matching the semantics ``_diag['first_chunk_at']`` has on
+                    # the other two paths (both count message_start / empty
+                    # frames). Deliberately not ``_fire_first()``, which is the
+                    # on_first_delta UI gate and fires only on
+                    # text/tool/reasoning, so it would not be comparable.
+                    _bedrock_last_event["t"] = time.time()
+                    # One-shot per ATTEMPT. on_event fires for every yielded
+                    # Bedrock event, and stamp_first_frame takes a process-wide
+                    # lock, so an unguarded call would acquire it once per token
+                    # frame. The other two streaming paths guard the identical
+                    # call with their ``_diag['first_chunk_at'] is None`` check;
+                    # here the already-stamped token is the equivalent latch
+                    # (``_wire['token']`` is replaced on every new attempt).
+                    if _wire.get("stamped_token") is not _wire["token"]:
+                        _wire["stamped_token"] = _wire["token"]
+                        _stamp_first_frame(_wire["token"])
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
                     final_kwargs = dict(next_api_kwargs)
@@ -3408,6 +4273,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
+                        _wire["token"] = begin_wire_attempt(
+                            agent, "bedrock_converse"
+                        )
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -3507,12 +4375,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     if agent.reasoning_callback or agent.stream_delta_callback or plugin_reasoning_observer
                     else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
-                    on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
+                    on_event=_bedrock_on_event,
                 )
                 result["response"] = stream.final_response or streamed_response
             except Exception as e:
                 result["error"] = e
             finally:
+                _finish_wire_attempt(_wire["token"], "")
                 if stream is not None:
                     stream.close()
 
@@ -3609,6 +4478,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # recovered provider doesn't carry a stale streak into later turns.
             if result["response"] is not None:
                 _reset_stale_streak(agent)
+                _note_provider_success(agent)
             _emit_stream_end(final_text=_stream_final_text(result["response"]), finished=True, error=None)
             return result["response"]
         except Exception as exc:
@@ -3753,6 +4623,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         "discarded_bytes": 0,
     }
     managed_stream_holder = {"stream": None}
+    # Per-PHYSICAL-attempt TTFT slot for the chat_completions path, held at this
+    # scope (like ``managed_stream_holder``) so the stream factory that runs on
+    # the worker thread can publish the token and the outer terminal ``finally``
+    # can stamp the attempt's end. Re-stamped by the factory on every inner
+    # stream retry; ``begin_wire_attempt`` closes out the superseded record.
+    _wire = {"token": None}
 
     def _set_managed_stream(stream: Any) -> Any:
         managed_stream_holder["stream"] = stream
@@ -3839,7 +4715,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = get_provider_request_timeout(
+            agent.provider,
+            agent.model,
+            requested_provider=getattr(agent, "requested_provider", None),
+        )
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
@@ -3900,6 +4780,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         usage_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        try:
+            agent._last_stream_diag = _diag
+        except Exception:
+            pass
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
         attempt_stream_response = {"value": None}
@@ -3926,6 +4810,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
+            _wire["token"] = begin_wire_attempt(agent, "chat_completions")
             agent._touch_activity("waiting for provider response (streaming)")
             return request_client.chat.completions.create(**stream_kwargs)
 
@@ -4053,6 +4938,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
+                    # True model TTFT numerator: a monotonic_ns() read plus one
+                    # dict write behind this same one-shot guard. No SQLite and
+                    # no buffering — the first delta still reaches
+                    # agent._fire_stream_delta on this very iteration.
+                    _stamp_first_frame(_wire["token"])
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -4494,8 +5384,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         last_chunk_time["t"] = time.time()
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        try:
+            agent._last_stream_diag = _diag
+        except Exception:
+            pass
         _writer_token = {"value": None}
         _stream_context = {"manager": None, "stream": None}
+        # Anthropic has no pre-wire stamp inside its factory today —
+        # ``last_chunk_time["t"]`` above is set OUTSIDE it, so on a retried
+        # attempt it is stale. Re-stamped per physical attempt below.
+        _wire = {"token": None}
         base_final_message = None
 
         from agent import relay_llm
@@ -4509,6 +5407,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            _wire["token"] = begin_wire_attempt(agent, "anthropic_messages")
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()
@@ -4573,6 +5472,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
                         _diag["first_chunk_at"] = last_chunk_time["t"]
+                        _stamp_first_frame(_wire["token"])
                     _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(event)
                 except Exception:
                     pass
@@ -4616,6 +5516,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ) from None
                         raise
         finally:
+            _finish_wire_attempt(_wire["token"], "")
             try:
                 _close_managed_stream()
             finally:
@@ -5016,6 +5917,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             result["error"] = e
             return
         finally:
+            # Stamp this physical attempt's terminal instant. The OUTCOME is
+            # left blank on purpose: the recorder fills it from the terminal
+            # hook (success at post_api_request, failed/cancelled at
+            # api_request_error), so a failed attempt still produces a row.
+            _finish_wire_attempt(_wire["token"], "")
             _close_managed_stream()
             # Reuse reason only on a clean stream; any other outcome (error,
             # cancel-swallow) really closes so the next attempt builds a
@@ -5027,7 +5933,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider,
+        agent.model,
+        requested_provider=getattr(agent, "requested_provider", None),
+    )
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
@@ -5328,12 +6238,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
             return _stub
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

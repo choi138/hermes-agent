@@ -127,6 +127,7 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     task_id = kb.create_task(conn, title=title, assignee=assignee)
     lock = secrets.token_hex(8)
     future = int(time.time()) + 3600
+    worker_identity = f"test:worker:{worker_pid}"
     conn.execute(
         "UPDATE tasks SET status='running', claim_lock=?, "
         "claim_expires=?, worker_pid=? WHERE id=?",
@@ -134,12 +135,18 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     )
     cur = conn.execute(
         "INSERT INTO task_runs "
-        "(task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
-        "VALUES (?, 'running', ?, ?, ?, ?)",
-        (task_id, lock, future, worker_pid, int(time.time())),
+        "(task_id, status, claim_lock, claim_expires, worker_pid, "
+        "worker_identity, started_at) "
+        "VALUES (?, 'running', ?, ?, ?, ?, ?)",
+        (task_id, lock, future, worker_pid, worker_identity, int(time.time())),
+    )
+    run_id = cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET current_run_id=? WHERE id=?",
+        (run_id, task_id),
     )
     conn.commit()
-    return task_id, cur.lastrowid
+    return task_id, run_id
 
 
 def test_terminate_run_404_unknown_id(client):

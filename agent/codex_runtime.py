@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.background_review_policy import is_successful_review_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,36 @@ def _log_codex_request_failure(
         exception_chain,
         getattr(agent, "model", "unknown"),
     )
+
+
+def _begin_codex_wire_attempt(agent):
+    """Stamp one physical codex_responses request. Never raises (bare factory)."""
+    try:
+        from agent.chat_completion_helpers import begin_wire_attempt
+
+        return begin_wire_attempt(agent, "codex_responses")
+    except Exception:
+        return None
+
+
+def _stamp_codex_first_frame(token) -> None:
+    """Record the first wire frame of one codex attempt. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.stamp_first_frame(token)
+    except Exception:
+        pass
+
+
+def _finish_codex_wire_attempt(token) -> None:
+    """Record one codex attempt's terminal instant. Never raises."""
+    try:
+        from agent import model_call_timing
+
+        model_call_timing.finish_wire_attempt(token, "")
+    except Exception:
+        pass
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -870,26 +901,39 @@ def run_codex_app_server_turn(
     # _turns_since_memory and _user_turn_count are ALREADY incremented
     # in the run_conversation() pre-loop block (lines ~11793-11817) so we
     # do NOT touch them here — that would double-count.
-    # Only _iters_since_skill needs explicit increment, since the
-    # chat_completions loop bumps it per tool iteration (line ~12110)
-    # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+    # Commit cadence only after a successful primary turn. This prevents
+    # delegated Codex workers and errored/partial transcripts from creating
+    # automatic review work.
+    review_eligible = is_successful_review_outcome(
+        agent,
+        final_response=turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+        failed=turn.error is not None,
+        interrupted=turn.interrupted,
     )
+    if (
+        review_eligible
+        and agent._skill_nudge_interval > 0
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        agent._iters_since_skill = (
+            getattr(agent, "_iters_since_skill", 0) + max(int(turn.tool_iterations or 0), 1)
+        )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
 
-    # Now check the skill nudge AFTER iters were incremented — same
-    # pattern the chat_completions path uses (line ~15432).
+    # Check the skill nudge after successful work was committed.
     should_review_skills = False
     if (
-        agent._skill_nudge_interval > 0
+        review_eligible
+        and agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
         and "skill_manage" in agent.valid_tool_names
     ):
         should_review_skills = True
-        agent._iters_since_skill = 0
+
+    should_review_memory = bool(should_review_memory and review_eligible)
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
@@ -903,21 +947,36 @@ def run_codex_app_server_turn(
             )
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
+        # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW) —
+        # mirrors the turn_finalizer hook so the codex app-server path feeds
+        # the same mechanical salience accumulator. Fail-open.
+        try:
+            from agent.ingest_curator import observe_turn_completed
+            observe_turn_completed(agent, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator turn observation failed (fail-open)",
+                exc_info=True,
+            )
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
-        and not turn.interrupted
+        review_eligible
         and (should_review_memory or should_review_skills)
     ):
         try:
-            agent._spawn_background_review(
+            accepted = agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )
+            if accepted is not False:
+                if should_review_memory:
+                    agent._turns_since_memory = 0
+                if should_review_skills:
+                    agent._iters_since_skill = 0
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
@@ -1301,6 +1360,9 @@ def _consume_codex_event_stream(
         model=model,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
+        _hermes_streamed_chars=len(assembled_text),
+        _hermes_output_item_count=len(output),
+        _hermes_has_tool_items=has_tool_calls,
     )
     return final
 
@@ -1390,9 +1452,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_commentary_message(text: str) -> None:
         agent._fire_streamed_codex_commentary(text)
 
+    # Per-PHYSICAL-attempt TTFT slot. ``_on_event`` is defined OUTSIDE the
+    # attempt loop below, so it must read the CURRENT attempt's token from this
+    # mutable dict rather than closing over a value.
+    _wire = {"token": None}
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
+        # First wire frame of this attempt: _consume_codex_event_stream invokes
+        # on_event at the very top of its event loop before any event_type
+        # branching. Deliberately not the on_first_delta site, which codex does
+        # not fire on reasoning deltas while chat_completions does — those two
+        # are not comparable.
+        _stamp_codex_first_frame(_wire["token"])
         agent._touch_activity("receiving stream response")
 
     for attempt in range(max_stream_retries + 1):
@@ -1408,6 +1481,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
+            # Inside the factory AND inside the attempt loop, so each internal
+            # reconnect gets its own TTFT denominator. Bare body — the helper
+            # swallows everything and returns None.
+            _wire["token"] = _begin_codex_wire_attempt(agent)
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
@@ -1589,6 +1666,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             return final
         finally:
+            # Terminal instant for THIS physical attempt; the outcome is filled
+            # in by the recorder from the terminal lifecycle hook.
+            _finish_codex_wire_attempt(_wire["token"])
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:

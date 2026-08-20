@@ -15,6 +15,7 @@ Run with:  python -m pytest tests/test_code_execution.py -v
 import pytest
 # pytestmark removed — tests run fine (61 pass, ~99s)
 
+import base64
 import json
 import os
 import socket
@@ -46,8 +47,10 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    _rpc_poll_loop,
 )
 from tools.registry import registry
+from tools.environments.base import BaseEnvironment
 
 
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
@@ -118,6 +121,110 @@ class TestHermesToolsGeneration(unittest.TestCase):
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
+    def test_remote_rpc_uses_two_housekeeping_round_trips_per_call(self):
+        stop_event = threading.Event()
+        rpc_token = "test-token"
+        request_path = "/tmp/hermes_exec_test/rpc/req_000001"
+        request = base64.b64encode(
+            json.dumps(
+                {
+                    "tool": "terminal",
+                    "args": {"command": "true"},
+                    "seq": 1,
+                    "token": rpc_token,
+                }
+            ).encode("utf-8")
+        ).decode("ascii")
+
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append(command)
+                if command.startswith("for f in "):
+                    return {"output": f"{request_path}\t{request}\n"}
+                stop_event.set()
+                return {"output": "", "returncode": 0}
+
+        env = FakeEnv()
+        counter = [0]
+        call_log = []
+        with patch(
+            "model_tools.handle_function_call",
+            return_value=json.dumps({"output": "ok", "exit_code": 0}),
+        ):
+            _rpc_poll_loop(
+                env,
+                "/tmp/hermes_exec_test/rpc",
+                "task-1",
+                call_log,
+                counter,
+                5,
+                frozenset({"terminal"}),
+                stop_event,
+                rpc_token,
+            )
+
+        self.assertEqual(counter[0], 1)
+        self.assertEqual(len(env.commands), 2)
+        self.assertIn("base64 <", env.commands[0])
+        self.assertNotIn("cat ", " ".join(env.commands))
+        self.assertIn("rm -f", env.commands[1])
+        self.assertIn("__hermes_rpc_rc", env.commands[1])
+
+    def test_execute_remote_prepares_ssh_files_once(self):
+        """One compound SSH execution must not resync before every RPC command."""
+
+        class CountingSSHEnv(BaseEnvironment):
+            def __init__(self):
+                super().__init__(cwd="/tmp", timeout=30)
+                self.before_execute_calls = 0
+                self.commands = []
+                self._snapshot_ready = True
+
+            def _before_execute(self):
+                self.before_execute_calls += 1
+
+            def _run_bash(
+                self, cmd_string, *, login=False, timeout=120, stdin_data=None
+            ):
+                self.commands.append(cmd_string)
+                if "command -v python3" in cmd_string:
+                    return {"output": "OK\n", "returncode": 0}
+                if "python3 script.py" in cmd_string:
+                    return {"output": "hello\n", "returncode": 0}
+                return {"output": "", "returncode": 0}
+
+            def _wait_for_process(self, proc, **kwargs):
+                return dict(proc)
+
+            def cleanup(self):
+                pass
+
+        env = CountingSSHEnv()
+        fake_thread = MagicMock()
+
+        with patch(
+            "tools.code_execution_tool._load_config",
+            return_value={"timeout": 30, "max_tool_calls": 5},
+        ), patch(
+            "tools.code_execution_tool._get_or_create_env",
+            return_value=(env, "ssh"),
+        ), patch(
+            "tools.code_execution_tool._ship_file_to_remote",
+        ), patch(
+            "tools.code_execution_tool.threading.Thread",
+            return_value=fake_thread,
+        ):
+            result = json.loads(
+                _execute_remote("print('hello')", "task-1", ["terminal"])
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertGreaterEqual(len(env.commands), 4)
+        self.assertEqual(env.before_execute_calls, 1)
+
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
             def __init__(self):
@@ -458,6 +565,19 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertIn("parameters", schema)
         self.assertIn("code", schema["parameters"]["properties"])
         self.assertEqual(schema["parameters"]["required"], ["code"])
+
+    def test_independent_calls_are_direct_and_concurrent(self):
+        desc = build_execute_code_schema()["description"].lower()
+        self.assertIn("independent", desc)
+        self.assertIn("normal tool calls", desc)
+        self.assertIn("one assistant response", desc)
+        self.assertIn("concurrently", desc)
+
+    def test_data_dependent_calls_still_use_execute_code(self):
+        desc = build_execute_code_schema()["description"].lower()
+        self.assertIn("depend on earlier results", desc)
+        self.assertIn("conditional branching", desc)
+        self.assertIn("loop", desc)
 
     def test_subset_only_lists_enabled_tools(self):
         enabled = {"terminal", "read_file"}

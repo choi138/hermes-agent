@@ -56,6 +56,26 @@ def suppress_post_tool_call_hook():
     finally:
         _post_tool_call_hook_suppressed.reset(token)
 
+
+class TrustedToolResult(str):
+    """Model-facing tool text carrying an out-of-band raw registry result."""
+
+    def __new__(cls, value: str, trusted_raw_result: Any):
+        instance = super().__new__(cls, value)
+        instance.trusted_raw_result = trusted_raw_result
+        return instance
+
+    def __getnewargs_ex__(self):
+        """Preserve provenance when copy/pickle reconstructs this immutable value."""
+        return (str(self), self.trusted_raw_result), {}
+
+
+def get_trusted_raw_tool_result(result: Any) -> Any:
+    """Return the pre-middleware/plugin registry result when available."""
+    if isinstance(result, TrustedToolResult):
+        return result.trusted_raw_result
+    return result
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -333,7 +353,7 @@ def get_tool_definitions(
 
     Args:
         enabled_toolsets: Only include tools from these toolsets.
-        disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
+        disabled_toolsets: Exclude tools named directly or belonging to these toolsets.
         quiet_mode: Suppress status prints.
         skip_tool_search_assembly: When True, return the pre-assembly tool list
             (raw schemas for every enabled tool). Used internally by the
@@ -461,6 +481,7 @@ def _compute_tool_definitions(
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
+    individual_tool_denies: set[str] = set()
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
@@ -497,8 +518,36 @@ def _compute_tool_definitions(
                 tools_to_include.difference_update(legacy_tools)
                 if not quiet_mode:
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
+            elif registry.get_entry(toolset_name) is not None:
+                # Toolset names take precedence above. Otherwise, a registered
+                # tool name is an exact one-tool subtraction from the resolved
+                # surface, including catalogs rebuilt by the tool-search bridge.
+                individual_tool_denies.add(toolset_name)
+                tools_to_include.discard(toolset_name)
+                if not quiet_mode:
+                    print(f"🚫 Disabled tool '{toolset_name}'")
             elif not quiet_mode:
-                print(f"⚠️  Unknown toolset: {toolset_name}")
+                print(f"⚠️  Unknown toolset or tool: {toolset_name}")
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        # Task workers inherit the assignee profile's normal tools, but their
+        # Kanban authority is always the task-scoped lifecycle surface. Apply
+        # this after enabled/disabled resolution so a profile-level `kanban`,
+        # `kanban_submit`, composite toolset, or toolset deny cannot either
+        # restore orchestrator/intake tools or strip completion handoff. Exact
+        # individual-tool denies are reapplied below as the final user veto.
+        worker_tools = set(resolve_toolset("kanban_worker"))
+        non_worker_kanban_tools = (
+            set(resolve_toolset("kanban"))
+            | set(resolve_toolset("kanban_submit"))
+        ) - worker_tools
+        tools_to_include.difference_update(non_worker_kanban_tools)
+        tools_to_include.update(worker_tools)
+
+    # Session-specific augmentation must never resurrect an exact tool name
+    # that the user explicitly disabled. Whole-toolset behavior stays unchanged:
+    # bundle-level Kanban denies still preserve the worker lifecycle surface.
+    tools_to_include.difference_update(individual_tool_denies)
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
@@ -740,7 +789,14 @@ def _resolve_active_context_length() -> int:
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {
+    "todo",
+    "memory",
+    "session_search",
+    "delegate_task",
+    "model_status",
+    "model_switch",
+}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -1224,12 +1280,22 @@ def handle_function_call(
                        tools the session was actually granted.  ``None`` means
                        "no restriction" (the caller scopes to every toolset),
                        matching ``get_tool_definitions`` semantics.
-        disabled_toolsets: The session's disabled toolsets, applied as a
-                       subtraction when scoping the bridge catalog.
+        disabled_toolsets: The session's disabled toolsets or individual tools,
+                       applied as a subtraction when scoping the bridge catalog.
 
     Returns:
         Function result as a JSON string.
     """
+    # A model may emit an undeclared tool name even when it is absent from the
+    # advertised catalog.  Internal-only registry entries are available to
+    # narrowly bound capabilities, not to this model-originated dispatcher.
+    entry = registry.get_entry(function_name)
+    if entry is not None and not entry.expose_to_model:
+        return json.dumps(
+            {"error": f"Tool '{function_name}' is not available for model dispatch"},
+            ensure_ascii=False,
+        )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -1490,25 +1556,30 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            trusted_raw_result = None
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    nonlocal trusted_raw_result
+                    trusted_raw_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
+                    return trusted_raw_result
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    nonlocal trusted_raw_result
+                    trusted_raw_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+                    return trusted_raw_result
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
@@ -1583,7 +1654,11 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
-        return result
+        return (
+            TrustedToolResult(result, trusted_raw_result)
+            if isinstance(result, str)
+            else result
+        )
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"

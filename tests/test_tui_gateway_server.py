@@ -735,6 +735,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
 
+
     ready = threading.Event()
     sid = f"test-sid-{uuid.uuid4().hex[:8]}"
     session = {
@@ -748,6 +749,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         server._start_agent_build(sid, session)
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
         assert ready.wait(timeout=5), "agent_ready never set after build"
+
     finally:
         server._sessions.pop(sid, None)
 
@@ -797,6 +799,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
 
+
     ready = threading.Event()
     sid = f"test-secret-sid-{uuid.uuid4().hex[:8]}"
     session = {
@@ -810,6 +813,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
         server._start_agent_build(sid, session)
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
         assert ready.wait(timeout=5), "agent_ready never set after build"
+
     finally:
         server._sessions.pop(sid, None)
 
@@ -4858,6 +4862,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
 
     monkeypatch.setattr(_approval, "register_gateway_notify", lambda key, cb: None)
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_a, **_k: None)
 
     sid = "sid"
     try:

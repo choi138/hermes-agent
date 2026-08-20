@@ -144,6 +144,64 @@ def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
         if key not in defined and key in os.environ:
             del os.environ[key]
 
+# Dispatcher-spawned Kanban workers carry a private execution contract in the
+# process environment. Profile .env files intentionally override stale shell
+# exports, but they must never replace these server-injected identity/workspace
+# pins -- doing so can route a trusted local workspace to another backend.
+_KANBAN_EXECUTION_BACKEND_ENV = "_HERMES_KANBAN_EXECUTION_BACKEND"
+_KANBAN_WORKER_IDENTITY_ENV = {
+    "HERMES_HOME",
+    "HERMES_PROFILE",
+    "HERMES_TENANT",
+}
+
+
+def _capture_kanban_worker_runtime_pins() -> dict[str, str]:
+    if not os.environ.get(_KANBAN_EXECUTION_BACKEND_ENV):
+        return {}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if (
+            key == _KANBAN_EXECUTION_BACKEND_ENV
+            or key.startswith("HERMES_KANBAN_")
+            or key in _KANBAN_WORKER_IDENTITY_ENV
+        )
+    }
+
+
+def _restore_kanban_worker_runtime_pins(pins: dict[str, str]) -> None:
+    if not pins:
+        # The execution marker is a dispatcher-issued process capability, not
+        # profile configuration.  Do not let a copied/user-edited ``.env``
+        # manufacture one for an ordinary CLI session.
+        os.environ.pop(_KANBAN_EXECUTION_BACKEND_ENV, None)
+        return
+
+    # A profile .env may contain stale process-role variables from a copied
+    # service environment. Remove any it introduced, then restore only the
+    # dispatcher-provided contract captured on entry.
+    for key in tuple(os.environ):
+        if (
+            key == "_HERMES_GATEWAY"
+            or key.startswith("_HERMES_KANBAN_")
+            or key.startswith("HERMES_KANBAN_")
+            or key in _KANBAN_WORKER_IDENTITY_ENV
+        ) and key not in pins:
+            os.environ.pop(key, None)
+    os.environ.update(pins)
+
+    # ``load_hermes_dotenv`` is intentionally callable more than once during
+    # startup.  In particular, ``cli`` applies the Kanban execution contract
+    # and the later lazy import of ``run_agent`` loads the same profile .env
+    # again.  That second load used to reactivate TERMINAL_ENV=ssh after the
+    # CLI had correctly selected local execution, so the first real file tool
+    # call still ran on the assignee's remote machine.  Reapply the complete
+    # workspace/backend contract after *every* dotenv/managed-env overlay.
+    from hermes_cli.kanban_runtime import apply_worker_execution_contract
+
+    apply_worker_execution_contract(os.environ)
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -485,6 +543,7 @@ def load_hermes_dotenv(
       dependencies into the process that replaces that same environment.
     """
     loaded: list[Path] = []
+    kanban_worker_pins = _capture_kanban_worker_runtime_pins()
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -551,6 +610,12 @@ def load_hermes_dotenv(
     # so the merged config (which already carries the managed overlay) is
     # what lands in the env.
     _reapply_terminal_config_bridge(home_path)
+
+    # Dotenv, managed env, and the terminal config bridge deliberately override
+    # ordinary settings. A Kanban worker's dispatcher-issued runtime contract is
+    # not ordinary configuration, so restore it only after every override source
+    # has run.
+    _restore_kanban_worker_runtime_pins(kanban_worker_pins)
 
     return loaded
 

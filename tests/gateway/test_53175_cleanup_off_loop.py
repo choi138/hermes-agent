@@ -59,6 +59,28 @@ def _agent_with_close(close_fn):
     )
 
 
+def test_cleanup_resources_forwards_shutdown_deadline_to_agent_close():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    observed = []
+
+    class DeadlineAwareAgent:
+        _session_messages = None
+
+        def shutdown_memory_provider(self, *args, **kwargs):
+            pass
+
+        def close(self, *, shutdown_deadline=None):
+            observed.append(shutdown_deadline)
+
+    runner._cleanup_agent_resources(
+        DeadlineAwareAgent(), shutdown_deadline=123.5
+    )
+
+    assert observed == [123.5]
+
+
 @pytest.mark.asyncio
 async def test_cleanup_off_loop_does_not_block_event_loop():
     """A slow agent.close() must NOT freeze the loop. A concurrent heartbeat

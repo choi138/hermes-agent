@@ -132,6 +132,134 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
 
 
 
+def test_cli_goal_loop_shares_iteration_budget_and_emits_progress(
+    kanban_home,
+    monkeypatch,
+):
+    import cli as cli_module
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="observable bounded worker",
+            assignee="default",
+            goal_mode=True,
+            goal_max_turns=goals.KANBAN_DEFAULT_MAX_TURNS,
+        )
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.current_run_id is not None
+    assert task.claim_lock
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+
+    class _FakeAgent:
+        max_iterations = 5
+        session_id = "session-1"
+
+        def __init__(self):
+            self.clamps = []
+
+        def run_conversation(self, *, user_message, conversation_history):
+            self.clamps.append(self.max_iterations)
+            used = 2 if len(self.clamps) == 1 else 1
+            return {
+                "final_response": f"continued:{user_message[:8]}",
+                "api_calls": used,
+            }
+
+    agent = _FakeAgent()
+
+    class _FakeCLI:
+        conversation_history = []
+        session_id = "session-1"
+
+        def __init__(self):
+            self.agent = agent
+
+    captured = {}
+
+    def _fake_loop(**kwargs):
+        captured.update(kwargs)
+        assert kwargs["max_turns"] == goals.KANBAN_DEFAULT_MAX_TURNS
+        assert kwargs["iteration_budget_fn"]() == (2, 5)
+        kwargs["progress_fn"]({
+            "stage": "judge",
+            "turn": 1,
+            "max_turns": goals.KANBAN_DEFAULT_MAX_TURNS,
+            "verdict": "continue",
+            "reason": "run the deterministic checks",
+            "iterations_used": 2,
+            "iterations_total": 5,
+        })
+        # Same semantic verdict inside the three-turn window is kept in logs
+        # but does not multiply chat notifications.
+        kwargs["progress_fn"]({
+            "stage": "judge",
+            "turn": 2,
+            "max_turns": goals.KANBAN_DEFAULT_MAX_TURNS,
+            "verdict": "continue",
+            "reason": "this intermediate note is throttled",
+            "iterations_used": 3,
+            "iterations_total": 5,
+        })
+        kwargs["progress_fn"]({
+            "stage": "judge",
+            "turn": 4,
+            "max_turns": goals.KANBAN_DEFAULT_MAX_TURNS,
+            "verdict": "continue",
+            "reason": "report the periodic milestone",
+            "iterations_used": 4,
+            "iterations_total": 5,
+        })
+        kwargs["run_turn"]("continue one")
+        assert kwargs["iteration_budget_fn"]() == (4, 5)
+        kwargs["run_turn"]("continue two")
+        assert kwargs["iteration_budget_fn"]() == (5, 5)
+        return {"outcome": "blocked_iterations"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _fake_loop)
+
+    cli_module._run_kanban_goal_loop_q(
+        _FakeCLI(),
+        first_response="initial",
+        first_api_calls=2,
+    )
+
+    assert agent.clamps == [3, 1]
+    assert agent.max_iterations == 5
+    assert captured["first_response"] == "initial"
+
+    with kb.connect() as conn:
+        heartbeats = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "heartbeat" and (event.payload or {}).get("note")
+        ]
+    assert len(heartbeats) == 2
+    notes = [heartbeat.payload["note"] for heartbeat in heartbeats]
+    assert "**현재 단계:** 작업 완료 조건을 검토하고 있습니다" in notes[0]
+    assert "**확인:** 완료 조건을 아직 충족하지 못했습니다" in notes[0]
+    assert "**다음:** run the deterministic checks" in notes[0]
+    assert "report the periodic milestone" in notes[1]
+    assert all("this intermediate note is throttled" not in note for note in notes)
+    for forbidden in (
+        "Goal step",
+        "Judge:",
+        "Primary calls",
+        "iteration ",
+        "terminal",
+        "**Current stage:**",
+        "**Confirmed:**",
+        "**Next:**",
+    ):
+        assert all(forbidden not in note for note in notes)
+
+
 # ---------------------------------------------------------------------------
 # CLI judge gate tests (hermes kanban complete bypass fix)
 # ---------------------------------------------------------------------------
@@ -205,3 +333,34 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+def test_goal_mode_requires_explicit_positive_max_turns(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="goal_max_turns must be >= 1"):
+            kb.create_task(conn, title="t", assignee="worker", goal_mode=True)
+
+
+def test_loop_default_budget_preserves_full_quality_boundary(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 25)
+    turns = []
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-default-budget",
+        goal_text="bounded task",
+        run_turn=lambda p: turns.append(p) or "still going",
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: blocked.update(reason=reason),
+        first_response="turn1",
+    )
+
+    assert res["outcome"] == "blocked_budget"
+    assert (
+        res["turns_used"]
+        == goals.KANBAN_DEFAULT_MAX_TURNS
+        == goals.DEFAULT_MAX_TURNS
+        == 20
+    )
+    assert len(turns) == 19
+    assert "20/20" in blocked["reason"]

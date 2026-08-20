@@ -18,12 +18,14 @@ import logging
 import math
 import os
 import re
+import secrets
 import struct
 import subprocess
 import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
@@ -70,6 +72,7 @@ class _Snowflake:
         self.id = id
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+_DISCORD_MAX_SNOWFLAKE = (1 << 64) - 1
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -85,6 +88,13 @@ _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 _DISCORD_MAX_APP_COMMANDS = 100
 _DISCORD_SELECT_FIELD_LIMIT = 100
 _DISCORD_BUTTON_LABEL_LIMIT = 80
+
+
+def _is_discord_snowflake(value: str) -> bool:
+    return (
+        re.fullmatch(r"[1-9][0-9]{5,19}", value) is not None
+        and int(value) <= _DISCORD_MAX_SNOWFLAKE
+    )
 _DISCORD_ELLIPSIS = "\u2026"
 _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
@@ -145,7 +155,6 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import (
     MessageDeduplicator,
     ThreadParticipationTracker,
-    convert_table_to_bullets,
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
@@ -304,6 +313,146 @@ def _format_privileged_intents_guidance(*, needs_members: bool) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Markdown table → Discord-friendly fenced ASCII tables
+# ---------------------------------------------------------------------------
+# Discord does not render GitHub-flavored markdown pipe tables. Leaving them as
+# raw pipes makes dense tables hard to scan, especially in narrow mobile views.
+# Reformat detected tables as monospace box-drawing tables inside code fences.
+# BasePlatformAdapter.truncate_message() preserves code-block boundaries when
+# a converted table exceeds Discord's 2000-character message limit.
+
+# Matches a GFM table delimiter row: optional outer pipes, cells containing only
+# dashes (with optional leading/trailing colons for alignment) separated by '|'.
+# Requires at least one internal '|' so lone '---' horizontal rules are ignored.
+_TABLE_SEPARATOR_RE = re.compile(
+    r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$'
+)
+
+
+def _is_markdown_table_row(line: str) -> bool:
+    """Return True if *line* could plausibly be a markdown table data row."""
+    stripped = line.strip()
+    return bool(stripped) and '|' in stripped
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    """Split a simple GFM pipe-table row into stripped cell values."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _display_width(text: str) -> int:
+    """Return monospace display width, treating CJK full/wide chars as width 2."""
+    width = 0
+    for ch in text:
+        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+    return width
+
+
+def _pad_display_width(text: str, target_width: int) -> str:
+    """Pad *text* with spaces up to *target_width* display columns."""
+    padding = target_width - _display_width(text)
+    return text + (" " * padding if padding > 0 else "")
+
+
+def _render_markdown_table_for_discord(table_block: list[str]) -> str:
+    """Render a detected GFM pipe table as a fenced box-drawing table."""
+    if len(table_block) < 2:
+        return "\n".join(table_block)
+
+    headers = _split_markdown_table_row(table_block[0])
+    if len(headers) < 2:
+        return "\n".join(table_block)
+
+    num_cols = len(headers)
+    rows: list[list[str]] = []
+    for row_line in table_block[2:]:
+        row = _split_markdown_table_row(row_line)
+        if len(row) < num_cols:
+            row.extend([""] * (num_cols - len(row)))
+        elif len(row) > num_cols:
+            row = row[:num_cols]
+        rows.append(row)
+
+    col_widths = [max(3, _display_width(header)) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            col_widths[index] = max(col_widths[index], _display_width(cell))
+
+    def border(left: str, middle: str, right: str) -> str:
+        return left + middle.join("─" * (width + 2) for width in col_widths) + right
+
+    def data_row(cells: list[str]) -> str:
+        padded = [
+            " " + _pad_display_width(cell, col_widths[index]) + " "
+            for index, cell in enumerate(cells)
+        ]
+        return "│" + "│".join(padded) + "│"
+
+    rendered = [
+        border("┌", "┬", "┐"),
+        data_row(headers),
+        border("├", "┼", "┤"),
+    ]
+    rendered.extend(data_row(row) for row in rows)
+    rendered.append(border("└", "┴", "┘"))
+
+    return "```\n" + "\n".join(rendered) + "\n```"
+
+
+def _wrap_markdown_tables_for_discord(text: str) -> str:
+    """Rewrite GFM-style pipe tables into Discord-friendly codeblock tables.
+
+    Tables are detected by a header row containing '|' immediately followed by
+    a delimiter row matching :data:`_TABLE_SEPARATOR_RE`. Existing fenced code
+    blocks are left untouched so preformatted examples stay stable.
+    """
+    if '|' not in text or '-' not in text:
+        return text
+
+    lines = text.split('\n')
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        if stripped.startswith('```'):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        if (
+            '|' in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            table_block = [line, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and _is_markdown_table_row(lines[j]):
+                table_block.append(lines[j])
+                j += 1
+            out.append(_render_markdown_table_for_discord(table_block))
+            i = j
+            continue
+
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)
 
 
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
@@ -1110,6 +1259,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Parent message→channel lookup for durable mention-inbox anchored threads.
+        # The mapping is rebuilt from a successful send or marker reconciliation
+        # after each restart; Discord's message.thread remains the source of truth.
+        self._mention_inbox_parent_channels: Dict[str, str] = {}
+        self._mention_inbox_thread_locks: Dict[str, asyncio.Lock] = {}
+        self._mention_inbox_router: Any = None
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -3517,11 +3672,21 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                mention_inbox_nonce = (
+                    metadata.get("mention_inbox_nonce")
+                    if metadata and i == 0
+                    else None
+                )
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs: Dict[str, Any] = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if metadata and metadata.get("mention_inbox_no_mentions"):
+                        send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                    if mention_inbox_nonce is not None:
+                        send_kwargs["nonce"] = mention_inbox_nonce
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3540,10 +3705,15 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs: Dict[str, Any] = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if metadata and metadata.get("mention_inbox_no_mentions"):
+                            retry_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                        if mention_inbox_nonce is not None:
+                            retry_kwargs["nonce"] = mention_inbox_nonce
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -5765,12 +5935,13 @@ class DiscordAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Format message for Discord.
 
-        Converts GFM markdown tables to bullet-list groups since Discord
-        does not render pipe tables natively.
+        Discord uses its own markdown variant, but it does not render
+        GitHub-flavored pipe tables. Convert those to fenced ASCII tables so
+        they stay readable in Discord clients.
         """
         if not content:
             return content
-        return convert_table_to_bullets(content)
+        return _wrap_markdown_tables_for_discord(content)
 
     async def _run_simple_slash(
         self,
@@ -6428,6 +6599,547 @@ class DiscordAdapter(BasePlatformAdapter):
     # Thread creation helpers
     # ------------------------------------------------------------------
 
+    def remember_mention_inbox_parent(
+        self, parent_message_id: str, parent_channel_id: str
+    ) -> None:
+        """Remember where a sent/reconciled inbox alert can be fetched."""
+        message_id = str(parent_message_id)
+        channel_id = str(parent_channel_id)
+        if not message_id.isdigit() or not channel_id.isdigit():
+            raise ValueError("Discord parent message and channel IDs must be numeric")
+        mapping = getattr(self, "_mention_inbox_parent_channels", None)
+        if mapping is None:
+            mapping = {}
+            self._mention_inbox_parent_channels = mapping
+        mapping[message_id] = channel_id
+        while len(mapping) > 2000:
+            mapping.pop(next(iter(mapping)))
+
+    async def _mention_inbox_parent_message(self, parent_message_id: str) -> Any:
+        message_id = str(parent_message_id)
+        if not message_id.isdigit():
+            raise ValueError("Discord parent message ID must be numeric")
+        mapping = getattr(self, "_mention_inbox_parent_channels", {})
+        channel_id = mapping.get(message_id)
+        if channel_id is None:
+            raise ValueError("Discord parent channel is unknown")
+        client = getattr(self, "_client", None)
+        if client is None:
+            raise RuntimeError("Discord adapter is not connected")
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(channel_id))
+        if channel is None or not hasattr(channel, "fetch_message"):
+            raise RuntimeError("Discord parent channel is unavailable")
+        return await channel.fetch_message(int(message_id))
+
+    async def find_anchored_thread(self, parent_message_id: str) -> str | None:
+        """Return the public thread already anchored to an inbox alert, if any."""
+        message = await self._mention_inbox_parent_message(parent_message_id)
+        thread = getattr(message, "thread", None)
+        if thread is not None and getattr(thread, "id", None) is not None:
+            return str(thread.id)
+        client = getattr(self, "_client", None)
+        cached = client.get_channel(int(parent_message_id)) if client is not None else None
+        if cached is not None and getattr(cached, "id", None) is not None:
+            return str(cached.id)
+        return None
+
+    async def create_anchored_thread(
+        self,
+        parent_message_id: str,
+        name: str,
+        auto_archive_duration: int = 1440,
+    ) -> str:
+        """Idempotently create a public thread from a bot-authored parent alert."""
+        message_id = str(parent_message_id)
+        thread_name = " ".join(str(name).split())
+        if not message_id.isdigit():
+            raise ValueError("Discord parent message ID must be numeric")
+        if not thread_name or len(thread_name) > 100:
+            raise ValueError("Discord thread name must contain 1..100 characters")
+        if auto_archive_duration not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
+            raise ValueError("unsupported Discord auto archive duration")
+        locks = getattr(self, "_mention_inbox_thread_locks", None)
+        if locks is None:
+            locks = {}
+            self._mention_inbox_thread_locks = locks
+        lock = locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            existing = await self.find_anchored_thread(message_id)
+            if existing is not None:
+                return existing
+            message = await self._mention_inbox_parent_message(message_id)
+            try:
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=auto_archive_duration,
+                )
+            except Exception:
+                # Discord can report an already-created race. Re-fetch the
+                # parent and accept only a real anchored thread before raising.
+                existing = await self.find_anchored_thread(message_id)
+                if existing is not None:
+                    return existing
+                raise
+            thread_id = getattr(thread, "id", None)
+            if thread_id is None:
+                raise RuntimeError("Discord thread creation returned no thread ID")
+            return str(thread_id)
+
+    async def ensure_mention_inbox_thread_participants(
+        self,
+        thread_id: str,
+        user_ids: frozenset[str],
+    ) -> None:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        participants = tuple(sorted(str(user_id) for user_id in user_ids))
+        if any(
+            not _is_discord_snowflake(user_id)
+            for user_id in participants
+        ):
+            raise ValueError("Discord participant user ID is invalid")
+        if not participants:
+            return
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        add_user = getattr(thread, "add_user", None)
+        if not callable(add_user):
+            raise RuntimeError("Discord thread participant API is unavailable")
+        for user_id in participants:
+            result = add_user(_Snowflake(int(user_id)))
+            if not inspect.isawaitable(result):
+                raise RuntimeError("Discord thread participant API is not async")
+            await result
+
+    async def is_mention_inbox_thread_active(self, thread_id: str) -> bool:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        return (
+            getattr(thread, "archived", None) is False
+            and getattr(thread, "locked", None) is False
+        )
+
+    async def mention_inbox_thread_has_parent(
+        self,
+        thread_id: str,
+        parent_channel_id: str,
+    ) -> bool:
+        value = str(thread_id)
+        parent = str(parent_channel_id)
+        if not _is_discord_snowflake(value) or not _is_discord_snowflake(parent):
+            raise ValueError(
+                "Discord thread and parent IDs must be valid snowflakes"
+            )
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        return str(getattr(thread, "parent_id", "") or "") == parent
+
+    async def activate_mention_inbox_thread(self, thread_id: str) -> None:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        client = self._client
+        if client is None:
+            raise RuntimeError("Discord client is unavailable")
+        thread: Any = client.get_channel(int(value))
+        if thread is None:
+            thread = await client.fetch_channel(int(value))
+        if getattr(thread, "locked", None) is not False:
+            raise RuntimeError("Discord work thread is locked")
+        if getattr(thread, "archived", None) is False:
+            return
+        edit = getattr(thread, "edit", None)
+        if not callable(edit):
+            raise RuntimeError("Discord thread activation API is unavailable")
+        result = edit(archived=False)
+        if not inspect.isawaitable(result):
+            raise RuntimeError("Discord thread activation API is not async")
+        await result
+
+    def mark_mention_inbox_thread_participation(self, thread_id: str) -> None:
+        value = str(thread_id)
+        if not _is_discord_snowflake(value):
+            raise ValueError("Discord thread ID must be a valid snowflake")
+        tracker = getattr(self, "_threads", None)
+        if tracker is None:
+            raise RuntimeError("Discord thread participation tracker is unavailable")
+        tracker.mark(value)
+
+    async def handle_message(self, event: MessageEvent) -> bool:
+        """Replay queued Discord ingress through late-bound thread routers."""
+        source = getattr(event, "source", None)
+        is_startup_replay = bool(
+            getattr(event, "_hermes_startup_restore_replay", False)
+        )
+        is_external_discord_message = bool(
+            source is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and not getattr(event, "internal", False)
+        )
+        is_external_discord_thread = bool(
+            is_external_discord_message
+            and getattr(source, "chat_type", None) == "thread"
+        )
+        if is_startup_replay and is_external_discord_message:
+            route_channel_id = str(
+                (
+                    getattr(source, "thread_id", None)
+                    if is_external_discord_thread
+                    else None
+                )
+                or getattr(source, "chat_id", "")
+                or ""
+            )
+            route_parent_id = getattr(source, "parent_chat_id", None)
+            raw_message = getattr(event, "raw_message", None)
+            metadata = getattr(event, "metadata", {})
+            route_result = None
+            if route_channel_id and raw_message is None:
+                router = getattr(self, "_mention_inbox_router", None)
+                if router is not None:
+                    try:
+                        surface_checker = getattr(router, "is_agent_surface", None)
+                        agent_surface = bool(
+                            surface_checker(route_channel_id, route_parent_id)
+                            if callable(surface_checker)
+                            else False
+                        )
+                        registered_thread = bool(
+                            is_external_discord_thread
+                            and not agent_surface
+                            and router.is_work_thread(route_channel_id)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Startup replay work-surface validation failed closed",
+                            self.name,
+                            exc_info=True,
+                        )
+                        return True
+                    if registered_thread or agent_surface:
+                        logger.warning(
+                            "[%s] Dropping startup-replayed Work Inbox message "
+                            "without raw Discord human-admission evidence",
+                            self.name,
+                        )
+                        return True
+            if route_channel_id and raw_message is not None:
+                raw_channel = getattr(raw_message, "channel", None)
+                raw_parent_id = getattr(raw_channel, "parent_id", None)
+                if raw_parent_id is None:
+                    raw_parent_id = getattr(
+                        getattr(raw_channel, "parent", None),
+                        "id",
+                        None,
+                    )
+                if raw_parent_id is not None:
+                    route_parent_id = str(raw_parent_id)
+                replay_content = str(getattr(raw_message, "content", "") or "")
+                stored_content = (
+                    metadata.get("discord_original_content")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if isinstance(stored_content, str):
+                    comparable_content = stored_content
+                    bot_id = getattr(getattr(self, "_client", None), "user", None)
+                    bot_id = getattr(bot_id, "id", None)
+                    if bot_id is not None:
+                        comparable_content = comparable_content.replace(
+                            f"<@{bot_id}>", ""
+                        ).replace(f"<@!{bot_id}>", "")
+                    if comparable_content.strip() == replay_content.strip():
+                        replay_content = stored_content
+                route_result = await self._route_mention_inbox_message_result(
+                    raw_message,
+                    thread_id=route_channel_id,
+                    parent_channel_id=(
+                        None if route_parent_id is None else str(route_parent_id)
+                    ),
+                    raw_content=replay_content,
+                    check_registered_thread=is_external_discord_thread,
+                )
+            if route_result is not None and bool(route_result.handled):
+                return True
+            agent_text = (
+                None
+                if route_result is None
+                else getattr(route_result, "agent_text", None)
+            )
+            if isinstance(agent_text, str) and agent_text.strip():
+                event.text = agent_text
+                event.message_type = MessageType.TEXT
+                event.channel_context = None
+                event.media_urls = []
+                event.media_types = []
+                event.reply_to_message_id = None
+                event.reply_to_text = None
+                event.reply_to_author_id = None
+                event.reply_to_author_name = None
+                event.reply_to_is_own_message = False
+                if isinstance(metadata, dict):
+                    metadata["discord_original_content"] = replay_content
+                if event.source is not None:
+                    event.source.chat_name = "Work Inbox"
+
+        # Internal approved-execution events and ordinary Discord events stay
+        # on the shared adapter rail. Returning True records successful
+        # admission for enqueue_mention_inbox_execution().
+        await super().handle_message(event)
+        return True
+
+    def set_mention_inbox_router(self, router: Any | None) -> None:
+        """Install or clear the dedicated registered-work-thread router."""
+        self._mention_inbox_router = router
+
+    def set_mention_inbox_execution_observer(self, observer: Any | None) -> None:
+        """Install or clear the in-process approved-execution lifecycle observer."""
+        self._mention_inbox_execution_observer = observer
+
+    async def enqueue_mention_inbox_execution(
+        self, request: Any, prompt: str
+    ) -> str:
+        """Admit one approved envelope to the existing thread session rail."""
+        execution_id = str(getattr(request, "execution_id", ""))
+        proposal_hash = str(getattr(request, "proposal_hash", ""))
+        recovery_token = str(getattr(request, "recovery_token", ""))
+        mode = str(getattr(request, "executor_hint", ""))
+        approval_message_id = str(getattr(request, "approval_message_id", ""))
+        approver_user_id = str(getattr(request, "approver_user_id", ""))
+        thread_id = str(getattr(request, "thread_id", ""))
+        if not execution_id or len(execution_id) > 80:
+            raise ValueError("execution_id is invalid")
+        if len(proposal_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in proposal_hash
+        ):
+            raise ValueError("proposal_hash is invalid")
+        if mode not in {"direct", "kanban"}:
+            raise ValueError("execution mode is invalid")
+        if not recovery_token or len(recovery_token) > 80:
+            raise ValueError("execution recovery token is invalid")
+        owner_id = secrets.token_hex(16)
+        if not all(
+            value.isdigit()
+            for value in (approval_message_id, approver_user_id, thread_id)
+        ):
+            raise ValueError("Discord execution identities must be numeric")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20_000:
+            raise ValueError("approved execution prompt is invalid")
+        client = getattr(self, "_client", None)
+        if client is None:
+            raise RuntimeError("Discord adapter is not connected")
+        channel = client.get_channel(int(thread_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(thread_id))
+        if channel is None:
+            raise RuntimeError("approved execution thread is unavailable")
+        parent = getattr(channel, "parent", None)
+        parent_id = str(getattr(parent, "id", "") or "")
+        guild = getattr(channel, "guild", None)
+        guild_name = str(getattr(guild, "name", "") or "")
+        thread_name = str(getattr(channel, "name", "") or "work thread")
+        chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
+        chat_topic = getattr(parent, "topic", None)
+        source = self.build_source(
+            chat_id=thread_id,
+            chat_name=chat_name,
+            chat_type="thread",
+            user_id=approver_user_id,
+            user_name="approved mention-inbox user",
+            thread_id=thread_id,
+            chat_topic=chat_topic if isinstance(chat_topic, str) else None,
+            guild_id=(None if guild is None else str(getattr(guild, "id", "") or "")),
+            parent_chat_id=parent_id or None,
+            message_id=approval_message_id,
+            role_authorized=True,
+        )
+        has_config = getattr(self, "config", None) is not None
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=None,
+            auto_skill=(
+                self._resolve_channel_skills(thread_id, parent_id or None)
+                if has_config
+                else None
+            ),
+            channel_prompt=(
+                self._resolve_channel_prompt(thread_id, parent_id or None)
+                if has_config
+                else None
+            ),
+            internal=True,
+            metadata={
+                "mention_inbox_execution": {
+                    "execution_id": execution_id,
+                    "proposal_hash": proposal_hash,
+                    "mode": mode,
+                    "recovery_token": recovery_token,
+                    "owner_id": owner_id,
+                }
+            },
+        )
+        lock = getattr(
+            self,
+            "_mention_inbox_execution_admission_lock",
+            None,
+        )
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mention_inbox_execution_admission_lock = lock
+        bindings = getattr(
+            self,
+            "_mention_inbox_execution_admissions",
+            None,
+        )
+        if bindings is None:
+            bindings = {}
+            self._mention_inbox_execution_admissions = bindings
+        binding = (proposal_hash, mode, thread_id, recovery_token)
+        dispatch_id = f"{mode}:{execution_id}"
+        async with lock:
+            existing = bindings.get(execution_id)
+            if existing == binding:
+                return dispatch_id
+            if existing is not None:
+                raise ValueError(
+                    "execution_id is already bound to another approved execution"
+                )
+            bindings[execution_id] = binding
+            try:
+                if not await self.handle_message(event):
+                    raise RuntimeError(
+                        "approved execution event was not admitted"
+                    )
+            except BaseException:
+                if bindings.get(execution_id) == binding:
+                    del bindings[execution_id]
+                raise
+        return dispatch_id
+
+    async def _route_mention_inbox_message_result(
+        self,
+        message: Any,
+        *,
+        thread_id: str,
+        raw_content: str,
+        parent_channel_id: str | None = None,
+        check_registered_thread: bool = True,
+    ) -> Any | None:
+        router = getattr(self, "_mention_inbox_router", None)
+        if router is None:
+            return None
+        from plugins.mention_inbox.router import (
+            InboxDiscordMessage,
+            InboxRouteResult,
+        )
+
+        try:
+            surface_checker = getattr(router, "is_agent_surface", None)
+            agent_surface = bool(
+                surface_checker(thread_id, parent_channel_id)
+                if callable(surface_checker)
+                else False
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Mention-inbox work-surface validation failed closed",
+                self.name,
+                exc_info=True,
+            )
+            return InboxRouteResult(True, "agent_surface_validation_failed")
+        if agent_surface:
+            registered_thread = False
+        elif not check_registered_thread:
+            return None
+        else:
+            try:
+                registered_thread = bool(router.is_work_thread(thread_id))
+            except Exception:
+                logger.warning(
+                    "[%s] Mention-inbox registered-thread validation failed closed",
+                    self.name,
+                    exc_info=True,
+                )
+                return InboxRouteResult(True, "registered_thread_validation_failed")
+        if not registered_thread and not agent_surface:
+            return None
+
+        reference = getattr(message, "reference", None)
+        reply_to = getattr(reference, "message_id", None)
+        if reply_to is None:
+            reply_to = getattr(getattr(reference, "resolved", None), "id", None)
+        user_id = str(getattr(getattr(message, "author", None), "id", ""))
+        message_id = str(getattr(message, "id", ""))
+        author = getattr(message, "author", None)
+        admitted_human = (
+            author is not None
+            and getattr(author, "bot", None) is False
+            and getattr(message, "webhook_id", None) is None
+        )
+        content = raw_content
+        bot_id = getattr(getattr(self, "_client", None), "user", None)
+        bot_id = getattr(bot_id, "id", None)
+        if bot_id is not None:
+            content = content.replace(f"<@!{bot_id}>", f"<@{bot_id}>")
+        try:
+            return await router.handle_message(
+                InboxDiscordMessage(
+                    thread_id=thread_id,
+                    message_id=message_id,
+                    user_id=user_id,
+                    text=content,
+                    reply_to_message_id=(None if reply_to is None else str(reply_to)),
+                    parent_channel_id=parent_channel_id,
+                    admitted_human=admitted_human,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Mention-inbox work-thread router failed closed",
+                self.name,
+                exc_info=True,
+            )
+            try:
+                await message.channel.send(
+                    "이 work thread의 상태를 확인하지 못해 요청을 실행하지 않았어요. 잠시 뒤 다시 시도해 주세요.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                pass
+            return InboxRouteResult(True, "router_failed_closed")
+
+    async def _route_mention_inbox_message(
+        self, message: Any, *, thread_id: str, raw_content: str
+    ) -> bool:
+        """Compatibility wrapper for deterministic handled/not-handled checks."""
+
+        result = await self._route_mention_inbox_message_result(
+            message,
+            thread_id=thread_id,
+            raw_content=raw_content,
+        )
+        return bool(result is not None and result.handled)
+
     async def _handle_thread_create_slash(
         self,
         interaction: discord.Interaction,
@@ -6705,18 +7417,26 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
+        channels: set[str]
         if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        # Coerce non-list scalars (str/int/float) to str before splitting.
-        # YAML parses a bare numeric value such as
-        # `free_response_channels: 1491973769726791812` as int, which was
-        # previously falling through the isinstance(str) branch and silently
-        # returning an empty set.  str() here accepts whatever scalar the YAML
-        # loader hands us without changing existing string/CSV semantics.
-        s = str(raw).strip() if raw is not None else ""
-        if s:
-            return {part.strip() for part in s.split(",") if part.strip()}
-        return set()
+            channels = {str(part).strip() for part in raw if str(part).strip()}
+        else:
+            # Coerce non-list scalars (str/int/float) to str before splitting.
+            # YAML parses a bare numeric value such as
+            # `free_response_channels: 1491973769726791812` as int, which was
+            # previously falling through the isinstance(str) branch and silently
+            # returning an empty set.  str() here accepts whatever scalar the
+            # YAML loader hands us without changing existing string/CSV
+            # semantics.
+            value = str(raw).strip() if raw is not None else ""
+            channels = {part.strip() for part in value.split(",") if part.strip()}
+        # The home channel is the user's own conversation surface, so it never
+        # requires a mention.  Auto-threading is restored separately in
+        # _handle_message so this free-response entry does not suppress it.
+        home = getattr(self.config, "home_channel", None)
+        if home and getattr(home, "chat_id", None):
+            channels.add(str(home.chat_id))
+        return channels
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
@@ -7720,6 +8440,48 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_mention_inbox_proposal(
+        self,
+        thread_id: str,
+        content: str,
+        *,
+        proposal_id: str,
+        proposal_revision: int,
+        approval_offered: bool,
+    ) -> SendResult:
+        """Send a proposal message with a duplicate-safe nonce."""
+
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        if getattr(self, "_mention_inbox_router", None) is None:
+            return SendResult(success=False, error="Mention-inbox router unavailable")
+
+        try:
+            channel = self._client.get_channel(int(thread_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(thread_id))
+            nonce = hashlib.sha256(
+                (
+                    "mention-inbox-proposal\0"
+                    f"{proposal_id}\0{proposal_revision}"
+                ).encode()
+            ).hexdigest()[:25]
+            message = await channel.send(
+                content=self.format_message(content),
+                allowed_mentions=discord.AllowedMentions.none(),
+                nonce=nonce,
+            )
+            message_id = str(message.id)
+            self._nonconversational_messages.mark_many([message_id])
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_mention_inbox_proposal failed: %s",
+                self.name,
+                exc,
+            )
+            return SendResult(success=False, error=str(exc))
+
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
@@ -8062,6 +8824,7 @@ class DiscordAdapter(BasePlatformAdapter):
         recovered: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
+        gateway_ingress_monotonic = time.monotonic()
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
         # in a thread where the bot has already participated.
@@ -8082,10 +8845,15 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         is_voice_linked_channel = False
+        is_free_channel = False
+        is_home_channel = False
+        channel_ids: set[str] = set()
+        home = getattr(self.config, "home_channel", None)
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
-        raw_content = message.content.strip()
+        direct_content = message.content.strip()
+        raw_content = direct_content
         normalized_content = raw_content
         mention_prefix = False
 
@@ -8137,6 +8905,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 or bool(channel_keys & free_channels)
                 or is_voice_linked_channel
             )
+            home_channel_id = str(getattr(home, "chat_id", "") or "")
+            is_home_channel = bool(home_channel_id and home_channel_id in channel_ids)
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in)
@@ -8152,6 +8922,29 @@ class DiscordAdapter(BasePlatformAdapter):
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
+        mention_inbox_agent_passthrough = False
+        route_channel_id = str(getattr(message.channel, "id", ""))
+        route_parent_id = parent_channel_id
+        if route_channel_id:
+            route_result = await self._route_mention_inbox_message_result(
+                message,
+                thread_id=route_channel_id,
+                parent_channel_id=(
+                    None if route_parent_id is None else str(route_parent_id)
+                ),
+                raw_content=direct_content,
+                check_registered_thread=is_thread,
+            )
+            if route_result is not None and bool(route_result.handled):
+                return True
+            agent_text = (
+                None
+                if route_result is None
+                else getattr(route_result, "agent_text", None)
+            )
+            if isinstance(agent_text, str) and agent_text.strip():
+                normalized_content = agent_text
+                mention_inbox_agent_passthrough = True
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -8159,8 +8952,12 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = bool(channel_keys & no_thread_channels) or (
+                is_free_channel and not is_home_channel
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            if is_home_channel and getattr(home, "auto_thread", None) is not None:
+                auto_thread = bool(home.auto_thread)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
@@ -8204,10 +9001,15 @@ class DiscordAdapter(BasePlatformAdapter):
         referenced_attachments = []
         reference = getattr(message, "reference", None)
         resolved_reference = getattr(reference, "resolved", None) if reference else None
-        if resolved_reference is not None:
+        if resolved_reference is not None and not mention_inbox_agent_passthrough:
             referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
 
-        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
+        inherited_attachments = (
+            []
+            if mention_inbox_agent_passthrough
+            else snapshot_attachments + referenced_attachments
+        )
+        all_attachments = list(message.attachments) + inherited_attachments
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -8253,6 +9055,8 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"
+        if mention_inbox_agent_passthrough:
+            chat_name = "Work Inbox"
 
         # Get channel topic (if available - TextChannels have topics, DMs/threads don't).
         # For threads whose parent is a forum channel, inherit the parent's topic
@@ -8430,7 +9234,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # to keep the partition rule clean.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
+        if (
+            not _is_dm
+            and not mention_inbox_agent_passthrough
+            and self._discord_history_backfill()
+        ):
             # Run backfill when there's a real gap to fill:
             #   - mention-gated channels with no free-response override
             #     (messages between bot turns aren't in the transcript)
@@ -8507,7 +9315,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         reply_to_id = None
         reply_to_text = None
-        if message.reference:
+        if message.reference and not mention_inbox_agent_passthrough:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
@@ -8526,6 +9334,13 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata={
+                "gateway_ingress_monotonic": gateway_ingress_monotonic,
+                # Discord ingress strips the bot mention from message.content
+                # before normalization. Startup replay needs the untouched
+                # form so exact mention-inbox control syntax remains exact.
+                "discord_original_content": raw_content,
+            },
         )
 
         # Track thread participation so the bot won't require @mention for

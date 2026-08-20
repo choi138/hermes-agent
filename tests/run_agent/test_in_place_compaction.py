@@ -59,6 +59,48 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    def test_compression_copies_trusted_tool_result_messages(self):
+        """Compression accepts in-memory tool results carrying provenance."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+        from model_tools import TrustedToolResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260721_120000_trusted"
+            _seed(db, sid, "trusted-result")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "web_search", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "name": "web_search",
+                    "tool_call_id": "call_1",
+                    "content": TrustedToolResult(
+                        '{"ok": true}', {"ok": True, "source": "registry"}
+                    ),
+                },
+            ]
+
+            compressed, _ = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+
+            assert compressed == [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

@@ -33,7 +33,20 @@
 
 set -euo pipefail
 
-# ── Locate repo root ────────────────────────────────────────────────────────
+# macOS commonly starts shells with a soft open-file limit of 256.  A single
+# aiohttp-heavy pytest file can legitimately exceed that while its event loops
+# overlap during teardown, causing cascading Errno 24 failures unrelated to the
+# code under test.  Raise only the soft limit when the host allows it; child
+# pytest processes inherit the value.  Linux CI limits are left untouched.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  _soft_nofile="$(ulimit -Sn)"
+  if [[ "$_soft_nofile" != "unlimited" ]] && (( _soft_nofile < 4096 )); then
+    ulimit -S -n 4096 2>/dev/null || true
+  fi
+  unset _soft_nofile
+fi
+
+# Canonical repository test entrypoint.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -84,11 +97,8 @@ if [ -n "$VENV" ]; then
   PYTHON="$VENV_PYTHON"
 elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
-  # Guard with an import check: HERMES_PYTHON may point at the RELEASE
-  # venv (no pytest) when inherited from a wrapped `hermes` binary rather
-  # than the devShell hook.
   PYTHON="$HERMES_PYTHON"
-  echo "▶ no local venv — using Nix dev venv via HERMES_PYTHON: $PYTHON"
+  echo "▶ using explicit HERMES_PYTHON: $PYTHON"
 else
   echo "error: no virtualenv with pytest found in $REPO_ROOT/.venv or $REPO_ROOT/venv," >&2
   echo "       and HERMES_PYTHON is not a python with pytest (enter the Nix devShell or create a venv)" >&2

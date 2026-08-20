@@ -7,6 +7,8 @@ or a temp file (local).
 """
 
 import codecs
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -20,7 +22,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Iterable, Protocol
+from typing import IO, Callable, Iterable, Iterator, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -44,6 +46,24 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+
+# A compound operation such as remote execute_code can issue many commands
+# against one already-prepared filesystem snapshot. ContextVar keeps the
+# suppression scoped to that operation and lets the existing thread-context
+# bridge carry it into RPC workers without mutating shared environment state.
+_PRE_EXECUTE_HOOKS_SUPPRESSED: ContextVar[bool] = ContextVar(
+    "hermes_pre_execute_hooks_suppressed", default=False
+)
+
+
+@contextmanager
+def suppress_pre_execute_hooks() -> Iterator[None]:
+    """Skip per-command preparation inside one already-prepared operation."""
+    token = _PRE_EXECUTE_HOOKS_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _PRE_EXECUTE_HOOKS_SUPPRESSED.reset(token)
 
 
 # Sentinel capacity for full-fidelity capture (internal consumers). Large
@@ -76,6 +96,72 @@ class EnvironmentConnectionError(RuntimeError):
             "credentials), then retry the same command — recovery is "
             "automatic once the backend is back."
         )
+
+
+def _build_process_tree_kill_command(
+    *,
+    root_pid: int | None = None,
+    pid_file: str | None = None,
+) -> str:
+    """Build a Bash command that stops and terminates one POSIX process tree.
+
+    Exactly one root source must be supplied. ``root_pid`` is used for tracked
+    sandbox background processes, while ``pid_file`` lets an SSH transport
+    clean up the remote wrapper whose PID is only known after launch.
+
+    The root is stopped before descendants are enumerated, and each descendant
+    is stopped before its own children are inspected. This closes the fork
+    race that otherwise lets killing only the wrapper orphan a still-running
+    child under PID 1. The ``ps`` form works on both Linux and macOS.
+    """
+    if (root_pid is None) == (pid_file is None):
+        raise ValueError("exactly one of root_pid or pid_file is required")
+
+    cleanup = ""
+    if root_pid is not None:
+        try:
+            normalized_pid = int(root_pid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("root_pid must be an integer") from exc
+        if normalized_pid <= 1:
+            raise ValueError("root_pid must be greater than 1")
+        root_setup = f"__hermes_root={normalized_pid}; "
+    else:
+        if not isinstance(pid_file, str) or not pid_file:
+            raise ValueError("pid_file must be a non-empty path")
+        marker = shlex.quote(pid_file)
+        root_setup = (
+            f"__hermes_marker={marker}; "
+            "__hermes_root=; "
+            "if [ -r \"$__hermes_marker\" ]; then "
+            "__hermes_root=$(sed -n '1{s/[^0-9].*$//;p;}' "
+            "\"$__hermes_marker\"); "
+            "fi; "
+        )
+        cleanup = "rm -f -- \"$__hermes_marker\""
+
+    return (
+        root_setup
+        + "case \"$__hermes_root\" in ''|*[!0-9]*) ;; *) "
+        "__hermes_children() { "
+        "ps -eo pid=,ppid= 2>/dev/null | "
+        "awk -v parent=\"$1\" '$2 == parent { print $1 }'; "
+        "}; "
+        "__hermes_collect() { "
+        "kill -STOP \"$1\" 2>/dev/null || true; "
+        "for __hermes_child in $(__hermes_children \"$1\"); do "
+        "__hermes_collect \"$__hermes_child\"; done; "
+        "printf '%s\\n' \"$1\"; "
+        "}; "
+        "__hermes_pids=$(__hermes_collect \"$__hermes_root\"); "
+        "if [ -n \"$__hermes_pids\" ]; then "
+        "kill -TERM $__hermes_pids 2>/dev/null || true; "
+        "kill -CONT $__hermes_pids 2>/dev/null || true; "
+        "sleep 0.5; "
+        "kill -KILL $__hermes_pids 2>/dev/null || true; "
+        "fi ;; esac; "
+        + cleanup
+    )
 
 
 class _BoundedOutputCollector:
@@ -551,13 +637,9 @@ def _export_dump_excluding_session_vars(
     means ``export -p`` never emits those vars — including any continuation
     lines. ``|| true`` keeps the success contract for callers that chain on it.
 
-    The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. *tmp_path* is typically a shell-variable expansion (a
-    mktemp-allocated per-writer temp name); a redirection attached to a
-    pipeline segment would expand it inside that segment's subshell,
-    potentially inconsistently with the parent that expands the follow-up
-    ``mv``. The brace-group redirect is expanded in the current shell,
-    keeping both expansions consistent.
+    The dump is wrapped in a brace group with the redirection applied to the
+    whole group. Callers pass the quoted ``mktemp`` result, so the complete dump
+    lands in the same per-writer file later published by ``mv``.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
@@ -731,24 +813,19 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` would be unique per writer,
-        # but macOS ships bash 3.2 which does NOT provide it — the name expands
-        # empty there, so every writer shares one temp path and the race is
-        # back.  ``mktemp`` allocates a per-writer unique path portably across
-        # bash versions.  The template is shell-quoted (Windows/Git-Bash drive
-        # letters, spaces) and the resulting path lives in a shell variable so
-        # every later expansion is consistent.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
-        _snap_tmp = '"$__hermes_snap_tmp"'
+        # The temp name MUST be unique per concurrent writer. ``$$`` is shared
+        # by ``&``-launched bash subshells, while ``$BASHPID`` does not exist in
+        # macOS' system bash 3.2. ``mktemp`` is portable across macOS, Linux,
+        # and Git Bash and creates the file beside the snapshot, preserving the
+        # same-filesystem atomic-rename guarantee.
+        _snap_tmp_template = self._quote_shell_path(
+            self._snapshot_path + ".tmp.XXXXXX"
+        )
+        _snap_tmp = '"$__hermes_snapshot_tmp"'
         snapshot_excluded = self._snapshot_excluded_passthrough_names()
         bootstrap = (
             f"umask 077\n"
-            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
+            f"__hermes_snapshot_tmp=$(command mktemp {_snap_tmp_template}) || exit 1\n"
             f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
@@ -771,7 +848,9 @@ class BaseEnvironment(ABC):
             f"echo 'set +u' >> {_snap_tmp}\n"
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"mv -f {_snap_tmp} {_quoted_snap} || "
+            f"{{ rm -f {_snap_tmp}; exit 1; }}\n"
+            f"unset __hermes_snapshot_tmp\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -857,13 +936,13 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``mktemp`` is used instead of
-        # ``$BASHPID``/``$$`` because macOS bash 3.2 lacks ``$BASHPID`` (it
-        # expands empty, collapsing every writer onto one temp name) and ``$$``
-        # is shared by ``&``-launched subshells.  Template shell-quoted
-        # (Windows/spaces); the allocated path lives in a shell variable.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
-        _snap_tmp = '"$__hermes_snap_tmp"'
+        # truncated/half-written file. Use ``mktemp`` rather than process-ID
+        # suffixes: ``$$`` is shared by concurrent bash subshells, and macOS'
+        # system bash 3.2 does not provide ``$BASHPID``.
+        _snap_tmp_template = self._quote_shell_path(
+            self._snapshot_path + ".tmp.XXXXXX"
+        )
+        _snap_tmp = '"$__hermes_snapshot_tmp"'
 
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()
@@ -934,16 +1013,16 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the temp path is allocated with mktemp into a shell variable
-        # first — the redirection inside _export_dump_excluding_session_vars is
-        # attached to a brace group so the variable expands in the same shell
-        # that later expands the ``mv`` operand, keeping both consistent.
+        # Resolve a unique path before dumping; if mktemp is unavailable, keep
+        # the prior good snapshot and preserve the user's command result.
         if self._snapshot_ready:
             parts.append(
-                f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
-                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"if __hermes_snapshot_tmp=$(command mktemp {_snap_tmp_template} "
+                f"2>/dev/null); then {{ "
+                f"{_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
+                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} 2>/dev/null || "
+                f"rm -f {_snap_tmp} 2>/dev/null || true; fi; "
+                f"unset __hermes_snapshot_tmp"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since
@@ -1327,6 +1406,23 @@ class BaseEnvironment(ABC):
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+    def terminate_process_tree(self, pid: int, *, timeout: int = 5) -> dict:
+        """Terminate a tracked process and every descendant inside this backend."""
+        command = _build_process_tree_kill_command(root_pid=pid)
+        result = self.execute(
+            command,
+            timeout=timeout,
+            rewrite_compound_background=False,
+        )
+        returncode = result.get("returncode")
+        if returncode not in (None, 0):
+            detail = str(result.get("output") or "").strip()
+            raise RuntimeError(
+                f"process-tree termination failed (rc={returncode})"
+                + (f": {detail}" if detail else "")
+            )
+        return result
+
     # ------------------------------------------------------------------
     # CWD extraction
     # ------------------------------------------------------------------
@@ -1416,7 +1512,8 @@ class BaseEnvironment(ABC):
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
         """
-        self._before_execute()
+        if not _PRE_EXECUTE_HOOKS_SUPPRESSED.get():
+            self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default.

@@ -481,6 +481,7 @@ class HomeChannel:
     # authorization boundary and resolves them against its authoritative stores.
     user_id: Optional[str] = None
     scope_id: Optional[str] = None
+    auto_thread: Optional[bool] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -494,6 +495,8 @@ class HomeChannel:
             result["user_id"] = self.user_id
         if self.scope_id:
             result["scope_id"] = self.scope_id
+        if self.auto_thread is not None:
+            result["auto_thread"] = self.auto_thread
         return result
     
     @classmethod
@@ -505,6 +508,11 @@ class HomeChannel:
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
             user_id=str(data["user_id"]) if data.get("user_id") else None,
             scope_id=str(data["scope_id"]) if data.get("scope_id") else None,
+            auto_thread=(
+                _coerce_bool(data.get("auto_thread"), True)
+                if data.get("auto_thread") is not None
+                else None
+            ),
         )
 
 
@@ -974,6 +982,11 @@ class GatewayConfig:
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
 
+    # Skip repository context files (AGENTS.md, CLAUDE.md, etc.) when creating
+    # conversational gateway agents. Useful when the messaging gateway runs
+    # from a large source checkout whose developer instructions are irrelevant
+    # to ordinary chat. Kanban workers and CLI sessions are unaffected.
+    skip_context_files: bool = False
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
@@ -1122,6 +1135,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
+            "skip_context_files": self.skip_context_files,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1211,6 +1225,9 @@ class GatewayConfig:
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
             multiplex_profiles = nested_gateway.get("multiplex_profiles")
+        skip_context_files = data.get("skip_context_files")
+        if skip_context_files is None and isinstance(nested_gateway, dict):
+            skip_context_files = nested_gateway.get("skip_context_files")
         # Operator override: GATEWAY_MULTIPLEX_PROFILES wins over config.yaml when
         # set to a recognized value. Hosted deployments (Nous Portal / Fly) stamp
         # it on the container so the single multiplexed gateway — which the
@@ -1267,6 +1284,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             multiplex_profile_allowlist=multiplex_profile_allowlist,
+            skip_context_files=_coerce_bool(skip_context_files, False),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
@@ -1422,6 +1440,8 @@ def load_gateway_config() -> GatewayConfig:
                     "multiplex_profile_allowlist"
                 ]
 
+            if "skip_context_files" in yaml_cfg:
+                gw_data["skip_context_files"] = yaml_cfg["skip_context_files"]
             # Profile-based routing rules: accept either top-level
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form
             # (matching the multiplex_profiles parity above).
@@ -1435,6 +1455,11 @@ def load_gateway_config() -> GatewayConfig:
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
+                if (
+                    "skip_context_files" in gateway_section
+                    and "skip_context_files" not in gw_data
+                ):
+                    gw_data["skip_context_files"] = gateway_section["skip_context_files"]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
                 if "systemd_watchdog_seconds" in gateway_section:
@@ -1554,6 +1579,35 @@ def load_gateway_config() -> GatewayConfig:
                 for _bridge_key in ("port", "key", "host", "cors_origins", "model_name"):
                     if _bridge_key in _api_plat and _bridge_key not in _api_extra:
                         _api_extra[_bridge_key] = _api_plat.pop(_bridge_key)
+
+            # Back-compat for home channels persisted by older /sethome flows.
+            for _plat, _env_prefix in (
+                (Platform.TELEGRAM, "TELEGRAM"),
+                (Platform.DISCORD, "DISCORD"),
+                (Platform.SLACK, "SLACK"),
+            ):
+                _home_key = f"{_env_prefix}_HOME_CHANNEL"
+                _home_val = yaml_cfg.get(_home_key)
+                if not _home_val:
+                    continue
+                _plat_data = platforms_data.setdefault(_plat.value, {})
+                if not isinstance(_plat_data, dict):
+                    _plat_data = {}
+                    platforms_data[_plat.value] = _plat_data
+                _home_data = {
+                    "platform": _plat.value,
+                    "chat_id": str(_home_val),
+                    "name": str(yaml_cfg.get(f"{_home_key}_NAME") or "Home"),
+                }
+                _thread_val = yaml_cfg.get(f"{_home_key}_THREAD_ID")
+                if _thread_val:
+                    _home_data["thread_id"] = str(_thread_val)
+                _auto_thread_key = f"{_home_key}_AUTO_THREAD"
+                if _plat == Platform.DISCORD and _auto_thread_key in yaml_cfg:
+                    _home_data["auto_thread"] = _coerce_bool(
+                        yaml_cfg.get(_auto_thread_key), True
+                    )
+                _plat_data.setdefault("home_channel", _home_data)
 
             if platforms_data:
                 gw_data["platforms"] = platforms_data
@@ -1949,6 +2003,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=discord_home,
             name=getenv("DISCORD_HOME_CHANNEL_NAME", "Home"),
             thread_id=getenv("DISCORD_HOME_CHANNEL_THREAD_ID") or None,
+            auto_thread=(
+                _coerce_bool(getenv("DISCORD_HOME_CHANNEL_AUTO_THREAD"), True)
+                if getenv("DISCORD_HOME_CHANNEL_AUTO_THREAD") is not None
+                else None
+            ),
         )
     
     # Reply threading mode for Discord (off/first/all)

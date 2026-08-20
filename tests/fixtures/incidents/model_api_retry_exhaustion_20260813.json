@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "primary": {"provider": "custom", "model": "gpt-5.6-sol", "reason": "server_error"},
+  "fallback": {"provider": "codex-lb", "model": "gpt-5.5", "reason": "timeout"},
+  "same_failure_domain": true,
+  "messages": 23,
+  "approx_tokens": 64432,
+  "retries": 3
+}

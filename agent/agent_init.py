@@ -665,6 +665,7 @@ def init_agent(
     # would mangle the escape sequences.  None = use builtins.print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
+    agent.runtime_update_callback = None  # Optional sync callback for session-scoped runtime switches
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
@@ -1131,7 +1132,11 @@ def init_agent(
     # every client construction path below (Anthropic native, OpenAI-wire,
     # router-based implicit auth) can apply it consistently.  Bedrock
     # Claude uses its own timeout path and is not covered here.
-    _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    _provider_timeout = get_provider_request_timeout(
+        agent.provider,
+        agent.model,
+        requested_provider=agent.requested_provider,
+    )
 
     if agent.api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -1523,6 +1528,10 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    agent._fallback_reason = getattr(agent, "_fallback_reason", None)
+    agent._refusal_clean_fork_active = False
+    agent._refusal_recall_quarantine = False
+    agent._refusal_recall_quarantine_pending = False
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:
@@ -1572,15 +1581,17 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    # Kanban worker/orchestrator guidance is session-static. Workers receive
+    # the task lifecycle protocol; configured orchestrators receive a routing
+    # preflight instead of the misleading "you own one board task" contract.
+    # Looking at enabled_toolsets as well as the filtered tool snapshot keeps
+    # the fail-closed routing contract available when a configured Kanban tool
+    # is unexpectedly absent from the current session schema.
+    from agent.prompt_builder import select_kanban_session_guidance
+    agent._kanban_worker_guidance = select_kanban_session_guidance(
+        enabled_toolsets=enabled_toolsets,
+        valid_tool_names=agent.valid_tool_names,
+        task_id=os.environ.get("HERMES_KANBAN_TASK"),
     )
 
     # Check tool requirements
@@ -1799,6 +1810,9 @@ def init_agent(
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
+    # Historical attribute name retained for compatibility. The counter now
+    # commits model-work units only when a top-level turn completes normally;
+    # delegated and failed turns never contribute to automatic review cadence.
     agent._iters_since_skill = 0
     # A flush/background agent may pass skip_memory=True to avoid spinning up an
     # external memory *provider*, but if the caller also explicitly enables the
@@ -1814,10 +1828,18 @@ def init_agent(
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+                from tools.memory_tool import (
+                    DEFAULT_MEMORY_CHAR_LIMIT,
+                    DEFAULT_USER_CHAR_LIMIT,
+                    MemoryStore,
+                )
                 agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_char_limit=mem_config.get(
+                        "memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT
+                    ),
+                    user_char_limit=mem_config.get(
+                        "user_char_limit", DEFAULT_USER_CHAR_LIMIT
+                    ),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1828,6 +1850,12 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
+    # ADR-004 Phase 0: per-agent memory-ingest kill switch. False for every
+    # live agent (unchanged behavior). Forks that need memory READ access but
+    # zero graph-write leakage (background review, the future ingest curator)
+    # set this True at fork construction — every write-leak call site gates on
+    # agent.memory_manager.memory_ingest_allowed(agent).
+    agent._memory_ingest_disabled = False
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
@@ -2107,6 +2135,55 @@ def init_agent(
             compression_min_tail_users = 1
     if compression_min_tail_users < 1:
         compression_min_tail_users = 1
+    # Aperture of the EXISTING preflight deferral predicate
+    # (ContextCompressor.should_defer_preflight_to_real_usage).  Defaults 4096 /
+    # 0.05 reproduce the previously hardcoded
+    # `max(4096, int(threshold_tokens * 0.05))` exactly, so an unset key is
+    # behavior-neutral.  Same parser semantics as min_tail_user_messages /
+    # max_attempts above: booleans rejected (bool subclasses int, so int(True)
+    # would silently become 1), fractional floats rejected for the integral
+    # tokens value rather than truncated, non-numeric values fall back to the
+    # default.  Both floored at 0 so a malformed or hostile value degrades
+    # toward NEVER deferring (today's most conservative behavior) instead of
+    # silently widening the aperture.
+    _raw_defer_growth_tokens = _compression_cfg.get(
+        "preflight_defer_growth_tokens", 4096
+    )
+    if isinstance(_raw_defer_growth_tokens, bool):
+        compression_preflight_defer_growth_tokens = 4096
+    elif isinstance(_raw_defer_growth_tokens, int):
+        compression_preflight_defer_growth_tokens = _raw_defer_growth_tokens
+    elif isinstance(_raw_defer_growth_tokens, float):
+        compression_preflight_defer_growth_tokens = (
+            int(_raw_defer_growth_tokens)
+            if _raw_defer_growth_tokens.is_integer()
+            else 4096
+        )
+    else:
+        try:
+            compression_preflight_defer_growth_tokens = int(
+                str(_raw_defer_growth_tokens).strip()
+            )
+        except (TypeError, ValueError):
+            compression_preflight_defer_growth_tokens = 4096
+    if compression_preflight_defer_growth_tokens < 0:
+        compression_preflight_defer_growth_tokens = 0
+    _raw_defer_growth_ratio = _compression_cfg.get(
+        "preflight_defer_growth_ratio", 0.05
+    )
+    if isinstance(_raw_defer_growth_ratio, bool):
+        compression_preflight_defer_growth_ratio = 0.05
+    elif isinstance(_raw_defer_growth_ratio, (int, float)):
+        compression_preflight_defer_growth_ratio = float(_raw_defer_growth_ratio)
+    else:
+        try:
+            compression_preflight_defer_growth_ratio = float(
+                str(_raw_defer_growth_ratio).strip()
+            )
+        except (TypeError, ValueError):
+            compression_preflight_defer_growth_ratio = 0.05
+    if compression_preflight_defer_growth_ratio < 0:
+        compression_preflight_defer_growth_ratio = 0.0
     # Cap on compression retry rounds before a turn gives up with "max
     # compression attempts reached" (compression.max_attempts).  Hardcoding 3
     # strands sessions that legitimately need more rounds — e.g. a restart
@@ -2222,6 +2299,15 @@ def init_agent(
     # stays off until an operator opts in and accepts the tradeoff.
     compression_micro_compact = is_truthy_value(
         _compression_cfg.get("micro_compact"), default=False
+    )
+    # Opt-in (default False): read-only R5 measurement probe. It records whether
+    # the summariser prompt's auto-derived focus block survives from the last
+    # quiescent point to the next compaction. No provider call, no cached
+    # summary, no behaviour change — it cannot make a compaction faster. Parsed
+    # through is_truthy_value so a MagicMock or a plugin engine's bare
+    # truthiness cannot satisfy the strict `is True` gates downstream.
+    compression_summary_prompt_drift_probe = is_truthy_value(
+        _compression_cfg.get("summary_prompt_drift_probe"), default=False
     )
     # How often a pass runs, in completed turns. Each pass rewrites
     # already-sent history and costs one prompt-cache break, so this is the
@@ -2716,6 +2802,12 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
+            preflight_defer_growth_tokens=(
+                compression_preflight_defer_growth_tokens
+            ),
+            preflight_defer_growth_ratio=(
+                compression_preflight_defer_growth_ratio
+            ),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -2735,6 +2827,13 @@ def init_agent(
         _cc._micro_compact_defrag_threshold_tokens = (
             compression_micro_compact_defrag_tokens
         )
+    # Read-only R5 prompt-drift measurement probe (feature is opt-in). The
+    # hasattr guard skips alternate compression engines; it only passes because
+    # ContextCompressor.__init__ declares the attribute, so that declaration is
+    # load-bearing — without it this stamp is a silent no-op and the probe would
+    # report zero observations, indistinguishable from a zero hit rate.
+    if _cc is not None and hasattr(_cc, "_r5_prompt_drift_probe_enabled"):
+        _cc._r5_prompt_drift_probe_enabled = compression_summary_prompt_drift_probe
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold

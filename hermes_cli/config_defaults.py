@@ -8,6 +8,9 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Purpose-based route catalog. Empty keeps routing fully dormant; users
+    # opt into evaluation under model_routes.router.mode.
+    "model_routes": {},
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the
@@ -41,6 +44,18 @@ DEFAULT_CONFIG = {
         # most-recent one. Set false to restore the old latest-session
         # behavior everywhere.
         "terminal_continue": True,
+    },
+    # Gateway operator alerts.  Disabled by default because the destination is
+    # deployment-specific; numeric policy defaults are shared by every host.
+    "agent_health": {
+        "enabled": False,
+        "channel": "",
+        "mention": "",
+        "silence_timeout": 600,
+        "turn_deadline": 1500,
+        "upstream_failure_streak": 3,
+        "cooldown_seconds": 900,
+        "hourly_cap": 12,
     },
     "agent": {
         "max_turns": 500,
@@ -192,8 +207,8 @@ DEFAULT_CONFIG = {
         # instead of one call per turn.  The runtime already runs independent
         # calls concurrently, so this just steers the model to produce the
         # batch — cutting round-trips and the resent-context cost that
-        # compounds over a long conversation.  Costs ~70 tokens in the cached
-        # system prompt.  Set False to disable globally.
+        # compounds over a long conversation.  Costs ~360 tokens in the
+        # cached system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
@@ -240,8 +255,9 @@ DEFAULT_CONFIG = {
         # tsc/lint/test before visual approval) and clean-diff expectations.
         # Set false to keep the evidence nudge terse.
         "verify_guidance": True,
-        # Upper bound on consecutive `pre_verify` "continue" nudges in a single
-        # turn, so a user/plugin hook can never trap the loop.
+        # Upper bound on consecutive verification-stop and `pre_verify`
+        # continuation nudges in a single turn, so either gate stays bounded.
+        # Verification-stop also retains its stricter built-in cap of 2.
         "max_verify_nudges": 3,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
@@ -272,6 +288,13 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
+        # When True, a native multi-choice clarify (buttons rendered,
+        # awaiting_text False) also accepts free prose as the answer instead
+        # of requiring a number or an exact option label. False keeps upstream
+        # behaviour, where an unrelated follow-up sent while the prompt is
+        # live cannot be swallowed as the answer (#62034). Multi-select
+        # prompts are unaffected either way.
+        "clarify_accept_prose": False,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
@@ -330,6 +353,10 @@ DEFAULT_CONFIG = {
         # detector instead of hanging forever. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
         "local_stream_stale_timeout": 900,
+        # Resume an interrupted gateway turn in place after restart.
+        "gateway_turn_resume": True,
+        # Maximum same-turn restart resumes before abandoning a poison turn.
+        "turn_resume_max": 2,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly
@@ -378,6 +405,10 @@ DEFAULT_CONFIG = {
         # preserves the historical error + traceback behavior.
         "degraded_mode": "warn",
         "cwd": ".",  # Use current directory
+        # Run non-PTY local background commands in transient user scopes and
+        # persist their output so they can survive a gateway service restart.
+        # Falls back to ordinary local spawning when systemd scopes are unavailable.
+        "durable_background": False,
         # Terminal font family for the desktop app's embedded xterm.js terminal.
         # When set (e.g. "'CaskaydiaCoveNerdFont', 'JetBrains Mono', monospace"),
         # the desktop terminal uses this as the CSS font-family value, with the
@@ -485,6 +516,10 @@ DEFAULT_CONFIG = {
         # Enabled by default for non-local backends (SSH); local is always opt-in
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
+        # Spread concurrent SSH commands over independent ControlMaster
+        # connections. This preserves delegation throughput while avoiding a
+        # single sshd connection's MaxSessions ceiling.
+        "ssh_connection_pool_size": 3,
     },
 
     "web": {
@@ -739,6 +774,41 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
+        "preflight_defer_growth_tokens": 4096,  # aperture of the EXISTING preflight
+                                      # deferral predicate
+                                      # (ContextCompressor.should_defer_preflight_to_real_usage).
+                                      # That predicate skips a foreground preflight
+                                      # compaction while the ROUGH request estimate has
+                                      # grown only modestly since a request the provider
+                                      # proved fit under the threshold — provider
+                                      # `prompt_tokens` are a better signal than
+                                      # repeating compaction from the same rough
+                                      # tool-schema overhead. The tolerated growth is
+                                      # max(preflight_defer_growth_tokens,
+                                      #     threshold_tokens * preflight_defer_growth_ratio),
+                                      # and these defaults (4096 / 0.05) reproduce the
+                                      # previously hardcoded
+                                      # `max(4096, int(threshold_tokens * 0.05))`
+                                      # EXACTLY, so an unset or default-valued key is
+                                      # byte-for-byte behavior-neutral.
+                                      # Raising these trades a foreground compression
+                                      # stall for reliance on the provider-proven
+                                      # recovery path (413 / context-length-exceeded),
+                                      # which is bounded — the predicate refuses to
+                                      # defer as soon as a real provider reading lands
+                                      # at or above the threshold. Do NOT raise them
+                                      # without the estimate-vs-real evidence described
+                                      # in the R5 measurement procedure: if the real
+                                      # headroom is smaller than assumed you get a
+                                      # failed round trip PLUS a synchronous
+                                      # compression, which is strictly worse than
+                                      # compressing up front.
+        "preflight_defer_growth_ratio": 0.05,  # see above; fraction of
+                                      # threshold_tokens tolerated as rough-estimate
+                                      # growth before preflight compression is no
+                                      # longer deferred. Clamped to [0.0, 1.0]; 0
+                                      # disables growth-based deferral (never defer =
+                                      # today's most conservative behavior).
         "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
                                       # no-LLM tool-result prune, run independently of
                                       # `threshold` above. On large-window models
@@ -758,10 +828,23 @@ DEFAULT_CONFIG = {
                                       # itself be re-summarized.
         "proactive_prune_min_reclaim_tokens": 4096,  # a proactive prune only commits
                                       # when it reclaims at least this many tokens
-                                      # (measured on the pruned output), then waits
-                                      # for a full trigger-sized token runway to
-                                      # regrow before rearming. Keeps prompt-cache
-                                      # breaks episodic. 0 = no minimum-savings gate.
+                                      # (measured on the pruned output). Keeps
+                                      # prompt-cache invalidation amortized: one big
+                                      # episodic break instead of a tiny break every
+                                      # tool iteration. 0 = commit any non-zero prune.
+        "summary_prompt_drift_probe": False,  # opt-in, read-only R5 MEASUREMENT
+                                      # probe. Records whether the summariser
+                                      # prompt's auto-derived focus block at the
+                                      # last quiescent point matches the one used
+                                      # at the next compaction. It makes NO
+                                      # provider call, stores no summary, changes
+                                      # no behaviour, and can never speed
+                                      # anything up — there is no cache and no
+                                      # reuse path. Cost when enabled: one
+                                      # auto-focus derivation per completed turn,
+                                      # paid inline on the turn thread. Enable
+                                      # only while measuring; see
+                                      # agent/summary_prompt_drift.py.
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead
@@ -1207,6 +1290,16 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
+        # ADR-004 ingest-curator fork. "auto" shares the main model and warm
+        # transcript; an explicit provider/model uses the cold WAL context.
+        "ingest_curator": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 300,
+            "extra_body": {},
         },
         "moa_reference": {
             "provider": "auto",
@@ -1867,6 +1960,7 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "default_route": "",  # optional model_routes route for unrouted delegate tasks
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
@@ -2128,6 +2222,19 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 5,  # retain last N regular snapshots
         },
+        # ADR-004 memory ingest curator. This is deliberately separate from
+        # the skill-maintenance `enabled` switch above and deploys inert.
+        "ingest_enabled": False,
+        "shadow_mode": True,
+        "salience": {
+            "threshold": 12,
+            "weight_proposal": 3,
+            "weight_tool_success": 2,
+            "weight_non_trivial": 1,
+            "fallback_turns": 10,
+        },
+        "idle_seconds": 600,
+        "session_end_min_turns": 3,
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
@@ -3156,11 +3263,21 @@ DEFAULT_CONFIG = {
         "profile_build": "ask",
     },
 
-    # Privacy-safe aggregate metrics written only to this profile's local
-    # telemetry directory. Collection is opt-in and no remote sink exists.
+    # Privacy-safe metrics written only to this profile's local telemetry
+    # directory. Collection is opt-in and no remote sink exists.
+    #
+    # Two storage shapes live behind ``enabled``:
+    #   * day-rolled bucketed counters, which are the only rows ever packaged
+    #     into <HERMES_HOME>/telemetry/shared_metrics/outbox/;
+    #   * ``local_observations`` — RAW per-event latency/token samples in the
+    #     ``observation_samples`` table of the same SQLite file. These are
+    #     numeric values with closed-allowlist dimensions, are NEVER packaged
+    #     or exported, and are bounded by a 30-day window plus a 250,000-row
+    #     cap. Set it to False to keep the counters without the raw samples.
     "telemetry": {
         "shared_metrics": {
             "enabled": False,
+            "local_observations": True,
         },
     },
 

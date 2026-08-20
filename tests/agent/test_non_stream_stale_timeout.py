@@ -7,6 +7,8 @@ Covers:
   list and full ``api_kwargs`` dicts.
 - The May 2026 default-base change (300s -> 90s) and the lowered
   context-tier ceilings (450/600 -> 150/240).
+- Per-call re-resolution of the base across an in-place fallback hop, so a
+  failed-over provider/model gets its own configured budget.
 """
 
 from __future__ import annotations
@@ -120,3 +122,95 @@ def test_openai_codex_stale_floor_tiers():
 
     assert openai_codex_stale_timeout_floor(55_000) == 900.0
     assert openai_codex_stale_timeout_floor(120_000) == 1200.0
+
+
+def test_proxied_codex_backend_gets_55k_timeout_floor(monkeypatch, tmp_path):
+    """A named proxy normalized to ``custom`` still gets Codex semantics."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+providers:
+  codex-lb:
+    api: https://codex-lb.example/v1
+    transport: codex_responses
+    backend_family: openai-codex
+    stale_timeout_seconds: 150
+""")
+
+    agent = _make_agent(tmp_path)
+    agent.provider = "custom"
+    agent.requested_provider = "codex-lb"
+    agent.api_mode = "codex_responses"
+    agent.base_url = "https://codex-lb.example/v1"
+
+    from agent.chat_completion_helpers import _is_openai_codex_backend
+
+    payload = {"model": "gpt-5.6-sol", "input": "x" * 220_000}
+    assert _is_openai_codex_backend(agent) is True
+    assert agent._compute_non_stream_stale_timeout(payload) == 900.0
+
+
+# ── per-call re-resolution across a fallback hop ───────────────────────────
+
+
+def test_non_stream_timeout_re_resolves_after_fallback(monkeypatch, tmp_path):
+    """A fallback hop must pick up the NEW provider/model's stale budget.
+
+    Replays the route from the 2026-08-13 retry-exhaustion incident
+    (``custom/gpt-5.6-sol`` -> ``codex-lb/gpt-5.5``; see
+    ``tests/run_agent/test_incident_retry_failure_trace.py``).  Failover
+    happens *in place* — the live ``AIAgent`` is mutated, not rebuilt — so a
+    base resolved once and cached would keep charging the fallback the
+    primary's 150s budget and cut it off 750s before its own 900s budget
+    expired, turning a survivable hop into a second timeout.
+
+    Pins that ``_compute_non_stream_stale_timeout`` re-reads
+    ``self.provider``/``self.model`` on every call.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, """\
+providers:
+  custom:
+    models:
+      gpt-5.6-sol:
+        stale_timeout_seconds: 150
+  codex-lb:
+    models:
+      gpt-5.5:
+        stale_timeout_seconds: 900
+""")
+
+    import importlib
+    from hermes_cli import timeouts as to_mod
+    importlib.reload(to_mod)
+
+    agent = _make_agent(
+        tmp_path,
+        provider="custom",
+        model="gpt-5.6-sol",
+        base_url="https://primary.invalid/v1",
+    )
+
+    # Well under the 50k tier, so the resolved base is returned verbatim and
+    # each assertion below reads the config value rather than a tier floor.
+    # The payload's own ``model`` field never changes: resolution must key off
+    # ``self.model``, not the request body.
+    payload = {"model": "gpt-5.6-sol", "input": "hi", "instructions": ""}
+
+    assert agent._compute_non_stream_stale_timeout(payload) == 150.0
+
+    # Successful failover: same agent object, new provider/model/base_url.
+    agent.provider = "codex-lb"
+    agent.model = "gpt-5.5"
+    agent.base_url = "https://codex-lb.invalid/v1"
+
+    assert agent._compute_non_stream_stale_timeout(payload) == 900.0
+
+    # Back to the primary — a cached base could not fall again.
+    agent.provider = "custom"
+    agent.model = "gpt-5.6-sol"
+    agent.base_url = "https://primary.invalid/v1"
+
+    assert agent._compute_non_stream_stale_timeout(payload) == 150.0

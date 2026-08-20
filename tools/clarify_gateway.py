@@ -194,7 +194,11 @@ def get_pending_for_session(
         ids = _session_index.get(session_key) or []
         for cid in ids:
             entry = _entries.get(cid)
-            if entry is None:
+            # Skip entries whose waiter has already been unblocked. Cleanup
+            # runs in wait_for_response on the agent thread, so a resolved
+            # entry lingers here briefly (or forever, if that thread died) and
+            # would otherwise swallow the NEXT message in the session.
+            if entry is None or entry.event.is_set():
                 continue
             if include_choice_prompts or entry.awaiting_text:
                 return entry
@@ -370,6 +374,18 @@ def _coerce_text_response_detailed(
     # Out-of-range / non-canonical integer is a failed selection, not prose.
     if is_int:
         return None, "invalid_selection"
+
+    # Opt-in (agent.clarify_accept_prose): treat free prose as the answer
+    # instead of rejecting it. Off by default because an unrelated follow-up
+    # sent while the prompt is live would then be consumed as the answer
+    # (#62034). Deliberately NOT applied to the multi_select branch above:
+    # clarify_tool._parse_multi_select_response comma-splits raw text into
+    # fabricated selections rather than rejecting it.
+    # Read here, on the reject path only, so the normal number/label path
+    # never pays for a config lookup.
+    if get_accept_prose():
+        return text, None
+
     return None, "prose"
 
 
@@ -572,6 +588,22 @@ def get_clarify_timeout() -> int:
         return resolve_clarify_timeout(load_config() or {})
     except Exception:
         return 3600
+
+
+def get_accept_prose() -> bool:
+    """Read ``agent.clarify_accept_prose`` from config.yaml.
+
+    True makes native interactive multi-choice clarifies (buttons rendered,
+    ``awaiting_text`` False) accept arbitrary prose as the answer. Defaults to
+    False, which preserves upstream behaviour: only a numeric selection or an
+    exact choice label resolves such a prompt.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        return bool((cfg.get("agent") or {}).get("clarify_accept_prose", False))
+    except Exception:
+        return False
 
 
 # =========================================================================

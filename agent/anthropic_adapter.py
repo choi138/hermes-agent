@@ -370,7 +370,7 @@ _OAUTH_ONLY_BETAS = [
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
 # The version must stay reasonably current — Anthropic rejects OAuth requests
 # when the spoofed user-agent version is too far behind the actual release.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.220"
 _claude_code_version_cache: Optional[str] = None
 
 
@@ -464,6 +464,66 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     if "anthropic.com" in normalized:
         return False  # Direct Anthropic API — OAuth applies
     return True  # Any other endpoint is a third-party proxy
+
+
+_signature_passthrough_urls_cache: Optional[frozenset[str]] = None
+
+
+def _get_signature_passthrough_urls() -> frozenset[str]:
+    """Return configured proxies that preserve Anthropic thinking signatures.
+
+    Providers opt in with ``anthropic_signature_passthrough: true`` in the raw
+    ``providers.<name>`` config entry.  The assertion is deliberately scoped
+    to an exact normalized base URL: only a proxy that forwards Anthropic
+    content blocks verbatim can safely retain the native signed-thinking replay
+    contract.
+
+    The result is cached for the process lifetime because provider endpoints do
+    not change underneath an already-running client.  Any read or parse failure
+    yields an empty set, preserving the default third-party stripping behavior.
+    """
+    global _signature_passthrough_urls_cache
+    if _signature_passthrough_urls_cache is None:
+        urls: set[str] = set()
+        try:
+            from hermes_constants import get_config_path
+            from utils import fast_safe_load
+
+            config_path = get_config_path()
+            if config_path.exists():
+                config = fast_safe_load(
+                    config_path.read_text(encoding="utf-8")
+                ) or {}
+                providers = config.get("providers") or {}
+                if isinstance(providers, dict):
+                    for provider_config in providers.values():
+                        if not isinstance(provider_config, dict):
+                            continue
+                        # Only the YAML boolean true is an opt-in.  Truthy
+                        # strings or malformed values must not broaden trust.
+                        if provider_config.get("anthropic_signature_passthrough") is not True:
+                            continue
+                        normalized = _normalize_base_url_text(
+                            provider_config.get("base_url")
+                        )
+                        if normalized:
+                            urls.add(normalized.rstrip("/").lower())
+        except Exception:
+            # Fail closed: unreadable or invalid config trusts no proxy.
+            logger.debug(
+                "Anthropic signature-passthrough config read failed",
+                exc_info=True,
+            )
+        _signature_passthrough_urls_cache = frozenset(urls)
+    return _signature_passthrough_urls_cache
+
+
+def _is_signature_passthrough_endpoint(base_url: str | None) -> bool:
+    """Return whether *base_url* opted into verbatim signature passthrough."""
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    return normalized.rstrip("/").lower() in _get_signature_passthrough_urls()
 
 
 def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
@@ -1019,6 +1079,12 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
         return None
 
+    # ``text=True`` should always produce a string, but keep credential parsing
+    # fail-closed if a platform shim or test double violates that subprocess
+    # contract.  Never feed arbitrary objects into ``json.loads``.
+    if not isinstance(result.stdout, str):
+        logger.debug("Keychain: credentials payload was not text")
+        return None
     raw = result.stdout.strip()
     if not raw:
         return None
@@ -2532,7 +2598,11 @@ def _manage_thinking_signatures(
     same signed thinking blocks.  Sticky ``session_id`` keeps a conversation
     on one upstream instance so those signatures stay warm — stripping them
     here would 400 the first tool-loop turn ("thinking must be passed back").
-    Portal therefore takes the native Anthropic replay path below.
+    Portal therefore takes the native Anthropic replay path below.  A provider
+    explicitly marked ``anthropic_signature_passthrough: true`` makes the same
+    replay contract for its exact configured base URL: its latest assistant
+    turn retains signed thinking so interleaved-thinking tool loops do not
+    restart reasoning after every tool result.
 
     Mutates ``result`` in place.
     """
@@ -2542,6 +2612,7 @@ def _manage_thinking_signatures(
     _is_third_party = (
         _is_third_party_anthropic_endpoint(base_url)
         and not _is_nous_portal_endpoint(base_url)
+        and not _is_signature_passthrough_endpoint(base_url)
     )
 
     last_assistant_idx = None

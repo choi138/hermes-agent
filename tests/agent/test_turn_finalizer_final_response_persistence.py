@@ -32,6 +32,7 @@ class FakeAgent:
         self._iters_since_skill = 0
         self.valid_tool_names = []
         self.persisted_messages: list[dict[str, Any]] | None = None
+        self.trajectory_messages: list[dict[str, Any]] | None = None
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
@@ -45,8 +46,8 @@ class FakeAgent:
     def _safe_print(self, *_args, **_kwargs):
         pass
 
-    def _save_trajectory(self, *_args, **_kwargs):
-        pass
+    def _save_trajectory(self, messages, *_args, **_kwargs):
+        self.trajectory_messages = [dict(message) for message in messages]
 
     def _cleanup_task_resources(self, *_args, **_kwargs):
         pass

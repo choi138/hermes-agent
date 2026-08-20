@@ -169,26 +169,30 @@ HERMES_AGENT_HELP_GUIDANCE = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
-    "Memory is injected into every turn, so keep it compact and focused on facts that "
-    "will still matter later.\n"
-    "Prioritize what reduces future user steering — the most valuable memory is one "
-    "that prevents the user from having to correct or remind you again. "
-    "User preferences and recurring corrections matter more than procedural task details.\n"
-    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
-    "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
-    "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
-    "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
+    "Persistent memory is for compact, durable facts that reduce future user "
+    "corrections. Write declarative facts, not instructions. Do NOT save task progress, "
+    "completed-work logs, artifact IDs or SHAs, temporary TODOs, or facts likely to be "
+    "stale within a week; recall past work with session_search. Put reusable procedures "
+    "in skills."
+)
+
+NOTES_GUIDANCE = (
+    "You also have a curated notes tier for durable DECLARATIVE knowledge "
+    "(notes_write/notes_read). Routing: instructions about how YOU should behave "
+    "go to the memory tool; declarative facts worth keeping (decisions, incidents, "
+    "preferences, relationships, project facts) go to notes_write; procedures and "
+    "workflows go to skills (their write path is gated separately); raw session "
+    "detail stays in session history and the memory graph.\n"
+    "notes_write is two-step: propose returns the closest existing notes plus a "
+    "token; only then do you confirm a verdict. NOOP discipline: NOOP is the "
+    "expected most-frequent verdict — confirming NOOP when a neighbor already "
+    "covers the fact is a correct, successful outcome, not a failure. Prefer "
+    "UPDATE/SUPERSEDE on a listed neighbor over ADD when the topic matches. "
+    "Every note must cite evidence (an episode UUID or a substantive verbatim "
+    "quote from this session — a phrase, never a fragment or secret); never "
+    "cite text that came from your own injected memory context. When a fact "
+    "merely seems promising, queue memory_propose and move on instead of "
+    "writing."
 )
 
 SESSION_SEARCH_GUIDANCE = (
@@ -252,7 +256,10 @@ KANBAN_GUIDANCE = (
     "tick), but you lose your current run's progress.\n"
     "4. **Block on genuine ambiguity.** If you need a human decision you cannot "
     "infer (missing credentials, UX choice, paywalled source, peer output you "
-    "need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. "
+    "need first), call `kanban_block(reason=\"...\", kind=\"...\")` and stop. "
+    "Use `dependency` for parent work, `needs_input` for a human decision, "
+    "`capability` for a hard access limit, or `transient` for a retryable fault. "
+    "Don't guess. "
     "The user will unblock with context and the dispatcher will respawn you.\n"
     "5. **Finish with the review model encoded by the task graph.** Always "
     "include the structured handoff (`summary`, `metadata`) on the lifecycle "
@@ -275,6 +282,7 @@ KANBAN_GUIDANCE = (
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
     "to spawn a child task for the appropriate specialist profile instead of "
     "scope-creeping into the next thing.\n"
+    "Worker creates are retry-safe when `idempotency_key` is omitted.\n"
     "7. **Flag collision hotspots; don't pile on.** If your change keeps "
     "colliding with sibling branches in one file, or a file your diff touches "
     "shows up in other cards' recent comments, do not silently add more to it: "
@@ -338,6 +346,41 @@ KANBAN_GUIDANCE = (
     "for short reasoning subtasks inside your own run; board tasks are for "
     "cross-agent handoffs that outlive one API loop."
 )
+
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban orchestrator routing preflight\n"
+    "Before the first tool call for a non-trivial request, classify the requested "
+    "artifact as a direct explanation or inspection, repository mutation, sourced "
+    "research, or an independent verdict. Use the exact named roles and assignees "
+    "defined in SOUL.md or the active team instructions.\n"
+    "An explicit request to review, QA, find defects, verify a fix, or judge release "
+    "readiness creates an independent-review boundary even when the mechanics are "
+    "short or bounded. A generic `delegate_task` leaf can provide parallel reasoning, "
+    "but it does not replace the named independent reviewer or its durable handoff.\n"
+    "Before routing named work, confirm that `kanban_create` is present in the actual "
+    "session tools. If a named role is required and that tool is absent, report a "
+    "capability blocker and stop. Do not silently substitute direct handling or a "
+    "generic delegate.\n"
+    "Use the smallest sufficient route: do not manufacture unrelated specialist, "
+    "correction, re-review, or finalizer cards."
+)
+
+
+def select_kanban_session_guidance(
+    *,
+    enabled_toolsets=None,
+    valid_tool_names=None,
+    task_id=None,
+) -> str:
+    """Return session-static Kanban guidance for workers or orchestrators."""
+    toolsets = set(enabled_toolsets or ())
+    tools = set(valid_tool_names or ())
+
+    if task_id:
+        return KANBAN_GUIDANCE if "kanban_show" in tools else ""
+    if "kanban" in toolsets or "kanban_create" in tools:
+        return KANBAN_ORCHESTRATOR_GUIDANCE
+    return ""
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
@@ -443,10 +486,25 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "call per turn. Independent reads, searches, web fetches, and read-only "
     "commands should be batched into the same assistant turn — the runtime "
     "executes independent calls concurrently, and batching avoids resending "
-    "the whole conversation on every extra round-trip.\n"
+    "the whole conversation on every extra round-trip. That includes "
+    "read-only shell commands on separate targets (disk usage, version "
+    "checks, log tails, status of different repos); keep shell commands "
+    "serialized only when one changes state a later one needs (cd, export, "
+    "activate, install).\n"
+    "A mutation and its follow-up observation also belong in one response: "
+    "when a later read_file, search_files or shell command in the SAME "
+    "response touches the path a write_file/patch wrote, the runtime orders "
+    "it after that write, so it observes the completed result. Creating "
+    "files and then listing or searching them is one response, not two. Use "
+    "absolute paths on both the mutation and the observation so they are "
+    "recognised as the same target. Writes to different paths are not "
+    "ordered against each other.\n"
     "Only serialize calls when a later call genuinely depends on an earlier "
-    "call's result (e.g. you must read a file before you can patch it). When "
-    "in doubt and the calls are independent, batch them."
+    "call's result (e.g. you must read a file before you can patch it). "
+    "Reading a file and writing or patching that same file always go in "
+    "SEPARATE responses — you compose every call in a response before any of "
+    "them runs, so the read's content cannot inform what you write. When in "
+    "doubt and the calls are independent, batch them."
 )
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
@@ -1257,6 +1315,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     if cached is not None:
         return cached or None
 
+    env = None
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.
@@ -1321,6 +1380,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             container_config=container_config,
             task_id="prompt-backend-probe",
             host_cwd=config.get("host_cwd"),
+            probe_only=True,
         )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
@@ -1343,6 +1403,17 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        # Probe environments are never registered in terminal_tool's active
+        # environment map, so the normal session cleanup cannot see them.
+        # Close explicitly; otherwise BaseEnvironment.__del__ may run much
+        # later during interpreter teardown.  SSH probe_only mode makes this a
+        # connection-only close with no ~/.hermes sync-back.
+        if env is not None:
+            try:
+                env.cleanup()
+            except Exception:
+                logger.debug("Backend probe cleanup failed", exc_info=True)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}
@@ -2153,31 +2224,19 @@ def _build_skills_system_prompt_inner(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
+            "Before replying, scan the index. If a skill is even partly relevant, load it "
+            "with skill_view(name) and follow it. Skills define local commands, workflows, "
+            "preferences, and quality rules; use them even when general tools could do the task.\n"
+            "For Hermes setup, configuration, or troubleshooting, load `hermes-agent` first "
+            "and treat https://hermes-agent.nousresearch.com/docs as the current authority.\n"
+            "Patch faulty or outdated loaded skills with skill_manage(action='patch'). After "
+            "difficult reusable work, offer to save the workflow as a skill.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "Proceed without loading only when no skill applies."
             + hidden_note
         )
 

@@ -116,6 +116,42 @@ def _codex_message_response(text: str):
     )
 
 
+def _codex_stream_incomplete_response(text: str = "", *, has_tool_item: bool = False):
+    output = []
+    if text:
+        output.append(
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="incomplete",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            )
+        )
+    if has_tool_item:
+        output.append(
+            SimpleNamespace(
+                type="function_call",
+                id="fc_incomplete",
+                call_id="call_incomplete",
+                name="terminal",
+                arguments='{"command":"touch side-effect"}',
+            )
+        )
+    return SimpleNamespace(
+        output=output,
+        output_text=text,
+        usage=None,
+        status="failed",
+        error={
+            "code": "stream_incomplete",
+            "message": "Upstream websocket closed before response.completed",
+        },
+        model="gpt-5-codex",
+        _hermes_streamed_chars=len(text),
+        _hermes_has_tool_items=has_tool_item,
+    )
+
+
 def _codex_tool_call_response():
     return SimpleNamespace(
         output=[
@@ -1038,6 +1074,105 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_run_conversation_retries_zero_output_stream_disconnect_without_error_traceback(
+    monkeypatch, caplog
+):
+    agent = _build_agent(monkeypatch)
+    agent._api_max_retries = 1
+    calls = {"api": 0}
+
+    def _fake_api_call(api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            return _codex_stream_incomplete_response()
+        return _codex_message_response("Recovered")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    with caplog.at_level("WARNING", logger="agent.conversation_loop"):
+        result = agent.run_conversation("Say hello")
+
+    assert calls["api"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered"
+    assert result["api_calls"] == 1
+    assert agent.iteration_budget.used == 1
+    assert "Retryable Codex stream interruption" in caplog.text
+    assert "Outer loop error" not in caplog.text
+
+
+def test_run_conversation_does_not_blind_retry_partial_stream_disconnect(
+    monkeypatch, caplog
+):
+    agent = _build_agent(monkeypatch)
+    agent._api_max_retries = 1
+    calls = {"api": 0}
+
+    def _fake_api_call(api_kwargs):
+        calls["api"] += 1
+        return _codex_stream_incomplete_response("partial answer")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    with caplog.at_level("WARNING", logger="agent.conversation_loop"):
+        result = agent.run_conversation("Say hello")
+
+    assert calls["api"] == 1
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["final_response"] == "partial answer"
+    assert "Outer loop error" not in caplog.text
+
+
+def test_run_conversation_stops_after_two_safe_stream_retries(monkeypatch, caplog):
+    agent = _build_agent(monkeypatch)
+    agent._api_max_retries = 1
+    calls = {"api": 0}
+
+    def _fake_api_call(api_kwargs):
+        calls["api"] += 1
+        return _codex_stream_incomplete_response()
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    with caplog.at_level("WARNING", logger="agent.conversation_loop"):
+        result = agent.run_conversation("Say hello")
+
+    assert calls["api"] == 3
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["final_response"] == (
+        "Codex response stream ended before completion after 2 safe retries."
+    )
+    assert result["api_calls"] == 1
+    assert agent.iteration_budget.used == 1
+    assert "Codex stream recovery limit exhausted" in caplog.text
+    assert "Outer loop error" not in caplog.text
+
+
+def test_run_conversation_does_not_retry_incomplete_stream_with_tool_item(
+    monkeypatch,
+    caplog,
+):
+    agent = _build_agent(monkeypatch)
+    agent._api_max_retries = 1
+    calls = {"api": 0}
+
+    def _fake_api_call(api_kwargs):
+        calls["api"] += 1
+        return _codex_stream_incomplete_response(has_tool_item=True)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    with caplog.at_level("WARNING", logger="agent.conversation_loop"):
+        result = agent.run_conversation("Perform one action")
+
+    assert calls["api"] == 1
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert "automatic retry was skipped to avoid duplicate actions" in result["final_response"]
+    assert "tool_items=True" in caplog.text
+    assert "Outer loop error" not in caplog.text
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
     """Both mutable request boundaries must reject literal Harmony wire tokens."""
     agent = _build_agent(monkeypatch)
@@ -2389,5 +2524,7 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
         model="gpt-5-codex",
         on_reasoning_delta=reasoning_streamed.append,
     )
+
+
 
     assert "".join(reasoning_streamed) == "Need to inspect files."

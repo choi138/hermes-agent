@@ -177,3 +177,84 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
 
 
 
+
+
+def test_graphiti_ok_blocks_external_fallback_but_non_ok_statuses_allow_it():
+    controller = ToolCallGuardrailController()
+    controller.set_graphiti_routing_status("ok")
+
+    for tool_name in (
+        "web_search",
+        "web_extract",
+        "session_search",
+        "browser_navigate",
+        "browser_snapshot",
+        "computer_use",
+    ):
+        decision = controller.before_call(tool_name, {"query": "fallback"})
+        assert decision.action == "deny"
+        assert decision.should_halt is False
+        assert decision.code == "graphiti_fallback_not_allowed"
+        assert "ok" in decision.message
+
+    assert controller.before_call("search_memory_facts", {"query": "refine"}).action == "allow"
+    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+    for status in ("empty", "filtered", "timeout", "error", "missing"):
+        controller.set_graphiti_routing_status(status)
+        assert controller.before_call("web_search", {"query": status}).action == "allow"
+
+    controller.reset_for_turn()
+    assert controller.before_call("web_search", {"query": "new turn"}).action == "allow"
+
+
+def test_model_visible_graphiti_result_blocks_fallback_only_for_ok_recall():
+    controller = ToolCallGuardrailController()
+    controller.set_graphiti_routing_status("empty")
+
+    controller.after_call(
+        "search_memory_facts",
+        {"query": "refined"},
+        json.dumps({"status": "ok", "fallback_allowed": False}),
+        failed=False,
+    )
+    blocked = controller.before_call("web_search", {"query": "must not run"})
+    assert blocked.action == "deny"
+    assert blocked.should_halt is False
+    assert "ok" in blocked.message
+
+    controller.after_call(
+        "search_memory_facts",
+        {"query": "refined"},
+        json.dumps({"status": "empty", "fallback_allowed": True}),
+        failed=False,
+    )
+    assert controller.before_call("web_search", {"query": "now allowed"}).action == "allow"
+
+
+def test_malformed_model_visible_graphiti_result_allows_fallback():
+    controller = ToolCallGuardrailController()
+    controller.after_call(
+        "search_memory_facts",
+        {"query": "refined"},
+        "not-json",
+        failed=True,
+    )
+
+    decision = controller.before_call("session_search", {"query": "fallback"})
+    assert decision.action == "allow"
+
+
+def test_search_memory_facts_participates_in_idempotent_no_progress_guard():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=2)
+    )
+    args = {"query": "same history"}
+    result = json.dumps({"status": "empty", "fallback_allowed": True})
+
+    first = controller.after_call("search_memory_facts", args, result, failed=False)
+    second = controller.after_call("search_memory_facts", args, result, failed=False)
+
+    assert first.action == "allow"
+    assert second.action == "warn"
+    assert second.code == "idempotent_no_progress_warning"

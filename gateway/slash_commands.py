@@ -148,6 +148,13 @@ class GatewaySlashCommandsMixin:
         # Get existing session key
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
+        # Linearize /new against any durable completion that already passed
+        # its final claim read. This must happen before resource cleanup or any
+        # other await so the adapter rejects the old completion at admission.
+        self._invalidate_completion_admission_epoch(
+            session_key,
+            reason="session_reset",
+        )
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
         # False and leave its dead agent behind; clearing here keeps the slot
@@ -1461,7 +1468,17 @@ class GatewaySlashCommandsMixin:
             )
             return EphemeralReply(t("gateway.stop.stopped"))
 
-        # No run under the caller's own session key.  In a per-user thread
+        # No foreground run under the caller's own session key. Detached
+        # delegate_task workers and terminal background processes live outside
+        # _running_agents, so cancel them explicitly before looking for an
+        # authorized sibling run.
+        background_cancelled = await self._cancel_session_background_work(
+            session_key,
+            parent_session_id=str(getattr(session_entry, "session_id", "") or ""),
+            reason="stop_command_idle",
+        )
+
+        # In a per-user thread
         # (thread_sessions_per_user=True) each participant is isolated even
         # inside one shared thread, so a run another user started lives under
         # a different key.  Authorized users should still be able to /stop it
@@ -1481,6 +1498,15 @@ class GatewaySlashCommandsMixin:
                 session_key,
                 len(sibling_keys),
                 ", ".join(sibling_keys),
+            )
+            return EphemeralReply(t("gateway.stop.stopped"))
+
+        if background_cancelled:
+            logger.info(
+                "STOP (background-only) for session %s — cancelled %d "
+                "background job(s)",
+                session_key,
+                background_cancelled,
             )
             return EphemeralReply(t("gateway.stop.stopped"))
 
@@ -2010,6 +2036,10 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        # A manual model choice supersedes model-router intent.
+                        # Do not reconstruct a route later from ambiguous model
+                        # membership.
+                        _self._set_active_model_route(_session_key, "")
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2322,6 +2352,7 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            self._set_active_model_route(session_key, "")
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}

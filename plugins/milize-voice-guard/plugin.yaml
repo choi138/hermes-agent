@@ -1,0 +1,8 @@
+name: milize-voice-guard
+version: 1.0.0
+description: Default-profile Discord Korean voice contract and bounded style repair
+entry_point: __init__.py
+hooks:
+  - pre_llm_call
+  - transform_llm_output
+  - on_session_end

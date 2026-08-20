@@ -20,8 +20,15 @@ from agent.lsp.client import LSPClient
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _client(workspace: Path, script: str = "clean") -> LSPClient:
+def _client(
+    workspace: Path,
+    script: str = "clean",
+    *,
+    exit_delay: float = 0,
+) -> LSPClient:
     env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+    if exit_delay:
+        env["MOCK_LSP_EXIT_DELAY"] = str(exit_delay)
     return LSPClient(
         server_id=f"mock-{script}",
         workspace_root=str(workspace),
@@ -32,13 +39,25 @@ def _client(workspace: Path, script: str = "clean") -> LSPClient:
 
 
 @pytest.mark.asyncio
-async def test_client_lifecycle_clean(tmp_path: Path):
+async def test_client_lifecycle_clean(tmp_path: Path, monkeypatch):
     """Full lifecycle: spawn, initialize, open, get clean diagnostics, shutdown."""
     f = tmp_path / "x.py"
     f.write_text("print('hi')\n")
 
-    client = _client(tmp_path, "clean")
+    # Keep the mock alive briefly after ``exit`` so this deterministically
+    # proves shutdown waits for normal termination instead of sending SIGTERM.
+    client = _client(tmp_path, "clean", exit_delay=0.05)
     await client.start()
+    proc = client._proc
+    assert proc is not None
+    terminate_calls = []
+    real_terminate = proc.terminate
+
+    def _record_terminate():
+        terminate_calls.append(True)
+        real_terminate()
+
+    monkeypatch.setattr(proc, "terminate", _record_terminate)
     try:
         assert client.is_running
         version = await client.open_file(str(f), language_id="python")
@@ -48,6 +67,7 @@ async def test_client_lifecycle_clean(tmp_path: Path):
         assert diags == []
     finally:
         await client.shutdown()
+    assert terminate_calls == []
     assert not client.is_running
 
 
@@ -70,7 +90,6 @@ async def test_client_receives_published_errors(tmp_path: Path):
         assert "synthetic error" in d["message"]
     finally:
         await client.shutdown()
-
 
 
 

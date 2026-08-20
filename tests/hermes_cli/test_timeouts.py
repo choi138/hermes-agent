@@ -6,10 +6,76 @@ from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
+from hermes_cli.provider_config import get_provider_backend_family
 
 
 def _write_config(tmp_path, body: str) -> None:
     (tmp_path / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
+
+
+def test_named_custom_provider_uses_requested_identity(monkeypatch, tmp_path):
+    """Runtime ``custom`` must retain its original providers.<id> metadata."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+        providers:
+          codex-lb:
+            api: https://codex-lb.example/v1
+            transport: codex_responses
+            backend_family: openai-codex
+            request_timeout_seconds: 1800
+            stale_timeout_seconds: 150
+        """)
+
+    assert get_provider_request_timeout("custom") is None
+    assert get_provider_request_timeout(
+        "custom", requested_provider="codex-lb"
+    ) == 1800.0
+    assert get_provider_stale_timeout(
+        "custom", requested_provider="custom:codex-lb"
+    ) == 150.0
+    assert get_provider_backend_family(
+        "custom", requested_provider="codex-lb"
+    ) == "openai-codex"
+
+
+def test_concrete_fallback_provider_wins_over_stale_requested_identity(
+    monkeypatch, tmp_path
+):
+    """An in-place failover must resolve the fallback's current timeout."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+        providers:
+          custom:
+            models:
+              gpt-5.6-sol:
+                stale_timeout_seconds: 150
+          codex-lb:
+            models:
+              gpt-5.5:
+                stale_timeout_seconds: 900
+        """)
+
+    assert get_provider_stale_timeout(
+        "codex-lb",
+        "gpt-5.5",
+        requested_provider="custom",
+    ) == 900.0
+
+
+def test_backend_family_survives_custom_provider_normalization():
+    from hermes_cli.config import providers_dict_to_custom_providers
+
+    normalized = providers_dict_to_custom_providers(
+        {
+            "codex-lb": {
+                "api": "https://codex-lb.example/v1",
+                "backend_family": "openai-codex",
+            }
+        }
+    )
+    assert normalized[0]["backend_family"] == "openai-codex"
 
 
 
@@ -100,7 +166,5 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     # Case C: no config, no env → 1800.0 default
     monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     assert agent2._resolved_api_call_timeout() == 1800.0
-
-
 
 

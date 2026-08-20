@@ -196,6 +196,7 @@ class GatewayStreamConsumer:
         config: Optional[StreamConsumerConfig] = None,
         metadata: Optional[dict] = None,
         on_new_message: Optional[callable] = None,
+        on_content_delivered: Optional[Callable[[], Any]] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
@@ -212,6 +213,10 @@ class GatewayStreamConsumer:
         # the content, not edit the old bubble above it.
         # Called with no arguments. Exceptions are swallowed.
         self._on_new_message = on_new_message
+        # Fired after a successful platform send/edit carrying actual assistant
+        # content.  Tool progress and heartbeat bubbles are produced outside
+        # this consumer and therefore never advance the output-silence clock.
+        self._on_content_delivered = on_content_delivered
         # Fired once when the stream transitions into its finalization path.
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
@@ -409,7 +414,10 @@ class GatewayStreamConsumer:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        result = await self.adapter.edit_message(**kwargs)
+        if getattr(result, "success", False):
+            self._notify_content_delivered()
+        return result
 
     def _append_accumulated(self, text: str) -> None:
         """Append to the live buffer and the split-stable stream ledger."""
@@ -552,6 +560,23 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _notify_content_delivered(self) -> None:
+        """Fire the delivery callback without delaying or breaking streaming."""
+        cb = self._on_content_delivered
+        if cb is None:
+            return
+        try:
+            result = cb()
+            if inspect.isawaitable(result):
+                # Callers install a synchronous timestamp callback.  Refuse to
+                # await an accidental coroutine on the hot delivery path.
+                try:
+                    result.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     @staticmethod
     def _signal_flush(flush_event) -> None:
@@ -1286,6 +1311,8 @@ class GatewayStreamConsumer:
                     expect_edits=not final,
                 ),
             )
+            if result.success:
+                self._notify_content_delivered()
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
                 self._track_preview_ids_from_result(result)
@@ -1499,6 +1526,7 @@ class GatewayStreamConsumer:
                     metadata=self._metadata_for_send(final=True),
                 )
                 if result.success:
+                    self._notify_content_delivered()
                     break
                 retry_delay = self._fallback_flood_retry_delay(result)
                 if attempt == 0 and retry_delay is not None:
@@ -1609,6 +1637,7 @@ class GatewayStreamConsumer:
                 )
 
             if getattr(result, "success", False):
+                self._notify_content_delivered()
                 break
             retry_delay = self._fallback_flood_retry_delay(result)
             if attempt == 0 and retry_delay is not None:
@@ -1773,6 +1802,7 @@ class GatewayStreamConsumer:
             self._use_draft_streaming = False
             return False
         # Frame delivered.  Track text for parity with edit-based no-op skip.
+        self._notify_content_delivered()
         self._last_sent_text = text
         return True
 
@@ -1805,6 +1835,7 @@ class GatewayStreamConsumer:
                 metadata=self.metadata,
             )
             if result.success:
+                self._notify_content_delivered()
                 self._already_sent = True
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
@@ -1847,6 +1878,7 @@ class GatewayStreamConsumer:
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
             if result.success:
+                self._notify_content_delivered()
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
@@ -2001,6 +2033,7 @@ class GatewayStreamConsumer:
             return False
         if not getattr(result, "success", False):
             return False
+        self._notify_content_delivered()
         # Adopt the new message id as the current message so subsequent
         # callers (e.g. overflow split loops, finalize retries) see a
         # consistent state.
@@ -2402,6 +2435,7 @@ class GatewayStreamConsumer:
                     ),
                 )
                 if result.success:
+                    self._notify_content_delivered()
                     if result.message_id:
                         self._message_id = result.message_id
                         # Track when the preview first became visible to

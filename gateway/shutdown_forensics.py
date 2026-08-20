@@ -240,6 +240,30 @@ def spawn_async_diagnostic(
         "echo '=== end ==='"
     )
 
+    # GNU ``timeout`` is not installed by default on macOS.  Use the current
+    # Python interpreter as a tiny watchdog instead so every supported POSIX
+    # host gets the same bounded diagnostic.  The shell gets its own process
+    # group, allowing the watchdog to reap the complete pipeline on timeout.
+    timeout_runner = (
+        "import os, signal, subprocess, sys\n"
+        "proc = subprocess.Popen(['bash', '-c', sys.argv[2]], "
+        "start_new_session=True)\n"
+        "try:\n"
+        "    returncode = proc.wait(timeout=float(sys.argv[1]))\n"
+        "except subprocess.TimeoutExpired:\n"
+        "    try:\n"
+        "        kill_process_group = getattr(os, 'killpg', None)\n"
+        "        kill_signal = getattr(signal, 'SIGKILL', signal.SIGTERM)\n"
+        "        if kill_process_group is not None:\n"
+        "            kill_process_group(proc.pid, kill_signal)\n"
+        "        else:\n"
+        "            proc.kill()\n"
+        "    except ProcessLookupError:\n"
+        "        pass\n"
+        "    returncode = proc.wait()\n"
+        "raise SystemExit(returncode)\n"
+    )
+
     try:
         # Open the log file in append mode and let the subprocess inherit.
         # We use os.O_APPEND so concurrent diagnostics from rapid signals
@@ -255,7 +279,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [sys.executable, "-c", timeout_runner, str(timeout_seconds), script],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

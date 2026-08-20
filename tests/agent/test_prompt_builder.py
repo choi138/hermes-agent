@@ -841,10 +841,14 @@ class TestEnvironmentHints:
                     ),
                 }
 
+            def cleanup(self):
+                created["cleaned"] = True
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
             created["env_type"] = env_type
+            created.update(kwargs)
             return _FakeEnv()
 
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
@@ -854,6 +858,8 @@ class TestEnvironmentHints:
 
         line = _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
+        assert created.get("probe_only") is True
+        assert created.get("cleaned") is True
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
@@ -1051,10 +1057,60 @@ class TestParallelToolCallGuidance:
         # Heading delimits it as its own section in the assembled prompt.
         assert PARALLEL_TOOL_CALL_GUIDANCE.lstrip().startswith("#")
 
+    def test_states_mutation_and_observation_may_be_batched(self):
+        """R4 step 2: the block must tell the model a write and its follow-up
+        observation belong in ONE response.
+
+        The runtime already guarantees this (a path-scoped writer closes the
+        parallel run, so an overlapping later reader lands in a later
+        segment — agent/tool_dispatch_helpers._plan_tool_batch_segments), but
+        until the prompt says so the model pays a whole extra model round to
+        list/search files it just created.  Naming the fenced tools matters:
+        only write_file/patch/read_file/search_files are path-scoped, so a
+        broader promise ("anything touching that path") would be a lie for
+        skill_view / vision_analyze / MCP tools, which reserve nothing.
+        """
+        block = PARALLEL_TOOL_CALL_GUIDANCE
+        assert "SAME response" in block
+        assert "write_file" in block
+        assert "search_files" in block
+
+    def test_forbids_batching_a_read_with_a_write_of_the_same_file(self):
+        """The one batching pattern that is genuinely unsafe must stay banned.
+
+        Batched [read_file(x), write_file(x)] is ORDERED correctly by the
+        planner (read first) — and that is exactly the hazard: the read's
+        content never reaches the model, while record_read stamps a
+        non-partial view so check_stale returns None and the overwrite
+        proceeds with content the model never saw.  The value-dependency
+        example (read before patch) must survive too, since that is the
+        carve-out that keeps the read→patch chain serialized.
+        """
+        block = PARALLEL_TOOL_CALL_GUIDANCE
+        assert "SEPARATE responses" in block
+        assert "read a file before you can patch it" in block
+
+    def test_requires_absolute_paths_for_batched_mutation_and_observation(self):
+        """Mitigation for the planner/file-tool cwd divergence — must not be
+        silently dropped.
+
+        The planner canonicalises relative paths against
+        get_active_env(task_id).cwd, which collapses cwd-only-override
+        sessions to the shared "default" env, while the file tools resolve
+        via get_session_cwd on the RAW task_id.  A batch mixing a relative
+        write with an absolute read can therefore be admitted to one
+        parallel run.  An absolute path never consults any cwd, so this one
+        instruction closes the gap without touching the barrier engine.
+        """
+        assert "absolute paths" in PARALLEL_TOOL_CALL_GUIDANCE
+
+    def test_stays_short_enough_for_the_cached_prefix(self):
+        # Shipped in the prompt-cached stable prefix to every session.
+        # Cost is documented at hermes_cli/config_defaults.py
+        # ("parallel_tool_call_guidance").  Keep it bounded.
+        assert len(PARALLEL_TOOL_CALL_GUIDANCE) < 1600
 
 
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

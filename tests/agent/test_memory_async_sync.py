@@ -16,6 +16,9 @@ for session boundaries and deterministic tests. ``shutdown_all`` drains the
 executor with a bounded timeout so a wedged provider can't hang teardown.
 """
 import logging
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 
@@ -166,3 +169,24 @@ def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, 
     assert "queued" not in calls
     assert "abandoning 1 queued memory write" in caplog.text
     release.set()
+
+
+def test_wedged_memory_worker_does_not_block_interpreter_exit():
+    script = textwrap.dedent(
+        """
+        import threading
+        import agent.memory_manager as memory_manager
+
+        memory_manager._SYNC_DRAIN_TIMEOUT_S = 0.02
+        manager = memory_manager.MemoryManager()
+        started = threading.Event()
+        blocker = threading.Event()
+        manager._submit_background(lambda: (started.set(), blocker.wait()))
+        assert started.wait(1)
+        manager.shutdown_all()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=2
+    )
+    assert completed.returncode == 0, completed.stderr

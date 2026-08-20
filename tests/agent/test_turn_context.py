@@ -30,9 +30,13 @@ class _FakeTodoStore:
 class _FakeGuardrails:
     def __init__(self):
         self.reset_called = False
+        self.graphiti_statuses = []
 
     def reset_for_turn(self):
         self.reset_called = True
+
+    def set_graphiti_routing_status(self, status):
+        self.graphiti_statuses.append(status)
 
 
 class _FakeAgent:
@@ -299,6 +303,35 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_memory_nudge_fires_at_interval():
+    agent = _FakeAgent()
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"memory"}
+    agent._memory_store = object()
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is True
+    # A trigger is only a due marker. The finalizer resets it after a healthy
+    # foreground turn successfully queues/deduplicates the review; a failed
+    # turn must leave the learning opportunity due.
+    assert agent._turns_since_memory == 1
+
+
+def test_subagent_does_not_tick_memory_review_cadence():
+    agent = _FakeAgent()
+    agent._delegate_depth = 1
+    agent.platform = "subagent"
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"memory"}
+    agent._memory_store = object()
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is False
+    assert agent._turns_since_memory == 0
+
+
 
 
 
@@ -452,3 +485,47 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_prefetch_graphiti_first_status_arms_runtime_fallback_guard():
+    agent = _FakeAgent()
+    agent._memory_manager = types.SimpleNamespace(
+        on_turn_start=lambda *_args: None,
+        prefetch_all=lambda _query: (
+            "# Graphiti Lookup Status\n"
+            "source: graphiti_historical_memory\n"
+            "routing_policy: graphiti_first\n"
+            "status: filtered\n"
+            "fallback_allowed: false"
+        ),
+    )
+
+    ctx = _build(agent, user_message="Instagram에서 마지막 연락 상대를 찾아줘")
+
+    assert agent._tool_guardrails.graphiti_statuses == ["filtered"]
+    assert ctx.ext_prefetch_cache == ""
+    assert "api_content" not in ctx.messages[-1]
+
+
+def test_prefetch_keeps_recall_but_never_persists_graphiti_status_block():
+    agent = _FakeAgent()
+    recall = "# Graphiti Recall (read-only historical context)\n- remembered fact"
+    status = (
+        "# Graphiti Lookup Status\n"
+        "source: graphiti_historical_memory\n"
+        "routing_policy: graphiti_first\n"
+        "status: ok\n"
+        "candidate_count: 1\n"
+        "fallback_allowed: false"
+    )
+    agent._memory_manager = types.SimpleNamespace(
+        on_turn_start=lambda *_args: None,
+        prefetch_all=lambda _query: recall + "\n\n" + status,
+    )
+
+    ctx = _build(agent, user_message="전에 하던 작업을 이어줘")
+
+    assert agent._tool_guardrails.graphiti_statuses == ["ok"]
+    assert ctx.ext_prefetch_cache == recall
+    assert recall in ctx.messages[-1]["api_content"]
+    assert "Graphiti Lookup Status" not in ctx.messages[-1]["api_content"]

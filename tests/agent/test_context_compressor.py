@@ -2087,13 +2087,24 @@ class TestTruncateToolCallArgsJson:
     The previous implementation produced invalid JSON by slicing
     ``function.arguments`` mid-string, which caused non-retryable 400s from
     strict providers (observed on MiniMax) and stuck long sessions in a
-    re-send loop. The helper here must always emit parseable JSON whose
-    shape matches the original — shrunken, not corrupted.
+    re-send loop. A later regression showed that preserving a replayable
+    prefix inside ``write_file.content`` is also unsafe: the model can mistake
+    the compacted history for complete file bytes and overwrite a large file
+    with the preview. The helper must therefore emit parseable JSON whose
+    long string leaves are explicit, non-replayable tombstones.
     """
+
+    _ELISION_PREFIX = "[HERMES_CONTEXT_ELIDED "
 
     def _helper(self):
         from agent.context_compressor import _truncate_tool_call_args_json
         return _truncate_tool_call_args_json
+
+    def _assert_elided(self, value):
+        assert isinstance(value, str)
+        assert value.startswith(self._ELISION_PREFIX)
+        assert "DO_NOT_REUSE_AS_INPUT" in value
+        assert "...[truncated]" not in value
 
     def test_shrunken_args_remain_valid_json(self):
         import json as _json
@@ -2106,7 +2117,8 @@ class TestTruncateToolCallArgsJson:
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["content"])
+        assert "# Shopping Browser Setup Notes" not in parsed["content"]
         assert len(shrunk) < len(original)
 
 
@@ -2127,7 +2139,7 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        self._assert_elided(parsed["note"])
 
 
 
@@ -2165,7 +2177,8 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        self._assert_elided(parsed["content"])
+        assert "# Shopping Browser Setup Notes" not in parsed["content"]
 
 
 class TestLazyContextResolution:
@@ -3352,3 +3365,60 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestCompressionTokenTelemetryFields:
+    """compress() must publish the before/after estimates it already computes."""
+
+    def test_compress_publishes_token_estimates(self, compressor):
+        from agent.context_compressor import estimate_messages_tokens_rough
+
+        compressor._begin_compression_telemetry(
+            attempt_id="attempt-1", current_tokens=90_000
+        )
+        msgs = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"message {i} " + "y" * 400,
+            }
+            for i in range(20)
+        ]
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("no provider"),
+        ):
+            result = compressor.compress(msgs)
+
+        telemetry = compressor._active_compression_telemetry
+        assert telemetry["tokens_before"] == estimate_messages_tokens_rough(msgs)
+        assert telemetry["tokens_after"] == estimate_messages_tokens_rough(result)
+        # Both are real estimates of the actual inputs/outputs, not placeholders.
+        assert telemetry["tokens_before"] > 0
+        assert telemetry["tokens_after"] > 0
+
+    def test_telemetry_shape_is_stable_on_every_abort_path(self, compressor):
+        """All 11 batch emit sites read the same payload keys."""
+        telemetry = compressor._begin_compression_telemetry(
+            attempt_id="attempt-1", current_tokens=1_000
+        )
+
+        for field in ("tokens_before", "tokens_after"):
+            assert field in telemetry
+            assert telemetry[field] is None
+        assert telemetry["work_lane"] == ""
+        assert telemetry["platform"] == ""
+
+    def test_seeded_lane_and_platform_reach_the_telemetry_dict(self, compressor):
+        compressor._compression_telemetry_seed = {
+            "attempt_id": "attempt-2",
+            "session_id": "session-x",
+            "trigger_source": "auto",
+            "work_lane": "research",
+            "platform": "gateway",
+        }
+        telemetry = compressor._begin_compression_telemetry(current_tokens=1_000)
+
+        assert telemetry["attempt_id"] == "attempt-2"
+        assert telemetry["work_lane"] == "research"
+        assert telemetry["platform"] == "gateway"

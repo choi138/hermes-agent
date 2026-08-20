@@ -4,8 +4,10 @@ Tests verify tool schemas, handler dispatch, validation logic, and error
 handling without requiring a running terminal environment.
 """
 
+import hashlib
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,7 +56,9 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once_with(
+            str(Path("/tmp/out.txt").resolve()), "hello world!\n"
+        )
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -145,7 +149,9 @@ class TestPatchHandler:
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once_with(
+            str(Path("/tmp/f.py").resolve()), "foo", "bar", False
+        )
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -161,6 +167,73 @@ class TestPatchHandler:
         assert result["status"] == "ok"
         mock_ops.patch_v4a.assert_called_once()
 
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_append_mode_calls_atomic_append(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"success": True, "diff": "diff"}
+        mock_ops.patch_append.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="append",
+            path="/tmp/f.py",
+            content="\nnew_test()\n",
+            expected_sha256="abc123",
+        ))
+
+        assert result["success"] is True
+        mock_ops.patch_append.assert_called_once_with(
+            str(Path("/tmp/f.py").resolve()),
+            "\nnew_test()\n",
+            expected_sha256="abc123",
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_append_mode_requires_path_and_content(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        missing_path = json.loads(patch_tool(mode="append", content="x"))
+        missing_content = json.loads(patch_tool(mode="append", path="/tmp/f.py"))
+
+        assert "error" in missing_path
+        assert "error" in missing_content
+        mock_get.return_value.patch_append.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_mode_rejects_context_elision_tombstone(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        tombstone = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(patch_tool(
+            mode="replace",
+            path="/tmp/f.py",
+            old_string="old",
+            new_string=tombstone,
+        ))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.return_value.patch_replace.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_mode_rejects_context_elision_tombstone(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        tombstone = (
+            "[HERMES_CONTEXT_ELIDED chars=5328 sha256=0123456789ab "
+            "DO_NOT_REUSE_AS_INPUT]"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=tombstone))
+
+        assert "error" in result
+        assert "context-elided" in result["error"].lower()
+        mock_get.return_value.patch_v4a.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
     def test_unknown_mode_errors(self, mock_get):
@@ -502,11 +575,14 @@ class TestPatchSchemaShape:
         desc = PATCH_SCHEMA["description"]
         assert "REQUIRED PARAMETERS: mode, path, old_string, new_string" in desc
         assert "REQUIRED PARAMETERS: mode, patch" in desc
+        assert "REQUIRED PARAMETERS: mode, path, content" in desc
         props = PATCH_SCHEMA["parameters"]["properties"]
         for name in ("path", "old_string", "new_string"):
             assert "REQUIRED when mode='replace'" in props[name]["description"]
         assert "REQUIRED when mode='patch'" in props["patch"]["description"]
         assert "must differ from old_string" in props["new_string"]["description"]
+        assert "REQUIRED when mode='append'" in props["content"]["description"]
+        assert "append" in props["mode"]["enum"]
 
     def test_no_anyof_required_stays_mode_only(self):
         # anyOf/oneOf at parameters level break Anthropic, Fireworks, and the
@@ -671,7 +747,7 @@ class TestSilentFileMisplacementE2E:
 
         # 3) The next relative write must still land in the project dir.
         res = json.loads(ft.write_file_tool("report.txt", "hello\n", task_id))
-        assert res.get("resolved_path") == str(project / "report.txt"), res
+        assert res.get("resolved_path") == str((project / "report.txt").resolve()), res
         assert (project / "report.txt").exists(), "file should be in the user's cwd"
         assert not (config_default / "report.txt").exists(), \
             "file silently misplaced into config default (the #26211 bug)"
@@ -1000,3 +1076,79 @@ class TestNotFoundCache:
         assert _check_not_found_cache("read", "/tmp/never-exists-notify", tid) is None, (
             "notify_other_tool_call must clear cached misses"
         )
+
+
+class TestReadFileSchemaHonesty:
+    """R4 step 2: READ_FILE_SCHEMA's declared ``limit`` default must match
+    what the registered handler actually forwards.
+
+    The schema used to advertise ``default: 2000`` while ``_handle_read_file``
+    forwarded 500.  A model that wanted a whole file therefore omitted
+    ``limit``, got 500 lines plus a ``next_offset``, and paid a continuation
+    round the schema had promised it would not need.  Nothing in the tree
+    pinned the two together (``_handle_read_file`` is referenced only at its
+    definition and its registry registration), so they were free to drift.
+
+    Both values are DERIVED here rather than hardcoded on both sides, so the
+    test fails on divergence in either direction instead of freezing one
+    number.
+    """
+
+    def test_read_file_schema_default_matches_handler_fallback(self):
+        from tools.file_tools import READ_FILE_SCHEMA
+
+        assert READ_FILE_SCHEMA["parameters"]["properties"]["limit"]["default"] == 500
+
+    def test_handler_forwards_the_schema_default_when_limit_is_omitted(
+        self, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        recorded = {}
+
+        def _recorder(path, offset=1, limit=None, task_id=None, **kwargs):
+            recorded.update(path=path, offset=offset, limit=limit, task_id=task_id)
+            return json.dumps({"content": ""})
+
+        monkeypatch.setattr(ft, "read_file_tool", _recorder)
+        ft._handle_read_file({"path": "/tmp/schema-honesty-probe.txt"})
+
+        schema_default = ft.READ_FILE_SCHEMA["parameters"]["properties"]["limit"][
+            "default"
+        ]
+        assert recorded["limit"] == schema_default, (
+            "the registered read_file handler must forward the limit the schema "
+            f"advertises; schema says {schema_default}, handler sent "
+            f"{recorded['limit']}"
+        )
+
+    def test_schema_tells_the_model_how_to_get_a_whole_file_in_one_call(self):
+        """The honesty fix alone saves zero rounds — the model cannot predict
+        a file's length.  The explicit ``limit=2000`` hint is what converts an
+        accurate schema into a round saver, and the max must stay 2000 so no
+        capability is removed."""
+        from tools.file_tools import READ_FILE_SCHEMA
+
+        limit_prop = READ_FILE_SCHEMA["parameters"]["properties"]["limit"]
+        assert limit_prop["maximum"] == 2000
+        assert "limit=2000" in limit_prop["description"]
+
+    def test_gateway_compact_description_carries_the_same_hint(self):
+        """Gateway/Discord sessions are shown a compacted schema from a
+        separate table; fixing only one of the two descriptions the model can
+        see would leave the round-saving hint off for those surfaces."""
+        from gateway.tool_policy import _DISCORD_CORE_COMPACT_DESCRIPTIONS
+
+        compact = _DISCORD_CORE_COMPACT_DESCRIPTIONS["read_file"][
+            ("parameters", "properties", "limit")
+        ]
+        assert "default 500" in compact
+        assert "2000" in compact
+        # The two assertions above also hold for the pre-change string
+        # "Line limit (default 500, max 2000)." — pin the ACTIONABLE hint, which
+        # is the part that actually removes a pagination round.
+        assert "whole file in one call" in compact
+
+        write = _DISCORD_CORE_COMPACT_DESCRIPTIONS["write_file"][()]
+        assert "bytes_written" in write
+        assert "wc/ls/stat" in write

@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import sqlite3
+import threading
 import time
 import json
 import threading
@@ -756,6 +757,54 @@ class TestTimestampPreservation:
         assert len(raw) == 3
         assert raw[1:] == timestamps[-2:]
         assert raw[0] > timestamps[-1]  # summary stamped with a current time
+
+
+class TestRefusalMessageMasking:
+    def test_deactivate_and_reactivate_only_flip_active(self, db):
+        db.create_session(session_id="s1", source="gateway")
+        first = db.append_message("s1", "assistant", "first refusal")
+        compacted = db.append_message("s1", "assistant", "archived-looking row")
+        unlisted = db.append_message("s1", "user", "keep visible")
+        already_inactive = db.append_message("s1", "assistant", "already hidden")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET compacted = 1 WHERE id = ?", (compacted,),
+            )
+            db._conn.execute(
+                "UPDATE messages SET active = 0 WHERE id = ?", (already_inactive,),
+            )
+            db._conn.commit()
+
+        assert db.deactivate_messages(
+            "s1", [first, compacted, already_inactive],
+        ) == 2
+        assert db.deactivate_messages("s1", []) == 0
+        assert [message["id"] for message in db.get_messages("s1")] == [unlisted]
+
+        all_rows = {
+            message["id"]: message
+            for message in db.get_messages("s1", include_inactive=True)
+        }
+        assert all_rows[first]["active"] == 0
+        assert all_rows[first]["compacted"] == 0
+        assert all_rows[compacted]["active"] == 0
+        assert all_rows[compacted]["compacted"] == 1
+        assert all_rows[already_inactive]["compacted"] == 0
+
+        assert db.reactivate_messages(
+            "s1", [first, compacted, already_inactive],
+        ) == 3
+        assert db.reactivate_messages("s1", []) == 0
+        assert [message["id"] for message in db.get_messages("s1")] == [
+            first, compacted, unlisted, already_inactive,
+        ]
+        restored = {
+            message["id"]: message
+            for message in db.get_messages("s1", include_inactive=True)
+        }
+        assert restored[first]["compacted"] == 0
+        assert restored[compacted]["compacted"] == 1
+        assert restored[already_inactive]["compacted"] == 0
 
 
 # =========================================================================
@@ -2751,8 +2800,8 @@ class TestOptimizeFts:
 
 
 
-    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
-        """Routine writes use bounded merge and never full optimize."""
+    def test_maintenance_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """The maintenance tick uses bounded merge, never full optimize."""
         db._FTS_MERGE_EVERY_N_WRITES = 5
         calls = []
 
@@ -2770,11 +2819,14 @@ class TestOptimizeFts:
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
         assert calls == []  # Four successful writes are below the boundary.
         db.append_message(session_id="s1", role="user", content="needle 3")
+        assert calls == []  # The write hot path only advances the counter.
+        db._db_maintenance_tick()
         assert calls == [500]  # The fifth write gets the production page budget.
         for i in range(4, 8):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
         assert calls == [500]
         db.append_message(session_id="s1", role="user", content="needle 8")
+        db._db_maintenance_tick()
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 

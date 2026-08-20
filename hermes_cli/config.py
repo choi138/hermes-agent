@@ -1389,10 +1389,14 @@ def _normalize_custom_provider_entry(
         "key_cmd",
         "api_mode", "transport", "model", "default_model", "models",
         "models_discovered",
+        "backend_family",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
+        # Read directly from raw config.yaml by agent.anthropic_adapter; this
+        # trust flag intentionally does not enter the normalized runtime entry.
+        "anthropic_signature_passthrough",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -1470,6 +1474,10 @@ def _normalize_custom_provider_entry(
     api_mode = entry.get("api_mode") or entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():
         normalized["api_mode"] = _canonical_api_mode(api_mode)
+
+    backend_family = entry.get("backend_family")
+    if isinstance(backend_family, str) and backend_family.strip():
+        normalized["backend_family"] = backend_family.strip()
 
     model_name = entry.get("model") or entry.get("default_model")
     if isinstance(model_name, str) and model_name.strip():
@@ -1576,6 +1584,7 @@ def _custom_provider_entry_to_provider_config(
         "name",
         "api_key",
         "key_env",
+        "backend_family",
         "models",
         "models_discovered",
         "context_length",
@@ -2198,6 +2207,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
             ))
+
+    # Deferred import avoids config.py <-> model_routes.py import cycles while
+    # still making `hermes doctor` the single validation surface.
+    try:
+        from hermes_cli.model_routes import validate_model_routes
+
+        issues.extend(validate_model_routes(config))
+    except Exception:
+        logger.debug("model_routes config validation failed", exc_info=True)
 
     return issues
 
@@ -3427,6 +3445,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
     "ssh_key": "TERMINAL_SSH_KEY",
+    "ssh_connection_pool_size": "TERMINAL_SSH_CONNECTION_POOL_SIZE",
     "container_cpu": "TERMINAL_CONTAINER_CPU",
     "container_memory": "TERMINAL_CONTAINER_MEMORY",
     "container_disk": "TERMINAL_CONTAINER_DISK",

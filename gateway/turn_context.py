@@ -25,6 +25,7 @@ Field notes:
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -34,6 +35,7 @@ class TurnContext:
     """Closed-over locals of ``_run_agent_inner`` needed by ``TurnRunner``."""
 
     # --- read-only turn identity / wiring -------------------------------
+    event: Any = None
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
@@ -42,10 +44,17 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    semantic_progress_enabled: bool = False
+    semantic_progress_tracker: Any = None
+    semantic_progress_text: Optional[str] = None
 
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
     log_queue: Any = None
+    # Cross-thread finalization fence. The stream consumer sets this before
+    # its final platform send/edit; agent callbacks and the progress sender
+    # then reject or discard every later progress event for this turn.
+    progress_closed: threading.Event = field(default_factory=threading.Event)
 
     # --- mutable single-element containers (shared with the outer body) --
     last_progress_msg: list = field(default_factory=lambda: [None])
@@ -54,6 +63,9 @@ class TurnContext:
     repeat_count: list = field(default_factory=lambda: [0])
     long_tool_hint_fired: list = field(default_factory=lambda: [False])
     agent_holder: list = field(default_factory=lambda: [None])
+    semantic_progress_message_id_ref: list = field(
+        default_factory=lambda: [None]
+    )
 
     # --- constants / cleanup bookkeeping ---------------------------------
     _LONG_TOOL_THRESHOLD_S: float = 30.0
@@ -96,9 +108,14 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications
     # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
+    turn_resume_marker: Optional[dict] = None
+    turn_trace_obj: Any = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
+    tool_policy: Any = None
+    mention_inbox_execution_id: Optional[str] = None
+    mention_inbox_execution_observer: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False

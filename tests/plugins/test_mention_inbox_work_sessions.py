@@ -1,0 +1,478 @@
+"""Durable work-item session and exact proposal approval persistence."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from plugins.mention_inbox.proposals import (
+    ProposalStatus,
+    build_work_proposal,
+    proposal_to_json,
+    revise_work_proposal,
+)
+from plugins.mention_inbox.store import (
+    SCHEMA_VERSION,
+    MentionInboxStore,
+    ProposalMessageBinding,
+)
+
+NOW = datetime(2026, 7, 29, 11, 0, tzinfo=timezone.utc)
+SUBJECT = "github:R_repo:PR_7"
+DEDUPE = "github:IC_99:U_recent"
+SOURCE_REVISION = "2026-07-29T10:01:00Z"
+APPROVER = "396159160201658368"
+PARENT_CHANNEL = "1531851208858275860"
+
+
+def _store(path: Path) -> MentionInboxStore:
+    return MentionInboxStore(path, clock=lambda: NOW)
+
+
+def _proposal(*, revision: int = 1, head_sha: str = "head-1"):
+    return build_work_proposal(
+        revision=revision,
+        source_dedupe_key=DEDUPE,
+        source_revision=SOURCE_REVISION,
+        subject_key=SUBJECT,
+        head_sha=head_sha,
+        goal="요청된 PR 변경을 확인하고 필요한 수정을 준비한다.",
+        steps=("diff를 읽는다.", "범위 내 수정을 한다.", "테스트한다."),
+        allowed_actions=("read_repository", "edit_scoped_files", "run_tests"),
+        forbidden_actions=("merge", "deploy", "delete", "read_secrets"),
+        verification=("대상 테스트 통과", "diff 검토"),
+        executor_hint="direct",
+    )
+
+
+def test_one_active_thread_per_subject_and_record_is_idempotent(tmp_path: Path) -> None:
+    store = _store(tmp_path / "inbox.db")
+    first = store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    second = store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+
+    assert first.subject_key == second.subject_key == SUBJECT
+    assert second.discord_thread_id is None
+    recorded = store.record_work_item_thread(
+        SUBJECT, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
+    repeated = store.record_work_item_thread(
+        SUBJECT, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
+    assert recorded.discord_thread_id == repeated.discord_thread_id == "thread-1"
+    with pytest.raises(ValueError, match="different thread"):
+        store.record_work_item_thread(
+            SUBJECT, "parent-2", PARENT_CHANNEL, "thread-2"
+        )
+
+    connection = sqlite3.connect(store.path)
+    assert (
+        connection.execute("SELECT COUNT(*) FROM work_item_sessions").fetchone()[0] == 1
+    )
+    connection.close()
+
+
+def test_interrupted_thread_creation_retry_survives_restart(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.db"
+    _store(path).reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+
+    restarted = _store(path)
+    restored = restarted.get_active_work_item_session(SUBJECT)
+    assert restored is not None
+    assert restored.parent_message_id is None
+    assert restored.discord_thread_id is None
+    restarted.record_work_item_thread(
+        SUBJECT, "parent-1", PARENT_CHANNEL, "thread-1"
+    )
+    assert (
+        restarted.get_active_work_item_session(SUBJECT).discord_thread_id == "thread-1"
+    )
+
+
+def test_github_pr_identity_and_parent_message_are_unique(tmp_path: Path) -> None:
+    store = _store(tmp_path / "mention-inbox.db")
+    first = store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+
+    assert first.repository_node_id == "R_repo"
+    assert first.pr_node_id == "PR_7"
+
+    store.prepare_work_item_parent(SUBJECT, "parent-1", PARENT_CHANNEL)
+    store.reserve_work_item_session(
+        "github:R_other:PR_8",
+        "github:IC_100:U_recent",
+        SOURCE_REVISION,
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        store.prepare_work_item_parent(
+            "github:R_other:PR_8", "parent-1", PARENT_CHANNEL
+        )
+
+
+@pytest.mark.parametrize(
+    "parent_channel_id",
+    ("not-a-snowflake", "12345", str(1 << 64)),
+)
+def test_parent_channel_rejects_invalid_discord_snowflakes(
+    tmp_path: Path,
+    parent_channel_id: str,
+) -> None:
+    store = _store(tmp_path / "invalid-parent-channel.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+
+    with pytest.raises(ValueError, match="valid Discord snowflake"):
+        store.prepare_work_item_parent(
+            SUBJECT, "parent-1", parent_channel_id
+        )
+
+
+def test_v7_session_rows_backfill_immutable_github_identity(tmp_path: Path) -> None:
+    path = tmp_path / "mention-inbox.db"
+    connection = sqlite3.connect(path)
+    connection.execute("""
+        CREATE TABLE work_item_sessions (
+            subject_key TEXT PRIMARY KEY,
+            source_dedupe_key TEXT NOT NULL,
+            parent_message_id TEXT,
+            discord_thread_id TEXT,
+            state TEXT NOT NULL,
+            last_event_revision TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    connection.execute(
+        """
+        INSERT INTO work_item_sessions (
+            subject_key, source_dedupe_key, state, last_event_revision,
+            created_at, updated_at
+        ) VALUES (?, ?, 'reserved', ?, ?, ?)
+        """,
+        (SUBJECT, DEDUPE, SOURCE_REVISION, SOURCE_REVISION, SOURCE_REVISION),
+    )
+    connection.execute("PRAGMA user_version = 7")
+    connection.commit()
+    connection.close()
+
+    session = _store(path).get_work_item_session(SUBJECT)
+
+    assert session is not None
+    assert session.repository_node_id == "R_repo"
+    assert session.pr_node_id == "PR_7"
+
+
+def test_restart_restores_pending_proposal_and_message_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.db"
+    store = _store(path)
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        "proposal-message-1",
+        approval_offered=True,
+    )
+
+    restarted = _store(path)
+    restored = restarted.get_proposal_by_message_id("proposal-message-1")
+    assert restored == proposal
+    assert restarted.get_latest_proposal(SUBJECT) == proposal
+
+
+def test_exact_pending_proposal_approval_succeeds_once(tmp_path: Path) -> None:
+    store = _store(tmp_path / "inbox.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        "proposal-message-1",
+        approval_offered=True,
+    )
+
+    result = store.approve_proposal_cas(
+        proposal_id=proposal.proposal_id,
+        revision=proposal.revision,
+        proposal_hash=proposal.content_hash,
+        source_revision=proposal.source_revision,
+        current_head_sha=proposal.head_sha,
+        approver_platform="discord",
+        approver_user_id=APPROVER,
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id="approval-message-1",
+    )
+    replay = store.approve_proposal_cas(
+        proposal_id=proposal.proposal_id,
+        revision=proposal.revision,
+        proposal_hash=proposal.content_hash,
+        source_revision=proposal.source_revision,
+        current_head_sha=proposal.head_sha,
+        approver_platform="discord",
+        approver_user_id=APPROVER,
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id="approval-message-1",
+    )
+
+    assert result.approved is True
+    assert result.reason == "approved"
+    assert result.proposal.status is ProposalStatus.APPROVED
+    assert replay.approved is False
+    assert replay.reason in {"already_approved", "approval_message_reused"}
+
+
+def test_another_user_cannot_approve(tmp_path: Path) -> None:
+    store = _store(tmp_path / "inbox.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+
+    result = store.approve_proposal_cas(
+        proposal_id=proposal.proposal_id,
+        revision=1,
+        proposal_hash=proposal.content_hash,
+        source_revision=proposal.source_revision,
+        current_head_sha=proposal.head_sha,
+        approver_platform="discord",
+        approver_user_id="someone-else",
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id="approval-message-2",
+    )
+
+    assert result.approved is False
+    assert result.reason == "unauthorized_approver"
+    assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.PENDING
+
+
+def test_non_reply_cannot_select_a_proposal_implicitly(tmp_path: Path) -> None:
+    store = _store(tmp_path / "inbox.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    store.create_proposal(_proposal())
+    assert store.get_proposal_by_message_id("not-a-proposal-message") is None
+
+
+def test_r2_invalidates_old_pending_revision(tmp_path: Path) -> None:
+    store = _store(tmp_path / "inbox.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    first = _proposal()
+    store.create_proposal(first)
+    second = revise_work_proposal(
+        first,
+        source_revision="2026-07-29T10:02:00Z",
+        head_sha="head-2",
+        goal="최신 HEAD에서 다시 확인한다.",
+        steps=("최신 diff를 읽는다.",),
+        allowed_actions=first.allowed_actions,
+        forbidden_actions=first.forbidden_actions,
+        verification=first.verification,
+        executor_hint=first.executor_hint,
+    )
+    store.create_proposal(second)
+
+    stale = store.approve_proposal_cas(
+        proposal_id=first.proposal_id,
+        revision=1,
+        proposal_hash=first.content_hash,
+        source_revision=first.source_revision,
+        current_head_sha=first.head_sha,
+        approver_platform="discord",
+        approver_user_id=APPROVER,
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id="approval-old",
+    )
+    assert stale.approved is False
+    assert stale.reason in {"not_latest_revision", "needs_reapproval"}
+    assert store.get_latest_proposal(SUBJECT).revision == 2
+
+
+@pytest.mark.parametrize(
+    "source_revision,current_head_sha,reason",
+    [
+        ("2026-07-29T10:05:00Z", "head-1", "source_changed"),
+        (SOURCE_REVISION, "head-2", "head_changed"),
+    ],
+)
+def test_source_or_head_mismatch_marks_needs_reapproval(
+    tmp_path: Path, source_revision: str, current_head_sha: str, reason: str
+) -> None:
+    store = _store(tmp_path / f"{reason}.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        1,
+        f"proposal-{reason}",
+        approval_offered=True,
+    )
+
+    result = store.approve_proposal_cas(
+        proposal_id=proposal.proposal_id,
+        revision=1,
+        proposal_hash=proposal.content_hash,
+        source_revision=source_revision,
+        current_head_sha=current_head_sha,
+        approver_platform="discord",
+        approver_user_id=APPROVER,
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id=f"approval-{reason}",
+    )
+
+    assert result.approved is False
+    assert result.reason == reason
+    assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.NEEDS_REAPPROVAL
+
+
+def test_proposal_message_capability_persists_and_is_immutable(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.db"
+    store = _store(path)
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+
+    binding = store.record_proposal_message(
+        proposal.proposal_id,
+        proposal.revision,
+        "proposal-message-capability",
+        approval_offered=True,
+    )
+    restored = _store(path).get_proposal_message_binding(
+        proposal.proposal_id, proposal.revision
+    )
+
+    assert binding == ProposalMessageBinding(
+        proposal=proposal,
+        message_id="proposal-message-capability",
+        approval_offered=True,
+    )
+    assert restored == binding
+    with pytest.raises(ValueError, match="capability"):
+        store.record_proposal_message(
+            proposal.proposal_id,
+            proposal.revision,
+            "proposal-message-capability",
+            approval_offered=False,
+        )
+
+
+def test_proposal_message_without_approval_offer_cannot_be_approved(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "inbox.db")
+    store.reserve_work_item_session(SUBJECT, DEDUPE, SOURCE_REVISION)
+    proposal = _proposal()
+    store.create_proposal(proposal)
+    store.record_proposal_message(
+        proposal.proposal_id,
+        proposal.revision,
+        "review-only-message",
+        approval_offered=False,
+    )
+
+    result = store.approve_proposal_cas(
+        proposal_id=proposal.proposal_id,
+        revision=proposal.revision,
+        proposal_hash=proposal.content_hash,
+        source_revision=proposal.source_revision,
+        current_head_sha=proposal.head_sha,
+        approver_platform="discord",
+        approver_user_id=APPROVER,
+        authorized_approver_ids=frozenset({APPROVER}),
+        approval_message_id="approval-review-only",
+    )
+
+    assert result.approved is False
+    assert result.reason == "approval_not_offered"
+    assert store.get_latest_proposal(SUBJECT).status is ProposalStatus.PENDING
+
+
+def test_v5_proposal_rows_migrate_to_review_only_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-v5.db"
+    proposal = _proposal()
+    connection = sqlite3.connect(path)
+    connection.execute("""
+        CREATE TABLE work_proposals (
+            proposal_id TEXT NOT NULL,
+            proposal_revision INTEGER NOT NULL,
+            subject_key TEXT NOT NULL,
+            source_dedupe_key TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            head_sha TEXT,
+            proposal_json TEXT NOT NULL,
+            proposal_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            discord_message_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (proposal_id, proposal_revision)
+        )
+    """)
+    connection.execute(
+        """
+        INSERT INTO work_proposals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            proposal.proposal_id,
+            proposal.revision,
+            proposal.subject_key,
+            proposal.source_dedupe_key,
+            proposal.source_revision,
+            proposal.head_sha,
+            proposal_to_json(proposal),
+            proposal.content_hash,
+            proposal.status.value,
+            "legacy-message",
+            "2026-07-29T11:00:00Z",
+            "2026-07-29T11:00:00Z",
+        ),
+    )
+    connection.execute("PRAGMA user_version = 5")
+    connection.commit()
+    connection.close()
+
+    store = _store(path)
+    binding = store.get_proposal_message_binding(
+        proposal.proposal_id, proposal.revision
+    )
+    connection = sqlite3.connect(path)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    approval_offered = connection.execute(
+        "SELECT approval_offered FROM work_proposals"
+    ).fetchone()[0]
+    quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+    connection.close()
+
+    assert version == SCHEMA_VERSION
+    assert approval_offered == 0
+    assert binding == ProposalMessageBinding(
+        proposal=proposal,
+        message_id="legacy-message",
+        approval_offered=False,
+    )
+    assert quick_check == "ok"
+
+
+def test_additive_schema_keeps_database_private_and_healthy(tmp_path: Path) -> None:
+    store = _store(tmp_path / "inbox.db")
+    mode = store.path.stat().st_mode & 0o777
+    connection = sqlite3.connect(store.path)
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+    connection.close()
+
+    assert mode == 0o600
+    assert {
+        "mention_events",
+        "delivery_outbox",
+        "work_item_sessions",
+        "work_proposals",
+        "work_approvals",
+    } <= tables
+    assert quick_check == "ok"

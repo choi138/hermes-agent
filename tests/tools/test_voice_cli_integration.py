@@ -594,7 +594,13 @@ class TestVoiceFullDuplexListener:
         interrupted = threading.Event()
         cli.agent = SimpleNamespace(interrupt=lambda: interrupted.set())
         disabled = []
-        cli._disable_voice_mode = lambda: disabled.append(True)
+
+        def _disable_voice_mode():
+            disabled.append(True)
+            cli._voice_mode = False
+            cli._voice_continuous = False
+
+        cli._disable_voice_mode = _disable_voice_mode
         monkeypatch.setattr(
             "tools.voice_mode.transcribe_recording",
             lambda path, model=None: {"success": True, "transcript": "stop"},
@@ -654,6 +660,17 @@ class TestFallbackSpeakArmsBargeMonitor:
     continuous voice mode. This is the safety net for speak calls outside a
     chat turn — the primary arm happens at utterance-submit in chat()."""
 
+    class _ImmediateThread:
+        """Exercise scheduled targets without leaking daemon threads at exit."""
+
+        def __init__(self, target=None, args=(), kwargs=None, **_thread_kwargs):
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs or {}
+
+        def start(self):
+            self.target(*self.args, **self.kwargs)
+
     def _cli(self, **overrides):
         cli = _make_voice_cli(**overrides)
         cli._monitor_calls = []
@@ -669,15 +686,16 @@ class TestFallbackSpeakArmsBargeMonitor:
 
     def test_monitor_armed_in_continuous_voice_mode(self):
         cli = self._cli(_voice_mode=True, _voice_tts=True, _voice_continuous=True)
-        cli._voice_speak_response_async("a reply")
+        with patch("cli.threading.Thread", self._ImmediateThread):
+            cli._voice_speak_response_async("a reply")
         assert cli._monitor_armed.wait(5.0), "listener was never armed"
         assert len(cli._monitor_calls) == 1
 
     def test_no_monitor_outside_continuous_mode(self):
         cli = self._cli(_voice_mode=True, _voice_tts=True, _voice_continuous=False)
-        cli._voice_speak_response_async("a reply")
+        with patch("cli.threading.Thread", self._ImmediateThread):
+            cli._voice_speak_response_async("a reply")
         # Nothing to wait for — a short negative window is enough to prove the
         # speak thread came and went without arming the mic.
         assert not cli._monitor_armed.wait(0.05)
         assert cli._monitor_calls == []
-

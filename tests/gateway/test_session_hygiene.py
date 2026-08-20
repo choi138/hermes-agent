@@ -10,6 +10,7 @@ so CLI and messaging platforms behave identically.
 
 import asyncio
 import importlib
+import logging
 import sys
 import threading
 import time
@@ -215,7 +216,9 @@ class TestTokenEstimation:
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
+async def test_session_hygiene_preserves_transcript_when_no_rotation(
+    monkeypatch, tmp_path, caplog
+):
     """Regression for #21301: the hygiene agent is built without a session_db,
     so _compress_context cannot rotate. When it neither rotates NOR compacts
     in place, the transcript MUST be preserved — an unconditional
@@ -248,6 +251,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
@@ -256,6 +260,9 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -325,6 +332,10 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     assert result == "ok"
     # The transcript must NOT be rewritten — the original is preserved.
     runner.session_store.rewrite_transcript.assert_not_called()
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "trigger=token_threshold" in log_text
+    assert "no session_db on the hygiene agent" in log_text
+    assert "#21301" in log_text
 
     # This run neither rotated nor compacted in place, so it did NOT recover
     # the session: the reset must NOT have been reached. Spying on the module
@@ -418,6 +429,9 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -552,6 +566,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -710,6 +727,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -794,7 +814,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
 
 @pytest.mark.asyncio
 async def test_session_hygiene_honors_configurable_hard_message_limit(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     """compression.hygiene_hard_message_limit overrides the default.
 
@@ -836,6 +856,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
@@ -844,6 +865,9 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -908,6 +932,9 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
         "Expected hygiene compression to fire when message count (12) "
         "exceeds configured hygiene_hard_message_limit (10)"
     )
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "trigger=hard_message_limit (10)" in log_text
+    assert "trigger=token_threshold" not in log_text
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +964,9 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -1025,6 +1055,9 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    # Runtime tracks per-turn start times; these runners are built with
+    # object.__new__ so __init__ never ran (see gateway.run __init__).
+    runner._turn_started_at = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
@@ -1080,7 +1113,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 @pytest.mark.asyncio
 async def test_hygiene_compression_cooldown_survives_gateway_restart(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     """Regression for #74136: the compression-failure cooldown must be
     persisted to the state DB, not an in-memory dict on the runner.
@@ -1096,6 +1129,7 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
     session_id = "sess-restart"
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
+        caplog.set_level(logging.INFO, logger="gateway.run")
         db.create_session(session_id, "telegram")
 
         main_thread = threading.get_ident()
@@ -1141,6 +1175,12 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert AbortingCompressAgent.instances == 1
         assert len(streak_threads) == 1
         assert streak_threads[0] != main_thread
+        first_run_logs = "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+        assert "aborted during summary generation" in first_run_logs
+        assert "no session_db on the hygiene agent" not in first_run_logs
+        assert "#21301" not in first_run_logs
 
         # The abort must have persisted a cooldown to the DB.
         state = db.get_compression_failure_cooldown(session_id)
@@ -1194,5 +1234,89 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         escalated = db.get_compression_failure_cooldown(session_id)
         assert escalated is not None
         assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_skips_active_no_progress_cooldown(
+    monkeypatch, tmp_path
+):
+    """The gateway honors the cooldown written by a no-progress attempt."""
+    from hermes_state import SessionDB
+
+    session_id = "sess-no-progress-cooldown"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        db.record_compression_failure_cooldown(
+            session_id,
+            time.time() + 300,
+            "no_progress: protected tail spans the whole transcript",
+        )
+
+        class ShouldNotRunAgent:
+            instances = 0
+
+            def __init__(self, **_kwargs):
+                type(self).instances += 1
+
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
+        )
+
+        assert await runner._handle_message(event) == "ok"
+        assert ShouldNotRunAgent.instances == 0
+        assert runner._run_agent.await_count == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_logs_no_progress_without_missing_db_diagnosis(
+    monkeypatch, tmp_path, caplog
+):
+    """A bound compressor no-op reports protected-tail cooldown, not #21301."""
+    from hermes_state import SessionDB
+
+    session_id = "sess-no-progress-diagnostic"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+
+        class NoProgressCompressAgent:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id", session_id)
+                self._session_db = kwargs.get("session_db")
+                self._last_compaction_in_place = False
+                self._last_compression_no_progress = False
+                self.context_compressor = SimpleNamespace(
+                    bind_session_state=MagicMock(),
+                    _last_compress_aborted=False,
+                    _last_aux_model_failure_model=None,
+                )
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
+
+            def _compress_context(self, messages, *_args, **_kwargs):
+                self._last_compression_no_progress = True
+                self._session_db.record_compression_failure_cooldown(
+                    self.session_id,
+                    time.time() + 300,
+                    "no_progress: protected tail spans the whole transcript",
+                )
+                return (messages, None)
+
+        caplog.set_level(logging.INFO, logger="gateway.run")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, NoProgressCompressAgent, db, session_id
+        )
+
+        assert await runner._handle_message(event) == "ok"
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "protected tail exceeds the compressible budget" in log_text
+        assert "compression-failure cooldown was recorded" in log_text
+        assert "no session_db on the hygiene agent" not in log_text
+        assert "#21301" not in log_text
     finally:
         db.close()

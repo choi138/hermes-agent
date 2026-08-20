@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 import subprocess
+import sys
 
 
-def _make_task(kb, *, assignee: str):
+def _make_task(kb, *, assignee: str, workspace_kind: str = "dir"):
     return kb.Task(
         id="t_spawn_tools",
         title="spawn tools",
@@ -15,7 +19,7 @@ def _make_task(kb, *, assignee: str):
         created_at=1,
         started_at=None,
         completed_at=None,
-        workspace_kind="dir",
+        workspace_kind=workspace_kind,
         workspace_path=None,
         claim_lock="lock",
         claim_expires=None,

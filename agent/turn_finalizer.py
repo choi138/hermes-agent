@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
+from agent import turn_trace
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.background_review_policy import is_successful_review_outcome
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
@@ -72,24 +75,33 @@ def _record_kanban_budget_exhausted(
     """
     try:
         from hermes_cli import kanban_db as _kb
+        _raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+        _expected_run_id = int(_raw_run_id) if _raw_run_id else None
+        if _expected_run_id is not None and _expected_run_id <= 0:
+            raise ValueError("invalid HERMES_KANBAN_RUN_ID")
         _conn = _kb.connect()
         try:
-            _kb._record_task_failure(
-                _conn,
-                kanban_task,
-                error=(
+            _failure_kwargs = {
+                "error": (
                     f"Iteration budget exhausted "
                     f"({api_call_count}/{max_iterations}) — "
                     "task could not complete within the allowed "
                     "iterations"
                 ),
-                outcome="timed_out",
-                release_claim=True,
-                end_run=True,
-                event_payload_extra={
+                "outcome": "timed_out",
+                "release_claim": True,
+                "end_run": True,
+                "event_payload_extra": {
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
                 },
+            }
+            if _expected_run_id is not None:
+                _failure_kwargs["expected_run_id"] = _expected_run_id
+            _kb._record_task_failure(
+                _conn,
+                kanban_task,
+                **_failure_kwargs,
             )
         finally:
             try:
@@ -141,6 +153,9 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    _tt = turn_trace.safe_get_bound(agent)
+    _finalize_started = time.time() if _tt is not None else None
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -224,14 +239,140 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    kanban_terminal_response = _turn_exit_reason == "kanban_terminal"
     completed = (
         final_response is not None
         and not failed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or kanban_terminal_response
         )
     )
+    _initial_final_response = final_response
+
+    # File-mutation verifier footer.
+    # If one or more ``write_file`` / ``patch`` calls failed during this
+    # turn and were never superseded by a successful write to the same
+    # path, append an advisory footer to the assistant response.  This
+    # catches the specific case — reported by Ben Eng (#15524-adjacent)
+    # — where a model issues a batch of parallel patches, half of them
+    # fail with "Could not find old_string", and the model summarises
+    # the turn claiming every file was edited.  The user then has to
+    # manually run ``git status`` to catch the lie.  With this footer
+    # the truth is surfaced on every turn, so over-claiming is
+    # structurally impossible past the model.
+    #
+    # Gate: only applied when a real text response exists for this
+    # turn and the user didn't interrupt.  Empty/interrupted turns
+    # already have other surface text that shouldn't be augmented.
+    _hooks_started = time.time() if _tt is not None else None
+    if final_response and not interrupted:
+        try:
+            _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
+            if _failed and agent._file_mutation_verifier_enabled():
+                footer = agent._format_file_mutation_failure_footer(_failed)
+                if footer:
+                    final_response = final_response.rstrip() + "\n\n" + footer
+        except Exception as _ver_err:
+            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+
+    # Turn-completion explainer.
+    # When a turn ends abnormally after substantive work — empty content
+    # after retries, a partial/truncated stream, a still-pending tool
+    # result, or an iteration/budget limit — the user otherwise gets a
+    # blank or fragmentary response box with no consolidated reason why
+    # the agent stopped (#34452).  Surface a single user-visible
+    # explanation derived from ``_turn_exit_reason``, mirroring the
+    # file-mutation verifier footer pattern above.
+    #
+    # Gate carefully so healthy turns stay quiet:
+    #   - ``text_response(...)`` exits never produce an explanation
+    #     (handled inside the formatter), so a terse ``Done.`` is silent.
+    #   - We only ACT when there is no genuinely usable reply this turn:
+    #     an empty response, the "(empty)" terminal sentinel, or a
+    #     suspiciously short partial fragment with no terminating
+    #     punctuation (e.g. "The").  A real short answer keeps its text.
+    if not interrupted:
+        try:
+            if agent._turn_completion_explainer_enabled():
+                _stripped = (final_response or "").strip()
+                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
+                # A short fragment that is not a normal text_response exit
+                # and lacks sentence-ending punctuation is treated as a
+                # truncated partial (the "The" case from #34452).
+                _is_partial_fragment = (
+                    not _is_empty_terminal
+                    and not preserved_verification_fallback
+                    and not str(_turn_exit_reason).startswith("text_response")
+                    and len(_stripped) <= 24
+                    and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
+                )
+                _is_partial_stream_recovery = (
+                    str(_turn_exit_reason) == "partial_stream_recovery"
+                )
+                if (
+                    _is_empty_terminal
+                    or _is_partial_fragment
+                    or _is_partial_stream_recovery
+                ):
+                    _explanation = agent._format_turn_completion_explanation(
+                        _turn_exit_reason
+                    )
+                    if _explanation:
+                        if _is_empty_terminal:
+                            # Replace the bare "(empty)"/blank sentinel with
+                            # the actionable explanation.
+                            final_response = _explanation
+                        else:
+                            # Keep the partial fragment, append the reason so
+                            # the user sees both what arrived and why it
+                            # stopped.
+                            final_response = (
+                                _stripped + "\n\n" + _explanation
+                            )
+        except Exception as _exp_err:
+            logger.debug("turn-completion explainer failed: %s", _exp_err)
+
+    _response_transformed = False
+
+    # Plugin hook: transform_llm_output
+    # Fired once per turn after the tool-calling loop completes.
+    # Plugins can transform the LLM's output text before it's returned.
+    # First hook to return a string wins; None/empty return leaves text unchanged.
+    if final_response and not interrupted:
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _transform_results = _invoke_hook(
+                "transform_llm_output",
+                response_text=final_response,
+                session_id=agent.session_id or "",
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+            for _hook_result in _transform_results:
+                if isinstance(_hook_result, str) and _hook_result:
+                    if _hook_result != final_response:
+                        final_response = _hook_result
+                        _response_transformed = True
+                    break  # First non-empty string wins
+        except Exception as exc:
+            logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Synchronize the canonical assistant row before any trajectory or
+    # session write. Match the exact pre-finalizer response so unrelated
+    # tool-call fallback text is never clobbered. This also keeps deterministic
+    # footer/explainer additions durable, not only plugin transformations.
+    if final_response and not interrupted and messages:
+        _tail = messages[-1]
+        if (
+            isinstance(_tail, dict)
+            and _tail.get("role") == "assistant"
+            and _tail.get("content") == _initial_final_response
+            and _tail.get("content") != final_response
+        ):
+            _tail["content"] = final_response
+            _tail.pop("_db_persisted", None)
 
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
@@ -278,23 +419,36 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    with turn_trace.safe_span("finalize.trajectory", trace=_tt):
+        try:
+            agent._save_trajectory(
+                messages, _summarize_user_message_for_log(user_message), completed
+            )
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error(
+                "finalize_turn: _save_trajectory failed: %s",
+                _save_err,
+                exc_info=True,
+            )
 
     # Clean up VM and browser for this task after conversation completes
-    try:
-        agent._cleanup_task_resources(effective_task_id)
-    except Exception as _cleanup_err:
-        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
+    with turn_trace.safe_span("finalize.resource_cleanup", trace=_tt):
+        try:
+            agent._cleanup_task_resources(effective_task_id)
+        except Exception as _cleanup_err:
+            _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+            logger.error(
+                "finalize_turn: _cleanup_task_resources failed: %s",
+                _cleanup_err,
+                exc_info=True,
+            )
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _persist_started = time.time() if _tt is not None else None
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -450,6 +604,10 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+    if _persist_started is not None:
+        turn_trace.safe_add_span(
+            _tt, "finalize.persist", _persist_started, time.time()
+        )
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -697,6 +855,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "turn_id": turn_id,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -726,6 +885,15 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _hooks_started is not None:
+        turn_trace.safe_add_span(
+            _tt, "finalize.post_hooks", _hooks_started, time.time()
+        )
+    if kanban_terminal_response:
+        result["kanban_terminal"] = True
+        result["kanban_terminal_transition"] = getattr(
+            agent, "_kanban_terminal_transition", None,
+        )
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -767,15 +935,38 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
-    # Check skill trigger NOW — based on how many tool iterations THIS turn used.
+    # Automatic self-improvement reviews are learned only from a successfully
+    # completed top-level turn.  Accumulate this turn's work now rather than in
+    # the model loop so failed and delegated work cannot trip the cadence.
+    _review_eligible = is_successful_review_outcome(
+        agent,
+        final_response=final_response,
+        completed=completed,
+        failed=failed,
+        interrupted=interrupted,
+        exit_reason=_turn_exit_reason,
+        cleanup_failed=bool(_cleanup_errors),
+    )
+    if (
+        _review_eligible
+        and agent._skill_nudge_interval > 0
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        # Keep the historical cadence for healthy foreground work: one unit
+        # per completed API/model iteration, committed atomically at turn end.
+        agent._iters_since_skill += max(int(api_call_count or 0), 1)
+
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (_review_eligible
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
-        agent._iters_since_skill = 0
+
+    _should_review_memory = bool(_should_review_memory and _review_eligible)
 
     # External memory provider: sync the completed turn + queue next prefetch.
+    _md_started = time.time() if _tt is not None else None
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
         final_response=final_response,
@@ -783,23 +974,132 @@ def finalize_turn(
         messages=messages,
     )
 
+    # ── R5 summariser-prompt drift probe: park (read-only, default OFF) ────
+    # The quiescent point: the session is persisted, the result dict is built
+    # and the interrupt state is cleared, so the transcript is stable for the
+    # rest of this function.
+    #
+    # This is a MEASUREMENT, not a precompute. It records the SHA-256 of the
+    # auto-derived focus block as it stands now, so the next compaction can say
+    # whether the block it actually sends is the same one. It stores no summary,
+    # makes no provider call and cannot make any compaction faster.
+    #
+    # Runs INLINE on this thread. There is no thread, no executor and no
+    # deepcopy: `_derive_auto_focus_topic` is a classmethod that only reads
+    # message dicts and returns a new string, `_redact_compaction_text` is pure,
+    # and the list is never retained past this block — so the mutation hazards
+    # that would force a snapshot (compress()'s in-place marker popping and
+    # tool-result pruning) are unreachable from here.
+    #
+    # There is deliberately NO compaction-imminence predicate. A conservative
+    # one would decline exactly the busy turns and bias the sample toward quiet
+    # turns, which are systematically the most likely to agree — inflating the
+    # number this probe exists to establish honestly. The cost is measured as
+    # park_ms instead.
+    _r5_drift_compressor = getattr(agent, "context_compressor", None)
+    if (
+        _r5_drift_compressor is not None
+        and getattr(
+            _r5_drift_compressor, "_r5_prompt_drift_probe_enabled", False
+        ) is True
+        # Persistence-isolated agents (background review fork) replay a
+        # throwaway transcript — same exclusion the micro-compaction block
+        # above uses, and for the same reason: their turns are not real turns.
+        and not getattr(agent, "_persist_disabled", False)
+        and not getattr(agent, "is_subagent", False)
+        and getattr(agent, "session_id", "")
+    ):
+        try:
+            import time as _r5_time
+
+            from agent.context_compressor import (
+                _redact_compaction_text as _r5_redact,
+            )
+
+            _r5_t0 = _r5_time.monotonic()
+            _r5_focus_block = _r5_drift_compressor._derive_auto_focus_topic(messages)
+            # The foreground redacts `_previous_summary` IN PLACE before it
+            # builds the prompt, so hash the redacted form here too or the two
+            # sides would disagree for a reason that is not drift. This call
+            # computes the redacted form without storing it back.
+            _r5_prev = _r5_redact(
+                getattr(_r5_drift_compressor, "_previous_summary", None) or ""
+            )
+            try:
+                from hermes_time import now as _r5_now
+
+                _r5_today = _r5_now().strftime("%Y-%m-%d")
+            except Exception:
+                _r5_today = ""
+            _r5_seq = int(getattr(agent, "_r5_drift_turn_seq", 0)) + 1
+            agent._r5_drift_turn_seq = _r5_seq
+            # Microseconds too: the derivation is sub-millisecond on ordinary
+            # transcripts, and an all-zero ms histogram cannot answer whether
+            # the measurement is itself too expensive to leave enabled.
+            _r5_elapsed_us = int((_r5_time.monotonic() - _r5_t0) * 1_000_000)
+
+            from agent.summary_prompt_drift import park as _r5_drift_park
+
+            _r5_drift_park(
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                focus_block=_r5_focus_block,
+                prev_summary_redacted=_r5_prev,
+                has_user_turn=getattr(
+                    _r5_drift_compressor, "_summary_has_user_turn", None
+                ),
+                today_str=_r5_today,
+                msg_count=len(messages),
+                turn_seq=_r5_seq,
+                elapsed_ms=_r5_elapsed_us // 1000,
+                elapsed_us=_r5_elapsed_us,
+            )
+        except Exception:
+            # A measurement probe must never affect a turn's outcome.
+            try:
+                from agent.summary_prompt_drift import (
+                    record_park_failure as _r5_park_failed,
+                )
+
+                _r5_park_failed()
+            except Exception:
+                pass
+    # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW). Pure
+    # O(turn-slice) arithmetic inline; any curator run spawns on a daemon
+    # thread. No-op unless curator.ingest_enabled; fail-open.
+    if final_response and not interrupted:
+        try:
+            from agent.ingest_curator import observe_turn_completed
+            observe_turn_completed(agent, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator turn observation failed (fail-open)",
+                exc_info=True,
+            )
+
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
     # Suppressed when skip_background_review=True (e.g. cron) — review forks
     # spawn another AIAgent (~30K tokens / event) and cron sessions have no
     # human-in-the-loop benefit from the review.
     if (
-        final_response
-        and not interrupted
+        _review_eligible
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
         try:
-            agent._spawn_background_review(
+            _accepted = agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
             )
+            # ``None`` is accepted for compatibility with patched/legacy
+            # implementations.  The coordinator returns False only when it
+            # could not retain the request (for example, a full queue).
+            if _accepted is not False:
+                if _should_review_memory:
+                    agent._turns_since_memory = 0
+                if _should_review_skills:
+                    agent._iters_since_skill = 0
         except Exception:
             pass  # Background review is best-effort
 
@@ -832,5 +1132,14 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    if _md_started is not None:
+        turn_trace.safe_add_span(
+            _tt, "finalize.memory_dispatch", _md_started, time.time()
+        )
+    if _finalize_started is not None:
+        turn_trace.safe_add_span(
+            _tt, "turn.finalize", _finalize_started, time.time()
+        )
 
     return result

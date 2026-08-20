@@ -676,8 +676,8 @@ When on, skill writes are staged under `~/.hermes/pending/skills/` and reviewed 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
-  user_char_limit: 1375     # ~500 tokens
+  memory_char_limit: 2750   # ~1,000 tokens
+  user_char_limit: 2750     # ~1,000 tokens
   write_approval: false     # true = require approval before any memory write
 ```
 
@@ -837,6 +837,8 @@ compression:
   proactive_prune_tokens: 0                         # Opt-in tokens trigger for the no-LLM tool-result prune (0 = off; see below)
   proactive_prune_min_result_chars: 8000            # Prune's summarize pass only touches tool results larger than this (clamped >= 200)
   proactive_prune_min_reclaim_tokens: 4096          # Prune only commits when it reclaims at least this many tokens (0 = commit any)
+  preflight_defer_growth_tokens: 4096               # Aperture of the preflight deferral heuristic (see below)
+  preflight_defer_growth_ratio: 0.05                # Same, as a fraction of the effective threshold
 
 # The summarization model/provider is configured under auxiliary:
 auxiliary:
@@ -875,6 +877,10 @@ The value is the **first rung** of an escalating ladder, not a fixed interval: c
 `idle_compact_after_seconds` is an **opt-in, time-based** trigger that complements the size-based `threshold`. Default `0` (disabled). When set above 0, a session that resumes after at least that many seconds of inactivity compacts its accumulated history up front, before the first reply — so a long-lived thread (e.g. a Telegram conversation you come back to hours later) doesn't re-read its full stale context on every subsequent turn. It never fires when the context is already at or below the post-compression target (`threshold × target_ratio`), and it honors the same failure-cooldown, anti-thrash, and per-session lock guards as every automatic compaction. Example: `idle_compact_after_seconds: 1800` compacts after 30 minutes idle.
 
 `proactive_prune_tokens` enables a deterministic, no-LLM prune of old tool-result payloads that runs independently of `threshold`. On large-window models the `threshold` compaction (≈50% of the window) rarely fires, so bulky tool outputs (terminal dumps, file reads, web extracts) ride along in history and get re-sent on every subsequent turn. When re-sent history exceeds `proactive_prune_tokens` (default `0` = off; try `48000` to enable), the prune dedupes identical results, summarizes older oversized ones, and truncates large tool-call arguments — protecting the most recent `protect_last_n` messages and never calling the model. Full outputs stay recoverable from the session store. `proactive_prune_min_result_chars` (default `8000`, clamped to ≥ 200) sets the size below which a tool result is left untouched. `proactive_prune_min_reclaim_tokens` (default `4096`) prevents a prune from committing unless it reclaims at least that many tokens — a committed prune rewrites already-sent history and invalidates the provider's prompt-cache prefix, so this gate keeps those cache breaks episodic and amortized (one meaningful break, like a compression boundary) instead of firing on every tool iteration. This runs only under the built-in `compressor` engine; other context engines inherit a no-op.
+
+`preflight_defer_growth_tokens` / `preflight_defer_growth_ratio` set the aperture of an existing heuristic, not a new feature. The turn-start (preflight) estimate deliberately **over**estimates schema-heavy requests so Hermes compacts before a provider rejects the payload — with 50+ tools the schemas alone can be 20-30K tokens. Once the provider has reported a real `prompt_tokens` count below the threshold, that real count is a better signal than compacting again from the same rough overhead, so Hermes defers the preflight compaction while the rough estimate has grown only modestly since a request the provider proved fit. "Modestly" means `max(preflight_defer_growth_tokens, threshold_tokens × preflight_defer_growth_ratio)`; the defaults `4096` / `0.05` reproduce the previously hardcoded behavior exactly, so leaving them unset changes nothing.
+
+Raising them removes more turn-start compaction stalls, at the cost of leaning on the provider-proven recovery path (a 413 / context-length rejection followed by a synchronous compaction and retry). That trade is bounded — the heuristic stops deferring as soon as a real provider reading lands at or above the threshold, so a session cannot defer indefinitely — but if the real headroom is smaller than assumed you pay a failed round trip **and** a compaction, which is worse than compacting up front. Measure before raising, and note that deferral only delays a compaction; it never changes how history is summarized. Setting both to `0` disables growth-based deferral entirely (always compact at turn start).
 
 :::tip Gateway hot-reload of compression and context length
 As of recent releases, editing `model.context_length` or any `compression.*` key in `config.yaml` on a running gateway takes effect on the next message — no gateway restart, no `/reset`, no session rotation required. The cached-agent signature includes these keys, so the gateway transparently rebuilds the agent when it sees a change. API keys and tool/skill config still require the usual reload paths.

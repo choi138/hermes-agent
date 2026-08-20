@@ -709,6 +709,19 @@ def load_cli_config() -> Dict[str, Any]:
                     os.environ[env_var] = json.dumps(val)
                 else:
                     os.environ[env_var] = str(val)
+
+    # Dispatcher-managed Kanban workspaces live on the dispatcher's host.
+    # Reapply the private worker execution contract only after the assignee
+    # profile's terminal config has been bridged above; otherwise an explicit
+    # profile ``terminal.backend: ssh`` wins and sends this local workspace path
+    # to another machine. Ordinary CLI sessions never carry this marker.
+    if os.environ.get("_HERMES_KANBAN_EXECUTION_BACKEND"):
+        from hermes_cli.kanban_runtime import apply_worker_execution_contract
+
+        apply_worker_execution_contract(
+            os.environ,
+            terminal_config=terminal_config,
+        )
     
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})
@@ -15620,7 +15633,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
+        try:
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                attachment_count=len(images or []),
+            )
+        except TypeError as exc:
+            if "attachment_count" not in str(exc):
+                raise
+            turn_route = self._resolve_turn_agent_config(message)
+        if turn_route.get("blocked"):
+            response = turn_route["blocked"].get("message") or "Smart model routing blocked this turn."
+            _cprint(f"{_DIM}{response}{_RST}")
+            return response
+        if turn_route.get("gjc_execution"):
+            from hermes_cli.gjc_coordinator import run_gjc_execution
+
+            response_payload = run_gjc_execution(turn_route["gjc_execution"])
+            response = (
+                response_payload.get("final_response")
+                if isinstance(response_payload, dict)
+                else str(response_payload)
+            )
+            if response:
+                _cprint(response)
+            return response
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -15660,6 +15697,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _, _img_provider = _split_model_config_default(self.provider)
                 else:
                     _img_provider = str(self.provider or "")
+                _img_provider = str(
+                    turn_route["runtime"].get("provider") or _img_provider or ""
+                )
+                _img_model = str(turn_route.get("model") or _img_model or "")
                 _img_mode = decide_image_input_mode(
                     _img_provider.strip(),
                     _img_model.strip(),
@@ -20069,7 +20110,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(
+    cli: "HermesCLI",
+    first_response: str,
+    first_api_calls: Optional[int] = None,
+) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -20093,7 +20138,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import (
+        KANBAN_DEFAULT_MAX_TURNS as _DEF_TURNS,
+        run_kanban_goal_loop as _run_loop,
+    )
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -20117,11 +20165,42 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
-    def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
-            user_message=prompt,
-            conversation_history=cli.conversation_history,
+    # One primary-model budget covers the first turn and every goal
+    # continuation. run_conversation resets its IterationBudget each turn, so
+    # clamp max_iterations to the remainder before each call and restore the
+    # configured value afterward.
+    total_iterations = max(1, int(getattr(cli.agent, "max_iterations", 1) or 1))
+    if first_api_calls is None:
+        first_api_calls = getattr(
+            getattr(cli.agent, "iteration_budget", None), "used", 0,
         )
+    try:
+        iterations_used = max(0, min(total_iterations, int(first_api_calls or 0)))
+    except (TypeError, ValueError):
+        iterations_used = 0
+
+    def _run_turn(prompt: str) -> str:
+        nonlocal iterations_used
+        remaining = max(0, total_iterations - iterations_used)
+        if remaining <= 0:
+            raise RuntimeError("kanban cumulative iteration budget exhausted")
+        configured_max = cli.agent.max_iterations
+        cli.agent.max_iterations = remaining
+        try:
+            result = cli.agent.run_conversation(
+                user_message=prompt,
+                conversation_history=cli.conversation_history,
+            )
+        finally:
+            cli.agent.max_iterations = configured_max
+        if isinstance(result, dict):
+            try:
+                used_this_turn = max(0, int(result.get("api_calls") or 0))
+            except (TypeError, ValueError):
+                used_this_turn = 0
+        else:
+            used_this_turn = 0
+        iterations_used = min(total_iterations, iterations_used + used_this_turn)
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -20144,14 +20223,110 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 pass
 
     def _block(reason: str) -> None:
+        import json as _json
+        from tools.kanban_tools import _handle_block
+
+        outcome = _json.loads(_handle_block({
+            "task_id": task_id,
+            "reason": reason,
+            "kind": "needs_input",
+        }))
+        if not outcome.get("ok"):
+            raise RuntimeError(outcome.get("error") or "could not block task")
+
+    def _iteration_budget() -> tuple[int, int]:
+        return iterations_used, total_iterations
+
+    from agent.i18n import get_language as _get_language, t as _t
+
+    _progress_language = _get_language()
+    _last_progress_turn = 0
+    _last_progress_verdict = ""
+
+    def _progress(event: dict) -> None:
+        nonlocal _last_progress_turn, _last_progress_verdict
+        if event.get("stage") != "judge":
+            return
+        from agent.redact import redact_sensitive_text as _redact_sensitive_text
+
+        verdict = str(event.get("verdict") or "continue").strip().casefold()
+        try:
+            turn = max(1, int(event.get("turn") or 1))
+        except (TypeError, ValueError):
+            turn = 1
+        # Goal-mode can judge several continuation turns in quick succession.
+        # Emit the first semantic milestone, a changed verdict, or a periodic
+        # update every three turns; keep every judge decision in logs without
+        # multiplying Discord messages one-for-one.
+        if (
+            _last_progress_turn
+            and verdict == _last_progress_verdict
+            and turn - _last_progress_turn < 3
+        ):
+            return
+        reason = _redact_sensitive_text(
+            str(event.get("reason") or ""), force=True,
+        ).strip()
+        if verdict == "done":
+            confirmed_key = "confirmed_done"
+            next_key = "next_done"
+        else:
+            confirmed_key = "confirmed_continue"
+            next_key = "next_continue"
+        note_lines = [
+            "**"
+            + _t(
+                "gateway.kanban_role.field.current_stage",
+                lang=_progress_language,
+            )
+            + ":** "
+            + _t(
+                "gateway.kanban_role.goal.reviewing",
+                lang=_progress_language,
+            ),
+            "**"
+            + _t(
+                "gateway.kanban_role.field.confirmed",
+                lang=_progress_language,
+            )
+            + ":** "
+            + _t(
+                f"gateway.kanban_role.goal.{confirmed_key}",
+                lang=_progress_language,
+            ),
+            "**"
+            + _t(
+                "gateway.kanban_role.field.next",
+                lang=_progress_language,
+            )
+            + ":** "
+            + (
+                reason[:300]
+                or _t(
+                    f"gateway.kanban_role.goal.{next_key}",
+                    lang=_progress_language,
+                )
+            ),
+        ]
         c = _kb.connect()
         try:
-            _kb.block_task(
+            claim_lock = (_os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+            if claim_lock:
+                _kb.heartbeat_claim(c, task_id, claimer=claim_lock)
+            raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+            try:
+                expected_run_id = int(raw_run_id) if raw_run_id else None
+            except ValueError:
+                expected_run_id = None
+            emitted = _kb.heartbeat_worker(
                 c,
                 task_id,
-                reason=reason,
-                expected_run_id=worker_run_id,
+                note="\n".join(note_lines),
+                expected_run_id=expected_run_id,
             )
+            if emitted:
+                _last_progress_turn = turn
+                _last_progress_verdict = verdict
         finally:
             try:
                 c.close()
@@ -20167,6 +20342,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        progress_fn=_progress,
+        iteration_budget_fn=_iteration_budget,
     )
 
 
@@ -20648,7 +20825,27 @@ def main(
                                 single_query_images,
                                 announce=False,
                             )
-                    turn_route = cli._resolve_turn_agent_config(effective_query)
+                    try:
+                        turn_route = cli._resolve_turn_agent_config(
+                            effective_query,
+                            attachment_count=len(single_query_images or []) + len(single_query_image_urls or []),
+                        )
+                    except TypeError as exc:
+                        if "attachment_count" not in str(exc):
+                            raise
+                        turn_route = cli._resolve_turn_agent_config(effective_query)
+                    if turn_route.get("blocked"):
+                        print(turn_route["blocked"].get("message") or "Smart model routing blocked this turn.")
+                        return
+                    if turn_route.get("gjc_execution"):
+                        from hermes_cli.gjc_coordinator import run_gjc_execution
+
+                        result = run_gjc_execution(turn_route["gjc_execution"])
+                        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        if response:
+                            print(response)
+                        print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                        sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
                     if turn_route["signature"] != cli._active_agent_route_signature:
                         cli.agent = None
                     if cli._init_agent(
@@ -20705,7 +20902,11 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _run_kanban_goal_loop_q(
+                                    cli,
+                                    response,
+                                    result.get("api_calls") if isinstance(result, dict) else None,
+                                )
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

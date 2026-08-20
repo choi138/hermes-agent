@@ -207,12 +207,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "expose_to_model",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 expose_to_model=True):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +232,9 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Internal capabilities can remain dispatchable through the registry
+        # without being advertised to the model or tool-search bridge.
+        self.expose_to_model = bool(expose_to_model)
 
 
 class _PluginOverridePolicy:
@@ -497,7 +501,7 @@ class ToolRegistry:
         """
         check_results: Dict[Callable, bool] = {}
         for entry in entries:
-            if entry.toolset != toolset:
+            if entry.toolset != toolset or not entry.expose_to_model:
                 continue
             if not entry.check_fn:
                 return True
@@ -749,6 +753,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        expose_to_model: bool = True,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -844,6 +849,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                expose_to_model=expose_to_model,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1034,7 +1040,7 @@ class ToolRegistry:
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
-            if not entry:
+            if not entry or not entry.expose_to_model:
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:

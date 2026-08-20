@@ -99,7 +99,24 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "tour", "delegate_task"}
+    {
+        "model_status",
+        "model_switch",
+        "todo",
+        "session_search",
+        "memory",
+        "notes_write",
+        "notes_read",
+        "memory_propose",
+        "curator_verdict",
+        "clarify",
+        "read_terminal",
+        "read_preview",
+        "read_window_below",
+        "setup_mcp",
+        "tour",
+        "delegate_task",
+    }
 )
 
 
@@ -1357,7 +1374,11 @@ def try_recover_primary_transport(
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
                 rt["anthropic_api_key"], rt["anthropic_base_url"],
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                timeout=get_provider_request_timeout(
+                    agent.provider,
+                    agent.model,
+                    requested_provider=getattr(agent, "requested_provider", None),
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1614,7 +1635,11 @@ def restore_primary_runtime(agent) -> bool:
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
                 rt["anthropic_api_key"], rt["anthropic_base_url"],
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                timeout=get_provider_request_timeout(
+                    agent.provider,
+                    agent.model,
+                    requested_provider=getattr(agent, "requested_provider", None),
+                ),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1751,6 +1776,7 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
+        agent._fallback_reason = None
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -1767,6 +1793,15 @@ def restore_primary_runtime(agent) -> bool:
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
         )
+        # Publish the restore on the runtime_state hook so guardrail plugins
+        # (skill-gate) drop the fallback_reason from their cache when the
+        # primary returns.  Best-effort — restore must not fail on a hook.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="restore", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state restore event failed: %s", _hook_err)
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
@@ -1861,6 +1896,91 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         return "\n\n".join(reasoning_parts)
     
     return None
+
+
+_REASONING_PROGRESS_LIMIT = 500
+_SUBAGENT_REASONING_PROGRESS_LIMIT = 80
+
+
+def reasoning_progress_text(
+    agent,
+    assistant_message,
+    *,
+    limit: int = _REASONING_PROGRESS_LIMIT,
+) -> Optional[str]:
+    """Return bounded, display-safe reasoning for a progress event.
+
+    Only provider reasoning fields and explicitly tagged inline reasoning are
+    eligible because ``agent._extract_reasoning`` owns that classification.
+    Ordinary assistant content -- including the final answer -- is never used
+    as a fallback here. Opaque replay state (signatures, encrypted content,
+    reasoning item ids) is likewise excluded by the extractor.
+    """
+    try:
+        reasoning_text = agent._extract_reasoning(assistant_message)
+    except Exception:
+        logger.debug("Reasoning progress extraction failed", exc_info=True)
+        return None
+
+    if not isinstance(reasoning_text, str):
+        return None
+    reasoning_text = _ORPHAN_REASONING_TAG_PATTERN.sub("", reasoning_text).strip()
+    if not reasoning_text:
+        return None
+
+    # Progress text crosses a user-visible boundary. Force redaction even when
+    # transcript redaction is disabled, and fail closed if the redactor itself
+    # is unavailable so raw reasoning never leaks credentials.
+    try:
+        from agent.redact import redact_sensitive_text
+
+        reasoning_text = redact_sensitive_text(reasoning_text, force=True).strip()
+    except Exception:
+        logger.debug("Reasoning progress redaction failed", exc_info=True)
+        return None
+    if not reasoning_text:
+        return None
+
+    return reasoning_text[: max(0, int(limit))] or None
+
+
+def emit_reasoning_progress(agent, assistant_message) -> bool:
+    """Emit one reasoning-only progress event, deduplicated within the turn.
+
+    Main agents use the structured ``reasoning.available`` callback shape.
+    Delegated agents retain the legacy ``_thinking`` shape consumed by the
+    child-progress relay, but the payload now comes from real reasoning rather
+    than from the child's final assistant summary.
+    """
+    callback = getattr(agent, "tool_progress_callback", None)
+    if callback is None:
+        return False
+
+    text = reasoning_progress_text(agent, assistant_message)
+    if not text:
+        return False
+
+    seen = getattr(agent, "_reasoning_progress_seen", None)
+    if not isinstance(seen, set):
+        seen = set()
+        agent._reasoning_progress_seen = seen
+    if text in seen:
+        return False
+
+    try:
+        if getattr(agent, "_delegate_depth", 0) > 0:
+            first_line = text.splitlines()[0][:_SUBAGENT_REASONING_PROGRESS_LIMIT]
+            if not first_line:
+                return False
+            callback("_thinking", first_line)
+        else:
+            callback("reasoning.available", "_thinking", text, None)
+    except Exception:
+        logger.debug("Reasoning progress callback failed", exc_info=True)
+        return False
+
+    seen.add(text)
+    return True
 
 
 
@@ -2798,7 +2918,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url,
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                timeout=get_provider_request_timeout(
+                    agent.provider,
+                    agent.model,
+                    requested_provider=getattr(agent, "requested_provider", None),
+                ),
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
@@ -2828,7 +2952,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 )
             except Exception:
                 logger.debug("custom-provider TLS resolution skipped on switch_model", exc_info=True)
-            _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
+            _sm_timeout = get_provider_request_timeout(
+                agent.provider,
+                agent.model,
+                requested_provider=getattr(agent, "requested_provider", None),
+            )
             if _sm_timeout is not None:
                 agent._client_kwargs["timeout"] = _sm_timeout
             # Reapply provider-specific headers (e.g. OpenRouter HTTP-Referer,
@@ -2995,6 +3123,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # ── Reset fallback state ──
     agent._fallback_activated = False
     agent._fallback_index = 0
+    agent._fallback_reason = None
 
     # When the user deliberately swaps primary providers (e.g. openrouter
     # → anthropic), drop any fallback entries that target the OLD primary
@@ -3078,6 +3207,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None
+    policy_evaluation_failed = False
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
@@ -3092,7 +3222,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             if modified_args is not None:
                 function_args = modified_args
         except Exception:
-            block_message = None
+            logger.exception("pre-tool policy evaluation failed for %s", function_name)
+            policy_evaluation_failed = True
+            block_message = (
+                f"BLOCKED: pre-tool policy evaluation failed for {function_name}"
+            )
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
@@ -3107,7 +3241,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 status="blocked",
-                error_type="plugin_block",
+                error_type=(
+                    "plugin_policy_error" if policy_evaluation_failed else "plugin_block"
+                ),
                 error_message=block_message,
                 middleware_trace=list(_tool_middleware_trace),
             )
@@ -3137,7 +3273,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
-    if function_name == "todo":
+    if function_name == "model_status":
+        def _execute(next_args: dict) -> Any:
+            from agent.runtime_control import model_status as _model_status
+
+            return _finish_agent_tool(_model_status(agent), next_args)
+    elif function_name == "model_switch":
+        def _execute(next_args: dict) -> Any:
+            from agent.runtime_control import dispatch_model_switch
+
+            return _finish_agent_tool(
+                dispatch_model_switch(agent, next_args),
+                next_args,
+            )
+    elif function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
             return _finish_agent_tool(
@@ -3181,12 +3330,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 content=next_args.get("content"),
                 old_text=next_args.get("old_text"),
                 operations=operations,
+                reason=next_args.get("reason", ""),
                 store=agent._memory_store,
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
-            # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager:
+            # (MemoryManager.notify_memory_tool_write). Skipped for
+            # ingest-disabled forks (ADR-004 Phase 0) — their built-in
+            # MEMORY.md writes must not fan out to the external graph.
+            from agent.memory_manager import memory_ingest_allowed
+            if agent._memory_manager and memory_ingest_allowed(agent):
                 agent._memory_manager.notify_memory_tool_write(
                     result,
                     next_args,
@@ -3196,9 +3349,64 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
+    elif function_name == "notes_write":
+        # Notes tier (ADR-004 Phase 1) — agent-state resolution (session id,
+        # ingest-allowed MemoryManager for the flag-gated backfill) lives in
+        # tools.notes_tool.dispatch_notes_tool_for_agent, shared with the
+        # sequential path.
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "notes_write", next_args),
+                next_args,
+            )
+    elif function_name == "notes_read":
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "notes_read", next_args),
+                next_args,
+            )
+    elif function_name == "memory_propose":
+        def _execute(next_args: dict) -> Any:
+            from tools.notes_tool import dispatch_notes_tool_for_agent
+            return _finish_agent_tool(
+                dispatch_notes_tool_for_agent(agent, "memory_propose", next_args),
+                next_args,
+            )
+    elif function_name == "curator_verdict":
+        # Ingest-curator verdict submission (ADR-004 Phase 2) — agent-scoped:
+        # only a curator fork carries the verdict sink; other agents are
+        # refused inside the handler.
+        def _execute(next_args: dict) -> Any:
+            from agent.ingest_curator import dispatch_curator_verdict_for_agent
+            return _finish_agent_tool(
+                dispatch_curator_verdict_for_agent(agent, next_args),
+                next_args,
+            )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            result = agent._memory_manager.handle_tool_call(function_name, next_args)
+            # ADR-004 §① origin-taint (Phase 2): mirror of the sequential
+            # registration site in tool_executor — memory-provider results
+            # returned via THIS dispatch path must land in the injected-span
+            # registry too, or one _PARALLEL_SAFE_TOOLS allowlist edit would
+            # silently reopen the echo-chamber bypass. Gated on
+            # memory_ingest_allowed for the same fork-isolation reason
+            # (shared live session registry). Fail-open, never raises.
+            if result:
+                try:
+                    from agent.memory_manager import memory_ingest_allowed
+                    if memory_ingest_allowed(agent):
+                        from agent import memory_taint
+                        memory_taint.record_injected_tool_result(
+                            getattr(agent, "session_id", "") or "",
+                            str(result),
+                            source=function_name,
+                        )
+                except Exception:
+                    pass
+            return _finish_agent_tool(result, next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool
@@ -4397,6 +4605,8 @@ __all__ = [
     "drop_thinking_only_and_merge_users",
     "restore_primary_runtime",
     "extract_reasoning",
+    "reasoning_progress_text",
+    "emit_reasoning_progress",
     "dump_api_request_debug",
     "prompt_caching_disabled_from_config",
     "blank_cache_policy_stub",

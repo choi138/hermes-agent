@@ -74,6 +74,8 @@ _HISTORY_MEDIA_LOOKUP_MAX_WORKERS = 2
 _HISTORY_MEDIA_LOOKUP_ADMISSION = threading.BoundedSemaphore(
     _HISTORY_MEDIA_LOOKUP_MAX_WORKERS
 )
+_COMPLETION_ADMISSION_TOKEN_KEY = "_hermes_completion_admission"
+_COMPLETION_ADMISSION_REJECTED_KEY = "_hermes_completion_admission_rejected"
 
 
 def _platform_name(platform) -> str:
@@ -579,6 +581,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+
+try:
+    from agent import turn_trace as _turn_trace_mod
+except Exception:  # pragma: no cover - tracing import must not break gateway startup
+    _turn_trace_mod = None
 
 if TYPE_CHECKING:
     from agent.display import ToolPreview
@@ -3012,6 +3019,12 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Runner-owned callback for successful user-visible response delivery.
+        # Progress/typing paths never call it.  The callback is synchronous so
+        # delivery ACK handling cannot be held up by monitoring I/O.
+        self._content_delivered_handler: Optional[
+            Callable[[str, Optional[int]], None]
+        ] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3090,6 +3103,14 @@ class BasePlatformAdapter(ABC):
         # same ``agent:main:`` key (see ``_session_key_profile``). ``None`` on a
         # primary/single-profile adapter, which keeps the legacy namespace.
         self._owner_profile: Optional[str] = None
+        # GatewayRunner installs a validator for durable async-completion
+        # events.  The event carries the cancellation epoch captured before
+        # its final durable-claim revalidation; the adapter checks it at the
+        # actual queue/task admission boundary so /stop cannot slip through
+        # an earlier TOCTOU read.
+        self._completion_admission_validator: Optional[
+            Callable[[MessageEvent, str], bool]
+        ] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3650,6 +3671,24 @@ class BasePlatformAdapter(ABC):
         """
         self._platform_event_handler = handler
 
+    def set_content_delivered_handler(
+        self,
+        handler: Optional[Callable[[str, Optional[int]], None]],
+    ) -> None:
+        """Install a non-blocking callback for confirmed final content."""
+        self._content_delivered_handler = handler
+
+    def _notify_content_delivered(
+        self, session_key: str, run_generation: Optional[int]
+    ) -> None:
+        handler = getattr(self, "_content_delivered_handler", None)
+        if not callable(handler):
+            return
+        try:
+            handler(session_key, run_generation)
+        except Exception:
+            pass
+
     def set_topic_recovery_fn(
         self,
         fn: Optional[Callable[[Any], Optional[str]]],
@@ -3687,6 +3726,61 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_completion_admission_validator(
+        self,
+        validator: Optional[Callable[[MessageEvent, str], bool]],
+    ) -> None:
+        """Install the runner-owned synthetic completion admission validator."""
+        self._completion_admission_validator = validator
+
+    def _completion_admission_allowed(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Validate a tokenized completion at its real admission boundary.
+
+        Normal user messages and untokenized synthetic events remain
+        unaffected. Tokenized events fail closed when the runner validator is
+        absent or raises, so a completion that never entered a queue or task is
+        not acknowledged as successfully admitted.
+        """
+        metadata = getattr(event, "metadata", None)
+        if (
+            not isinstance(metadata, dict)
+            or _COMPLETION_ADMISSION_TOKEN_KEY not in metadata
+        ):
+            return True
+
+        validator = getattr(self, "_completion_admission_validator", None)
+        allowed = False
+        if callable(validator):
+            try:
+                allowed = bool(validator(event, session_key))
+            except Exception:
+                logger.warning(
+                    "[%s] Completion admission validation failed for %s",
+                    self.name,
+                    session_key,
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                "[%s] Rejecting synthetic completion for %s: "
+                "no admission validator",
+                self.name,
+                session_key,
+            )
+
+        if not allowed:
+            metadata[_COMPLETION_ADMISSION_REJECTED_KEY] = True
+            logger.info(
+                "[%s] Dropping stale synthetic completion admission for %s",
+                self.name,
+                session_key,
+            )
+        return allowed
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5873,6 +5967,9 @@ class BasePlatformAdapter(ABC):
         False is returned so the caller isn't left holding a half-installed
         session lock.
         """
+        if not self._completion_admission_allowed(event, session_key):
+            return False
+
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
 
@@ -5960,6 +6057,22 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
+    def _finish_inline_turn_trace(self, event: MessageEvent) -> None:
+        """Finish a trace for dispatch paths that bypass the background task."""
+        try:
+            if _turn_trace_mod is None:
+                return
+            _trace = _turn_trace_mod.safe_get_bound(event)
+            if _trace is None:
+                _trace = _turn_trace_mod.safe_get_bound(
+                    getattr(event, "source", None)
+                )
+            _turn_trace_mod.safe_finish(_trace, status="ok")
+            if _trace is not None:
+                _turn_trace_mod.safe_bind(getattr(event, "source", None), None)
+        except Exception:
+            pass
+
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -6034,6 +6147,8 @@ class BasePlatformAdapter(ABC):
                 else:
                     self._release_session_guard(session_key, guard=command_guard)
             raise
+        finally:
+            self._finish_inline_turn_trace(event)
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
@@ -6077,6 +6192,13 @@ class BasePlatformAdapter(ABC):
                 expected_session_key,
                 session_key,
             )
+            return
+
+        # Synthetic completions are prepared by GatewayRunner before this call,
+        # but topic recovery above is an await boundary. Recheck the captured
+        # cancellation epoch here, after that boundary and before this event can
+        # enter any adapter queue or task.
+        if not self._completion_admission_allowed(event, session_key):
             return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
@@ -6148,6 +6270,8 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                finally:
+                    self._finish_inline_turn_trace(event)
                 return
 
             # Clarify reply bypass: if the agent is blocked on a
@@ -6163,7 +6287,11 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd and event.allow_gateway_control:
+            if (
+                not cmd
+                and event.allow_gateway_control
+                and not getattr(event, "internal", False)
+            ):
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
@@ -6204,6 +6332,8 @@ class BasePlatformAdapter(ABC):
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
+                    finally:
+                        self._finish_inline_turn_trace(event)
                     return
 
             if self._busy_session_handler is not None:
@@ -6212,6 +6342,12 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+
+            # The busy handler is awaitable. Recheck after it returns so a
+            # /stop that advanced the session epoch while it ran wins before
+            # this completion reaches any pending queue.
+            if not self._completion_admission_allowed(event, session_key):
+                return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
@@ -6328,12 +6464,38 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
-        
+
+        def _resolve_turn_trace():
+            try:
+                if _turn_trace_mod is None:
+                    return None
+                _trace = _turn_trace_mod.safe_get_bound(event)
+                if _trace is None:
+                    _trace = _turn_trace_mod.safe_get_bound(
+                        getattr(event, "source", None)
+                    )
+                return _trace
+            except Exception:
+                return None
+
+        def _finish_turn_trace(status: str) -> None:
+            try:
+                _trace = _resolve_turn_trace()
+                _turn_trace_mod.safe_finish(_trace, status=status)
+                if _trace is not None and _turn_trace_mod is not None:
+                    _turn_trace_mod.safe_bind(
+                        getattr(event, "source", None), None
+                    )
+            except Exception:
+                pass
+
+        _turn_trace = None
         try:
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            _turn_trace = _resolve_turn_trace()
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6366,6 +6528,7 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            _delivery_start = time.time() if _turn_trace is not None else 0.0
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -6537,6 +6700,15 @@ class BasePlatformAdapter(ABC):
                                 and getattr(tts_result, "success", False)
                             )
                         )
+                        if getattr(tts_result, "success", False):
+                            self._notify_content_delivered(
+                                session_key,
+                                getattr(
+                                    interrupt_event,
+                                    "_hermes_run_generation",
+                                    None,
+                                ),
+                            )
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -6611,6 +6783,15 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if getattr(result, "success", False):
+                        self._notify_content_delivered(
+                            session_key,
+                            getattr(
+                                interrupt_event,
+                                "_hermes_run_generation",
+                                None,
+                            ),
+                        )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -6747,6 +6928,15 @@ class BasePlatformAdapter(ABC):
                                 is_voice=is_voice,
                                 metadata=_final_thread_metadata,
                             )
+                        else:
+                            self._notify_content_delivered(
+                                session_key,
+                                getattr(
+                                    interrupt_event,
+                                    "_hermes_run_generation",
+                                    None,
+                                ),
+                            )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -6780,6 +6970,15 @@ class BasePlatformAdapter(ABC):
                                 file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        else:
+                            self._notify_content_delivered(
+                                session_key,
+                                getattr(
+                                    interrupt_event,
+                                    "_hermes_run_generation",
+                                    None,
+                                ),
+                            )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
@@ -6796,6 +6995,18 @@ class BasePlatformAdapter(ABC):
                         "for %s (empty after extract, recovery yielded nothing).",
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
+
+            if _turn_trace is not None:
+                if response:
+                    _turn_trace_mod.safe_add_span(
+                        _turn_trace,
+                        "transport.delivery",
+                        _delivery_start,
+                        time.time(),
+                        delivered=delivery_succeeded,
+                    )
+                _turn_trace_mod.safe_finish(_turn_trace, status="ok")
+                _turn_trace_mod.safe_bind(getattr(event, "source", None), None)
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
@@ -6836,6 +7047,11 @@ class BasePlatformAdapter(ABC):
                 if _active is not None:
                     _active.clear()
                 await _stop_typing_task()
+                if not self._completion_admission_allowed(
+                    pending_event,
+                    session_key,
+                ):
+                    return
                 # Spawn a fresh task for the pending message instead of
                 # recursing.  Issue #17758: `await
                 # self._process_message_background(...)` here grew the
@@ -6859,6 +7075,7 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            _finish_turn_trace("cancelled")
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6866,6 +7083,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            _finish_turn_trace("error")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6896,6 +7114,7 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            _finish_turn_trace("error")
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
@@ -6953,6 +7172,14 @@ class BasePlatformAdapter(ABC):
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
             late_pending = self._pending_messages.pop(session_key, None)
+            if (
+                late_pending is not None
+                and not self._completion_admission_allowed(
+                    late_pending,
+                    session_key,
+                )
+            ):
+                late_pending = None
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)

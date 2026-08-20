@@ -1722,3 +1722,245 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
+
+
+
+# ── True model TTFT instrumentation (R3) ─────────────────────────────────
+
+
+class TestWireAttemptTimingInstrumentation:
+    """The TTFT numerator/denominator must bracket the real provider wire.
+
+    Every assertion here uses a fake stream with a KNOWN sleep before its first
+    chunk and a DIFFERENT known gap between later chunks. Without that, a fake
+    with no sleeps makes every plausible wrong implementation (measuring from
+    api_start_time, from the wrong interval end, or from the wrong provider
+    path) also produce ~0ms, and the test proves nothing.
+    """
+
+    FIRST_FRAME_DELAY_S = 0.12
+    LATER_GAP_S = 0.01
+
+    @pytest.fixture(autouse=True)
+    def isolated_timing(self):
+        from agent import model_call_timing
+
+        model_call_timing.reset_for_tests()
+        yield
+        model_call_timing.reset_for_tests()
+
+    def _agent(self, mock_create, chunk_factory, request_id="turn-1:api:1"):
+        from run_agent import AIAgent
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = chunk_factory
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._current_api_request_id = request_id
+        agent._work_lane = "direct"
+        return agent
+
+    def _slow_stream(self):
+        import time as _time
+
+        def factory(*_args, **_kwargs):
+            def generate():
+                _time.sleep(self.FIRST_FRAME_DELAY_S)
+                yield _make_stream_chunk(content="Hel")
+                _time.sleep(self.LATER_GAP_S)
+                yield _make_stream_chunk(content="lo")
+                _time.sleep(self.LATER_GAP_S)
+                yield _make_stream_chunk(
+                    content="!", finish_reason="stop", model="test-model"
+                )
+
+            return generate()
+
+        return factory
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_chat_completions_stream_records_ttft(self, mock_close, mock_create):
+        from agent import model_call_timing
+
+        agent = self._agent(mock_create, self._slow_stream())
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "Hello!"
+        [record] = model_call_timing.drain("turn-1:api:1")
+        assert record["api_mode_family"] == "chat_completions"
+        assert record["stream_mode"] == "streaming"
+        assert record["work_lane"] == "direct"
+
+        ttft_ms = (record["first_frame_ns"] - record["issued_ns"]) / 1_000_000
+        duration_ms = (record["end_ns"] - record["issued_ns"]) / 1_000_000
+        expected_ms = self.FIRST_FRAME_DELAY_S * 1000
+        # Discriminates the correct interval from every plausible wrong one:
+        # measuring to the LAST frame would land near duration_ms, and
+        # measuring from a later stamp would land near 0.
+        assert expected_ms * 0.6 <= ttft_ms <= expected_ms * 1.8
+        assert ttft_ms < duration_ms
+        assert duration_ms >= expected_ms + self.LATER_GAP_S * 2 * 1000 * 0.5
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_first_delta_is_not_delayed_by_metric_recording(
+        self, mock_close, mock_create, monkeypatch, tmp_path
+    ):
+        import time as _time
+
+        from hermes_cli.observability import local_observations
+        from hermes_cli.observability.shared_metrics import SharedMetricsStore
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config_readonly",
+            lambda: {"telemetry": {"shared_metrics": {"enabled": True}}},
+        )
+        local_observations._reset_for_tests()
+
+        record_calls: list[int] = []
+        real_record = SharedMetricsStore.record_observations
+
+        def spy(self, rows):
+            record_calls.append(1)
+            return real_record(self, rows)
+
+        monkeypatch.setattr(SharedMetricsStore, "record_observations", spy)
+
+        agent = self._agent(mock_create, self._slow_stream())
+        first_delta_state: dict = {}
+
+        def capture_delta(text):
+            if "at_first_delta" not in first_delta_state:
+                first_delta_state["at_first_delta"] = len(record_calls)
+                first_delta_state["monotonic"] = _time.monotonic()
+
+        agent._fire_stream_delta = capture_delta
+        started = _time.monotonic()
+        agent._interruptible_streaming_api_call({})
+
+        # No durable write may have happened by the time the first delta lands.
+        assert first_delta_state["at_first_delta"] == 0
+        # And the first delta is not measurably delayed by the stamp.
+        elapsed_ms = (first_delta_state["monotonic"] - started) * 1000
+        assert elapsed_ms < self.FIRST_FRAME_DELAY_S * 1000 * 2.5
+        local_observations._reset_for_tests()
+
+    @patch("run_agent.AIAgent._replace_primary_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_two_physical_stream_attempts_record_two_rows(
+        self, mock_close, mock_create, mock_replace, monkeypatch
+    ):
+        import time as _time
+
+        import httpx as _httpx
+
+        from agent import model_call_timing
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+        attempts = {"n": 0}
+
+        def factory(*_args, **_kwargs):
+            attempts["n"] += 1
+            is_first = attempts["n"] == 1
+
+            def generate():
+                _time.sleep(self.FIRST_FRAME_DELAY_S)
+                yield _make_stream_chunk(content="Let me write: ")
+                yield _make_stream_chunk(tool_calls=[
+                    _make_tool_call_delta(index=0, tc_id="call_1", name="write_file"),
+                ])
+                if is_first:
+                    yield _make_stream_chunk(tool_calls=[
+                        _make_tool_call_delta(index=0, arguments='{"path": '),
+                    ])
+                    raise _httpx.RemoteProtocolError("peer closed connection")
+                yield _make_stream_chunk(tool_calls=[
+                    _make_tool_call_delta(
+                        index=0, arguments='{"path": "/tmp/x", "content": "hi"}'
+                    ),
+                ])
+                yield _make_stream_chunk(finish_reason="tool_calls")
+
+            return generate()
+
+        agent = self._agent(mock_create, factory)
+        agent._fire_stream_delta = lambda text: None
+        agent._interruptible_streaming_api_call({})
+
+        assert attempts["n"] == 2
+        records = model_call_timing.drain("turn-1:api:1")
+        # One row per PHYSICAL wire attempt under ONE api_request_id.
+        assert len(records) == 2
+        for record in records:
+            ttft_ms = (record["first_frame_ns"] - record["issued_ns"]) / 1_000_000
+            assert ttft_ms >= 0
+            assert ttft_ms <= self.FIRST_FRAME_DELAY_S * 1000 * 1.8
+        # Attempt 2's denominator postdates attempt 1's first frame — the exact
+        # scenario a request-id-keyed denominator would turn negative.
+        assert records[0]["first_frame_ns"] < records[1]["issued_ns"]
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_an_attempt_that_dies_before_any_frame_has_no_ttft(
+        self, mock_close, mock_create
+    ):
+        import httpx as _httpx
+
+        from agent import model_call_timing
+
+        def factory(*_args, **_kwargs):
+            raise _httpx.ConnectError("no route to host")
+
+        agent = self._agent(mock_create, factory)
+        with pytest.raises(Exception):
+            agent._interruptible_streaming_api_call({})
+
+        records = model_call_timing.drain("turn-1:api:1")
+        assert records
+        for record in records:
+            assert record["first_frame_ns"] is None
+            assert record["end_ns"] is not None
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_stamp_failure_does_not_break_the_turn(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        from agent import chat_completion_helpers, model_call_timing
+
+        def exploding(*_args, **_kwargs):
+            raise RuntimeError("timing subsystem is broken")
+
+        monkeypatch.setattr(model_call_timing, "begin_wire_attempt", exploding)
+        monkeypatch.setattr(model_call_timing, "stamp_first_frame", exploding)
+        monkeypatch.setattr(model_call_timing, "finish_wire_attempt", exploding)
+        del chat_completion_helpers
+
+        agent = self._agent(mock_create, self._slow_stream())
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "Hello!"
+        assert getattr(agent, "_disable_streaming", False) is False
+
+
+def test_stream_diag_init_is_unchanged():
+    """Timing lives in agent/model_call_timing.py, not in stream_diag."""
+    from agent.stream_diag import stream_diag_init
+
+    diag = stream_diag_init()
+    assert diag["first_chunk_at"] is None
+    assert "started_monotonic_ns" not in diag
+    assert "first_frame_monotonic_ns" not in diag

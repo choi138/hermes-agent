@@ -34,6 +34,7 @@ from hermes_cli.observability.shared_metrics_contract import (
     MODEL_CALL_PROFILE_MODEL,
     MODEL_IDENTIFIER_MAX_LENGTH,
     MODEL_ROUTE_METRIC,
+    PRIMARY_MODEL_CALL_ROLE,
     PROVIDER_IDENTIFIER_MAX_LENGTH,
     SCHEMA_KEY,
     SCHEMA_VERSION,
@@ -76,6 +77,14 @@ from hermes_cli.observability.shared_metrics_contract import (
     tool_outcome,
     tool_retry_bucket,
     tool_terminal_fields,
+)
+from hermes_cli.observability.shared_metrics_contract import (
+    FALLBACK_REASONS,
+    OBSERVATION_CALL_ROLES,
+    OBSERVATION_METRICS,
+    RETRY_REASONS,
+    TTFT_METRIC,
+    WORK_LANES,
 )
 
 
@@ -1526,3 +1535,308 @@ def test_store_and_export_are_owner_only(tmp_path):
     assert stat.S_IMODE(outbox_directory.stat().st_mode) == 0o700
     assert stat.S_IMODE(database_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(package_path.stat().st_mode) == 0o600
+
+
+# ── Local observation samples (R3) ──────────────────────────────────────
+
+
+def _observation_dimensions(**overrides: str) -> dict[str, str]:
+    base = {
+        "api_mode_family": "chat_completions",
+        "attempt_outcome": "success",
+        "call_role": "primary",
+        "execution_surface": "cli",
+        "model_family": "claude",
+        "provider_family": "direct",
+        "stream_mode": "streaming",
+        "work_lane": "direct",
+    }
+    base.update(overrides)
+    return base
+
+
+def _observation_row(value: float, **overrides: str) -> dict[str, Any]:
+    return {
+        "metric_name": TTFT_METRIC,
+        "dimensions": _observation_dimensions(**overrides),
+        "value": value,
+        "hermes_version": "test-version",
+    }
+
+
+def test_observation_table_is_created_on_an_existing_v1_store(tmp_path):
+    """A pre-existing v1 store migrates while retaining local observations."""
+    database_path = tmp_path / "metrics.sqlite3"
+    legacy = sqlite3.connect(database_path)
+    with legacy:
+        legacy.execute(
+            "CREATE TABLE telemetry_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        legacy.execute(
+            """
+            CREATE TABLE counter_aggregates (
+                period_start TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                hermes_version TEXT NOT NULL,
+                dimensions_json TEXT NOT NULL,
+                value INTEGER NOT NULL,
+                packaged_value INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (
+                    period_start, metric_name, hermes_version, dimensions_json
+                )
+            )
+            """
+        )
+        legacy.execute(
+            """
+            CREATE TABLE package_outbox (
+                package_id TEXT PRIMARY KEY,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                exported_at TEXT
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO telemetry_state(key, value) VALUES ('schema_version', '1')"
+        )
+    legacy.close()
+
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    store.record_observation(TTFT_METRIC, _observation_dimensions(), 12.5, "v")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        version = connection.execute(
+            "SELECT value FROM telemetry_state WHERE key = 'schema_version'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert "observation_samples" in tables
+    assert "observation_samples_metric_period_idx" in indexes
+    assert "observation_samples_period_idx" in indexes
+    assert version == "2"
+    assert [row["value"] for row in store.observation_samples()] == [12.5]
+
+
+def test_observations_are_never_exported(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_model_call(_dimensions(), _resource())
+    store.record_observations(
+        [_observation_row(11.0), _observation_row(22.0)]
+    )
+
+    [package_path] = store.create_and_export_package()
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    _schema_validator().validate(package)
+
+    exported_names = {metric["name"] for metric in package["metrics"]}
+    assert exported_names == {MODEL_ROUTE_METRIC}
+    assert not exported_names & set(OBSERVATION_METRICS)
+    # The rows still exist locally after the export.
+    assert len(store.observation_samples()) == 2
+
+
+def test_record_observation_rejects_unregistered_metrics_and_dimensions(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+
+    with pytest.raises(ValueError):
+        store.record_observation(
+            "hermes.not_a_metric", _observation_dimensions(), 1.0, "v"
+        )
+    with pytest.raises(ValueError):
+        store.record_observation(TTFT_METRIC, {"work_lane": "direct"}, 1.0, "v")
+    with pytest.raises(ValueError):
+        store.record_observation(
+            TTFT_METRIC,
+            _observation_dimensions(work_lane="scheduled"),
+            1.0,
+            "v",
+        )
+    extra = _observation_dimensions()
+    extra["attempt_id"] = "abc"
+    with pytest.raises(ValueError):
+        store.record_observation(TTFT_METRIC, extra, 1.0, "v")
+    assert store.observation_samples() == []
+
+
+def test_record_observations_drops_negative_and_nonfinite_values(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+
+    written = store.record_observations(
+        [
+            _observation_row(-1.0),
+            _observation_row(float("nan")),
+            _observation_row(float("inf")),
+            _observation_row(0.0),
+            _observation_row(42.0),
+        ]
+    )
+
+    assert written == 2
+    assert sorted(row["value"] for row in store.observation_samples()) == [0.0, 42.0]
+
+
+def test_record_observations_writes_one_transaction(tmp_path, monkeypatch):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    connects: list[int] = []
+    real_connect = sqlite3.connect
+
+    def counting_connect(*args: Any, **kwargs: Any):
+        connects.append(1)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(shared_metrics_module.sqlite3, "connect", counting_connect)
+    store.record_observations([_observation_row(float(index)) for index in range(4)])
+
+    assert len(connects) == 1
+    assert len(store.observation_samples()) == 4
+
+
+def test_prune_observation_samples_is_relay_independent(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_observations([_observation_row(1.0), _observation_row(2.0)])
+    connection = sqlite3.connect(store.database_path)
+    with connection:
+        connection.execute(
+            "UPDATE observation_samples SET period_start = '2000-01-01' "
+            "WHERE value = 1.0"
+        )
+    connection.close()
+
+    assert store.prune_observation_samples() is True
+
+    remaining = [row["value"] for row in store.observation_samples()]
+    assert remaining == [2.0]
+
+
+def test_prune_observation_samples_enforces_the_row_cap(tmp_path, monkeypatch):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    monkeypatch.setattr(shared_metrics_module, "_MAX_OBSERVATION_ROWS", 3)
+    store.record_observations([_observation_row(float(index)) for index in range(6)])
+
+    assert store.prune_observation_samples() is True
+
+    remaining = [row["value"] for row in store.observation_samples()]
+    assert remaining == [3.0, 4.0, 5.0]
+
+
+def _trace_sql(monkeypatch, statements: list[str]) -> None:
+    """Record every statement the store executes (sqlite3.Connection is immutable)."""
+    real_connect = shared_metrics_module.sqlite3.connect
+
+    def tracing_connect(*args: Any, **kwargs: Any):
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(
+        shared_metrics_module.sqlite3, "connect", tracing_connect
+    )
+
+
+def test_prune_observation_samples_runs_once_per_utc_day(tmp_path, monkeypatch):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_observations([_observation_row(1.0)])
+    assert store.prune_observation_samples() is True
+
+    statements: list[str] = []
+    _trace_sql(monkeypatch, statements)
+    assert store.prune_observation_samples() is False
+
+    assert statements
+    assert not any("DELETE FROM observation_samples" in sql for sql in statements)
+
+
+def test_prune_cap_delete_is_bounded(tmp_path, monkeypatch):
+    """The cap DELETE must not walk the table under BEGIN IMMEDIATE."""
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_observations([_observation_row(1.0)])
+
+    statements: list[str] = []
+    _trace_sql(monkeypatch, statements)
+    store.prune_observation_samples()
+
+    cap_statements = [
+        sql
+        for sql in statements
+        if "DELETE FROM observation_samples" in sql and "sample_id" in sql
+    ]
+    assert cap_statements
+    for sql in cap_statements:
+        assert "ORDER BY" not in sql.upper()
+        assert "LIMIT" not in sql.upper()
+        assert "MAX(sample_id)" in sql
+
+
+def test_expired_history_prune_also_trims_observations(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_observations([_observation_row(1.0), _observation_row(2.0)])
+    connection = sqlite3.connect(store.database_path)
+    with connection:
+        connection.execute(
+            "UPDATE observation_samples SET period_start = '2000-01-01' "
+            "WHERE value = 1.0"
+        )
+    connection.close()
+
+    store._prune_expired_history()
+
+    assert [row["value"] for row in store.observation_samples()] == [2.0]
+
+
+def test_observation_summary_reports_percentiles(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_observations(
+        [_observation_row(float(value)) for value in (10, 20, 30, 40)]
+    )
+
+    [summary] = store.observation_summary()
+
+    assert summary["metric_name"] == TTFT_METRIC
+    assert summary["unit"] == "ms"
+    assert summary["count"] == 4
+    assert summary["min"] == 10.0
+    assert summary["max"] == 40.0
+    assert summary["p95"] == 40.0
+
+
+def test_retry_reasons_cover_the_failover_taxonomy():
+    from agent.error_classifier import FailoverReason
+
+    assert {reason.value for reason in FailoverReason} <= RETRY_REASONS
+    assert "invalid_response" in RETRY_REASONS
+    assert "none" in FALLBACK_REASONS
+
+
+def test_counter_call_role_contract_is_unchanged():
+    """The exported counter vocabulary must not gain the observation roles."""
+    from hermes_cli.observability.shared_metrics_contract import (
+        _COUNTER_DIMENSION_VALUES,
+    )
+
+    assert _COUNTER_DIMENSION_VALUES["hermes.model_call.count"]["call_role"] == (
+        frozenset({PRIMARY_MODEL_CALL_ROLE})
+    )
+    assert "fallback" in OBSERVATION_CALL_ROLES
+
+
+def test_work_lanes_exclude_dispatch_surfaces():
+    assert "scheduled" not in WORK_LANES
+    assert "batch" not in WORK_LANES
+    assert {"scheduled_task", "batch"} <= EXECUTION_SURFACES

@@ -2009,6 +2009,113 @@ class TestTransientTransportRetry:
         assert client.chat.completions.create.call_count == 1
 
 
+    def test_repeated_5xx_escalates_to_provider_fallback(self):
+        """A reachable but unavailable provider must not trap an aux call.
+
+        Pure 5xx errors are transient transport failures but deliberately are
+        not classified as connection errors. Once the bounded same-provider
+        retries are exhausted, they still represent temporary capacity loss
+        and must continue through the configured provider fallback chain.
+        """
+
+        class _Err500(Exception):
+            status_code = 500
+
+        primary = MagicMock()
+        primary.base_url = "https://primary.example/v1"
+        primary.chat.completions.create.side_effect = _Err500(
+            "MODEL_TEMPORARILY_UNAVAILABLE"
+        )
+
+        fallback = MagicMock()
+        fallback.base_url = "https://fallback.example/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1,
+            p2,
+            p3,
+            patch(
+                "agent.auxiliary_client._transient_retry_count",
+                return_value=1,
+            ),
+            patch(
+                "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE",
+                0.0,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fallback, "fallback-model", "fallback"),
+            ),
+        ):
+            result = call_llm(
+                task="mention_inbox",
+                messages=[{"role": "user", "content": "질문"}],
+            )
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_count == 2
+        assert fallback.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_repeated_5xx_escalates_to_provider_fallback(self):
+        """The async auxiliary path has the same exhausted-5xx contract."""
+
+        class _Err500(Exception):
+            status_code = 500
+
+        primary = MagicMock()
+        primary.base_url = "https://primary.example/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=_Err500("MODEL_TEMPORARILY_UNAVAILABLE")
+        )
+
+        fallback = MagicMock()
+        fallback.base_url = "https://fallback.example/v1"
+        fallback.chat.completions.create = AsyncMock(
+            return_value={"fallback": True}
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "primary-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "primary-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda response, _task, **_kwargs: response,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_fallback_chain",
+                return_value=(object(), "fallback-model", "fallback"),
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "fallback-model"),
+            ),
+        ):
+            result = await async_call_llm(
+                task="mention_inbox",
+                messages=[{"role": "user", "content": "질문"}],
+            )
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.await_count == 2
+        assert fallback.chat.completions.create.await_count == 1
+
     def test_compression_skips_same_provider_retry_on_timeout(self):
         """A timeout on the critical compression path must NOT retry the same
         provider (that doubles the user-visible stall, issue #54465) — it
@@ -2380,11 +2487,76 @@ class TestAuxiliaryTaskExtraBody:
     def test_anthropic_aux_extra_body_passthrough(self):
         """Bug B (#37217): vendor fields in extra_body reach the Anthropic SDK."""
         api_kwargs = self._run_anthropic_adapter(
-            call_extra_body={"thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"}},
+            call_extra_body={
+                "thinking": {"type": "disabled"},
+                "metadata": {"user_id": "u1"},
+                "reasoning": {"enabled": False},
+                "_private": "not-on-wire",
+            },
         )
         assert api_kwargs["extra_body"] == {
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
+
+    def test_anthropic_aux_translates_json_schema_response_format(self):
+        schema = {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        }
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "thread_title",
+                        "schema": schema,
+                        "strict": False,
+                    },
+                },
+                "metadata": {"user_id": "autotitle"},
+            },
+            bak_result={
+                "model": "claude-sonnet-4-6",
+                "messages": [],
+                "max_tokens": 64,
+                "output_config": {"effort": "high"},
+            },
+        )
+
+        assert api_kwargs["output_config"] == {
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": schema},
+        }
+        assert api_kwargs["extra_body"] == {
+            "metadata": {"user_id": "autotitle"}
+        }
+        assert "response_format" not in api_kwargs
+        assert "response_format" not in api_kwargs["extra_body"]
+
+    def test_anthropic_aux_translates_json_object_response_format(self):
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={"response_format": {"type": "json_object"}},
+        )
+
+        assert api_kwargs["output_config"]["format"] == {
+            "type": "json_schema",
+            "schema": {"type": "object"},
+        }
+        assert "response_format" not in api_kwargs
+        assert "extra_body" not in api_kwargs
+
+    def test_anthropic_aux_does_not_translate_unrelated_response_format(self):
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {"type": "text"},
+                "vendor_option": True,
+            },
+        )
+
+        assert "output_config" not in api_kwargs
+        assert api_kwargs["extra_body"] == {"vendor_option": True}
+        assert "response_format" not in api_kwargs["extra_body"]
 
 
 

@@ -44,7 +44,100 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter, _display_width  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Markdown table formatting tests
+# ---------------------------------------------------------------------------
+
+
+def test_format_message_converts_markdown_table_to_fenced_ascii_table():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    formatted = adapter.format_message(
+        "Here is a table:\n\n"
+        "| Name  | Score | Grade |\n"
+        "|-------|-------|-------|\n"
+        "| Alice | 95    | A     |\n"
+        "| Bob   | 82    | B     |\n\n"
+        "Done."
+    )
+
+    assert "|-------|" not in formatted
+    assert "```\n┌" in formatted
+    assert "│ Name  │ Score │ Grade │" in formatted
+    assert "│ Alice │ 95    │ A     │" in formatted
+    assert formatted.endswith("Done.")
+
+
+def test_format_message_preserves_tables_inside_existing_fenced_code_blocks():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    formatted = adapter.format_message(
+        "```\n"
+        "| Not | A | Table |\n"
+        "|-----|---|-------|\n"
+        "| x   | y | z     |\n"
+        "```\n\n"
+        "| Real | Table |\n"
+        "|------|-------|\n"
+        "| a    | b     |"
+    )
+
+    assert "| Not | A | Table |" in formatted
+    assert "|-----|---|-------|" in formatted
+    assert "│ Real │ Table │" in formatted
+    assert "│ a    │ b     │" in formatted
+    assert formatted.count("┌") == 1
+
+
+def test_format_message_aligns_cjk_wide_characters():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    formatted = adapter.format_message(
+        "| 항목 | 설명 |\n"
+        "|------|------|\n"
+        "| CPU  | 중앙처리장치 |\n"
+        "| RAM  | 메모리 |"
+    )
+
+    table_lines = [
+        line for line in formatted.splitlines()
+        if line and line[0] in "┌├└│"
+    ]
+    assert len({_display_width(line) for line in table_lines}) == 1
+    assert "│ CPU  │ 중앙처리장치 │" in formatted
+    assert "│ RAM  │ 메모리       │" in formatted
+
+
+def test_format_message_leaves_non_table_pipe_text_unchanged():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    text = "Use the | operator for bitwise OR."
+
+    assert adapter.format_message(text) == text
+
+
+def test_truncate_message_preserves_generated_table_codeblock_boundaries():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    rows = "\n".join(
+        f"| row-{index:03d} | {'값' * 20} | {'x' * 30} |"
+        for index in range(80)
+    )
+    formatted = adapter.format_message(
+        "| Row | Korean | ASCII |\n"
+        "|-----|--------|-------|\n"
+        f"{rows}"
+    )
+
+    assert len(formatted) > adapter.MAX_MESSAGE_LENGTH
+    chunks = adapter.truncate_message(formatted, adapter.MAX_MESSAGE_LENGTH)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= adapter.MAX_MESSAGE_LENGTH for chunk in chunks)
+    assert all(chunk.count("```") % 2 == 0 for chunk in chunks)
+    assert chunks[0].startswith("```\n┌")
+    assert chunks[1].startswith("```\n")
 
 
 @pytest.mark.asyncio
@@ -105,6 +198,29 @@ def _native_voice_payload(request):
     form = request.await_args.kwargs["form"]
     payload = next(part["value"] for part in form if part["name"] == "payload_json")
     return json.loads(payload)
+
+
+@pytest.mark.asyncio
+async def test_mention_inbox_send_forces_allowed_mentions_none():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    expected = object()
+    sys.modules["discord"].AllowedMentions.none.return_value = expected
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=1234)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "555",
+        "@everyone untrusted",
+        metadata={"mention_inbox_no_mentions": True},
+    )
+
+    assert result.success is True
+    assert channel.send.await_args.kwargs["allowed_mentions"] is expected
 
 
 @pytest.mark.asyncio

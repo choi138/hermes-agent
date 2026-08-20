@@ -1009,6 +1009,9 @@ class TestBuildSystemPrompt:
         assert "SKILLS_PROMPT" in prompt
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
+        from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE, SKILLS_GUIDANCE
+        assert HERMES_AGENT_HELP_GUIDANCE not in prompt
+        assert SKILLS_GUIDANCE not in prompt
 
 
 class TestToolUseEnforcementConfig:
@@ -2148,6 +2151,60 @@ class TestConcurrentToolExecution:
 
 
 
+    def test_invoke_tool_policy_error_fails_closed(self, agent, monkeypatch):
+        """A broken authorization backend must never authorize execution."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy backend unavailable")),
+        )
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        payload = json.loads(result)
+        assert "policy evaluation failed" in payload["error"].lower()
+
+    def test_sequential_policy_error_fails_closed(self, agent, monkeypatch):
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"test.txt","content":"hello"}',
+            call_id="policy-seq",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy backend unavailable")),
+        )
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert len(messages) == 1
+        assert "policy evaluation failed" in messages[0]["content"].lower()
+        assert messages[0]["effect_disposition"] == "none"
+
+    def test_concurrent_policy_error_fails_closed(self, agent, monkeypatch):
+        calls = [
+            _mock_tool_call(name="web_search", arguments='{"q":"one"}', call_id="policy-c1"),
+            _mock_tool_call(name="web_search", arguments='{"q":"two"}', call_id="policy-c2"),
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=calls)
+        messages = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy backend unavailable")),
+        )
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert len(messages) == 2
+        assert all(
+            "policy evaluation failed" in msg["content"].lower()
+            for msg in messages
+        )
+        assert all(msg["effect_disposition"] == "none" for msg in messages)
+
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
         tool_call = _mock_tool_call(name="write_file",
@@ -2382,6 +2439,9 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("todo", {"todos": []}),
         ("session_search", {"query": "needle"}),
         ("memory", {"action": "view", "target": "memory"}),
+        ("notes_write", {"step": "propose", "content": "gist", "kind": "fact"}),
+        ("notes_read", {"action": "list"}),
+        ("memory_propose", {"content": "worth curating"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("read_preview", {}),
@@ -2418,6 +2478,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.memory_tool.memory_tool",
             lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.notes_tool.dispatch_notes_tool_for_agent",
+            lambda *args, **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",
@@ -2499,16 +2563,40 @@ class TestPathsOverlap:
 
 
 class TestParallelScopePathNormalization:
-    def test_extract_parallel_scope_path_normalizes_relative_to_cwd(self, tmp_path, monkeypatch):
+    def test_extract_parallel_scope_path_refuses_to_guess_a_relative_base(self, tmp_path, monkeypatch):
+        """Relative + no execution_cwd must NOT anchor to the process cwd.
+
+        Supersedes the previous assertion (``scoped == tmp_path / "notes.txt"``),
+        which pinned exactly the behaviour that caused the race: the file tools
+        anchor relative paths via ``_resolve_base_dir``
+        (``get_session_cwd`` -> registered override -> absolute
+        ``$TERMINAL_CWD`` -> process cwd), so the process cwd is the LAST resort
+        there and anchoring to it here can key the same runtime file differently.
+        The safety property the old test protected is asserted below and by
+        ``test_should_parallelize_tool_batch_rejects_same_file_with_mixed_path_spellings``,
+        both of which still hold.
+        """
+        from agent.tool_dispatch_helpers import _UNRESOLVED_SCOPE
         from run_agent import _extract_parallel_scope_path
 
         monkeypatch.chdir(tmp_path)
 
         scoped = _extract_parallel_scope_path("write_file", {"path": "./notes.txt"})
 
-        assert scoped == tmp_path / "notes.txt"
+        assert scoped is _UNRESOLVED_SCOPE
+        # An explicit execution_cwd is a deliberate base, not a guess, so it is
+        # still honoured.
+        from agent.tool_dispatch_helpers import _canonical_path
+
+        assert _canonical_path("./notes.txt", tmp_path) == (tmp_path / "notes.txt").resolve()
 
     def test_extract_parallel_scope_path_treats_relative_and_absolute_same_file_as_same_scope(self, tmp_path, monkeypatch):
+        """The load-bearing property: the two spellings must still CONFLICT.
+
+        Previously this held because both canonicalised to the same path. Now it
+        holds because the relative spelling is unresolved and unresolved overlaps
+        everything — a strictly more conservative route to the same guarantee.
+        """
         from run_agent import _extract_parallel_scope_path, _paths_overlap
 
         monkeypatch.chdir(tmp_path)
@@ -2517,8 +2605,8 @@ class TestParallelScopePathNormalization:
         rel_scoped = _extract_parallel_scope_path("write_file", {"path": "notes.txt"})
         abs_scoped = _extract_parallel_scope_path("write_file", {"path": str(abs_path)})
 
-        assert rel_scoped == abs_scoped
         assert _paths_overlap(rel_scoped, abs_scoped)
+        assert _paths_overlap(abs_scoped, rel_scoped)
 
     def test_should_parallelize_tool_batch_rejects_same_file_with_mixed_path_spellings(self, tmp_path, monkeypatch):
         from run_agent import _should_parallelize_tool_batch
@@ -2981,7 +3069,9 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
+        mock_try_activate_fallback.assert_called_once_with(
+            reason=FailoverReason.content_policy_blocked
+        )
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
@@ -4372,6 +4462,7 @@ class TestRunConversation:
         agent.max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -4416,6 +4507,7 @@ class TestRunConversation:
         assert call.kwargs.get("outcome") == "timed_out"
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
+        assert call.kwargs.get("expected_run_id") == 42
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
@@ -6748,3 +6840,94 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
+
+
+class TestWorkLaneAndHookPayloadStability:
+    """R3 additive-instrumentation guards on the turn boundary."""
+
+    def test_work_lane_is_resolved_before_start_task_run(self, agent):
+        from hermes_cli.observability.shared_metrics_contract import WORK_LANES
+
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+
+        observed = {}
+
+        def capture_start(**kwargs):
+            observed["lane_at_start"] = getattr(agent, "_work_lane", None)
+
+        with (
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+                side_effect=capture_start,
+            ),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch("agent.conversation_loop.run_conversation", return_value="done"),
+        ):
+            agent.run_conversation("hello", task_id="task-lane")
+
+        assert observed["lane_at_start"] in WORK_LANES
+
+    def test_kanban_env_makes_the_turn_lane_kanban(self, agent, monkeypatch):
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.platform = "cli"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-7")
+        monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+
+        with (
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch("agent.conversation_loop.run_conversation", return_value="done"),
+        ):
+            agent.run_conversation("hello", task_id="task-kanban")
+
+        assert agent._work_lane == "kanban"
+
+    def test_post_api_request_payload_keys_are_unchanged(self):
+        """No new kwarg may be added to this hook.
+
+        agent/outbound_webhooks.py forwards every kwarg outside
+        _TOP_LEVEL_PAYLOAD_KEYS into an HTTP POST body, so a new latency kwarg
+        would ship the R3 metrics off the machine with no new network code. The
+        recorder reads its timing from api_request_id instead.
+        """
+        import inspect
+        import re
+
+        from agent import conversation_loop
+
+        source = inspect.getsource(conversation_loop)
+        block = source.split('_invoke_hook(\n                        "post_api_request",', 1)
+        assert len(block) == 2, "post_api_request invoke site not found"
+        body = block[1].split("\n            except Exception:", 1)[0]
+        keys = set(re.findall(r"^\s{24}(\w+)=", body, re.M))
+
+        assert keys == {
+            "api_call_count",
+            "api_duration",
+            "api_mode",
+            "api_request_id",
+            "assistant_content_chars",
+            "assistant_message",
+            "assistant_tool_call_count",
+            "base_url",
+            "ended_at",
+            "finish_reason",
+            "message_count",
+            "model",
+            "platform",
+            "provider",
+            "response",
+            "response_model",
+            "session_id",
+            "started_at",
+            "task_id",
+            "turn_id",
+            "usage",
+        }

@@ -14,6 +14,8 @@ for the full rationale):
   their schemas, but once a session enables them they stay in the
   model-facing array. Tool Search is for MCP/plugin catalog bloat, not for
   hiding the tools that define this session's surface.
+* A narrow, policy-gated static toolset may also opt out explicitly with
+  ``defer_to_tool_search: False`` without expanding the global core surface.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -211,14 +213,28 @@ def _core_tool_names() -> frozenset[str]:
 _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
 
 
+def _toolset_keeps_tools_eager(toolset_name: str) -> bool:
+    """Return whether a static toolset explicitly opts out of deferral."""
+    try:
+        from toolsets import TOOLSETS
+
+        definition = TOOLSETS.get(toolset_name)
+        return (
+            isinstance(definition, dict)
+            and definition.get("defer_to_tool_search") is False
+        )
+    except Exception:
+        return False
+
+
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is neither in ``_HERMES_CORE_TOOLS`` nor a session-gated GUI
-    surface toolset. Core and direct surface tools are never deferred even
-    when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    OR it is neither in ``_HERMES_CORE_TOOLS``, a session-gated GUI surface
+    toolset, nor a static toolset that explicitly sets
+    ``defer_to_tool_search: False``. Core and direct surface tools are never
+    deferred even when technically plugin-provided.
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
@@ -232,7 +248,10 @@ def is_deferrable_tool_name(name: str) -> bool:
             return False
         if entry.toolset.startswith("mcp-"):
             return True
-        if entry.toolset in _DIRECT_SURFACE_TOOLSETS:
+        if (
+            entry.toolset in _DIRECT_SURFACE_TOOLSETS
+            or _toolset_keeps_tools_eager(entry.toolset)
+        ):
             return False
         # Non-MCP, non-core → plugin tool, eligible.
         return True

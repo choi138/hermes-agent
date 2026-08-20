@@ -217,9 +217,88 @@ def patch_sse_client():
 
 
 class TestSSEClientCert:
-    def test_no_factory_when_defaults(self, patch_sse_client):
-        """With no cert and ssl_verify=True (default), the SDK's own factory is
-        used — we don't inject one."""
+    @pytest.mark.parametrize(
+        "credential_header,credential_value",
+        [
+            ("Authorization", "Bearer synthetic"),
+            ("Proxy-Authorization", "Basic synthetic"),
+            ("Cookie", "session=synthetic"),
+        ],
+    )
+    def test_default_factory_blocks_ambient_credentials_on_cross_origin_redirect(
+        self,
+        patch_sse_client,
+        credential_header,
+        credential_value,
+    ):
+        """Default SSE still needs a redirect guard for ambient credentials.
+
+        Even without configured headers, auth, mTLS, or custom TLS settings, a
+        shared SDK client can acquire Authorization, Proxy-Authorization, or a
+        Cookie at runtime. The client factory (and its hook) must therefore be
+        installed for the default redirect-following path too.
+        """
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("sse-default-ambient")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http(
+                    {
+                        "url": "https://origin.example/mcp/sse",
+                        "transport": "sse",
+                    }
+                )
+
+        asyncio.run(drive())
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers={}, timeout=httpx.Timeout(30.0), auth=None)
+
+        hook = captured_client_kwargs["event_hooks"]["response"][0]
+        benign = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={"MCP-Protocol-Version": "2025-03-26"},
+            ),
+        )
+        asyncio.run(hook(benign))
+
+        credential_bearing = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={credential_header: credential_value},
+            ),
+        )
+        with pytest.raises(RuntimeError, match="cross-origin.*credential"):
+            asyncio.run(hook(credential_bearing))
+
+    def test_factory_blocks_custom_headers_on_cross_origin_redirect(
+        self, patch_sse_client
+    ):
         from tools.mcp_tool import MCPServerTask
 
         server = MCPServerTask("sse-test")
@@ -227,22 +306,116 @@ class TestSSEClientCert:
         server._sampling = None
 
         async def drive():
-            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
-                              new=AsyncMock(return_value="shutdown")), \
-                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+            with patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http(
+                    {
+                        "url": "https://origin.example/mcp/sse",
+                        "transport": "sse",
+                        "headers": {"X-Api-Key": "synthetic-secret"},
+                    }
+                )
+
+        asyncio.run(drive())
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(
+                headers={
+                    "X-Api-Key": "synthetic-secret",
+                    "Authorization": "Bearer synthetic",
+                    "Cookie": "session=synthetic",
+                    "X-Benign": "keep",
+                },
+                timeout=httpx.Timeout(30.0),
+                auth=None,
+            )
+
+        hook = captured_client_kwargs["event_hooks"]["response"][0]
+        same_origin = httpx.Response(
+            302,
+            headers={"Location": "/next"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={"X-Api-Key": "synthetic-secret"},
+            ),
+        )
+        asyncio.run(hook(same_origin))
+
+        cross_origin = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={
+                    "X-Api-Key": "synthetic-secret",
+                    "Authorization": "Bearer synthetic",
+                    "Cookie": "session=synthetic",
+                },
+            ),
+        )
+        with pytest.raises(RuntimeError, match="cross-origin.*credential"):
+            asyncio.run(hook(cross_origin))
+
+    def test_strict_loopback_factory_disables_proxy_environment(
+        self, patch_sse_client
+    ):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
                 try:
                     await asyncio.wait_for(
-                        server._run_http({
-                            "url": "https://example.com/mcp/sse",
-                            "transport": "sse",
-                        }),
+                        server._run_http(
+                            {
+                                "url": "http://127.0.0.1:8201/mcp/sse",
+                                "transport": "sse",
+                                "follow_redirects": False,
+                            }
+                        ),
                         timeout=2.0,
                     )
                 except (asyncio.TimeoutError, StopAsyncIteration, Exception):
                     pass
 
         asyncio.run(drive())
-        assert "httpx_client_factory" not in patch_sse_client
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers=None, timeout=None, auth=None)
+
+        assert captured_client_kwargs["follow_redirects"] is False
+        assert captured_client_kwargs["trust_env"] is False
 
     def test_factory_injected_when_cert_set(self, patch_sse_client, tmp_path):
         """With client_cert set, an httpx_client_factory is injected that
@@ -293,6 +466,154 @@ class TestSSEClientCert:
         assert captured_client_kwargs["verify"] is True
         assert captured_client_kwargs["follow_redirects"] is True
         assert captured_client_kwargs["headers"] == {"x": "y"}
+
+    def test_sse_cross_origin_redirect_with_cert_is_blocked(
+        self, patch_sse_client, tmp_path
+    ):
+        from tools.mcp_tool import MCPServerTask
+
+        cert = tmp_path / "client.pem"
+        cert.write_text("dummy")
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http(
+                    {
+                        "url": "https://origin.example/mcp/sse",
+                        "transport": "sse",
+                        "headers": {"X-Api-Key": "synthetic-secret"},
+                        "client_cert": str(cert),
+                    }
+                )
+
+        asyncio.run(drive())
+        factory = patch_sse_client["httpx_client_factory"]
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(
+                headers={"X-Api-Key": "synthetic-secret"},
+                timeout=httpx.Timeout(30.0),
+                auth=None,
+            )
+
+        hook = captured_client_kwargs["event_hooks"]["response"][0]
+        response = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request(
+                "GET",
+                "https://origin.example/mcp/sse",
+                headers={"X-Api-Key": "synthetic-secret"},
+            ),
+        )
+        with pytest.raises(RuntimeError, match="cross-origin.*client certificate"):
+            asyncio.run(hook(response))
+
+    def test_sse_oauth_alone_installs_cross_origin_boundary(
+        self, patch_sse_client
+    ):
+        from tools.mcp_tool import MCPServerTask
+
+        auth = object()
+        manager = MagicMock()
+        manager.get_or_build_provider.return_value = auth
+        server = MCPServerTask("sse-oauth")
+        server._auth_type = "oauth"
+        server._sampling = None
+
+        async def drive():
+            with patch(
+                "tools.mcp_oauth_manager.get_manager", return_value=manager
+            ), patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http(
+                    {
+                        "url": "https://origin.example/mcp/sse",
+                        "transport": "sse",
+                    }
+                )
+
+        asyncio.run(drive())
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers={}, timeout=httpx.Timeout(30.0), auth=auth)
+
+        hook = captured_client_kwargs["event_hooks"]["response"][0]
+        response = httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/mcp/sse"},
+            request=httpx.Request("GET", "https://origin.example/mcp/sse"),
+        )
+        with pytest.raises(RuntimeError, match="cross-origin.*credential"):
+            asyncio.run(hook(response))
+
+    def test_sse_client_cert_is_independent_of_streamable_http_api(
+        self, patch_sse_client, tmp_path
+    ):
+        from tools.mcp_tool import MCPServerTask
+
+        cert = tmp_path / "client.pem"
+        cert.write_text("dummy")
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch("tools.mcp_tool._MCP_NEW_HTTP", False), patch.object(
+                MCPServerTask,
+                "_wait_for_lifecycle_event",
+                new=AsyncMock(return_value="shutdown"),
+            ), patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http(
+                    {
+                        "url": "https://example.com/mcp/sse",
+                        "transport": "sse",
+                        "client_cert": str(cert),
+                    }
+                )
+
+        asyncio.run(drive())
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers=None, timeout=None, auth=None)
+
+        assert captured_client_kwargs["cert"] == str(cert)
 
     def test_factory_forwards_custom_ca_bundle(self, patch_sse_client, tmp_path):
         """ssl_verify as a path is forwarded to the factory's httpx client."""

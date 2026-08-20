@@ -38,6 +38,7 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    NOTES_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
@@ -370,6 +371,42 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # Resolve the skills index before assembling guidance so its compact
+    # preamble can own the Hermes-docs and skill-maintenance contracts.  The
+    # old prompt repeated both contracts in separate blocks, adding roughly a
+    # thousand static characters to every tool-enabled request.
+    has_skills_tools = any(
+        name in agent.valid_tool_names
+        for name in ("skills_list", "skill_view", "skill_manage")
+    )
+    skills_prompt = ""
+    if has_skills_tools:
+        avail_toolsets = {
+            toolset
+            for toolset in (
+                _r.get_toolset_for_tool(tool_name)
+                for tool_name in agent.valid_tool_names
+            )
+            if toolset
+        }
+        # Focus mode (opt-in) demotes non-coding skill categories to
+        # names-only in the index while keeping every skill discoverable.
+        _compact_cats = frozenset()
+        try:
+            from agent.coding_context import coding_compact_skill_categories
+
+            _compact_cats = coding_compact_skill_categories(
+                platform=agent.platform,
+                cwd=resolve_context_cwd(),
+            )
+        except Exception:
+            _compact_cats = frozenset()
+        skills_prompt = _r.build_skills_system_prompt(
+            available_tools=agent.valid_tool_names,
+            available_toolsets=avail_toolsets,
+            compact_categories=_compact_cats or None,
+        )
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -390,8 +427,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # The rendered skills preamble contains the same Hermes skill + docs
+    # contract. Keep the standalone block only when no index is available.
+    if not skills_prompt:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -417,9 +456,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     tool_guidance = []
     if "memory" in agent.valid_tool_names:
         tool_guidance.append(MEMORY_GUIDANCE)
+    if "notes_write" in agent.valid_tool_names:
+        tool_guidance.append(NOTES_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
+    # The skills-index preamble already covers patching and saving reusable
+    # workflows. Preserve this fallback for installations with no skill index.
+    if "skill_manage" in agent.valid_tool_names and not skills_prompt:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -915,6 +958,213 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     return joined
 
 
+def _fmt_runtime_value(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+# Permanently static whenever a route catalog is active: current-turn route
+# decisions no longer render here (they would flip this line on the routed turn
+# AND flip it back on the next turn -- two whole-prompt cache busts per routing
+# event). Routed directives are delivered on the triggering turn's user
+# message instead; see ``format_routing_directive``. When routes are dormant,
+# the whole DesiredRoute line stays absent to preserve the CurrentRuntime-only
+# mode introduced by the runtime-route awareness port.
+_STATIC_DESIRED_ROUTE_LINE = (
+    "DesiredRoute: label=UNCLASSIFIED target=current strictness=none "
+    'confidence=unknown reason="no current-turn route decision supplied"'
+)
+
+_RUNTIME_ROUTE_POLICY = (
+    "Policy: This block is authoritative for this LLM call; do not infer "
+    "current runtime from stale session headers, memory, or prior turns. "
+    "model_status is diagnostic fallback only. A current-turn routing "
+    "directive, when present, arrives on the current user message as a "
+    "[Routing directive: ...] line and is authoritative for that turn; "
+    "compare it against CurrentRuntime and, if mismatched and not "
+    "user_strict, treat as a routing anomaly before substantive work. "
+    "Routing is bidirectional and may be re-evaluated after context "
+    "discovery."
+)
+
+_RUNTIME_ONLY_POLICY = (
+    "Policy: CurrentRuntime is authoritative for this LLM call; do not infer "
+    "the active runtime from stale session headers, memory, or prior turns. "
+    "model_status is diagnostic fallback only."
+)
+
+
+def format_routing_directive(route: Any) -> str:
+    """Render a one-shot routing directive for current-user-message delivery.
+
+    Replaces the old per-turn ``DesiredRoute`` rendering inside the system
+    prompt: the directive rides the triggering turn's user message (persisted
+    byte-exact via the api_content sidecar), so the system prompt tail stays
+    byte-stable across routing events.
+    """
+    if not isinstance(route, dict) or not route:
+        return ""
+    label = _fmt_runtime_value(
+        route.get("label") or route.get("route_label"), "RUNTIME_OVERRIDE"
+    )
+    provider = _fmt_runtime_value(
+        route.get("target_provider") or route.get("provider"), "current"
+    )
+    model = _fmt_runtime_value(
+        route.get("target_model") or route.get("model"), "current"
+    )
+    effort = _fmt_runtime_value(
+        route.get("target_reasoning_effort") or route.get("reasoning_effort"),
+        "current",
+    )
+    strictness = _fmt_runtime_value(
+        route.get("strictness"), "auto_reconsiderable"
+    )
+    confidence = _fmt_runtime_value(route.get("confidence"), "unknown")
+    source = _fmt_runtime_value(route.get("source"), "pre_gateway_dispatch")
+    reason = str(route.get("reason") or "runtime routing").strip().replace('"', "'")
+    return (
+        "[Routing directive: "
+        f"label={label} target={provider}/{model}/{effort} "
+        f"strictness={strictness} confidence={confidence} source={source} "
+        f'reason="{reason}"]'
+    )
+
+
+def build_runtime_route_block(agent: Any) -> str:
+    """Return the API-call-time runtime/route awareness block.
+
+    The cached session system prompt is intentionally stable. Runtime truth is
+    not: model switches, fallback activation, and reasoning overrides can all
+    happen after the prompt cache was built. This block is appended at the API
+    boundary so the model can self-identify from authoritative live state
+    without calling ``model_status``.
+
+    Byte-stability contract (prompt-tail freeze): the rendered text is a pure
+    function of the runtime key tuple ``(provider, model, api_mode, base_url,
+    model_source, reasoning, reasoning_source)`` and is cached on the agent as
+    ``(key_tuple, text)``. Per-API-call recompute is a tuple compare; the same
+    effective runtime always yields the exact same bytes. Mid-turn runtime
+    mutations (fallback activation, model_switch tool) change the tuple and
+    re-render -- a legitimate cache bust.
+
+    When no route catalog is declared, the branch's dormant behavior remains a
+    CurrentRuntime-only block. With a catalog, DesiredRoute is permanently
+    static and current-turn route intent rides the user-message sidecar.
+    """
+    try:
+        from agent.runtime_control import get_runtime_state
+
+        state = get_runtime_state(agent)
+    except Exception:
+        state = {
+            "model": getattr(agent, "model", ""),
+            "provider": getattr(agent, "provider", ""),
+            "api_mode": getattr(agent, "api_mode", ""),
+            "reasoning": getattr(agent, "reasoning_config", None),
+            "model_source": getattr(agent, "_runtime_model_source", None)
+            or "agent",
+        }
+
+    reasoning = state.get("reasoning") if isinstance(state, dict) else None
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort is None and reasoning.get("enabled") is False:
+            effort = "none"
+        reasoning_text = _fmt_runtime_value(effort)
+        reasoning_source = _fmt_runtime_value(reasoning.get("source"), "default")
+    else:
+        reasoning_text = _fmt_runtime_value(reasoning)
+        reasoning_source = "default"
+
+    key_tuple = (
+        _fmt_runtime_value(
+            state.get("provider") if isinstance(state, dict) else ""
+        ),
+        _fmt_runtime_value(state.get("model") if isinstance(state, dict) else ""),
+        _fmt_runtime_value(
+            state.get("api_mode") if isinstance(state, dict) else ""
+        ),
+        _fmt_runtime_value(
+            state.get("base_url") if isinstance(state, dict) else ""
+        ),
+        _fmt_runtime_value(
+            state.get("model_source") if isinstance(state, dict) else "agent",
+            "agent",
+        ),
+        reasoning_text,
+        reasoning_source,
+    )
+    cached = getattr(agent, "_runtime_route_block_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and cached[0] == key_tuple
+        and isinstance(cached[1], str)
+    ):
+        return cached[1]
+
+    route_info = None
+    try:
+        from agent.runtime_control import _route_status_info
+
+        route_info = _route_status_info(agent)
+    except Exception:
+        route_info = None
+
+    # Route-language identity (ADR-003 Phase 3c): the model self-identifies as
+    # route + model. Raw provider/endpoint/api-mode identifiers are operator
+    # data -- surfacing them in every prompt invited stale-model bias and
+    # free-form switching requests. They remain in the cache key above (an
+    # endpoint/api-mode change must still re-render) but not in the rendered
+    # text. Route resolution is a pure function of the key tuple given stable
+    # config, so caching stays byte-correct. No catalog means no route field.
+    route_label = ""
+    if isinstance(route_info, dict):
+        route_label = str(route_info.get("current") or "") or "off-catalog"
+
+    current = (
+        "CurrentRuntime: "
+        + (f"route={route_label} " if route_label else "")
+        + f"model={key_tuple[1]} "
+        f"reasoning={reasoning_text} "
+        f"source={key_tuple[4]} "
+        # Always emitted (default ``default``): a presence-toggling suffix
+        # shifts every byte after it and re-keys the provider prompt cache.
+        f"reasoning_source={reasoning_source}"
+    )
+
+    if isinstance(route_info, dict):
+        text = (
+            "# Runtime/Route State\n"
+            + current
+            + "\n"
+            + _STATIC_DESIRED_ROUTE_LINE
+            + "\n"
+            + _RUNTIME_ROUTE_POLICY
+        )
+    else:
+        text = "# Runtime/Route State\n" + current + "\n" + _RUNTIME_ONLY_POLICY
+    try:
+        agent._runtime_route_block_cache = (key_tuple, text)
+    except Exception:
+        pass
+    return text
+
+
+def compose_effective_system_prompt(agent: Any, base_prompt: str) -> str:
+    """Append API-call-time system prompt additions to a cached base prompt."""
+    effective_system = base_prompt or ""
+    if getattr(agent, "ephemeral_system_prompt", None):
+        effective_system = (
+            effective_system + "\n\n" + agent.ephemeral_system_prompt
+        ).strip()
+    runtime_route_block = build_runtime_route_block(agent)
+    if runtime_route_block:
+        effective_system = (effective_system + "\n\n" + runtime_route_block).strip()
+    return effective_system
+
+
 def invalidate_system_prompt(agent: Any) -> None:
     """Invalidate the cached system prompt, forcing a rebuild on the next turn.
 
@@ -1008,6 +1258,9 @@ def format_tools_for_system_message(agent: Any) -> str:
 __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
+    "build_runtime_route_block",
+    "format_routing_directive",
+    "compose_effective_system_prompt",
     "invalidate_system_prompt",
     "restore_plugin_prompt_sections",
     "format_tools_for_system_message",

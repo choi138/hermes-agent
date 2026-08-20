@@ -35,6 +35,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -69,16 +70,17 @@ from hermes_constants import get_hermes_home
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
-    Only local CLI sessions get a recorded cwd: the directory the process was
-    launched from is meaningful for ``hermes -c`` / ``--resume`` (relaunch
-    where you left off). Gateway/cron/remote-backend sessions have no stable
-    host cwd to restore, so they record nothing.
+    Only local CLI and dispatcher-spawned Kanban sessions get a recorded cwd:
+    the directory the process was launched from is meaningful for ``hermes
+    -c`` / ``--resume`` and identifies a worker's bound workspace.
+    Gateway/cron/remote-backend sessions have no stable host cwd to restore,
+    so they record nothing.
 
     ``TERMINAL_ENV`` is set by the CLI's config bridge (``load_cli_config``);
     a non-"local" backend (docker/ssh/modal/...) means the host cwd is
     irrelevant to the agent's tools, so we skip it there too.
     """
-    if source != "cli":
+    if source not in {"cli", "kanban"}:
         return None
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     if backend and backend != "local":
@@ -100,6 +102,8 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     source = str(source or "").strip()
     if source:
         return source
+    if str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return "kanban"
     return platform or "cli"
 
 
@@ -115,6 +119,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent import turn_trace
 from agent.interrupt_compat import request_hard_interrupt
 
 
@@ -1392,7 +1397,11 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = get_provider_request_timeout(
+            self.provider,
+            self.model,
+            requested_provider=getattr(self, "requested_provider", None),
+        )
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -1415,7 +1424,11 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = get_provider_stale_timeout(
+            self.provider,
+            self.model,
+            requested_provider=getattr(self, "requested_provider", None),
+        )
         if cfg is not None:
             return cfg, False
 
@@ -1451,7 +1464,10 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        from agent.chat_completion_helpers import estimate_request_context_tokens
+        from agent.chat_completion_helpers import (
+            apply_openai_codex_stale_timeout_floor,
+            estimate_request_context_tokens,
+        )
         est_tokens = estimate_request_context_tokens(api_payload)
         if est_tokens > 100_000:
             timeout = max(stale_base, 240.0)
@@ -1459,6 +1475,12 @@ class AIAgent:
             timeout = max(stale_base, 150.0)
         else:
             timeout = stale_base
+
+        timeout = apply_openai_codex_stale_timeout_floor(
+            self,
+            api_payload,
+            timeout,
+        )
 
         # Wall-clock run budget cap: when a run budget is active, an implicit
         # (floor-/default-derived) stale timeout is capped at half the
@@ -1485,7 +1507,11 @@ class AIAgent:
         and the 90s default are implicit — they yield to the wall-clock run
         budget cap; explicit user configuration never does.
         """
-        if get_provider_stale_timeout(self.provider, self.model) is not None:
+        if get_provider_stale_timeout(
+            self.provider,
+            self.model,
+            requested_provider=getattr(self, "requested_provider", None),
+        ) is not None:
             return True
         return os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
 
@@ -1513,14 +1539,9 @@ class AIAgent:
         """
         if self.api_mode != "codex_responses":
             return None
-        is_codex_backend = (
-            self.provider == "openai-codex"
-            or (
-                getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-                and "/backend-api/codex" in (getattr(self, "_base_url_lower", "") or "")
-            )
-        )
-        if not is_codex_backend:
+        from agent.chat_completion_helpers import _is_openai_codex_backend
+
+        if not _is_openai_codex_backend(self):
             return None
         eff_model = (model if model is not None else self.model) or ""
         model_lower = eff_model.lower()
@@ -1840,29 +1861,28 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
         focus: Optional[str] = None,
-    ) -> None:
-        """Spawn the background memory/skill review thread.
+    ) -> bool:
+        """Queue a deduplicated background memory/skill review.
 
-        Thin wrapper — the heavy lifting lives in
+        The review fork itself still lives in
         ``agent.background_review.spawn_background_review_thread`` which
-        returns the thread target.  ``threading.Thread`` is constructed
-        here so existing tests that patch ``run_agent.threading.Thread``
-        keep working.
+        returns the executable target.  A process-wide coordinator owns the
+        daemon worker so concurrent sessions cannot start a review storm.
 
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
         """
-        # A delegation subagent (``_delegate_depth > 0``) must not run the
-        # automatic post-turn review. Subagents are ephemeral workers already
-        # barred from writing shared MEMORY.md (``DELEGATE_BLOCKED_TOOLS``) and
-        # are spawned with ``skip_memory=True``, so a review here has little to
-        # persist — yet it inherits the subagent's (often premium) delegation
-        # model and replays the whole conversation at premium rates, silently
-        # inflating token cost (#85859). An explicit ``/refine`` (``focus`` set)
-        # is a deliberate user request and still runs.
-        if focus is None and getattr(self, "_delegate_depth", 0) > 0:
-            return
+        from agent.background_review_policy import is_primary_foreground_agent
+
+        # Defense in depth: trigger sites use the same gate, but callers may
+        # invoke this method directly. Never let delegated workers or an
+        # internal review fork schedule another self-improvement review.
+        if not is_primary_foreground_agent(self):
+            return False
+        if not review_memory and not review_skills:
+            return False
+
         # Explicit off-switch for automatic post-turn forks
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
         # still works — same contract as zeroing the nudge intervals (#87250).
@@ -1873,23 +1893,67 @@ class AIAgent:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
-                return
+                return False
         from agent.background_review import spawn_background_review_thread
+        from agent.background_review_coordinator import (
+            ensure_background_review_owner_token,
+            get_background_review_coordinator,
+        )
         from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
+
+        snapshot = list(messages_snapshot)
+        # Build all possible targets while the foreground profile Context is
+        # still active.  ``propagate_context_to_thread`` captures that Context
+        # now, so a queued review writes to the right profile later (#54937).
+        targets = {}
+        for memory_flag, skills_flag in ((True, False), (False, True), (True, True)):
+            target, _prompt = spawn_background_review_thread(
+                self,
+                snapshot,
+                review_memory=memory_flag,
+                review_skills=skills_flag,
+                focus=focus,
+                task_cfg=task_cfg,
+            )
+            targets[(memory_flag, skills_flag)] = propagate_context_to_thread(target)
+
+        def _target_factory(memory_flag: bool, skills_flag: bool):
+            return targets[(memory_flag, skills_flag)]
+
+        coordinator = get_background_review_coordinator()
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+            review_cfg = (
+                auxiliary.get("background_review", {})
+                if isinstance(auxiliary, dict)
+                else {}
+            )
+            if not isinstance(review_cfg, dict):
+                review_cfg = {}
+            coordinator.configure(
+                idle_grace_seconds=float(review_cfg.get("idle_grace_seconds", 2.0)),
+                dedupe_ttl_seconds=float(review_cfg.get("dedupe_ttl_seconds", 3600.0)),
+                queue_limit=int(review_cfg.get("queue_limit", 64)),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid auxiliary.background_review coordinator settings; "
+                "using the last valid values"
+            )
+        except Exception:
+            logger.debug("Background review coordinator config load failed", exc_info=True)
+
+        disposition = coordinator.submit(
+            owner_token=ensure_background_review_owner_token(self),
+            messages_snapshot=snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
-            focus=focus,
-            task_cfg=task_cfg,
+            target_factory=_target_factory,
         )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+        return disposition != "queue_full"
 
     def _build_memory_write_metadata(
         self,
@@ -4282,6 +4346,137 @@ class AIAgent:
         except Exception:
             pass  # Never let header parsing break the agent loop
 
+    @staticmethod
+    def _recap_tool_label(function_name: str, arguments: Any) -> str:
+        """Render a compact semantic tool label instead of raw JSON noise."""
+        parsed = None
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            pass
+        if isinstance(parsed, dict):
+            if function_name == "terminal" and parsed.get("command"):
+                return f"terminal: {str(parsed['command'])[:70]}"
+            for key in ("path", "file_path", "file"):
+                if parsed.get(key):
+                    return f"{function_name}: {str(parsed[key])[:70]}"
+            if function_name == "search_files" and (
+                parsed.get("pattern") or parsed.get("query")
+            ):
+                query = parsed.get("pattern") or parsed.get("query")
+                return f"search: {str(query)[:60]}"
+            if parsed.get("action"):
+                return f"{function_name} {parsed['action']}"
+            if parsed.get("query"):
+                return f"{function_name}: {str(parsed['query'])[:60]}"
+        return f"{function_name}({str(arguments)[:50]})"
+
+    def get_activity_recap_context(self) -> dict:
+        """Return a read-only snapshot for gateway activity recaps.
+
+        The live message list is copied before inspection so the gateway loop
+        can request a recap while the agent turn continues in its worker.
+        """
+        messages = list(getattr(self, "_session_messages", None) or [])
+        goal = ""
+        goal_fallback = ""
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if not goal_fallback:
+                goal_fallback = text[:300]
+            stripped = re.sub(r"^(\[[^\]]*\]\s*)+", "", text).strip()
+            if stripped:
+                goal = stripped[:300]
+                break
+        if not goal:
+            goal = goal_fallback
+
+        recent_tools: list[str] = []
+        for message in reversed(messages):
+            if len(recent_tools) >= 5:
+                break
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                try:
+                    if isinstance(tool_call, dict):
+                        function = tool_call.get("function", {})
+                        function_name = function.get("name", "?")
+                        arguments = function.get("arguments", "")
+                    else:
+                        function_name = tool_call.function.name
+                        arguments = tool_call.function.arguments
+                except Exception:
+                    continue
+                recent_tools.append(
+                    self._recap_tool_label(function_name, arguments)
+                )
+                if len(recent_tools) >= 5:
+                    break
+
+        def _is_agent_utterance(text: str) -> bool:
+            lowered = text.strip().lower()
+            return bool(lowered) and not (
+                lowered.startswith("operation interrupted")
+                or lowered.startswith("(tool call")
+                or lowered.startswith("[")
+            )
+
+        voice_samples: list[str] = []
+        for message in reversed(messages):
+            if len(voice_samples) >= 3:
+                break
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and isinstance(message.get("content"), str)
+                and _is_agent_utterance(message["content"])
+            ):
+                voice_samples.append(
+                    " ".join(message["content"].strip().split())[:180]
+                )
+        voice_samples.reverse()
+
+        last_tool_result = ""
+        for message in reversed(messages):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "tool"
+                and isinstance(message.get("content"), str)
+                and message["content"].strip()
+            ):
+                last_tool_result = " ".join(
+                    message["content"].strip().split()
+                )[:150]
+                break
+
+        # A fresh session has no assistant utterances to imitate. The frozen
+        # system prompt carries its persona and style definition, so use a
+        # bounded prefix as the final voice source.
+        persona_snippet = ""
+        system_prompt = getattr(self, "_cached_system_prompt", None)
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            persona_snippet = system_prompt.strip()[:900]
+
+        summary = self.get_activity_summary()
+        return {
+            "goal": goal,
+            "recent_tools": list(reversed(recent_tools)),
+            "voice_samples": voice_samples,
+            "persona_snippet": persona_snippet,
+            "last_tool_result": last_tool_result,
+            "current_tool": summary.get("current_tool"),
+            "seconds_since_activity": summary.get("seconds_since_activity"),
+            "last_activity_desc": summary.get("last_activity_desc"),
+            "iteration": summary.get("api_call_count"),
+            "max_iterations": summary.get("max_iterations"),
+        }
+
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
@@ -4321,13 +4516,46 @@ class AIAgent:
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager:
+        # Ingest-curator session-end boundary (ADR-004 Phase 2, SHADOW):
+        # ≥3-turn sessions with a dirty buffer get a cold curation run on a
+        # daemon thread. Observed BEFORE provider teardown so the fork's
+        # memory_search reads still work. No-op unless curator.ingest_enabled;
+        # internally skips ingest-disabled forks; fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator session-end observation failed (fail-open)",
+                exc_info=True,
+            )
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and not memory_ingest_allowed(self):
+            # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager —
+            # it is rebound from the parent. on_session_end would run
+            # end-of-session extraction (a graph write) on the fork's harness
+            # transcript, and shutdown_all would tear down the parent's live
+            # provider mid-session. Skip both; the real owner cleans up.
+            pass
+        elif self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
+            except Exception:
+                pass
+            # ADR-004 §① origin-taint (Phase 2): evict this session's
+            # in-memory injected-span registry (the durable sidecar is kept
+            # for post-session readers — curator, dream — and TTLs out via
+            # its own GC). Owner-only by construction: this branch is only
+            # reached when memory_ingest_allowed(self), so an ingest-disabled
+            # fork sharing the parent's live session can never evict the
+            # parent's registry state mid-conversation.
+            try:
+                from agent import memory_taint
+                memory_taint.end_session(self.session_id or "")
             except Exception:
                 pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
@@ -4345,7 +4573,18 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if self._memory_manager:
+        # Ingest-curator session boundary (ADR-004 Phase 2, SHADOW) — same
+        # rationale as in shutdown_memory_provider. Fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator session-end observation failed (fail-open)",
+                exc_info=True,
+            )
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and memory_ingest_allowed(self):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
@@ -4402,6 +4641,13 @@ class AIAgent:
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
+            return
+        # ADR-004 Phase 0: ingest-disabled forks (background review, ingest
+        # curator) share the parent's manager for reads only — this is the
+        # sync_all/queue_prefetch_all write chokepoint (turn_finalizer +
+        # codex_runtime both land here), so it must gate.
+        from agent.memory_manager import memory_ingest_allowed
+        if not memory_ingest_allowed(self):
             return
         # Multimodal turns carry content as a list of typed parts; providers
         # expect plain strings, so flatten to text first (newline-joined for
@@ -4495,7 +4741,7 @@ class AIAgent:
         except Exception:
             pass
 
-    def close(self) -> None:
+    def close(self, *, shutdown_deadline: float | None = None) -> None:
         """Release all resources held by this agent instance.
 
         Cleans up subprocess resources that would otherwise become orphans:
@@ -4508,6 +4754,8 @@ class AIAgent:
 
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
+        During gateway shutdown, *shutdown_deadline* bounds terminal sandbox
+        sync-back without changing the normal session-close timeout policy.
         """
         # AIAgent.close() is the hard owner boundary. Gateway cleanup may
         # call shutdown_memory_provider() first; its idempotence prevents
@@ -4531,7 +4779,15 @@ class AIAgent:
 
         # 2. Clean terminal sandbox environments
         try:
-            cleanup_vm(task_id)
+            if shutdown_deadline is None:
+                cleanup_vm(task_id)
+            else:
+                cleanup_vm(
+                    task_id,
+                    shutdown_timeout_seconds=max(
+                        0.0, shutdown_deadline - time.monotonic()
+                    ),
+                )
         except Exception:
             pass
 
@@ -4560,7 +4816,20 @@ class AIAgent:
                 self._active_children.clear()
             for child in children:
                 try:
-                    child.close()
+                    close_fn = child.close
+                    supports_shutdown_deadline = False
+                    if shutdown_deadline is not None:
+                        try:
+                            supports_shutdown_deadline = (
+                                "shutdown_deadline"
+                                in inspect.signature(close_fn).parameters
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if supports_shutdown_deadline:
+                        close_fn(shutdown_deadline=shutdown_deadline)
+                    else:
+                        close_fn()
                 except Exception:
                     pass
         except Exception:
@@ -5341,6 +5610,12 @@ class AIAgent:
         return cache
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        with turn_trace.safe_span("llm.client_create", obj=self):
+            return self._create_request_openai_client_impl(
+                reason=reason, api_kwargs=api_kwargs
+            )
+
+    def _create_request_openai_client_impl(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
@@ -5528,7 +5803,11 @@ class AIAgent:
             "direct",
             self._anthropic_api_key,
             getattr(self, "_anthropic_base_url", None),
-            get_provider_request_timeout(self.provider, self.model),
+            get_provider_request_timeout(
+                self.provider,
+                self.model,
+                requested_provider=getattr(self, "requested_provider", None),
+            ),
             bool(getattr(self, "_oauth_1m_beta_disabled", False)),
         )
 
@@ -5593,7 +5872,7 @@ class AIAgent:
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=key[3],
                 drop_context_1m_beta=key[4],
             )
         logger.debug(
@@ -6262,7 +6541,11 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6404,7 +6687,11 @@ class AIAgent:
             self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -6515,7 +6802,11 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider,
+                    self.model,
+                    requested_provider=getattr(self, "requested_provider", None),
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
 
@@ -7320,7 +7611,11 @@ class AIAgent:
         the agent has a chance to recover.
         """
         if not _is_multimodal_tool_result(result):
-            return result
+            # Provenance-bearing string subclasses are only needed while the
+            # executor evaluates trusted control metadata. Canonical model
+            # history must contain plain strings so copy/serialization paths do
+            # not retain out-of-band registry objects.
+            return str(result) if isinstance(result, str) else result
 
         content = result.get("content") or []
         if not self._content_has_image_parts(content):
@@ -8268,14 +8563,29 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+        self._kanban_terminal_transition = None
+
+        # Keep the running tool-call count on the trace so the root span can
+        # report it without adding mutable state to the agent core.
+        _tt = turn_trace.safe_get_bound(self)
+        if _tt is not None:
+            turn_trace.safe_increment_tag(
+                _tt, "tool_calls", len(tool_calls)
+            )
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if len(tool_calls) <= 1:
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+            if len(tool_calls) <= 1 or any(
+                call.function.name in {"kanban_complete", "kanban_block"}
+                for call in tool_calls
+            ):
+                with turn_trace.safe_span(
+                    "tools.batch", trace=_tt, count=len(tool_calls), mode="sequential"
+                ):
+                    return self._execute_tool_calls_sequential(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
             _active_env = get_active_env(effective_task_id)
@@ -8284,19 +8594,34 @@ class AIAgent:
 
             if len(segments) == 1:
                 kind = segments[0][0]
-                if kind == "parallel":
-                    return self._execute_tool_calls_concurrent(
+                _mode = "concurrent" if kind == "parallel" else "sequential"
+                with turn_trace.safe_span(
+                    "tools.batch", trace=_tt, count=len(tool_calls), mode=_mode
+                ):
+                    if kind == "parallel":
+                        return self._execute_tool_calls_concurrent(
+                            assistant_message, messages, effective_task_id, api_call_count
+                        )
+                    return self._execute_tool_calls_sequential(
                         assistant_message, messages, effective_task_id, api_call_count
                     )
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
 
             from agent.tool_executor import execute_tool_calls_segmented
-            return execute_tool_calls_segmented(
-                self, assistant_message, messages, effective_task_id, api_call_count,
-                segments=segments,
-            )
+            with turn_trace.safe_span(
+                "tools.batch",
+                trace=_tt,
+                count=len(tool_calls),
+                mode="segmented",
+                segments=len(segments),
+            ):
+                return execute_tool_calls_segmented(
+                    self,
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                    segments=segments,
+                )
         finally:
             self._executing_tools = False
 
@@ -8333,6 +8658,9 @@ class AIAgent:
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
             parent_agent=self,
+            route=function_args.get("route"),
+            model=function_args.get("model"),
+            provider=function_args.get("provider"),
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
@@ -8437,6 +8765,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        resume_turn: bool = False,
+        turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8461,6 +8791,21 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
+        # Resolve the observability work lane ONCE per turn, on the turn thread
+        # where the routing ContextVar is valid. Used only as the SEED for
+        # per-attempt state (compression telemetry, wire-attempt records) — never
+        # read live at emit time, which is what keeps a concurrent turn or a
+        # pooled compression worker from relabelling another lane's row.
+        try:
+            from hermes_cli.observability import work_lane as _work_lane_module
+
+            self._work_lane = _work_lane_module.current_work_lane(
+                platform=str(task_context["platform"] or ""),
+                is_subagent=bool(getattr(self, "is_subagent", False)),
+                parent_session_id=str(getattr(self, "_parent_session_id", "") or ""),
+            )
+        except Exception:
+            self._work_lane = "unknown"
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
@@ -8802,6 +9147,8 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        resume_turn=resume_turn,
+                        turn_id=turn_id,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

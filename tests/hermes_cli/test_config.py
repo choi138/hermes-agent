@@ -31,6 +31,16 @@ from hermes_cli.config import (
 )
 
 
+def test_ssh_connection_pool_has_config_default_and_env_bridge():
+    from hermes_cli.config import terminal_config_env_var_for_key
+
+    assert DEFAULT_CONFIG["terminal"]["ssh_connection_pool_size"] == 3
+    assert (
+        terminal_config_env_var_for_key("terminal.ssh_connection_pool_size")
+        == "TERMINAL_SSH_CONNECTION_POOL_SIZE"
+    )
+
+
 class TestGetHermesHome:
     def test_default_path(self):
         with patch.dict(os.environ, {}, clear=False):

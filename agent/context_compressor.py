@@ -40,6 +40,7 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.tool_arg_elision import make_tool_arg_elision
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -340,6 +341,32 @@ _SUMMARY_END_MARKER = (
     "--- END OF CONTEXT SUMMARY — "
     "respond to the message below, not the summary above ---"
 )
+
+
+def _strip_analysis_block(text: str) -> str:
+    """Remove the ``<analysis>...</analysis>`` preparation block from a summary.
+
+    The summarization prompt asks the model to think through the turns inside
+    ``<analysis>`` tags before writing the summary body (chronological
+    pre-pass). The block is working material, not summary content — stored or
+    replayed it would bloat every subsequent iterative-update prompt, exactly
+    like ``<think>`` traces. Handles an unclosed tag defensively: everything
+    from ``<analysis>`` up to the first markdown heading after it is dropped
+    (or to end-of-text when no heading follows).
+    """
+    stripped = re.sub(
+        r"<analysis>.*?</analysis>", "", text, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
+    match = re.search(r"<analysis>", stripped, flags=re.IGNORECASE)
+    if match:
+        rest = stripped[match.start():]
+        heading = re.search(r"^#{1,3} ", rest, flags=re.MULTILINE)
+        if heading:
+            stripped = (stripped[: match.start()] + rest[heading.start():]).strip()
+        else:
+            stripped = stripped[: match.start()].strip()
+    return stripped
+
 
 # When the summary must be merged into the first tail message (the alternation
 # corner case where a standalone summary role would collide with both head and
@@ -1437,12 +1464,15 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     and the session gets stuck re-sending the same broken history on every
     turn. See issue #11762 for the observed loop.
 
-    This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
-    to begin with — some model backends use non-JSON tool arguments — the
-    original string is returned unchanged rather than replaced with
-    something neither we nor the backend can parse.
+    This helper parses the arguments, replaces long string leaves with an
+    explicit non-replayable tombstone, and re-serialises. Keeping a literal
+    prefix is unsafe for mutating tools: a compacted ``write_file.content``
+    prefix was later mistaken for complete file bytes and overwrote a
+    633-line source file with a 246-byte preview. Non-string values and short
+    strings (paths, ints, booleans) are preserved intact. If the arguments are
+    not valid JSON to begin with — some model backends use non-JSON tool
+    arguments — the original string is returned unchanged rather than
+    replaced with something neither we nor the backend can parse.
     """
     try:
         parsed = json.loads(args)
@@ -1452,7 +1482,7 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                return make_tool_arg_elision(obj)
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
@@ -1904,6 +1934,16 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_tokens_saved_total = 0
         self._micro_compact_turns_since_pass = 0
 
+        # R5 drift probe: /new and /reset are also real session boundaries, so
+        # the parked fingerprint must not survive them either.
+        if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+            try:
+                from agent.summary_prompt_drift import clear as _r5_drift_clear
+
+                _r5_drift_clear(getattr(self, "_session_id", "") or "")
+            except Exception:  # pragma: no cover - probe cleanup is best-effort
+                pass
+
     def _begin_compression_telemetry(
         self,
         *,
@@ -1914,15 +1954,27 @@ class ContextCompressor(ContextEngine):
     ) -> Dict[str, Any]:
         """Initialize content-free per-attempt compression telemetry."""
         seed = getattr(self, "_compression_telemetry_seed", None)
+        seed_work_lane = ""
+        seed_platform = ""
         if isinstance(seed, dict):
             attempt_id = attempt_id or seed.get("attempt_id")
             session_id = session_id or seed.get("session_id")
             trigger_source = trigger_source or seed.get("trigger_source")
+            seed_work_lane = str(seed.get("work_lane") or "")
+            seed_platform = str(seed.get("platform") or "")
         telemetry: Dict[str, Any] = {
             "event": "compression_attempt",
             "attempt_id": attempt_id or uuid.uuid4().hex,
             "session_id": session_id or "",
             "trigger_source": trigger_source or "unknown",
+            # Immutable per-attempt lane/surface for the local observation rows.
+            "work_lane": seed_work_lane,
+            "platform": seed_platform,
+            # Populated by compress() once the real estimates exist; present as
+            # None on every early-return/abort path so the payload shape is
+            # stable for all 11 emit sites.
+            "tokens_before": None,
+            "tokens_after": None,
             "main_provider": self.provider or "",
             "main_model": self.model or "",
             "main_context_limit": _safe_int(self.context_length),
@@ -2177,6 +2229,18 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        # R5 drift probe: drop the parked fingerprint on the same boundary this
+        # method exists to police. Defence in depth only — entries are keyed by
+        # session_id, the observe path rejects a foreign session, and the store
+        # is LRU-capped — but the probe's lifecycle should match every other
+        # per-session compaction field.
+        if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+            try:
+                from agent.summary_prompt_drift import clear as _r5_drift_clear
+
+                _r5_drift_clear(session_id)
+            except Exception:  # pragma: no cover - probe cleanup is best-effort
+                pass
         self._proactive_prune_rearm_tokens = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
@@ -2826,6 +2890,8 @@ class ContextCompressor(ContextEngine):
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
+        preflight_defer_growth_tokens: int = 4096,
+        preflight_defer_growth_ratio: float = 0.05,
         min_tail_user_messages: int = 1,
         tail_mode: str = "legacy",
     ):
@@ -2886,6 +2952,26 @@ class ContextCompressor(ContextEngine):
         self.proactive_prune_min_reclaim_tokens = max(
             0, int(proactive_prune_min_reclaim_tokens or 0)
         )
+        # Aperture of should_defer_preflight_to_real_usage(). These two scalars
+        # are read by that ONE predicate and by nothing else — not by
+        # compress(), not by _generate_summary(), not by any boundary or commit
+        # path — so no code that reshapes or persists a transcript can observe
+        # them. They are immutable configuration, never per-attempt state, so
+        # they need no entry in _COMPRESSOR_ATTEMPT_STATE_FIELDS and cannot
+        # survive or defeat a compression rollback.
+        #
+        # Defaults 4096 / 0.05 make the derived tolerance identical to the
+        # previously hardcoded max(4096, int(threshold_tokens * 0.05)).
+        # Clamped defensively (same idiom as proactive_prune_min_reclaim_tokens
+        # above) so a hostile config value degrades toward zero tolerance —
+        # i.e. NEVER defer, today's most conservative behavior — rather than
+        # toward an unbounded aperture.
+        self.preflight_defer_growth_tokens = max(
+            0, int(preflight_defer_growth_tokens or 0)
+        )
+        self.preflight_defer_growth_ratio = min(
+            1.0, max(0.0, float(preflight_defer_growth_ratio or 0.0))
+        )
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
@@ -2910,6 +2996,15 @@ class ContextCompressor(ContextEngine):
         # the prompt-cache prefix every turn instead of at an episodic
         # boundary. Operators opt in via `compression.micro_compact: true`.
         self._micro_compact_enabled: bool = False
+        # ── R5 summariser-prompt drift probe (read-only measurement) ──
+        # Default: OFF. When on, ``_generate_summary`` records whether the
+        # auto-derived focus block it is about to send matches the one derived
+        # at the previous quiescent point (parked by turn_finalizer). Records
+        # only hashes and counters — no cached summary, no provider call
+        # skipped, no behaviour change at any setting. Stamped from
+        # ``compression.summary_prompt_drift_probe`` in agent_init; that stamp
+        # is hasattr-guarded, so this declaration is what makes it effective.
+        self._r5_prompt_drift_probe_enabled: bool = False
         self._micro_compact_cursor: int = 0
         self._micro_compact_rolling_summary: str = ""
         self._micro_compact_consecutive_failures: int = 0
@@ -3045,6 +3140,19 @@ class ContextCompressor(ContextEngine):
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
+            # R5 probe (DEBUG only, inert): pairs the provider's REAL prompt
+            # count with the rough estimate that drove the last compaction for
+            # the same conversation. The estimate-vs-real gap is the quantity
+            # that decides whether foreground preflight compression is necessary
+            # at all; it is reconstructable from a log file at zero provider
+            # cost. Deliberately NOT a metric — the observability funnel and its
+            # closed compression_failure vocabulary stay read-only for R5.
+            logger.debug(
+                "hermes.r5probe real_usage prompt_tokens=%d "
+                "last_compression_rough=%d threshold=%d",
+                self.last_prompt_tokens, self.last_compression_rough_tokens,
+                self.threshold_tokens,
+            )
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
@@ -3583,15 +3691,21 @@ class ContextCompressor(ContextEngine):
                 return False
             new_tcs = []
             modified = False
-            for tc in msg["tool_calls"]:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
+            for tool_call in msg["tool_calls"]:
+                if isinstance(tool_call, dict):
+                    args = tool_call.get("function", {}).get("arguments", "")
                     if len(args) > 500:
                         new_args = _truncate_tool_call_args_json(args)
                         if new_args != args:
-                            tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
+                            tool_call = {
+                                **tool_call,
+                                "function": {
+                                    **tool_call["function"],
+                                    "arguments": new_args,
+                                },
+                            }
                             modified = True
-                new_tcs.append(tc)
+                new_tcs.append(tool_call)
             if modified:
                 result[idx] = {**msg, "tool_calls": new_tcs}
             return modified
@@ -4093,6 +4207,9 @@ Unknown from deterministic fallback. Inspect current repository/session state if
 ## Key Decisions
 None recoverable from deterministic fallback.
 
+## User Messages
+None recoverable from deterministic fallback.
+
 ## Resolved Questions
 None recoverable from deterministic fallback.
 
@@ -4418,6 +4535,47 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         except Exception:  # pragma: no cover - clock resolution is best-effort
             _today_str = ""
 
+        # ── R5 summariser-prompt drift probe (read-only, default OFF) ─────
+        # Every prompt component is already a local variable at this point, so
+        # capturing the complete fingerprint costs only hashing — no extraction
+        # of a pure `_build_summary_prompt` is needed, and not one prompt byte
+        # moves. This seam is deliberately AFTER the cooldown early-return
+        # above (a suppressed attempt must produce no observation) and the
+        # pre-LLM feasibility skip never reaches _generate_summary at all, so
+        # both denominator-pollution cases are excluded structurally.
+        #
+        # This records; it never decides. There is no cache lookup here and no
+        # branch anywhere below that consults one: the provider call remains
+        # unconditional at every gate setting.
+        if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+            try:
+                from agent.summary_prompt_drift import observe as _r5_drift_observe
+
+                _r5_drift_observe(
+                    session_id=getattr(self, "_session_id", "") or "",
+                    focus_topic=focus_topic,
+                    # compress() collapses a user-supplied `/compress <focus>`
+                    # and an auto-derived block into one argument, so the
+                    # attribution marker is set at that call site.
+                    explicit_focus=bool(
+                        getattr(self, "_r5_focus_was_explicit", False)
+                    ),
+                    prev_summary=self._previous_summary or "",
+                    has_user_turn=has_user_turn,
+                    today_str=_today_str,
+                    window_text=content_to_summarize,
+                    window_bounded=(
+                        "...[summary input truncated: omitted "
+                        in content_to_summarize
+                    ),
+                    budget=summary_budget,
+                    memory_context=_sanitized_memory_context,
+                    span_len=len(turns_to_summarize),
+                    msg_count=None,
+                )
+            except Exception:  # pragma: no cover - a probe must never break compaction
+                pass
+
         # Preamble shared by both first-compaction and iterative-update prompts.
         # Keep the wording deliberately plain: Azure/OpenAI-compatible content
         # filters have flagged stronger "injection" / "do not respond" framing.
@@ -4527,6 +4685,23 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
         else:
             _temporal_anchoring_rule = ""
 
+        # Chronological analysis pre-pass (mirrors Claude Code's /compact
+        # design). A cheap/fast summarizer that fills the template in one shot
+        # tends to fabricate or drop detail; forcing an explicit read-through
+        # first measurably improves faithfulness. The block is stripped from
+        # the output in the success path below — it never reaches the
+        # conversation or the iterative-update feedback loop. Wording is kept
+        # plain for the same content-filter reason as the preamble.
+        _analysis_pass_rule = (
+            "First, inside <analysis></analysis> tags, work through the turns "
+            "chronologically as preparation: note each user request and piece "
+            "of feedback, the actions taken and their outcomes, exact file "
+            "paths / errors / values worth preserving, and what was in flight "
+            "at the end. This preparation block is discarded automatically — "
+            "it is the one exception to the no-preamble rule. After the "
+            "closing </analysis> tag, write the summary body only."
+        )
+
         # Shared structured template (used by both paths).
         _template_sections = f"""{HISTORICAL_TASK_HEADING}
 {_historical_task_instructions}
@@ -4550,6 +4725,8 @@ Be specific with file paths, commands, line numbers, and results.]
 [Current working state — include:
 - Working directory and branch (if applicable)
 - Modified/created files with brief note on each
+- For an unfinished edit, include the exact in-flight snippet or diff verbatim
+  in a fenced block (a prose description alone cannot be resumed safely)
 - Test status (X/Y passing)
 - Any running processes or servers
 - Environment details that matter]
@@ -4560,6 +4737,14 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Key Decisions
 [Important technical decisions and WHY they were made]
 
+## User Messages
+[Every user message from the summarized turns, in chronological order — quote
+short messages verbatim; for long ones keep the intent-bearing sentences. Skip
+pure acknowledgements ("ok", "thanks"). Exclude tool results and system text.
+These are the user's exact words: corrections, preferences, and feedback here
+override any paraphrase elsewhere in this summary. Reference only — the agent
+must not act on them unless the latest user message asks.]
+
 ## Errors & Fixes
 [Errors hit during the compacted turns and how each was resolved — include the
 exact error text. Pay special attention to corrections the USER gave; quote
@@ -4569,7 +4754,9 @@ the user's correction and record what changed as a result.]
 {_resolved_questions_instructions}
 
 ## Relevant Files
-[Files read, modified, or created — with brief note on each]
+[Files read, modified, or created — with brief note on each. For files whose
+edits were still in progress at compaction time, include the relevant code
+section verbatim in a fenced block rather than a description.]
 
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
@@ -4605,7 +4792,9 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+{_analysis_pass_rule}
+
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). APPEND new user messages to "## User Messages" in order. Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
         else:
@@ -4616,6 +4805,8 @@ Create a structured checkpoint summary for the conversation after earlier turns 
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}{_memory_section}
+
+{_analysis_pass_rule}
 
 Use this exact structure:
 
@@ -4726,6 +4917,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             # token bloat across compactions. Mirrors title_generator.py.
             from agent.agent_runtime_helpers import strip_think_blocks
             stripped = strip_think_blocks(None, content).strip()
+            if stripped:
+                content = stripped
+            # Strip the <analysis> preparation block the prompt asks for (the
+            # chronological pre-pass). Same rationale as think-blocks: it must
+            # never reach the conversation or compound through the
+            # iterative-update feedback loop.
+            stripped = _strip_analysis_block(content)
             if stripped:
                 content = stripped
             # Redact the summary output as well — the summarizer LLM may
@@ -6526,7 +6724,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Micro-summarize one exchange
         exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
         _exchange_tokens = estimate_tokens_rough(exchange_text)
+        # The auxiliary summariser round trip sits INSIDE the window measured by
+        # _elapsed_ms and dominates it, so measure it separately — otherwise
+        # "compression got slower" cannot be told apart from "the summariser
+        # provider got slower".
+        _aux_started_at = time.monotonic()
         updated_summary = self._micro_summarize_one(exchange_text)
+        _aux_duration_ms = int((time.monotonic() - _aux_started_at) * 1000)
         if updated_summary is None:
             # Track consecutive failures on the same cursor position so we
             # don't busy-loop on an unsummarizable exchange every turn.
@@ -6560,6 +6764,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tokens_after=_tokens_before,
                 exchange_tokens=_exchange_tokens,
                 duration_ms=_elapsed_ms(),
+                aux_duration_ms=_aux_duration_ms,
             )
             return messages
 
@@ -6581,6 +6786,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             tokens_after=estimate_messages_tokens_rough(result),
             exchange_tokens=_exchange_tokens,
             duration_ms=_elapsed_ms(),
+            aux_duration_ms=_aux_duration_ms,
         )
         return result
 
@@ -6640,6 +6846,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         tokens_after: int | None,
         exchange_tokens: int | None = None,
         duration_ms: int | None = None,
+        aux_duration_ms: int | None = None,
     ) -> None:
         """Emit one content-free JSON log line describing a micro-compaction pass.
 
@@ -6682,6 +6889,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "passes_total": self._micro_compact_passes,
                 "tokens_saved_total": self._micro_compact_tokens_saved_total,
                 "duration_ms": _safe_int(duration_ms),
+                "aux_duration_ms": _safe_int(aux_duration_ms),
                 # Headroom, not efficiency: how full the window is being kept.
                 # This is the number that says whether the session can keep
                 # going without a hard batch compaction.
@@ -6695,8 +6903,53 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "micro compaction telemetry: %s",
                 json.dumps(payload, sort_keys=True, separators=(",", ":")),
             )
+            self._record_micro_compaction_observations(payload)
         except Exception as exc:
             logger.debug("failed to emit micro-compaction telemetry: %s", exc)
+
+    def _record_micro_compaction_observations(self, payload: Dict[str, Any]) -> None:
+        """Persist the local compression observation rows for one micro pass.
+
+        Reads ONLY the payload built above, whose window fields already come
+        from the cached ``_threshold_tokens`` / ``_resolved_context_length``
+        rather than the lazy properties that can fire a synchronous /models
+        probe.
+
+        ContextCompressor holds no agent reference, so the lane comes from the
+        work-lane ContextVar snapshot — valid because micro-compaction runs
+        synchronously on the turn thread after the user has seen the response.
+        """
+        try:
+            from hermes_cli.observability import local_observations, work_lane
+
+            outcome = str(payload.get("outcome") or "")
+            local_observations.record_compression_attempt(
+                kind="defrag" if outcome.startswith("defrag") else "micro",
+                outcome=(
+                    "committed"
+                    if outcome in {"absorbed", "defrag"}
+                    else "skipped"
+                    if outcome == "exchange_skipped"
+                    else "failed"
+                ),
+                trigger="micro_turn_end",
+                # The micro path has no failure_class; the outcome string itself
+                # names the reason, so map the two failing shapes explicitly.
+                failure=(
+                    "guard"
+                    if outcome == "exchange_skipped"
+                    else "other"
+                    if outcome in {"defrag_failed", "summarize_failed"}
+                    else None
+                ),
+                lane=work_lane.current_work_lane(),
+                duration_ms=payload.get("duration_ms"),
+                aux_duration_ms=payload.get("aux_duration_ms"),
+                tokens_before=payload.get("tokens_before"),
+                tokens_after=payload.get("tokens_after"),
+            )
+        except Exception as exc:
+            logger.debug("failed to record micro-compaction observations: %s", exc)
 
     def _sync_micro_compact_to_db(
         self,
@@ -7278,6 +7531,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Deriving the auto focus topic scans recent user turns — only pay
             # for it when a summary will actually be generated.
             summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+            # R5 drift probe attribution only (gate-scoped, read by no
+            # behavioural path): `_generate_summary` receives one collapsed
+            # argument and so cannot tell a user-supplied `/compress <focus>`
+            # from an auto-derived block. Rewritten on every compaction that
+            # reaches the summariser, so it can never go stale. Deliberately
+            # NOT cleared at the observe seam: the main-model retry re-enters
+            # `_generate_summary` with the same focus_topic and must keep the
+            # same attribution.
+            if getattr(self, "_r5_prompt_drift_probe_enabled", False) is True:
+                self._r5_focus_was_explicit = bool(focus_topic)
             try:
                 summary = self._generate_summary(
                     turns_to_summarize,
@@ -7667,6 +7930,20 @@ This compaction should PRIORITISE preserving all information related to the focu
         saved_estimate = pre_estimate - new_estimate
         savings_pct = (saved_estimate / pre_estimate * 100) if pre_estimate > 0 else 0
         self._last_compression_savings_pct = savings_pct
+
+        # Reuse the estimates the anti-thrash verdict already computed — zero
+        # extra token estimation, zero extra traversal — so the compression
+        # observation rows can report before/after per invocation. The dict is
+        # the same object _begin_compression_telemetry created and is already
+        # covered by the attempt-state snapshot/restore across the pooled
+        # executor's worker boundary.
+        try:
+            active_telemetry = getattr(self, "_active_compression_telemetry", None)
+            if isinstance(active_telemetry, dict):
+                active_telemetry["tokens_before"] = _safe_int(pre_estimate)
+                active_telemetry["tokens_after"] = _safe_int(new_estimate)
+        except Exception:
+            pass
 
         # Message-only savings are diagnostic. The anti-thrashing verdict is
         # owned by the next provider-reported prompt count, which answers the

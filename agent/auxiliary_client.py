@@ -1964,7 +1964,7 @@ class AsyncCodexAuxiliaryClient:
 def _translate_anthropic_response_format(
     anthropic_kwargs: Dict[str, Any], response_format: Any,
 ) -> None:
-    """Merge an OpenAI response format into Anthropic ``output_config``."""
+    """Translate supported OpenAI structured output into Anthropic format."""
     if not isinstance(response_format, dict):
         return
 
@@ -9901,6 +9901,7 @@ def _call_llm_impl(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -9924,6 +9925,7 @@ def _call_llm_impl(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -9946,8 +9948,10 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
-            else:
+            elif _is_connection_error(first_err):
                 reason = "connection error"
+            else:
+                reason = "server error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
@@ -10611,6 +10615,7 @@ async def _async_call_llm_impl(
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -10626,6 +10631,7 @@ async def _async_call_llm_impl(
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
+            or _is_transient_transport_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
@@ -10644,8 +10650,10 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
-            else:
+            elif _is_connection_error(first_err):
                 reason = "connection error"
+            else:
+                reason = "server error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 

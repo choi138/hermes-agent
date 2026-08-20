@@ -1185,8 +1185,60 @@ def _emit_compression_attempt_telemetry(
             "context compression attempt telemetry: %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
+        _record_compression_observations(agent, payload)
     except Exception as exc:
         logger.debug("failed to emit compression attempt telemetry: %s", exc)
+
+
+def _record_compression_observations(agent: Any, payload: dict) -> None:
+    """Persist the local compression observation rows for one batch attempt.
+
+    Called from the SINGLE funnel every batch emit site converges on, whose body
+    is already wrapped in try/except so a durable write cannot break
+    compression.
+
+    Two guards matter:
+      * the pool-saturation site passes ``started_at=time.monotonic()`` inline
+        and therefore always yields ~0ms — it is mapped to
+        compression_outcome="skipped" and writes NO duration row;
+      * tokens_before/tokens_after are written ONLY when the payload's
+        attempt_id still matches ``agent._compression_attempt_id``. The abort
+        sites emit WITHOUT calling ``_begin_compression_telemetry``, so
+        ``payload = dict(telemetry)`` would otherwise carry the PREVIOUS
+        successful compaction's token counts stamped with this attempt's
+        outcome. ``payload.setdefault("attempt_id", ...)`` preserves the stale
+        id, which is exactly what makes the equality check a correct freshness
+        test.
+    """
+    try:
+        from hermes_cli.observability import local_observations
+
+        outcome = str(payload.get("commit_status") or "")
+        is_skipped = str(payload.get("failure_class") or "") == "pool_saturated"
+        fresh = bool(
+            payload.get("attempt_id")
+            and payload.get("attempt_id")
+            == getattr(agent, "_compression_attempt_id", None)
+        )
+        local_observations.record_compression_attempt(
+            kind="batch",
+            outcome="skipped" if is_skipped else outcome,
+            # Without this, every abort reason collapses into outcome="aborted"
+            # and "why did compression abort?" is unanswerable from the table.
+            failure=payload.get("failure_class"),
+            trigger=payload.get("trigger_source"),
+            # Seeded when the attempt began, never read live: compression runs
+            # on a shared worker pool whose jobs can outlive the turn that
+            # started them, so a live read could label a lane-A row with lane B.
+            lane=payload.get("work_lane") or "",
+            platform=payload.get("platform") or "",
+            duration_ms=None if is_skipped else payload.get("total_duration_ms"),
+            aux_duration_ms=payload.get("aux_call_duration_ms"),
+            tokens_before=payload.get("tokens_before") if fresh else None,
+            tokens_after=payload.get("tokens_after") if fresh else None,
+        )
+    except Exception as exc:
+        logger.debug("failed to record compression observations: %s", exc)
 
 
 def compression_skipped_due_to_lock(agent: Any) -> bool:
@@ -1291,7 +1343,11 @@ def _adopt_live_compression_child(
             except Exception:
                 pass
     try:
-        if agent._memory_manager:
+        # Same ADR-004 Phase 0 gate as the boundary switch below: an
+        # ingest-disabled fork borrows the parent's manager for reads and must
+        # never flush the parent's provider buffers on its own lifecycle.
+        from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+        if agent._memory_manager and _ingest_allowed(agent):
             agent._memory_manager.on_session_switch(
                 child_session_id,
                 parent_session_id=parent_session_id,
@@ -2289,6 +2345,7 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_compression_no_progress = False
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
     # #58630/#69853). A stale ``True``/holder value from a prior lock-skip
@@ -2307,6 +2364,11 @@ def compress_context(
             "attempt_id": _attempt_id,
             "session_id": agent.session_id or "",
             "trigger_source": _trigger_source,
+            # Snapshot the lane and surface HERE, on the turn thread, so a
+            # pooled compression worker that outlives its turn cannot have its
+            # row relabelled by a concurrent turn's lane.
+            "work_lane": str(getattr(agent, "_work_lane", "") or ""),
+            "platform": str(getattr(agent, "platform", "") or ""),
         })
     except Exception:
         pass
@@ -2934,8 +2996,13 @@ def compress_context(
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
         # instead of silently discarding the provider's return value.
+        # Ingest-disabled forks (ADR-004 Phase 0) must not trigger provider
+        # extraction from their harness transcript (forks pin
+        # compression_enabled=False anyway; this is the systematic guarantee).
+        from agent.memory_manager import memory_ingest_allowed
+
         memory_context = ""
-        if agent._memory_manager:
+        if agent._memory_manager and memory_ingest_allowed(agent):
             try:
                 _maybe_ctx = agent._memory_manager.on_pre_compress(messages)
                 if isinstance(_maybe_ctx, str):
@@ -2967,6 +3034,20 @@ def compress_context(
                     "without provider-supplied summary context",
                     engine_name,
                 )
+
+        # Ingest-curator pre-compress boundary (ADR-004 Phase 2, SHADOW):
+        # snapshot synchronously, curation async on a daemon thread — this path
+        # runs mid-turn at context capacity, so nothing here may block (§4.3:
+        # the 10-worker pool saturation was the silent-stall incident). No-op
+        # unless curator.ingest_enabled; fail-open.
+        try:
+            from agent.ingest_curator import observe_pre_compress
+            observe_pre_compress(agent, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator pre-compress observation failed (fail-open)",
+                exc_info=True,
+            )
 
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
@@ -3167,6 +3248,30 @@ def compress_context(
         if compressed == messages_before_compression:
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
+            agent._last_compression_no_progress = True
+            _no_progress_error = (
+                "no_progress: protected tail spans the whole transcript"
+            )
+            try:
+                from agent.context_compressor import (
+                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                )
+
+                _record_cooldown = getattr(
+                    agent.context_compressor,
+                    "_record_compression_failure_cooldown",
+                    None,
+                )
+                if callable(_record_cooldown):
+                    _record_cooldown(
+                        float(_SUMMARY_FAILURE_COOLDOWN_SECONDS),
+                        _no_progress_error,
+                    )
+            except Exception:
+                logger.debug(
+                    "no-progress compression cooldown persist failed",
+                    exc_info=True,
+                )
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
@@ -3752,6 +3857,42 @@ def compress_context(
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
+        # Publish a fresh runtime-state snapshot for the new session before
+        # later gates observe the rotated session_id.
+        try:
+            if _old_sid:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+                _reasoning_config = getattr(agent, "reasoning_config", None)
+                _reasoning_effort = ""
+                if isinstance(_reasoning_config, dict):
+                    if _reasoning_config.get("enabled") is False:
+                        _reasoning_effort = "none"
+                    else:
+                        _reasoning_effort = str(_reasoning_config.get("effort") or "")
+
+                _invoke_hook(
+                    "runtime_state",
+                    session_id=agent.session_id or "",
+                    task_id=_old_sid,
+                    state={
+                        "session_id": agent.session_id or "",
+                        "task_id": _old_sid,
+                        "model": getattr(agent, "model", "") or "",
+                        "provider": getattr(agent, "provider", "") or "",
+                        "base_url": getattr(agent, "base_url", "") or "",
+                        "api_mode": getattr(agent, "api_mode", "") or "",
+                        "platform": getattr(agent, "platform", "") or "",
+                        "reasoning_effort": _reasoning_effort,
+                        "parent_session_id": _old_sid,
+                        "boundary_reason": "compression",
+                    },
+                )
+        except Exception as _rt_err:
+            logger.debug(
+                "runtime_state hook after compression split failed: %s", _rt_err
+            )
+
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before
         # the rotation re-pointed agent.session_id at the child). Without a
@@ -3804,7 +3945,8 @@ def compress_context(
         # parent (the conversation didn't fork, but the buffer must still be told
         # the transcript was compacted so it doesn't double-count dropped turns).
         try:
-            if _is_boundary and agent._memory_manager:
+            from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+            if _is_boundary and agent._memory_manager and _ingest_allowed(agent):
                 agent._memory_manager.on_session_switch(
                     agent.session_id or "",
                     parent_session_id=_boundary_parent,

@@ -2091,10 +2091,35 @@ def preflight_db_writability(
         except (OSError, ValueError):
             return False
 
-    def _ensure_writable(p: Path, *, is_dir: bool = False) -> None:
+    def _ensure_writable(
+        p: Path,
+        *,
+        is_dir: bool = False,
+        missing_ok: bool = False,
+    ) -> None:
         import stat as _stat
 
         if os.access(p, os.R_OK | os.W_OK):
+            return
+
+        # The main DB and its WAL/SHM sidecars are volatile between the
+        # caller's ``is_file()`` probe and this access check. A concurrent
+        # zeroed-DB quarantine can rename the main file, and SQLite can remove
+        # sidecars during checkpoint/close. A vanished optional file is not a
+        # read-only file, so let the subsequent connection re-evaluate the
+        # current path instead of reporting a false permission failure.
+        def _vanished() -> bool:
+            if not missing_ok:
+                return False
+            try:
+                p.stat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            return False
+
+        if _vanished():
             return
         if _in_repair_scope(p):
             try:
@@ -2110,6 +2135,8 @@ def preflight_db_writability(
                     "x" if is_dir else "",
                 )
                 return
+        if _vanished():
+            return
         kind = "directory" if is_dir else "file"
         wal_note = (
             " Do NOT delete the -wal file — it contains committed data that "
@@ -2133,7 +2160,7 @@ def preflight_db_writability(
     for suffix in ("", "-wal", "-shm"):
         p = db_path.with_name(db_path.name + suffix) if suffix else db_path
         if p.is_file():
-            _ensure_writable(p)
+            _ensure_writable(p, missing_ok=True)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
@@ -3090,6 +3117,24 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
+def _db_maintenance_loop(
+    db_ref: "weakref.ReferenceType[SessionDB]",
+    stop_event: threading.Event,
+    interval: float,
+) -> None:
+    """Drive checkpoint/FTS maintenance without retaining the SessionDB."""
+    while not stop_event.wait(interval):
+        db = db_ref()
+        if db is None:
+            return
+        try:
+            db._db_maintenance_tick()
+        except Exception:
+            logger.debug("db maintenance tick failed", exc_info=True)
+        finally:
+            del db
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -3318,6 +3363,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_busy = False
         self._token_atexit_hook: Optional[Callable[[], None]] = None
         initialization_complete = False
+        self._last_checkpoint_write_count = 0
+        self._last_fts_merge_write_count = 0
+        self._maint_stop = threading.Event()
+        self._maint_thread: Optional[threading.Thread] = None
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -3495,6 +3544,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise
                 _connect_and_init_with_lock_patience()
 
+            self._start_db_maintenance_thread()
+
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
             # v22 inline FTS untouched here; only the explicit foreground
@@ -3522,6 +3573,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+
+    # ── Background DB maintenance ──
+
+    _MAINT_INTERVAL_S = 5.0
+
+    def _start_db_maintenance_thread(self) -> None:
+        if self.read_only or self._maint_thread is not None:
+            return
+        thread = threading.Thread(
+            target=_db_maintenance_loop,
+            args=(weakref.ref(self), self._maint_stop, self._MAINT_INTERVAL_S),
+            name="session-db-maintenance",
+            daemon=True,
+        )
+        self._maint_thread = thread
+        thread.start()
+
+    def _db_maintenance_tick(self) -> None:
+        """Run due maintenance outside the caller's write transaction."""
+        write_count = self._write_count
+        if (
+            write_count - self._last_checkpoint_write_count
+            >= self._CHECKPOINT_EVERY_N_WRITES
+        ):
+            self._last_checkpoint_write_count = write_count
+            self._try_wal_checkpoint()
+        if (
+            write_count - self._last_fts_merge_write_count
+            >= self._FTS_MERGE_EVERY_N_WRITES
+        ):
+            self._last_fts_merge_write_count = write_count
+            self._try_incremental_merge_fts()
 
     # ── Read-path split ──
 
@@ -3929,6 +4012,124 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             self._fts_cjk_available = False
 
+    def _ensure_fts_cjk_schema(self, cursor) -> None:
+        """Create / repair / self-heal the CJK-bigram index surface.
+
+        ``cursor`` may be a Cursor or a Connection (both expose execute /
+        executescript). Called only for v23-shape DBs with the base FTS
+        surface healthy. Sets ``self._fts_cjk_available``. Never raises;
+        every failure mode degrades to "no cjk index" (trigram/LIKE routing
+        keeps working).
+
+        Cases:
+          tokenizer loaded, table absent  → create. Empty DB: index is
+              complete by construction (triggers cover everything). Populated
+              DB: set the cjk backfill markers so the id-gated triggers stay
+              correct and `optimize-storage` can backfill; the index is NOT
+              served until the backfill completes.
+          tokenizer loaded, table present → ensure triggers (recreates any
+              dropped by a tokenizer-less process), honour the stale
+              breadcrumb (serve only when absent and no backfill pending).
+          tokenizer NOT loaded, table present with live triggers → drop the
+              cjk triggers so message INSERTs don't fail at trigger time,
+              and leave the stale breadcrumb (#self-heal). The table itself
+              stays for a later capable open to rebuild.
+        """
+        cjk_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'messages_fts_cjk'"
+        ).fetchone())
+
+        if not self._fts_cjk_loaded:
+            if cjk_present:
+                live = [
+                    r[0] for r in cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                        _FTS_CJK_TRIGGERS,
+                    ).fetchall()
+                ]
+                if live:
+                    # Self-heal: this process cannot tokenize, so every
+                    # message INSERT would die inside the cjk trigger.
+                    # Breadcrumb FIRST (crash between the two statements is
+                    # merely conservative), then drop.
+                    logger.warning(
+                        "messages_fts_cjk triggers present but the "
+                        "cjk_unicode61 tokenizer is unavailable (%s) — "
+                        "dropping the cjk triggers so message writes keep "
+                        "working. CJK search falls back to trigram/LIKE; "
+                        "run `hermes sessions optimize-storage` on a host "
+                        "with the extension to rebuild.",
+                        fts5_cjk_so_path(),
+                    )
+                    cursor.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                        (FTS_CJK_STALE_KEY,),
+                    )
+                    for trig in live:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            self._fts_cjk_available = False
+            return
+
+        try:
+            cursor.executescript(FTS_CJK_TABLE_SQL)
+            if not cjk_present:
+                # Freshly created. An empty DB's index is complete by
+                # construction (triggers will cover every future row); a
+                # populated DB (e.g. a v23 install predating the cjk index)
+                # gets the dedicated marker pair so the id-gated triggers
+                # keep NEW rows indexed while old rows await the
+                # `optimize-storage` backfill. Either way any old stale
+                # breadcrumb refers to a table that no longer exists.
+                cursor.execute(
+                    "DELETE FROM state_meta WHERE key = ?",
+                    (FTS_CJK_STALE_KEY,),
+                )
+                n_msgs = cursor.execute(
+                    "SELECT COUNT(*) FROM messages WHERE role <> 'tool'"
+                ).fetchone()[0]
+                if n_msgs > 0:
+                    hw = cursor.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM messages"
+                    ).fetchone()[0]
+                    for k, v in (
+                        ("fts_cjk_rebuild_high_water", str(hw)),
+                        ("fts_cjk_rebuild_progress", "0"),
+                    ):
+                        cursor.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+            stale = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_CJK_STALE_KEY,),
+            ).fetchone()
+            if stale:
+                # A tokenizer-less process dropped the triggers at some
+                # unknown point — the index has a gap of unknown extent.
+                # Do NOT reinstall triggers (an external-content 'delete'
+                # for an unindexed rowid corrupts the index); the next
+                # `optimize-storage` run rebuilds from scratch.
+                self._fts_cjk_available = False
+                return
+            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            backfill_pending = cursor.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
+            ).fetchone()
+            self._fts_cjk_available = not backfill_pending
+        except sqlite3.OperationalError:
+            # Includes "no such tokenizer: cjk_unicode61" if the extension
+            # loaded but registration failed — degrade to trigram/LIKE.
+            logger.warning(
+                "messages_fts_cjk ensure failed; CJK search stays on "
+                "trigram/LIKE", exc_info=True,
+            )
+            self._fts_cjk_available = False
+
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
         for trigger in _FTS_TRIGGERS:
@@ -4023,12 +4224,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                # Maintenance is driven by the dedicated DB thread; the write
+                # hot path only advances the cadence counter.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor
@@ -4394,6 +4592,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         races the gateway's live writer and tears B-tree pages — issue
         #45383). Read-only connections never request a checkpoint.
         """
+        self._maint_stop.set()
+        maint = self._maint_thread
+        if maint is not None and maint.is_alive():
+            maint.join(timeout=2.0)
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
@@ -5689,7 +5891,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, source, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -5713,12 +5915,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
-                    source,
+                    parent["source"] or source,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt_hash,
                     parent_session_id,
-                    cwd or parent["cwd"],
+                    parent["cwd"] or cwd,
                     parent["git_branch"],
                     parent["git_repo_root"],
                     # Same inheritance contract as _insert_session_row's
@@ -5726,7 +5928,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # fix): the child stays on the parent's profile and keeps
                     # the gateway routing/origin columns so peer recovery
                     # still works after a crash at the boundary.
-                    profile_name or parent["profile_name"],
+                    parent["profile_name"] or profile_name,
                     parent["user_id"],
                     parent["session_key"],
                     parent["chat_id"],
@@ -9909,6 +10111,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def deactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
+        """Hide the listed active message rows without deleting or archiving them.
+
+        This is a narrow, reversible mask.  In particular, it deliberately
+        leaves ``compacted`` untouched so refusal masking keeps the same
+        ``active=0, compacted=0`` meaning as rewind/undo rather than becoming a
+        compaction archive.  Returns the number of rows flipped.
+        """
+        if not message_ids:
+            return 0
+        ids = [int(message_id) for message_id in message_ids]
+        placeholders = ", ".join("?" for _ in ids)
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"UPDATE messages SET active = 0 WHERE session_id = ? "
+                f"AND id IN ({placeholders}) AND active = 1",
+                (session_id, *ids),
+            )
+            return cursor.rowcount
+
+        return int(self._execute_write(_do) or 0)
+
+    def reactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
+        """Reverse :meth:`deactivate_messages` for the explicitly listed rows."""
+        if not message_ids:
+            return 0
+        ids = [int(message_id) for message_id in message_ids]
+        placeholders = ", ".join("?" for _ in ids)
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"UPDATE messages SET active = 1 WHERE session_id = ? "
+                f"AND id IN ({placeholders}) AND active = 0",
+                (session_id, *ids),
+            )
+            return cursor.rowcount
+
+        return int(self._execute_write(_do) or 0)
+
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
 
@@ -10463,6 +10705,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 current = child_id
 
             return best if best is not None else session_id
+
+    def get_recent_dialogue_messages(
+        self,
+        session_id: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Load the newest user/assistant rows with a query-level limit.
+
+        This is the lightweight context path for classifiers that need only a
+        small dialogue tail. Rows are selected newest-first so SQLite can stop
+        at ``limit``, then restored to insertion order for prompt construction.
+        """
+        try:
+            bounded_limit = int(limit)
+        except (TypeError, ValueError):
+            return []
+        if bounded_limit <= 0:
+            return []
+
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT id, role, content FROM ("
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "AND role IN ('user', 'assistant') "
+                "ORDER BY id DESC LIMIT ?"
+                ") ORDER BY id",
+                (session_id, bounded_limit),
+            ).fetchall()
+
+        messages: List[Dict[str, Any]] = []
+        for row in rows:
+            content = self._decode_content(row["content"])
+            if isinstance(content, str):
+                content = sanitize_context(content).strip()
+            messages.append({"role": row["role"], "content": content})
+        messages = _strip_background_review_harness(messages)
+        return _strip_stale_tool_call_markers(messages)
 
     def get_messages_as_conversation(
         self,
@@ -12768,6 +13048,105 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception as exc:
             logger.debug("Could not read logical DB size: %s", exc)
             return None
+
+    def logical_size_bytes(self) -> Optional[int]:
+        """Database size in bytes as SQLite itself accounts for it.
+
+        ``page_count * page_size`` — the size the main DB file will have once
+        the WAL is checkpointed back into it.
+
+        Prefer this over ``os.path.getsize(db_path)`` when reporting the effect
+        of a VACUUM. In WAL mode a VACUUM's rewrite lands in the ``-wal`` file,
+        and the checkpoint that folds it back is refused while any other
+        connection (a live gateway) holds a read-mark. Until that happens the
+        main file on disk still carries its pre-VACUUM size and keeps growing,
+        so a stat()-based before/after delta understates the win and can go
+        negative — the "reclaimed -3820.1 MB" report on a database that had
+        actually shrunk 60%.
+
+        Returns None if the pragmas cannot be read.
+        """
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return None
+                page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
+                page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+            return int(page_count) * int(page_size)
+        except Exception as exc:
+            logger.debug("Could not read logical DB size: %s", exc)
+            return None
+
+    def _merge_fts_incrementally(
+        self, *, max_pages: int, max_commands: Optional[int] = None
+    ) -> int:
+        """Run bounded FTS5 ``'merge'`` commands against each present index.
+
+        A positive merge rank tells SQLite to stop after approximately that
+        many output pages, so each command holds the write lock for
+        milliseconds regardless of index size — unlike ``'optimize'``, which
+        rewrites the whole index in one transaction (measured 9-18 s per
+        index on a 10 GB production DB, long enough to exhaust a competing
+        writer's entire lock-retry patience).
+
+        Protocol (SQLite FTS5 §6.8-6.9):
+
+        - ``usermerge`` is lowered to its minimum of 2 (persisted in the
+          ``%_config`` shadow table, applied once per instance) so a
+          positive merge acts on ANY level holding >= 2 segments. With the
+          default of 4, levels below that threshold are never merged by a
+          positive-rank command and a fragmented index cannot converge.
+        - Up to *max_commands* merge commands run per index, stopping early
+          on the documented no-progress signal: the delta in
+          ``total_changes`` is < 2 (the command's own INSERT accounts
+          for 1 change; >= 2 means real merge work happened).
+
+        Each command is its own implicit transaction (the connection runs
+        with ``isolation_level=None``), so the SQLite write lock is released
+        between commands and competing processes can interleave writes
+        mid-pass. Missing tables are valid schema variants (FTS variants are
+        optional, and ``optimize_fts_storage`` legitimately drops + backfills
+        these tables while writers keep running) and are skipped, mirroring
+        ``optimize_fts``. Other SQLite errors propagate to the caller.
+
+        Returns the number of merge commands executed.
+        """
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int):
+            raise TypeError("max_pages must be an integer")
+        if max_pages <= 0:
+            raise ValueError("max_pages must be greater than zero")
+        if max_commands is None:
+            max_commands = self._FTS_MERGE_COMMANDS_PER_PASS
+        if isinstance(max_commands, bool) or not isinstance(max_commands, int):
+            raise TypeError("max_commands must be an integer")
+        if max_commands <= 0:
+            raise ValueError("max_commands must be greater than zero")
+
+        executed = 0
+        with self._lock:
+            for tbl in self._FTS_TABLES:
+                if not self._fts_table_exists(tbl):
+                    continue
+                # One-time (per instance) usermerge floor; the value is
+                # persisted in the index's config shadow table so future
+                # connections inherit it. Setting config is a metadata-only
+                # write — it never touches segment data.
+                if not getattr(self, "_fts_usermerge_floor_applied", False):
+                    self._conn.execute(
+                        f"INSERT INTO {tbl}({tbl}, rank) "
+                        "VALUES('usermerge', 2)"
+                    )
+                for _ in range(max_commands):
+                    before = self._conn.total_changes
+                    self._conn.execute(
+                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
+                        (max_pages,),
+                    )
+                    executed += 1
+                    if self._conn.total_changes - before < 2:
+                        break
+            self._fts_usermerge_floor_applied = True
+        return executed
 
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.

@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -23,6 +24,343 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+_KANBAN_EXECUTION_EVENT_KINDS = frozenset({
+    "spawned",
+    "heartbeat",
+    "completed",
+    "blocked",
+    "dependency_wait",
+    "gave_up",
+    "crashed",
+    "timed_out",
+})
+
+_KANBAN_ROLE_MESSAGE_LIMIT = 1800
+
+
+async def _wait_for_dispatcher_wake(
+    wake_event: Optional[asyncio.Event],
+    interval: float,
+    keep_running: Callable[[], bool],
+) -> bool:
+    """Wait for intake or timeout; return True only for an intake wake."""
+
+    slept = 0.0
+    while slept < interval and keep_running():
+        wait_for = min(1.0, interval - slept)
+        if wake_event is None:
+            await asyncio.sleep(wait_for)
+            slept += wait_for
+            continue
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=wait_for)
+            return True
+        except asyncio.TimeoutError:
+            slept += wait_for
+    return False
+
+
+def _neutralize_discord_mentions(value: str) -> str:
+    """Keep authored text visible without allowing lifecycle updates to ping."""
+    return (
+        value
+        .replace("<@", "<@\u200b")
+        .replace("@everyone", "@\u200beveryone")
+        .replace("@here", "@\u200bhere")
+    )
+
+
+def _is_escaped_markdown_delimiter(value: str, index: int) -> bool:
+    """Return whether the delimiter at index has an odd backslash prefix."""
+    backslashes = 0
+    index -= 1
+    while index >= 0 and value[index] == "\\":
+        backslashes += 1
+        index -= 1
+    return bool(backslashes % 2)
+
+
+def _is_markdown_fence_line_start(value: str, index: int) -> bool:
+    """Return whether a backtick run has valid fenced-code indentation."""
+    line_start = value.rfind("\n", 0, index) + 1
+    indentation = value[line_start:index]
+    return len(indentation) <= 3 and not indentation.strip(" ")
+
+
+def _is_markdown_fence_opener(value: str, index: int, run_end: int) -> bool:
+    """Return whether a backtick run is a valid opening fenced-code line."""
+    if not _is_markdown_fence_line_start(value, index):
+        return False
+    line_end = value.find("\n", run_end)
+    if line_end < 0:
+        line_end = len(value)
+    return "`" not in value[run_end:line_end]
+
+
+def _is_markdown_indented_code_backtick(value: str, index: int) -> bool:
+    """Return whether a backtick run is literal within an indented code line."""
+    line_start = value.rfind("\n", 0, index) + 1
+    line_prefix = value[line_start:index]
+    leading_whitespace = line_prefix[: len(line_prefix) - len(line_prefix.lstrip(" \t"))]
+    return "\t" in leading_whitespace or len(leading_whitespace) >= 4
+
+
+def _is_markdown_fence_closer(value: str, index: int, run_end: int) -> bool:
+    """Return whether a backtick run is a closing fenced-code line."""
+    if not _is_markdown_fence_line_start(value, index):
+        return False
+    line_end = value.find("\n", run_end)
+    if line_end < 0:
+        line_end = len(value)
+    return not value[run_end:line_end].strip(" \t")
+
+
+def _truncate_kanban_markdown(value: str, limit: int) -> str:
+    """Budget one Markdown field without raw mid-token clipping."""
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return "…"[:limit]
+
+    candidate = text[: limit - 1]
+    while candidate and unicodedata.combining(candidate[-1]):
+        candidate = candidate[:-1]
+    boundary = max(
+        candidate.rfind("\n"),
+        candidate.rfind(" "),
+        candidate.rfind("\t"),
+    )
+    candidate = candidate[:boundary].rstrip() if boundary >= 0 else ""
+
+    # If omission lands inside Markdown, discard the incomplete construct
+    # instead of emitting a dangling fence/emphasis/code span.
+    unmatched_fence: Optional[tuple[int, int]] = None
+    unmatched_code_span: Optional[tuple[int, int]] = None
+    unmatched_emphasis: dict[str, Optional[int]] = {
+        marker: None for marker in ("**", "__", "*", "_")
+    }
+    index = 0
+    while index < len(candidate):
+        if candidate[index] == "`":
+            run_end = index + 1
+            while run_end < len(candidate) and candidate[run_end] == "`":
+                run_end += 1
+            run_length = run_end - index
+            if _is_escaped_markdown_delimiter(candidate, index):
+                index = run_end
+                continue
+            if unmatched_fence is not None:
+                if run_length >= unmatched_fence[1] and _is_markdown_fence_closer(
+                    candidate, index, run_end
+                ):
+                    unmatched_fence = None
+                index = run_end
+                continue
+            if unmatched_code_span is not None:
+                if run_length == unmatched_code_span[1]:
+                    unmatched_code_span = None
+                index = run_end
+                continue
+            if run_length >= 3 and _is_markdown_fence_opener(
+                candidate, index, run_end
+            ):
+                unmatched_fence = (index, run_length)
+            elif _is_markdown_indented_code_backtick(candidate, index):
+                pass
+            else:
+                unmatched_code_span = (index, run_length)
+            index = run_end
+            continue
+        if _is_escaped_markdown_delimiter(candidate, index):
+            index += 1
+            continue
+        if unmatched_fence is None and unmatched_code_span is None:
+            marker = next(
+                (
+                    marker
+                    for marker in unmatched_emphasis
+                    if candidate.startswith(marker, index)
+                ),
+                None,
+            )
+            if marker is not None:
+                unmatched_emphasis[marker] = (
+                    index if unmatched_emphasis[marker] is None else None
+                )
+                index += len(marker)
+                continue
+        index += 1
+    unclosed = [
+        start
+        for start in (
+            unmatched_fence[0] if unmatched_fence is not None else None,
+            unmatched_code_span[0] if unmatched_code_span is not None else None,
+            *unmatched_emphasis.values(),
+        )
+        if start is not None
+    ]
+    if unclosed:
+        candidate = candidate[: min(unclosed)].rstrip()
+
+    return f"{candidate}…" if candidate else "…"
+
+
+def _render_kanban_role_message(
+    header: str,
+    fields: list[tuple[Optional[str], str, bool]],
+) -> str:
+    """Render a compact header plus at most three line-aware body fields."""
+    prepared: list[tuple[str, str]] = []
+    for label, raw_value, force_multiline in fields[:3]:
+        value = _neutralize_discord_mentions(str(raw_value or ""))
+        if not value.strip():
+            continue
+        multiline = force_multiline or "\n" in value
+        prefix = "\n"
+        if label:
+            prefix += f"**{label}:**" + ("\n" if multiline else " ")
+        prepared.append((prefix, value))
+
+    content_budget = max(
+        0,
+        _KANBAN_ROLE_MESSAGE_LIMIT
+        - len(header)
+        - sum(len(prefix) for prefix, _ in prepared),
+    )
+    budgets = [0] * len(prepared)
+    pending = set(range(len(prepared)))
+    remaining = content_budget
+    while pending:
+        share = remaining // len(pending)
+        completed = {index for index in pending if len(prepared[index][1]) <= share}
+        if not completed:
+            for index in pending:
+                budgets[index] = share
+            for index in sorted(pending, reverse=True)[: remaining % len(pending)]:
+                budgets[index] += 1
+            break
+        for index in completed:
+            budgets[index] = len(prepared[index][1])
+            remaining -= budgets[index]
+        pending -= completed
+
+    message = header
+    for (prefix, value), budget in zip(prepared, budgets):
+        if budget <= 0:
+            continue
+        message += prefix + _truncate_kanban_markdown(value, budget)
+    return message
+
+
+def _localize_kanban_progress_fields(value: str, language: str) -> str:
+    """Translate standard heartbeat field labels outside fenced code.
+
+    Workers are asked to write milestone notes in the user's language, but an
+    older worker (or a model following the historical examples) may still emit
+    ``Current / Evidence / Next``.  The durable producer knows the subscriber's
+    profile language, so normalize only those fixed labels before staging the
+    immutable outbox message.  Authored prose and fenced code stay untouched.
+    """
+
+    current_stage = t(
+        "gateway.kanban_role.field.current_stage", lang=language,
+    )
+    # Locales that intentionally retain the English baseline keep the worker's
+    # authored field choice (``Current`` vs ``Current stage``, ``Evidence`` vs
+    # ``Confirmed``). Only a genuinely localized target needs normalization.
+    if current_stage == t("gateway.kanban_role.field.current_stage", lang="en"):
+        return str(value or "")
+    replacements = {
+        "Current stage": current_stage,
+        "Current": current_stage,
+        "Evidence": t("gateway.kanban_role.field.confirmed", lang=language),
+        "Confirmed": t("gateway.kanban_role.field.confirmed", lang=language),
+        "Next": t("gateway.kanban_role.field.next", lang=language),
+        "Update": t("gateway.kanban_role.field.update", lang=language),
+    }
+    fixed_value_replacements = {
+        t(f"gateway.kanban_role.goal.{key}", lang="en"): t(
+            f"gateway.kanban_role.goal.{key}", lang=language,
+        )
+        for key in (
+            "reviewing",
+            "confirmed_continue",
+            "confirmed_done",
+            "next_continue",
+            "next_done",
+        )
+    }
+    rendered: list[str] = []
+    open_fence_len = 0
+    for line in str(value or "").splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body):]
+        stripped = body.lstrip(" ")
+        indent = len(body) - len(stripped)
+        tick_count = len(stripped) - len(stripped.lstrip("`"))
+        if indent <= 3 and tick_count >= 3:
+            remainder = stripped[tick_count:]
+            if open_fence_len == 0 and "`" not in remainder:
+                open_fence_len = tick_count
+            elif (
+                open_fence_len
+                and tick_count >= open_fence_len
+                and not remainder.strip(" \t")
+            ):
+                open_fence_len = 0
+            rendered.append(line)
+            continue
+        if open_fence_len == 0:
+            for source_label, localized_label in replacements.items():
+                prefix = f"**{source_label}:**"
+                if stripped.startswith(prefix):
+                    stripped = (
+                        f"**{localized_label}:**" + stripped[len(prefix):]
+                    )
+                    body = (" " * indent) + stripped
+                    break
+            for source_value, localized_value in fixed_value_replacements.items():
+                suffix = f":** {source_value}"
+                if stripped.startswith("**") and stripped.endswith(suffix):
+                    stripped = stripped[: -len(source_value)] + localized_value
+                    body = (" " * indent) + stripped
+                    break
+        rendered.append(body + newline)
+    return "".join(rendered)
+
+
+def _kanban_event_profile(kb, conn, event, task) -> Optional[str]:
+    """Return the profile that actually produced a worker execution event.
+
+    Modern events carry ``run_id`` and are attributed exclusively through the
+    immutable ``task_runs.profile`` row.  Falling back to the task's current
+    assignee for such an event would misattribute an old attempt after a retry
+    or reassignment.  Only pre-runs legacy events (``run_id IS NULL``) use the
+    historical assignee fallback.
+    """
+    if event.kind not in _KANBAN_EXECUTION_EVENT_KINDS:
+        return None
+    run_id = getattr(event, "run_id", None)
+    if run_id is not None:
+        run = kb.get_run(conn, run_id)
+        if run is None:
+            logger.warning(
+                "kanban notifier: event %s for %s references missing run %s; "
+                "refusing current-assignee fallback",
+                event.id, event.task_id, run_id,
+            )
+            return None
+        return (run.profile or "").strip() or None
+    # Explicit compatibility path for task_events rows created before
+    # task_runs/run_id existed.
+    return (
+        (getattr(task, "assignee", None) or "").strip() or None
+        if task is not None
+        else None
+    )
 
 
 def _resolve_auto_decompose_settings(
@@ -176,19 +514,242 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _kanban_execution_adapter(self, platform, profile: Optional[str]):
+        """Resolve an explicitly-attributed worker adapter without fallback.
+
+        The active profile's adapters live in ``self.adapters`` and are
+        intentionally absent from the central authorization resolver's
+        secondary-profile registry. All other profiles stay behind that policy
+        boundary; a missing, denied, or failed resolution is fail-closed.
+        """
+        profile_name = (profile or "").strip()
+        if not profile_name:
+            return None
+        active_profile = (
+            (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+            or self._active_profile_name()
+            or "default"
+        )
+        if profile_name == active_profile:
+            return (getattr(self, "adapters", None) or {}).get(platform)
+        try:
+            adapter = self._authorization_adapter(platform, profile_name)
+            if isinstance(adapter, str) and not adapter.strip():
+                return None
+            return adapter or None
+        except Exception:
+            logger.warning(
+                "kanban notifier: authorization adapter resolution failed for "
+                "Discord run profile %s",
+                profile_name,
+                exc_info=True,
+            )
+            return None
+
+    def _kanban_role_profile_authorized(self, profile: Optional[str]) -> bool:
+        """Whether central profile inventory permits a cross-process sender.
+
+        A profile-local adapter remains the stronger authorization signal. This
+        inventory check is only for the split-process path where the notifier
+        intentionally cannot see the target adapter object.
+        """
+        profile_name = (profile or "").strip()
+        if not profile_name:
+            return False
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            return profile_name in {
+                name for name, _home in profiles_to_serve(multiplex=True)
+            }
+        except Exception:
+            logger.warning(
+                "kanban notifier: profile inventory unavailable; denying "
+                "cross-process role %s",
+                profile_name,
+                exc_info=True,
+            )
+            return False
+
+    def _kanban_role_delivery_language(self, sub: dict[str, Any]) -> str:
+        """Resolve copy from the subscribing bot profile, never the assignee.
+
+        The dispatch owner renders the immutable outbox row. In a multiplexed
+        process its ambient config may belong to another bot, so explicitly
+        scope the read to ``notifier_profile`` before choosing the language.
+        The rendered text then survives cross-process delivery without asking
+        the worker-profile sender to reinterpret it.
+        """
+        profile = str(sub.get("notifier_profile") or "").strip()
+        if not profile:
+            profile = (
+                (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+                or self._active_profile_name()
+                or "default"
+            )
+        try:
+            from gateway.run import _load_gateway_config, _profile_runtime_scope
+            from hermes_cli.profiles import get_profile_dir
+
+            with _profile_runtime_scope(get_profile_dir(profile)):
+                config = _load_gateway_config()
+            display = config.get("display") if isinstance(config, dict) else None
+            language = display.get("language") if isinstance(display, dict) else None
+            # Missing profile-local configuration means the documented English
+            # default. Do not call the process-global language cache here: in a
+            # multiplexer it may have been populated by another bot profile.
+            return str(language).strip() if str(language or "").strip() else "en"
+        except Exception:
+            logger.warning(
+                "kanban notifier: could not resolve role-message language for "
+                "subscriber profile %s; using English",
+                profile,
+                exc_info=True,
+            )
+            return "en"
+
+    @staticmethod
+    def _kanban_role_delivery_message(
+        sub,
+        event,
+        task,
+        board_name: str,
+        who: Optional[str],
+        *,
+        language: str = "en",
+    ) -> Optional[str]:
+        """Render an immutable execution-event snapshot for durable staging."""
+        kind = event.kind
+        payload = event.payload or {}
+        task_id = sub["task_id"]
+        title = task.title if task else task_id
+        board_tag = f" · `[{board_name}]`" if board_name else ""
+        if kind == "spawned":
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.running', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [(t("gateway.kanban_role.field.task", lang=language), title, False)],
+            )
+        if kind == "heartbeat":
+            note = str(payload.get("note") or "")
+            if not note.strip():
+                return None
+            note = _localize_kanban_progress_fields(note, language)
+            field = (
+                (None, note, True)
+                if "\n" in note
+                else (t("gateway.kanban_role.field.update", lang=language), note, False)
+            )
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.progress', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [field],
+            )
+        if kind == "completed":
+            summary = str(payload.get("summary") or "")
+            if not summary.strip() and task and task.result:
+                summary = str(task.result)
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.completed', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (t("gateway.kanban_role.field.result", lang=language), summary, True),
+                ],
+            )
+        if kind in {"blocked", "dependency_wait"}:
+            reason = str(payload.get("reason") or "")
+            block_kind = payload.get("kind")
+            label = {
+                "needs_input": t(
+                    "gateway.kanban_role.field.needs_input", lang=language,
+                ),
+                "dependency": t(
+                    "gateway.kanban_role.field.waiting_on", lang=language,
+                ),
+                "transient": t(
+                    "gateway.kanban_role.field.retry_issue", lang=language,
+                ),
+                "capability": t(
+                    "gateway.kanban_role.field.limitation", lang=language,
+                ),
+            }.get(
+                block_kind,
+                t("gateway.kanban_role.field.blocked_by", lang=language),
+            )
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.blocked', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (label, reason, False),
+                ],
+            )
+        if kind == "gave_up":
+            error = str(payload.get("error") or "").strip()
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.stopped', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (
+                        t("gateway.kanban_role.field.state", lang=language),
+                        t(
+                            "gateway.kanban_role.state.repeated_spawn_failures",
+                            lang=language,
+                        ),
+                        False,
+                    ),
+                    (t("gateway.kanban_role.field.error", lang=language), error, False),
+                ],
+            )
+        if kind == "crashed":
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.retrying', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (
+                        t("gateway.kanban_role.field.state", lang=language),
+                        t(
+                            "gateway.kanban_role.state.worker_crashed_retry",
+                            lang=language,
+                        ),
+                        False,
+                    ),
+                ],
+            )
+        if kind == "timed_out":
+            limit = int(payload.get("limit_seconds") or 0)
+            return _render_kanban_role_message(
+                f"### {t('gateway.kanban_role.heading.timed_out', lang=language)} "
+                f"· `{task_id}`{board_tag}",
+                [
+                    (t("gateway.kanban_role.field.task", lang=language), title, False),
+                    (
+                        t("gateway.kanban_role.field.state", lang=language),
+                        t(
+                            "gateway.kanban_role.state.runtime_limit_retry",
+                            lang=language,
+                            limit_seconds=limit,
+                        ),
+                        False,
+                    ),
+                ],
+            )
+        return None
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll ``kanban_notify_subs`` and deliver task events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. The subscription is removed only when the
-        task is ``archived``. A ``done`` task can be reopened for review or
-        continuation, so its subscription and origin-session ownership must
-        survive completion. Cursor advancement prevents old events replaying
-        when that happens.
+        stored cursor, including worker start, explicit progress notes, and
+        terminal outcomes. Sends one message per visible event to
+        ``(platform, chat_id, thread_id)``, then advances the cursor. Empty
+        automatic heartbeats remain silent. The subscription is removed only
+        when the task is ``archived``. A ``done`` task can be reopened for
+        review or continuation, so its subscription and origin-session
+        ownership survive completion; cursor advancement prevents replay.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -217,7 +778,21 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        NOTIFY_KINDS = (
+            "spawned",
+            "heartbeat",
+            "completed",
+            "blocked",
+            "dependency_wait",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "status",
+            "archived",
+            "unblocked",
+            "block_loop_detected",
+            "review_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -432,17 +1007,101 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    task = _kb.get_task(conn, sub["task_id"])
+                                    event_profiles: dict[int, Optional[str]] = {}
+                                    staged_role_event_ids: set[int] = set()
+                                    role_language = (
+                                        self._kanban_role_delivery_language(sub)
+                                        if platform == _Platform.DISCORD.value
+                                        else "en"
+                                    )
+
+                                    def _stage_cross_process_rows(events):
+                                        rows = []
+                                        for ev in events:
+                                            who = _kanban_event_profile(
+                                                _kb, conn, ev, task,
+                                            )
+                                            event_profiles[ev.id] = who
+                                            if platform != _Platform.DISCORD.value:
+                                                continue
+                                            if ev.kind not in _KANBAN_EXECUTION_EVENT_KINDS:
+                                                continue
+                                            # Only immutable task_runs.profile,
+                                            # reached via task_events.run_id, may
+                                            # select a sender process.
+                                            if getattr(ev, "run_id", None) is None:
+                                                continue
+                                            if not self._kanban_role_profile_authorized(who):
+                                                continue
+                                            message = self._kanban_role_delivery_message(
+                                                sub,
+                                                ev,
+                                                task,
+                                                slug,
+                                                who,
+                                                language=role_language,
+                                            )
+                                            if message is None:
+                                                continue
+                                            staged_role_event_ids.add(ev.id)
+                                            rows.append({
+                                                "event_id": ev.id,
+                                                "task_id": sub["task_id"],
+                                                "event_kind": ev.kind,
+                                                "platform": sub["platform"],
+                                                "chat_id": sub["chat_id"],
+                                                "thread_id": sub.get("thread_id") or "",
+                                                "sender_profile": who,
+                                                "notifier_profile": (
+                                                    sub.get("notifier_profile")
+                                                    or notifier_profile
+                                                ),
+                                                "message": message,
+                                                "event_payload": ev.payload,
+                                                "artifact_manifest": (
+                                                    self._kanban_role_artifact_candidates(
+                                                        (
+                                                            getattr(
+                                                                self,
+                                                                "adapters",
+                                                                None,
+                                                            )
+                                                            or {}
+                                                        ).get(_Platform.DISCORD),
+                                                        ev.payload,
+                                                        task,
+                                                    )
+                                                    if ev.kind == "completed"
+                                                    else []
+                                                ),
+                                                "created_at": ev.created_at,
+                                            })
+                                        return rows
+
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=NOTIFY_KINDS,
+                                        role_delivery_builder=(
+                                            _stage_cross_process_rows
+                                        ),
                                     )
                                     if not events:
                                         continue
-                                    task = _kb.get_task(conn, sub["task_id"])
+                                    # The builder populates every profile while
+                                    # staging role rows. Fill any gaps for local
+                                    # and non-Discord paths after the claim.
+                                    for ev in events:
+                                        event_profiles.setdefault(
+                                            ev.id,
+                                            _kanban_event_profile(
+                                                _kb, conn, ev, task,
+                                            ),
+                                        )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -452,6 +1111,10 @@ class GatewayKanbanWatchersMixin:
                                         "old_cursor": old_cursor,
                                         "cursor": cursor,
                                         "events": events,
+                                        "event_profiles": event_profiles,
+                                        "staged_role_event_ids": (
+                                            staged_role_event_ids
+                                        ),
                                         "task": task,
                                         "board": slug,
                                     })
@@ -492,8 +1155,10 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
-                    if adapter is None:
+                    coordinator_adapter = self._authorization_adapter(
+                        plat, sub_profile or None,
+                    )
+                    if coordinator_adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                             platform_str, sub["task_id"],
@@ -526,12 +1191,47 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
+                        heartbeat_note = ""
+                        if kind == "heartbeat":
+                            if ev.payload and ev.payload.get("note"):
+                                heartbeat_note = str(ev.payload["note"]).strip()
+                            if not heartbeat_note:
+                                # Automatic liveness heartbeats are intentionally
+                                # silent; only explicit milestone notes reach chat.
+                                continue
+                        # Execution events belong to the immutable run profile,
+                        # not the task's mutable current assignee. Discord can
+                        # therefore send through the worker profile's real bot.
+                        who = d.get("event_profiles", {}).get(ev.id)
+                        if who is None and kind not in _KANBAN_EXECUTION_EVENT_KINDS:
+                            who = task.assignee if task and task.assignee else None
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        adapter = coordinator_adapter
+                        role_routed = (
+                            plat == _Platform.DISCORD
+                            and kind in _KANBAN_EXECUTION_EVENT_KINDS
+                        )
+                        role_cross_process = False
+                        role_resolution_denied = False
+                        if role_routed:
+                            if ev.id in d.get("staged_role_event_ids", set()):
+                                role_cross_process = True
+                            else:
+                                # Blank/missing run profile or inventory denial
+                                # fails closed here; the producer never looks up
+                                # a worker adapter.
+                                role_resolution_denied = True
+                        if kind == "spawned":
+                            msg = (
+                                f"▶ {board_tag}{tag}Kanban {sub['task_id']} running"
+                                f" — {title}"
+                            )
+                        elif kind == "heartbeat":
+                            msg = (
+                                f"… {board_tag}{tag}Kanban {sub['task_id']} progress: "
+                                f"{heartbeat_note[:500]}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -602,7 +1302,7 @@ class GatewayKanbanWatchersMixin:
                             # human decision. This is the ONE transition that
                             # exists to force human attention, yet it emits no
                             # `blocked`/`status` event — so before adding it to
-                            # TERMINAL_KINDS it produced zero notification and
+                            # NOTIFY_KINDS it produced zero notification and
                             # the task stalled in triage silently. Ping loudly.
                             reason = ""
                             recurrences = None
@@ -616,7 +1316,7 @@ class GatewayKanbanWatchersMixin:
                                 f" — needs a human decision{rc}{reason}"
                             )
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # archived / unblocked are claimed by NOTIFY_KINDS
                             # (so the cursor advances past them and they can't
                             # wedge a later completed/blocked event behind an
                             # unclaimed row) but are intentionally SILENT: an
@@ -668,6 +1368,49 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
+                            if role_resolution_denied:
+                                raise PermissionError(
+                                    "role adapter authorization denied"
+                                )
+                            if role_cross_process:
+                                if ev.id not in d.get(
+                                    "staged_role_event_ids", set(),
+                                ):
+                                    raise RuntimeError(
+                                        "role delivery was not atomically staged"
+                                    )
+                                logger.debug(
+                                    "kanban notifier: staged %s event for %s "
+                                    "to Discord profile %s on board %s",
+                                    kind,
+                                    sub["task_id"],
+                                    who,
+                                    board_slug,
+                                )
+                                sub_fail_counts.pop(sub_key, None)
+                                continue
+
+                            # Adapters with no push channel (the API server —
+                            # ``supports_async_delivery = False``) can NEVER
+                            # satisfy a text-send: ``send()`` always reports
+                            # SendResult(success=False) by design (see
+                            # ApiServerAdapter.send()). Treating that as a
+                            # delivery failure would rewind/drop the subscription
+                            # forever and would also make the wake-on-completion
+                            # path unreachable. Skip the doomed send attempt;
+                            # the creator is woken via the self-post below.
+                            from gateway.wake import adapter_supports_push
+
+                            if not adapter_supports_push(adapter):
+                                logger.debug(
+                                    "kanban notifier: adapter %s has no push "
+                                    "channel; skipping text ping for %s, relying "
+                                    "on wake self-post instead",
+                                    platform_str, sub["task_id"],
+                                )
+                                # The wake self-post below is the delivery, so
+                                # it owns failure-counter reset or increment.
+                                continue
                             _send_res = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
@@ -713,6 +1456,34 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            if role_routed:
+                                logger.warning(
+                                    "kanban notifier: delivery failed for %s event %s "
+                                    "via Discord run profile %s: %s",
+                                    sub["task_id"], kind, who, exc,
+                                )
+                                warning = (
+                                    f"⚠ {board_tag}Kanban {sub['task_id']} delivery failed: "
+                                    f"Discord run profile `{who}` could not send the {kind} "
+                                    "event; check gateway logs for details."
+                                )
+                                try:
+                                    await coordinator_adapter.send(
+                                        sub["chat_id"], warning, metadata=metadata,
+                                    )
+                                except Exception as coordinator_exc:
+                                    logger.warning(
+                                        "kanban notifier: coordinator delivery-failure warning "
+                                        "for %s also failed: %s",
+                                        sub["task_id"], coordinator_exc,
+                                    )
+                                else:
+                                    # The coordinator visibly reported the failed
+                                    # worker-bot delivery. Treat that warning as the
+                                    # durable outcome instead of silently retrying
+                                    # through (or impersonating with) the default bot.
+                                    sub_fail_counts.pop(sub_key, None)
+                                    continue
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
@@ -982,7 +1753,12 @@ class GatewayKanbanWatchersMixin:
                         # work for review corrections and continuation. The
                         # retained cursor prevents replay while preserving the
                         # original delivery and wake ownership for that cycle.
-                        if _is_push_adapter and send_passive and _wake_kinds:
+                        if (
+                            _is_push_adapter
+                            and send_passive
+                            and _wake_kinds
+                            and _session_key
+                        ):
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
                             # injection stays best-effort.
@@ -1010,6 +1786,425 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    async def _kanban_role_delivery_watcher(self, interval: float = 5.0) -> None:
+        """Send durable Discord lifecycle handoffs through locally-owned bots.
+
+        Every gateway may run this lightweight consumer, including named-profile
+        gateways with ``kanban.dispatch_in_gateway=false``. A normal gateway
+        consumes only rows for its exact active profile. The default profile
+        multiplexer may additionally consume rows for profiles whose Discord
+        adapters it started and owns in ``_profile_adapters``. It never resolves
+        an arbitrary foreign adapter, dispatches workers, or scans task events.
+        The board DB is the sole cross-process handoff.
+        """
+        from gateway.config import Platform as _Platform
+        from hermes_cli import kanban_db as _kb
+
+        boot_profile = (
+            (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+        )
+        if not boot_profile:
+            logger.warning(
+                "kanban role sender: boot profile is blank; sender disabled"
+            )
+            return
+
+        await asyncio.sleep(5)
+        while self._running:
+            # Build the sender set only from adapters this process connected
+            # itself. The primary map is bound to the immutable boot profile.
+            # Secondary maps are eligible only when this runner is the explicit
+            # profile multiplexer; never consult the authorization resolver or
+            # any global adapter registry for a requested sender identity.
+            sender_targets: list[tuple[str, Any]] = []
+            primary_adapter = (
+                getattr(self, "adapters", None) or {}
+            ).get(_Platform.DISCORD)
+            if primary_adapter is not None:
+                sender_targets.append((boot_profile, primary_adapter))
+
+            multiplex_enabled = bool(
+                getattr(
+                    getattr(self, "config", None),
+                    "multiplex_profiles",
+                    False,
+                )
+            )
+            if multiplex_enabled:
+                seen_profiles = {boot_profile}
+                profile_adapters = getattr(self, "_profile_adapters", None) or {}
+                for raw_profile, adapter_map in sorted(profile_adapters.items()):
+                    sender_profile = str(raw_profile or "").strip()
+                    if not sender_profile or sender_profile in seen_profiles:
+                        continue
+                    adapter = (adapter_map or {}).get(_Platform.DISCORD)
+                    if adapter is None:
+                        continue
+                    seen_profiles.add(sender_profile)
+                    sender_targets.append((sender_profile, adapter))
+
+            for sender_profile, current_adapter in sender_targets:
+                claimant = f"{sender_profile}:{os.getpid()}:{id(self)}"
+
+                def _claim(
+                    profile: str = sender_profile,
+                    claim_owner: str = claimant,
+                ):
+                    claimed: list[dict] = []
+                    try:
+                        boards = _kb.list_boards(include_archived=False)
+                    except Exception:
+                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    seen_db_paths: set[str] = set()
+                    for board_meta in boards:
+                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        db_path = board_meta.get("db_path")
+                        try:
+                            resolved = str(
+                                Path(db_path).expanduser().resolve()
+                                if db_path else _kb.kanban_db_path(slug).resolve()
+                            )
+                        except Exception:
+                            resolved = f"slug:{slug}"
+                        if resolved in seen_db_paths:
+                            continue
+                        seen_db_paths.add(resolved)
+                        try:
+                            conn = _kb.connect(board=slug)
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban role sender: cannot open board %s: %s", slug, exc,
+                            )
+                            continue
+                        try:
+                            rows = _kb.claim_role_deliveries(
+                                conn,
+                                sender_profile=profile,
+                                platform="discord",
+                                claimant=claim_owner,
+                                limit=1,
+                            )
+                            for row in rows:
+                                row["board"] = slug
+                            claimed.extend(rows)
+                            if claimed:
+                                return claimed
+                        finally:
+                            conn.close()
+                    return claimed
+
+                try:
+                    deliveries = await asyncio.to_thread(_claim)
+                except Exception as exc:
+                    logger.warning("kanban role sender claim failed: %s", exc)
+                    deliveries = []
+
+                for delivery in deliveries:
+                    board_slug = delivery.get("board")
+                    claim_token = delivery["claim_token"]
+                    metadata: dict[str, Any] = {}
+                    if delivery.get("thread_id"):
+                        metadata["thread_id"] = delivery["thread_id"]
+                    lease_stop = asyncio.Event()
+                    lease_lost = asyncio.Event()
+                    lease_task = asyncio.create_task(
+                        self._kanban_maintain_role_delivery_lease(
+                            delivery, claim_token, board_slug,
+                            lease_stop, lease_lost,
+                        )
+                    )
+                    try:
+                        if lease_lost.is_set():
+                            raise RuntimeError("lost delivery lease before send")
+                        if not delivery.get("text_delivered"):
+                            await current_adapter.send(
+                                delivery["chat_id"],
+                                delivery["message"],
+                                metadata=metadata,
+                            )
+                            if lease_lost.is_set():
+                                raise RuntimeError("lost delivery lease during text send")
+                            # Discord may already have accepted the message when
+                            # this local checkpoint fails. Without a verified
+                            # remote idempotency key, a restart can duplicate the
+                            # text; the outbox therefore guarantees at-least-once,
+                            # not exactly-once, across this accept/ack window.
+                            checkpointed = await asyncio.to_thread(
+                                self._kanban_advance_role_delivery_progress,
+                                delivery,
+                                claim_token,
+                                board_slug,
+                                True,
+                                None,
+                            )
+                            if not checkpointed:
+                                raise RuntimeError("lost text-progress lease")
+                            delivery["text_delivered"] = 1
+
+                        artifacts = (
+                            delivery.get("artifact_manifest") or []
+                            if delivery["event_kind"] == "completed" else []
+                        )
+                        start_index = int(delivery.get("next_artifact_index") or 0)
+                        for index, path in enumerate(
+                            artifacts[start_index:], start=start_index,
+                        ):
+                            if lease_lost.is_set():
+                                raise RuntimeError("lost delivery lease before artifact send")
+                            await self._send_kanban_role_artifact(
+                                adapter=current_adapter,
+                                chat_id=delivery["chat_id"],
+                                metadata=metadata,
+                                path=path,
+                            )
+                            checkpointed = await asyncio.to_thread(
+                                self._kanban_advance_role_delivery_progress,
+                                delivery,
+                                claim_token,
+                                board_slug,
+                                None,
+                                index + 1,
+                            )
+                            if not checkpointed:
+                                raise RuntimeError("lost artifact-progress lease")
+                            delivery["next_artifact_index"] = index + 1
+                    except Exception as exc:
+                        logger.warning(
+                            "kanban role sender: %s event for %s failed via profile %s: %s",
+                            delivery["event_kind"], delivery["task_id"],
+                            sender_profile, exc,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                self._kanban_retry_role_delivery,
+                                delivery,
+                                claim_token,
+                                type(exc).__name__,
+                                board_slug,
+                            )
+                        except Exception as retry_exc:
+                            logger.warning(
+                                "kanban role sender: failed to release delivery %s for retry: %s",
+                                delivery["id"], retry_exc,
+                            )
+                        continue
+                    else:
+                        try:
+                            acknowledged = await asyncio.to_thread(
+                                self._kanban_complete_role_delivery,
+                                delivery,
+                                claim_token,
+                                board_slug,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban role sender: acknowledgement failed for delivery %s: %s",
+                                delivery["id"], exc,
+                            )
+                            acknowledged = False
+                        if not acknowledged:
+                            logger.warning(
+                                "kanban role sender: lost acknowledgement lease for delivery %s",
+                                delivery["id"],
+                            )
+                        else:
+                            logger.debug(
+                                "kanban role sender: delivered %s event for %s via profile %s on board %s",
+                                delivery["event_kind"], delivery["task_id"],
+                                sender_profile, board_slug,
+                            )
+                    finally:
+                        lease_stop.set()
+                        try:
+                            await lease_task
+                        except Exception as exc:
+                            lease_lost.set()
+                            logger.warning(
+                                "kanban role sender: lease maintenance failed for delivery %s: %s",
+                                delivery["id"], exc,
+                            )
+
+            for _ in range(int(max(1, interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
+    async def _kanban_maintain_role_delivery_lease(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str],
+        stop: asyncio.Event,
+        lost: asyncio.Event,
+    ) -> None:
+        """Renew a send lease while an adapter call is in flight."""
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=20.0)
+                return
+            except asyncio.TimeoutError:
+                try:
+                    renewed = await asyncio.to_thread(
+                        self._kanban_renew_role_delivery_lease,
+                        delivery,
+                        claim_token,
+                        board,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "kanban role sender: lease renewal failed for delivery %s: %s",
+                        delivery["id"], exc,
+                    )
+                    lost.set()
+                    return
+                if not renewed:
+                    lost.set()
+                    return
+
+    def _kanban_renew_role_delivery_lease(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.renew_role_delivery_lease(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+                lease_seconds=60,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_retry_role_delivery(
+        self,
+        delivery: dict,
+        claim_token: str,
+        error_kind: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            attempts = int(delivery.get("attempts") or 0)
+            return _kb.retry_role_delivery(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+                error_kind=error_kind,
+                retry_after_seconds=min(60, 2 ** min(attempts, 6)),
+            )
+        finally:
+            conn.close()
+
+    def _kanban_advance_role_delivery_progress(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str],
+        text_delivered: Optional[bool],
+        next_artifact_index: Optional[int],
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.advance_role_delivery_progress(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+                text_delivered=text_delivered,
+                next_artifact_index=next_artifact_index,
+            )
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _kanban_role_artifact_candidates(adapter, event_payload, task) -> list[str]:
+        """Resolve existing artifacts once in stable order and enforce safe roots."""
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: str) -> None:
+            expanded = os.path.expanduser(path)
+            if expanded and expanded not in seen and os.path.isfile(expanded):
+                seen.add(expanded)
+                candidates.append(expanded)
+
+        extract = getattr(adapter, "extract_local_files", None)
+        if isinstance(event_payload, dict):
+            raw = event_payload.get("artifacts")
+            if isinstance(raw, (list, tuple)):
+                for item in raw:
+                    if isinstance(item, str):
+                        _add(item)
+            summary = event_payload.get("summary")
+            if callable(extract) and isinstance(summary, str) and summary:
+                paths, _ = extract(summary)
+                for path in paths:
+                    _add(path)
+        result = getattr(task, "result", None) if task is not None else None
+        if callable(extract) and result:
+            paths, _ = extract(str(result))
+            for path in paths:
+                _add(path)
+
+        from gateway.platforms.base import BasePlatformAdapter
+
+        return BasePlatformAdapter.filter_local_delivery_paths(candidates)
+
+    @staticmethod
+    async def _send_kanban_role_artifact(*, adapter, chat_id, metadata, path) -> None:
+        """Send one artifact and propagate failure so its index is not advanced."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        safe_paths = BasePlatformAdapter.filter_local_delivery_paths([path])
+        if len(safe_paths) != 1:
+            raise PermissionError("staged artifact is missing or outside safe roots")
+        path = safe_paths[0]
+
+        from pathlib import Path as _Path
+        from urllib.parse import quote as _quote
+
+        extension = _Path(path).suffix.lower()
+        if extension in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            await adapter.send_multiple_images(
+                chat_id=chat_id,
+                images=[(f"file://{_quote(path)}", "")],
+                metadata=metadata,
+            )
+        elif extension in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}:
+            await adapter.send_video(
+                chat_id=chat_id, video_path=path, metadata=metadata,
+            )
+        else:
+            await adapter.send_document(
+                chat_id=chat_id, file_path=path, metadata=metadata,
+            )
+
+    def _kanban_complete_role_delivery(
+        self,
+        delivery: dict,
+        claim_token: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.complete_role_delivery(
+                conn,
+                delivery_id=delivery["id"],
+                claim_token=claim_token,
+            )
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
@@ -1180,7 +2375,7 @@ class GatewayKanbanWatchersMixin:
                 )
 
     async def _kanban_dispatcher_watcher(self) -> None:
-        """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
+        """Embedded dispatcher — periodic ticks plus immediate intake wakeups.
 
         Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
         When true, the gateway hosts the single dispatcher for this profile:
@@ -1197,6 +2392,19 @@ class GatewayKanbanWatchersMixin:
         in-flight ``to_thread`` returns on its own after the current
         ``dispatch_once`` call finishes (typically <1ms on an idle board).
         """
+        # Named-profile gateways may consume role-delivery outbox rows, but only
+        # the immutable default gateway may dispatch workers. Keep this check
+        # ahead of config loading, singleton locking, and all board DB work.
+        active_profile = (
+            (getattr(self, "_kanban_notifier_profile", None) or "").strip()
+        )
+        if active_profile != "default":
+            logger.info(
+                "kanban dispatcher: disabled for non-default or unknown gateway profile %s",
+                active_profile or "<unknown>",
+            )
+            return
+
         # Read config once at boot. If the user flips the flag later, they
         # restart the gateway; same pattern as every other background
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
@@ -1677,7 +2885,13 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
+        wake_event = getattr(self, "_kanban_dispatch_wake_event", None)
         while self._running:
+            # Clear before work, never after it. An intake committed while this
+            # tick is running then leaves the event set and triggers an
+            # immediate follow-up tick instead of being erased by a late clear.
+            if wake_event is not None:
+                wake_event.clear()
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -1747,11 +2961,13 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+            # Wait in 1s slices so shutdown remains snappy, but let a committed
+            # gateway intake break the wait immediately. The timeout preserves
+            # periodic reclaim/health ticks when no new card arrives.
+            await _wait_for_dispatcher_wake(
+                wake_event,
+                interval,
+                lambda: bool(self._running),
+            )
 
         self._release_kanban_dispatcher_lock()

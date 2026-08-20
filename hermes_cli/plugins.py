@@ -214,6 +214,9 @@ VALID_HOOKS: Set[str] = {
     # Contract: the transform-family first-valid-wins shape in
     # docs/plugins/hook-taxonomy.md.
     "transform_api_error_classification",
+    # Effective runtime/model state notifications emitted by core runtime
+    # control seams. Payloads are secret-free telemetry snapshots.
+    "runtime_state",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -6169,11 +6172,15 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
-    details = _get_pre_tool_call_directive_details(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
-    )
+    try:
+        details = _get_pre_tool_call_directive_details(
+            tool_name, args, task_id=task_id, session_id=session_id,
+            tool_call_id=tool_call_id, turn_id=turn_id,
+            api_request_id=api_request_id, middleware_trace=middleware_trace,
+        )
+    except Exception:
+        logger.exception("pre_tool_call policy evaluation failed for %s", tool_name)
+        return f"BLOCKED: pre-tool policy evaluation failed for {tool_name}"
     return _resolve_block_from_details(
         details, tool_name,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
