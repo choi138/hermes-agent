@@ -478,7 +478,11 @@ async def test_github_resolver_reloads_subject_revision_and_head_from_stored_url
     _store_source_event(store, api_url=api_url)
     client = _GitHubClient()
 
-    state = await GitHubSubjectStateResolver(store=store, client=client).resolve(
+    state = await GitHubSubjectStateResolver(
+        store=store,
+        client=client,
+        allowed_repositories=frozenset({"silviahealth/content"}),
+    ).resolve(
         proposal
     )
 
@@ -542,6 +546,7 @@ async def test_external_resolver_rejects_fresh_private_or_changed_scope(
     resolver = GitHubSubjectStateResolver(
         store=store,
         client=_GitHubClient(payload),
+        allowed_repositories=frozenset({"silviahealth/content"}),
         include_public_actionable_activity=True,
         external_repository_actions="own_pr_write",
     )
@@ -562,7 +567,11 @@ async def test_github_resolver_rejects_forged_subject_url_before_network(
     client = _GitHubClient()
 
     with pytest.raises(ValueError):
-        await GitHubSubjectStateResolver(store=store, client=client).resolve(proposal)
+        await GitHubSubjectStateResolver(
+            store=store,
+            client=client,
+            allowed_repositories=frozenset({"silviahealth/content"}),
+        ).resolve(proposal)
     assert client.urls == []
 
 
