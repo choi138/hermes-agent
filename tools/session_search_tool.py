@@ -994,6 +994,8 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # Guardrail-only signal; never changes query construction or results.
+    graphiti_irrelevant: bool = False,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -1005,6 +1007,10 @@ def session_search(
     Pass ``profile`` to read another profile's sessions (e.g. resolving an
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
+
+    ``graphiti_irrelevant`` is consumed by the pre-call guardrail. It is
+    accepted here only to keep the registered handler shape explicit and has no
+    effect on search behavior.
     """
     if db is None:
         try:
@@ -1266,6 +1272,19 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "graphiti_irrelevant": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY when a Graphiti recall in this turn returned "
+                    "status=ok but the returned facts were clearly unrelated to the "
+                    "user's question. This bypasses Graphiti-first routing for this "
+                    "one call and is logged; follow-up scroll/read calls into a "
+                    "session found that way do not need the flag again. Never set it "
+                    "to skip checking Graphiti, and never set it when Graphiti was "
+                    "not consulted."
+                ),
+                "default": False,
+            },
         },
         "required": [],
     },
@@ -1288,6 +1307,7 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         profile=args.get("profile"),
+        graphiti_irrelevant=bool(args.get("graphiti_irrelevant", False)),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),

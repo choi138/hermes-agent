@@ -1727,6 +1727,21 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        "graphiti": {
+            # Narrow, auditable escape hatch when a successful Graphiti recall
+            # returned facts clearly unrelated to the user's question. The
+            # runtime still requires Graphiti first and permits only one flagged
+            # session_search call per turn. False preserves the strict default.
+            "allow_irrelevant_fallback": False,
+            # How many explicitly flagged (graphiti_irrelevant=true)
+            # session_search calls the hatch permits per turn. Only consulted
+            # when allow_irrelevant_fallback is true. 0 means unlimited, which
+            # effectively disables Graphiti-first routing for session_search
+            # and is not recommended. Follow-up scroll/read calls into a
+            # session already reached through the hatch are free and never
+            # charged against this budget.
+            "irrelevant_fallback_max_per_turn": 1,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

@@ -1,6 +1,7 @@
 """Pure tool-call guardrail primitive tests."""
 
 import json
+import logging
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -9,6 +10,7 @@ from agent.tool_guardrails import (
     canonical_tool_args,
     classify_tool_failure,
 )
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
@@ -258,3 +260,356 @@ def test_search_memory_facts_participates_in_idempotent_no_progress_guard():
     assert first.action == "allow"
     assert second.action == "warn"
     assert second.code == "idempotent_no_progress_warning"
+
+
+
+# ── Graphiti irrelevance escape hatch ───────────────────────────────────────
+
+
+def test_graphiti_irrelevant_fallback_config_defaults_off_and_reads_memory_key():
+    default_cfg = ToolCallGuardrailConfig.from_mapping(
+        DEFAULT_CONFIG["tool_loop_guardrails"],
+        memory_config=DEFAULT_CONFIG["memory"],
+    )
+    enabled_cfg = ToolCallGuardrailConfig.from_mapping(
+        {},
+        memory_config={"graphiti": {"allow_irrelevant_fallback": True}},
+    )
+
+    assert default_cfg.allow_graphiti_irrelevant_fallback is False
+    assert enabled_cfg.allow_graphiti_irrelevant_fallback is True
+
+
+def test_graphiti_irrelevant_fallback_budget_defaults_to_one_and_parses_override():
+    default_cfg = ToolCallGuardrailConfig.from_mapping(
+        DEFAULT_CONFIG["tool_loop_guardrails"],
+        memory_config=DEFAULT_CONFIG["memory"],
+    )
+    override_cfg = ToolCallGuardrailConfig.from_mapping(
+        {},
+        memory_config={
+            "graphiti": {
+                "allow_irrelevant_fallback": True,
+                "irrelevant_fallback_max_per_turn": 3,
+            }
+        },
+    )
+    unlimited_cfg = ToolCallGuardrailConfig.from_mapping(
+        {},
+        memory_config={"graphiti": {"irrelevant_fallback_max_per_turn": 0}},
+    )
+    junk_cfg = ToolCallGuardrailConfig.from_mapping(
+        {},
+        memory_config={"graphiti": {"irrelevant_fallback_max_per_turn": -4}},
+    )
+
+    assert default_cfg.graphiti_irrelevant_fallback_max_per_turn == 1
+    assert override_cfg.graphiti_irrelevant_fallback_max_per_turn == 3
+    # 0 is a legitimate "unlimited" value; negatives fall back to the default.
+    assert unlimited_cfg.graphiti_irrelevant_fallback_max_per_turn == 0
+    assert junk_cfg.graphiti_irrelevant_fallback_max_per_turn == 1
+
+
+def test_graphiti_ok_allows_flagged_session_search_when_escape_hatch_enabled(caplog):
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    with caplog.at_level(logging.INFO, logger="agent.tool_guardrails"):
+        decision = controller.before_call(
+            "session_search",
+            {"query": "actual preference", "graphiti_irrelevant": True},
+        )
+
+    assert decision.action == "allow"
+    assert "tool=session_search" in caplog.text
+    assert "Graphiti status=ok" in caplog.text
+
+
+def test_graphiti_ok_denies_flagged_session_search_when_escape_hatch_disabled():
+    controller = ToolCallGuardrailController()
+    controller.set_graphiti_routing_status("ok")
+
+    decision = controller.before_call(
+        "session_search",
+        {"query": "actual preference", "graphiti_irrelevant": True},
+    )
+
+    assert decision.action == "deny"
+    assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_irrelevant_flag_does_not_bypass_other_fallback_tools():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    decision = controller.before_call(
+        "web_search",
+        {"query": "actual preference", "graphiti_irrelevant": True},
+    )
+
+    assert decision.action == "deny"
+    assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_flagged_discovery_is_budgeted_one_per_turn_by_default():
+    # A second *flagged discovery* still costs a budget slot and is refused at
+    # the default budget of 1 — the Graphiti-first default stays strict.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    first = controller.before_call(
+        "session_search", {"query": "actual preference", "graphiti_irrelevant": True}
+    )
+    assert first.action == "allow"
+
+    second = controller.before_call(
+        "session_search", {"query": "a different topic", "graphiti_irrelevant": True}
+    )
+    assert second.action == "deny"
+    assert second.code == "graphiti_fallback_not_allowed"
+    assert "already spent for this turn" in second.message
+
+    controller.reset_for_turn()
+    controller.set_graphiti_routing_status("ok")
+    assert (
+        controller.before_call(
+            "session_search", {"query": "new turn", "graphiti_irrelevant": True}
+        ).action
+        == "allow"
+    )
+
+
+def test_graphiti_flagged_discovery_budget_is_configurable():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            allow_graphiti_irrelevant_fallback=True,
+            graphiti_irrelevant_fallback_max_per_turn=3,
+        )
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    for i in range(3):
+        decision = controller.before_call(
+            "session_search", {"query": f"topic {i}", "graphiti_irrelevant": True}
+        )
+        assert decision.action == "allow", i
+
+    assert (
+        controller.before_call(
+            "session_search", {"query": "topic 4", "graphiti_irrelevant": True}
+        ).action
+        == "deny"
+    )
+
+
+def test_graphiti_flagged_discovery_budget_zero_means_unlimited():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            allow_graphiti_irrelevant_fallback=True,
+            graphiti_irrelevant_fallback_max_per_turn=0,
+        )
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    for i in range(5):
+        decision = controller.before_call(
+            "session_search", {"query": f"topic {i}", "graphiti_irrelevant": True}
+        )
+        assert decision.action == "allow", i
+
+
+def test_graphiti_scroll_and_read_follow_ups_allowed_after_flagged_discovery():
+    """Flagged discovery must not strand its own follow-up reads.
+
+    Paging into an already-permitted session is a continuation, not a new
+    fallback source, so it must not consume or be blocked by the budget.
+    """
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    assert (
+        controller.before_call(
+            "session_search", {"query": "auth refactor", "graphiti_irrelevant": True}
+        ).action
+        == "allow"
+    )
+
+    # Scroll shape, flagged and unflagged, repeatedly — all follow-up paging.
+    for message_id in (4211, 4231, 4251):
+        flagged = controller.before_call(
+            "session_search",
+            {
+                "session_id": "20260824_x",
+                "around_message_id": message_id,
+                "graphiti_irrelevant": True,
+            },
+        )
+        assert flagged.action == "allow", message_id
+
+        unflagged = controller.before_call(
+            "session_search",
+            {"session_id": "20260824_x", "around_message_id": message_id},
+        )
+        assert unflagged.action == "allow", message_id
+
+    # Read shape (session_id only) is a continuation too.
+    assert (
+        controller.before_call("session_search", {"session_id": "20260824_x"}).action
+        == "allow"
+    )
+
+    # A brand-new flagged *discovery* is still refused — budget stays spent.
+    assert (
+        controller.before_call(
+            "session_search", {"query": "unrelated topic", "graphiti_irrelevant": True}
+        ).action
+        == "deny"
+    )
+
+
+def test_graphiti_scroll_denied_when_hatch_never_engaged():
+    # Without an allowed flagged discovery this turn, a session_id-shaped call
+    # is not a continuation of anything and stays denied.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    decision = controller.before_call(
+        "session_search", {"session_id": "20260824_x", "around_message_id": 4211}
+    )
+    assert decision.action == "deny"
+    assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_continuation_allowance_does_not_survive_turn_reset():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    assert (
+        controller.before_call(
+            "session_search", {"query": "auth refactor", "graphiti_irrelevant": True}
+        ).action
+        == "allow"
+    )
+    scroll = {"session_id": "20260824_x", "around_message_id": 4211}
+    assert controller.before_call("session_search", scroll).action == "allow"
+
+    controller.reset_for_turn()
+    controller.set_graphiti_routing_status("ok")
+    assert controller.before_call("session_search", scroll).action == "deny"
+
+
+def test_graphiti_scroll_denied_when_escape_hatch_disabled():
+    # Default config (hatch off): unchanged strict behavior for every shape.
+    controller = ToolCallGuardrailController()
+    controller.set_graphiti_routing_status("ok")
+
+    for args in (
+        {"query": "q", "graphiti_irrelevant": True},
+        {"session_id": "s", "around_message_id": 1},
+        {"session_id": "s", "around_message_id": 1, "graphiti_irrelevant": True},
+        {"session_id": "s"},
+    ):
+        decision = controller.before_call("session_search", args)
+        assert decision.action == "deny", args
+        assert decision.code == "graphiti_fallback_not_allowed"
+        # The hatch is off, so the denial must not advertise a spent budget.
+        assert "already spent" not in decision.message
+
+
+def test_graphiti_browser_navigate_stays_denied_even_after_hatch_engaged():
+    # browser_* is never covered by the escape hatch: the flag is a
+    # session_search-only signal and browser tools are a genuinely different
+    # source, not a continuation of session history.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    assert (
+        controller.before_call(
+            "session_search", {"query": "auth refactor", "graphiti_irrelevant": True}
+        ).action
+        == "allow"
+    )
+
+    for tool_name, args in (
+        ("browser_navigate", {"url": "https://example.com"}),
+        ("browser_navigate", {"url": "https://example.com", "graphiti_irrelevant": True}),
+        ("web_search", {"query": "x", "graphiti_irrelevant": True}),
+        ("web_extract", {"url": "https://example.com"}),
+        ("computer_use", {"action": "capture", "graphiti_irrelevant": True}),
+    ):
+        decision = controller.before_call(tool_name, args)
+        assert decision.action == "deny", (tool_name, args)
+        assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_falsey_or_non_session_id_shapes_are_not_continuations():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    controller.set_graphiti_routing_status("ok")
+
+    assert (
+        controller.before_call(
+            "session_search", {"query": "auth refactor", "graphiti_irrelevant": True}
+        ).action
+        == "allow"
+    )
+
+    # Browse shape (no args) and empty/non-string session_id are not
+    # continuations — they can start a fresh unflagged search.
+    for args in ({}, {"session_id": ""}, {"session_id": None}, {"session_id": 123}):
+        decision = controller.before_call("session_search", args)
+        assert decision.action == "deny", args
+        assert decision.code == "graphiti_fallback_not_allowed"
+
+
+def test_graphiti_non_ok_status_allows_every_session_search_shape():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+
+    for status in ("empty", "filtered", "timeout", "error", "missing"):
+        controller.set_graphiti_routing_status(status)
+        assert (
+            controller.before_call(
+                "session_search", {"session_id": "s", "around_message_id": 1}
+            ).action
+            == "allow"
+        ), status
+
+    # None of that consumed the budget, so a flagged call under status=ok
+    # still has its full allowance.
+    controller.set_graphiti_routing_status("ok")
+    assert (
+        controller.before_call(
+            "session_search", {"query": "q", "graphiti_irrelevant": True}
+        ).action
+        == "allow"
+    )
+
+
+def test_graphiti_empty_allows_flagged_session_search_without_consuming_bypass():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(allow_graphiti_irrelevant_fallback=True)
+    )
+    args = {"query": "actual preference", "graphiti_irrelevant": True}
+    controller.set_graphiti_routing_status("empty")
+
+    assert controller.before_call("session_search", args).action == "allow"
+
+    controller.set_graphiti_routing_status("ok")
+    assert controller.before_call("session_search", args).action == "allow"
