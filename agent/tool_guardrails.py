@@ -104,6 +104,31 @@ _GRAPHITI_ROUTING_STATUSES = frozenset(
     {"ok", "empty", "filtered", "timeout", "error", "missing"}
 )
 
+# Per-turn budget for the explicit Graphiti-irrelevance escape hatch. The
+# default of 1 keeps the documented "this one call" contract: the hatch is a
+# narrow, audited override, not a general opt-out of Graphiti-first routing.
+# Operators who legitimately need more flagged discovery calls in a single turn
+# raise ``memory.graphiti.irrelevant_fallback_max_per_turn``; 0 means unlimited
+# (matching LoopCapConfig's "0 disables the cap" convention) and is deliberately
+# NOT the default because unlimited flagged fallback neuters Graphiti-first.
+_DEFAULT_GRAPHITI_IRRELEVANT_FALLBACK_PER_TURN = 1
+
+
+def _is_session_search_continuation(args: Mapping[str, Any]) -> bool:
+    """Whether a session_search call reads an already-identified session.
+
+    session_search has four shapes: discovery (``query``), scroll
+    (``session_id`` + ``around_message_id``), read (``session_id`` alone), and
+    browse (no args). The two ``session_id`` shapes cannot originate a new
+    search — they can only re-read a session whose id the model already holds,
+    which in practice came from a discovery call this turn. They are follow-up
+    paging, not a fresh fallback source, so they must not be charged against
+    (or blocked by) the escape-hatch budget once the hatch is already engaged.
+    """
+    session_id = args.get("session_id")
+    return bool(session_id) and isinstance(session_id, str)
+
+
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
@@ -122,6 +147,9 @@ class ToolCallGuardrailConfig:
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
     allow_graphiti_irrelevant_fallback: bool = False
+    graphiti_irrelevant_fallback_max_per_turn: int = (
+        _DEFAULT_GRAPHITI_IRRELEVANT_FALLBACK_PER_TURN
+    )
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
@@ -181,6 +209,10 @@ class ToolCallGuardrailConfig:
             allow_graphiti_irrelevant_fallback=_as_bool(
                 graphiti_config.get("allow_irrelevant_fallback"),
                 defaults.allow_graphiti_irrelevant_fallback,
+            ),
+            graphiti_irrelevant_fallback_max_per_turn=_non_negative_int(
+                graphiti_config.get("irrelevant_fallback_max_per_turn"),
+                defaults.graphiti_irrelevant_fallback_max_per_turn,
             ),
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
@@ -356,7 +388,13 @@ class ToolCallGuardrailController:
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
         self._graphiti_routing_status: str | None = None
-        self._graphiti_irrelevant_fallback_used = False
+        # Count of flagged escape-hatch calls consumed this turn, and whether
+        # the hatch was ever engaged. The latter gates session_search
+        # continuation (scroll/read) calls: paging into a session the model
+        # only learned about through an allowed flagged discovery must not be
+        # denied, but it also must not become a free unflagged entry point.
+        self._graphiti_irrelevant_fallback_count = 0
+        self._graphiti_irrelevant_fallback_engaged = False
 
     def set_graphiti_routing_status(self, status: str | None) -> None:
         """Set the current turn's Graphiti-first fallback decision."""
@@ -371,6 +409,80 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def _graphiti_bypass_reason(
+        self, tool_name: str, args: Mapping[str, Any]
+    ) -> str | None:
+        """Why this call may bypass Graphiti-first routing, or None to deny.
+
+        Two distinct allowances, both scoped to ``session_search`` and both
+        requiring ``memory.graphiti.allow_irrelevant_fallback``:
+
+        ``flagged``
+            An explicit ``graphiti_irrelevant=true`` call. Charged against the
+            per-turn budget (default 1) so the hatch stays narrow and audited.
+
+        ``continuation``
+            A ``session_id``-shaped call (scroll/read) made after the hatch was
+            already engaged this turn. Paging into a session that the model can
+            only have learned about from an allowed discovery is a follow-up
+            read of the SAME permitted source, not a new fallback source, so it
+            is free and does not consume budget. Requiring a fresh budget slot
+            for every page was the observed defect: discovery was allowed and
+            the follow-up read of its own result was then denied.
+
+        Anything else (other fallback tools, ``browser_*``, unflagged
+        discovery, or a continuation before the hatch was ever engaged) is
+        denied exactly as before.
+        """
+        if tool_name != "session_search":
+            return None
+        if not self.config.allow_graphiti_irrelevant_fallback:
+            return None
+
+        if bool(args.get("graphiti_irrelevant")):
+            cap = self.config.graphiti_irrelevant_fallback_max_per_turn
+            if cap and self._graphiti_irrelevant_fallback_count >= cap:
+                # Budget exhausted. A flagged continuation is still a
+                # follow-up read of an already-permitted session, so fall
+                # through to the continuation allowance rather than denying it.
+                if self._graphiti_irrelevant_fallback_engaged and (
+                    _is_session_search_continuation(args)
+                ):
+                    return "continuation"
+                return None
+            self._graphiti_irrelevant_fallback_count += 1
+            self._graphiti_irrelevant_fallback_engaged = True
+            return "flagged"
+
+        if self._graphiti_irrelevant_fallback_engaged and (
+            _is_session_search_continuation(args)
+        ):
+            return "continuation"
+
+        return None
+
+    def _graphiti_deny_message(self, tool_name: str, graphiti_status: str | None) -> str:
+        """Denial guidance, naming the escape hatch only when it is usable."""
+        message = (
+            f"Blocked {tool_name}: Graphiti-first routing permits another "
+            "source only after a confirmed status=empty result. The current "
+            f"Graphiti status is {graphiti_status}. Report that status instead "
+            "of silently falling back, unless the user explicitly directs a "
+            "different source."
+        )
+        cap = self.config.graphiti_irrelevant_fallback_max_per_turn
+        if (
+            self.config.allow_graphiti_irrelevant_fallback
+            and cap
+            and self._graphiti_irrelevant_fallback_count >= cap
+        ):
+            message += (
+                f" The graphiti_irrelevant escape hatch is already spent for this "
+                f"turn ({self._graphiti_irrelevant_fallback_count}/{cap}); do not "
+                "re-flag another call."
+            )
+        return message
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
 
@@ -380,31 +492,23 @@ class ToolCallGuardrailController:
             or tool_name.startswith("browser_")
         )
         if is_fallback_tool and graphiti_status == "ok":
-            graphiti_irrelevant_bypass = (
-                tool_name == "session_search"
-                and bool(_coerce_args(args).get("graphiti_irrelevant"))
-                and self.config.allow_graphiti_irrelevant_fallback
-                and not self._graphiti_irrelevant_fallback_used
-            )
-            if graphiti_irrelevant_bypass:
-                self._graphiti_irrelevant_fallback_used = True
+            call_args = _coerce_args(args)
+            bypass_reason = self._graphiti_bypass_reason(tool_name, call_args)
+            if bypass_reason is not None:
                 logger.info(
                     "Graphiti irrelevant-fallback escape hatch used: "
-                    "tool=%s Graphiti status=%s",
+                    "tool=%s Graphiti status=%s reason=%s budget=%s/%s",
                     tool_name,
                     graphiti_status,
+                    bypass_reason,
+                    self._graphiti_irrelevant_fallback_count,
+                    self.config.graphiti_irrelevant_fallback_max_per_turn or "unlimited",
                 )
             else:
                 return ToolGuardrailDecision(
                     action="deny",
                     code="graphiti_fallback_not_allowed",
-                    message=(
-                        f"Blocked {tool_name}: Graphiti-first routing permits another "
-                        "source only after a confirmed status=empty result. The current "
-                        f"Graphiti status is {graphiti_status}. Report that status instead "
-                        "of silently falling back, unless the user explicitly directs a "
-                        "different source."
-                    ),
+                    message=self._graphiti_deny_message(tool_name, graphiti_status),
                     tool_name=tool_name,
                     signature=signature,
                 )

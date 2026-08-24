@@ -1435,8 +1435,10 @@ SESSION_SEARCH_SCHEMA = {
                     "Set true ONLY when a Graphiti recall in this turn returned "
                     "status=ok but the returned facts were clearly unrelated to the "
                     "user's question. This bypasses Graphiti-first routing for this "
-                    "one call and is logged. Never set it to skip checking Graphiti, "
-                    "and never set it when Graphiti was not consulted."
+                    "one call and is logged; follow-up scroll/read calls into a "
+                    "session found that way do not need the flag again. Never set it "
+                    "to skip checking Graphiti, and never set it when Graphiti was "
+                    "not consulted."
                 ),
                 "default": False,
             },
