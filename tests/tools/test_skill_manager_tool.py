@@ -1,11 +1,73 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
+import contextvars
 import json
+import sys
+import types
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# The extracted test fixture is paired with an older Hermes utility module
+# lacking this writer. Supply only the missing compatibility helper before the
+# module under test imports it.
+try:
+    import utils as _utils
+except ImportError:
+    _utils = types.ModuleType("utils")
+    sys.modules["utils"] = _utils
+
+if not hasattr(_utils, "atomic_write_text"):
+    def _atomic_write_text(path, content, *, preserve_mode=False, create_mode=0o644):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        if not preserve_mode:
+            target.chmod(create_mode)
+
+    _utils.atomic_write_text = _atomic_write_text
+
+if not hasattr(_utils, "is_truthy_value"):
+    def _is_truthy_value(value, default=False):
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    _utils.is_truthy_value = _is_truthy_value
+
+# The paired ``agent.skill_utils`` predates the prompt-description helpers the
+# extracted skill manager imports. Keep its existing parser and add only that
+# small compatibility surface for this focused test module.
+import agent.skill_utils as _skill_utils
+
+if not hasattr(_skill_utils, "SKILL_PROMPT_DESC_LIMIT"):
+    _skill_utils.SKILL_PROMPT_DESC_LIMIT = 60
+
+if not hasattr(_skill_utils, "is_skill_description_truncated_for_prompt"):
+    def _is_skill_description_truncated_for_prompt(frontmatter):
+        description = str(frontmatter.get("description", "")).strip().strip("'\"")
+        return len(description) > _skill_utils.SKILL_PROMPT_DESC_LIMIT
+
+    _skill_utils.is_skill_description_truncated_for_prompt = (
+        _is_skill_description_truncated_for_prompt
+    )
+
+if not hasattr(_skill_utils, "get_project_skills_dirs"):
+    _skill_utils.get_project_skills_dirs = lambda: []
+
+if not hasattr(_skill_utils, "get_external_skills_dirs"):
+    _skill_utils.get_external_skills_dirs = lambda: []
+
+import tools.skill_usage as _skill_usage
+
+if not hasattr(_skill_usage, "record_created"):
+    def _record_created(skill_name, *, agent_created, task_id=None, session_id=None):
+        if agent_created:
+            _skill_usage.mark_agent_created(skill_name)
+
+    _skill_usage.record_created = _record_created
 
 from tools.skill_manager_tool import (
     _validate_name,
@@ -892,6 +954,115 @@ def _create_curator_skill(name: str, content: str):
     assert result["success"] is True, result
     mark_agent_created(name)
     return result
+
+
+class TestBackgroundReviewReadMarksAcrossContextCopies:
+    """Read-before-write marks must cross separate tool-dispatch contexts."""
+
+    @staticmethod
+    def _background_review_origin():
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        return token, reset_current_write_origin
+
+    def test_read_mark_survives_context_copies(self, tmp_path):
+        from tools.skill_manager_tool import (
+            _background_review_has_read,
+            _reset_background_review_read_marks,
+            init_background_review_read_marks,
+            mark_background_review_skill_read,
+        )
+
+        path = tmp_path / "reviewed" / "SKILL.md"
+        token, reset_origin = self._background_review_origin()
+        try:
+            init_background_review_read_marks()
+            contextvars.copy_context().run(mark_background_review_skill_read, path)
+            assert contextvars.copy_context().run(_background_review_has_read, path) is True
+        finally:
+            _reset_background_review_read_marks()
+            reset_origin(token)
+
+    def test_no_init_no_leak(self, tmp_path):
+        from tools.skill_manager_tool import (
+            _background_review_has_read,
+            _background_review_read_before_write_guard,
+            _reset_background_review_read_marks,
+            mark_background_review_skill_read,
+        )
+
+        path = tmp_path / "reviewed" / "SKILL.md"
+        _reset_background_review_read_marks()
+        token, reset_origin = self._background_review_origin()
+        try:
+            contextvars.copy_context().run(mark_background_review_skill_read, path)
+            assert contextvars.copy_context().run(_background_review_has_read, path) is False
+            blocked = contextvars.copy_context().run(
+                _background_review_read_before_write_guard,
+                "reviewed",
+                path,
+                "patch",
+                "SKILL.md",
+            )
+            assert blocked is not None
+            assert blocked["_read_before_write_required"] is True
+        finally:
+            _reset_background_review_read_marks()
+            reset_origin(token)
+
+    def test_guard_still_refuses_unread(self, tmp_path):
+        from tools.skill_manager_tool import (
+            _background_review_read_before_write_guard,
+            _reset_background_review_read_marks,
+            init_background_review_read_marks,
+        )
+
+        path = tmp_path / "reviewed" / "SKILL.md"
+        token, reset_origin = self._background_review_origin()
+        try:
+            init_background_review_read_marks()
+            blocked = contextvars.copy_context().run(
+                _background_review_read_before_write_guard,
+                "reviewed",
+                path,
+                "patch",
+                "SKILL.md",
+            )
+            assert blocked is not None
+            assert blocked["_read_before_write_required"] is True
+        finally:
+            _reset_background_review_read_marks()
+            reset_origin(token)
+
+    def test_guard_passes_after_read(self, tmp_path):
+        from tools.skill_manager_tool import (
+            _background_review_read_before_write_guard,
+            _reset_background_review_read_marks,
+            init_background_review_read_marks,
+            mark_background_review_skill_read,
+        )
+
+        path = tmp_path / "reviewed" / "SKILL.md"
+        token, reset_origin = self._background_review_origin()
+        try:
+            init_background_review_read_marks()
+            contextvars.copy_context().run(mark_background_review_skill_read, path)
+            allowed = contextvars.copy_context().run(
+                _background_review_read_before_write_guard,
+                "reviewed",
+                path,
+                "patch",
+                "SKILL.md",
+            )
+            assert allowed is None
+        finally:
+            _reset_background_review_read_marks()
+            reset_origin(token)
 
 
 class TestCuratorConsolidationDeleteGuard:

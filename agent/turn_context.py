@@ -491,6 +491,16 @@ def build_turn_context(
 
     # Bind the skill write-origin ContextVar for this thread.
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    if getattr(agent, "_memory_write_origin", "") == "background_review":
+        # resume_turn re-enters the SAME logical turn (e.g. after a gateway
+        # restart), so earlier tool calls' read marks must survive; rebinding
+        # a fresh set here would re-create the lost-marks defect on resume.
+        if not resume_turn:
+            try:
+                from tools.skill_manager_tool import init_background_review_read_marks
+                init_background_review_read_marks()
+            except Exception:
+                pass
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()

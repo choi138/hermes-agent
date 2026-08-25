@@ -52,9 +52,21 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
+_background_review_read_paths: "_ctxvars.ContextVar[Optional[set[str]]]" = _ctxvars.ContextVar(
+    "background_review_read_paths", default=None
 )
+
+
+def init_background_review_read_marks() -> None:
+    """Bind a fresh mutable read-marks set for this review turn.
+
+    Must run on the review fork's own thread BEFORE any tool dispatch:
+    tool calls execute in copy_context() copies, and only a container created
+    in the PARENT context is shared across those copies. A lazily-created set
+    inside a worker would be trapped in that worker's discarded copy (the
+    original defect).
+    """
+    _background_review_read_paths.set(set())
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -77,9 +89,13 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    marks = _background_review_read_paths.get()
+    if marks is None:
+        # Fork started without init (legacy path) — nothing shared to mutate;
+        # fall back to binding a fresh set so at least same-copy reads register.
+        marks = set()
+        _background_review_read_paths.set(marks)
+    marks.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +103,13 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    marks = _background_review_read_paths.get()
+    return bool(marks) and resolved in marks
 
 
 def _reset_background_review_read_marks() -> None:
     """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    _background_review_read_paths.set(None)
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
