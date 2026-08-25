@@ -452,31 +452,43 @@ class TestTruncateMessageContract:
 
     @staticmethod
     def _subclass_overrides():
+        """Real shipped adapters that override ``truncate_message``.
+
+        Walking ``__subclasses__()`` alone is unreliable inside a test session:
+        other test modules define ad-hoc BasePlatformAdapter subclasses that
+        stay registered for the rest of the run, so the set depends on test
+        ordering.  Restrict the scan to the adapter modules this repository
+        actually ships.
+        """
         import importlib
-        import inspect
+
+        modules = (
+            "gateway.platforms.bluebubbles",
+            "gateway.platforms.yuanbao",
+            "gateway.platforms.signal",
+            "gateway.platforms.whatsapp_cloud",
+            "gateway.platforms.weixin",
+            "gateway.platforms.webhook",
+        )
 
         from gateway.platforms.base import BasePlatformAdapter
 
-        # Import the adapter modules so the subclasses are registered.
-        for mod in (
-            "gateway.platforms.bluebubbles",
-            "gateway.platforms.yuanbao",
-        ):
+        seen = {}
+        for mod_name in modules:
             try:
-                importlib.import_module(mod)
+                mod = importlib.import_module(mod_name)
             except Exception:  # pragma: no cover - optional deps
                 continue
-
-        seen = {}
-
-        def walk(cls):
-            for sub in cls.__subclasses__():
-                own = sub.__dict__.get("truncate_message")
+            for attr in vars(mod).values():
+                if not isinstance(attr, type):
+                    continue
+                if not issubclass(attr, BasePlatformAdapter):
+                    continue
+                if attr.__module__ != mod_name:
+                    continue          # re-exported, not defined here
+                own = attr.__dict__.get("truncate_message")
                 if own is not None:
-                    seen[f"{sub.__module__}.{sub.__qualname__}"] = own
-                walk(sub)
-
-        walk(BasePlatformAdapter)
+                    seen[f"{mod_name}.{attr.__qualname__}"] = own
         return seen
 
     def test_overrides_accept_len_fn_keyword(self):
