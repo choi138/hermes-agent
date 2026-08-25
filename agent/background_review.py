@@ -177,7 +177,20 @@ def _resolve_review_runtime(
     task_api_key = (str(task.get("api_key", "")).strip() or None)
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
-    if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
+    primary_runtime = getattr(agent, "_primary_runtime", None)
+    primary_provider = (
+        primary_runtime.get("provider") or agent.provider or ""
+        if isinstance(primary_runtime, dict)
+        else agent.provider or ""
+    )
+    primary_model = (
+        primary_runtime.get("model") or agent.model or ""
+        if isinstance(primary_runtime, dict)
+        else agent.model or ""
+    )
+    # Aux config asks whether this is the configured main model; a fallback is
+    # transient, not a reconfiguration. This also applies to ingest-curator.
+    if task_provider == primary_provider and task_model == primary_model:
         return parent  # same model/provider as parent -> not routed
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider

@@ -113,6 +113,88 @@ def _parent_agent(fallback_chain):
     )
 
 
+def _runtime_agent(provider, model, primary_runtime=None, *, has_primary=True):
+    agent = SimpleNamespace(
+        provider=provider,
+        model=model,
+        _credential_pool=None,
+        request_overrides={},
+        max_tokens=None,
+        acp_command=None,
+        acp_args=[],
+        _current_main_runtime=lambda: {},
+    )
+    if has_primary:
+        agent._primary_runtime = primary_runtime
+    return agent
+
+
+def test_resolve_review_runtime_same_primary_model_is_not_routed(background_review):
+    module, _ = background_review
+
+    runtime = module._resolve_review_runtime(
+        _runtime_agent("claude-nekos", "primary-model"),
+        {"provider": "claude-nekos", "model": "primary-model"},
+    )
+
+    assert runtime["routed"] is False
+
+
+def test_resolve_review_runtime_fallback_uses_primary_model(background_review):
+    module, _ = background_review
+
+    runtime = module._resolve_review_runtime(
+        _runtime_agent(
+            "anthropic",
+            "fallback-model",
+            {"provider": "claude-nekos", "model": "primary-model"},
+        ),
+        {"provider": "claude-nekos", "model": "primary-model"},
+    )
+
+    assert runtime["routed"] is False
+
+
+def test_resolve_review_runtime_different_primary_model_is_routed(
+    background_review, monkeypatch
+):
+    module, _ = background_review
+    runtime_provider_module = types.ModuleType("hermes_cli.runtime_provider")
+    runtime_provider_module.resolve_runtime_provider = lambda **kwargs: {
+        "provider": kwargs["requested"],
+        "model": kwargs["target_model"],
+    }
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider_module)
+
+    runtime = module._resolve_review_runtime(
+        _runtime_agent(
+            "anthropic",
+            "fallback-model",
+            {"provider": "claude-nekos", "model": "primary-model"},
+        ),
+        {"provider": "other-provider", "model": "other-model"},
+    )
+
+    assert runtime["routed"] is True
+
+
+def test_resolve_review_runtime_without_primary_runtime_uses_live_runtime(
+    background_review,
+):
+    module, _ = background_review
+
+    runtime = module._resolve_review_runtime(
+        _runtime_agent(
+            "claude-nekos",
+            "primary-model",
+            has_primary=False,
+        ),
+        {"provider": "claude-nekos", "model": "primary-model"},
+    )
+
+    assert runtime["routed"] is False
+
+
 def _run_fork(background_review, captured, *, routed, fallback_chain):
     module = background_review
     module._resolve_review_runtime = lambda _agent, task_cfg: {
