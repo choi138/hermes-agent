@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
-from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
@@ -219,9 +218,11 @@ class GatewayStreamConsumer:
         self._initial_reply_to_id = initial_reply_to_id
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
-        # Full segment text mirror of ``_accumulated`` that is NOT truncated
-        # when overflow splits seal head chunks.  Used to record a reconciliable
-        # turn-final payload for multi-message deliveries (#78541).
+        # Full logical segment text mirror of ``_accumulated`` that is NOT
+        # truncated when overflow splits seal head chunks.  Fence close/reopen
+        # pairs inserted solely at message boundaries are presentation markup,
+        # not model output, so the ledger deliberately retains the canonical
+        # source text used to reconcile the final response (#78541).
         self._stream_ledger = ""
         self._message_id: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
@@ -1000,13 +1001,27 @@ class GatewayStreamConsumer:
                         and self._message_id is not None
                         and self._edit_supported
                     ):
-                        _cp_budget = _custom_unit_to_cp(
+                        chunks = self._truncate_for_stream(
                             self._accumulated, _safe_limit, _len_fn,
                         )
-                        split_at = self._accumulated.rfind("\n", 0, _cp_budget)
-                        if split_at < _cp_budget // 2:
-                            split_at = _cp_budget
-                        chunk = self._accumulated[:split_at]
+                        if (
+                            len(chunks) <= 1
+                            or _len_fn(chunks[0]) > _safe_limit
+                        ):
+                            # A malformed or legacy adapter splitter must not
+                            # make the sealed edit exceed the platform budget.
+                            chunks = self._split_text_chunks(
+                                self._accumulated, _safe_limit, _len_fn,
+                            )
+                        if (
+                            len(chunks) <= 1
+                            or _len_fn(chunks[0]) > _safe_limit
+                        ):
+                            # Do not spin on a degenerate splitter result.  The
+                            # normal send/edit path below retains the full text
+                            # for its existing fallback handling.
+                            break
+                        chunk = chunks[0]
                         # finalize=True so the adapter applies platform-specific
                         # rich-text markup (e.g. Telegram MarkdownV2). This
                         # sealed chunk will never be edited again — _message_id
@@ -1027,7 +1042,16 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        # Keep the canonical splitter's fence-reopened tail as
+                        # the active preview.  It may contain further balanced
+                        # chunks from an adapter-specific splitter; joining them
+                        # preserves every character for the normal send/edit
+                        # path rather than discarding an oversized remainder.
+                        # ``_stream_ledger`` intentionally remains the logical
+                        # model stream: these synthetic fence boundary markers
+                        # have no counterpart in ``final_response``, and the
+                        # recorder reconciles the canonical source text.
+                        self._accumulated = "".join(chunks[1:])
                         self._message_id = None
                         self._last_sent_text = ""
                         # Sealed head chunk delivered — this turn is now a

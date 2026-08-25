@@ -507,6 +507,44 @@ async def test_complete_overflow_split_still_suppresses_duplicate():
 
 
 @pytest.mark.asyncio
+async def test_existing_message_overflow_reopens_fenced_tail_and_reconciles():
+    """Path B keeps each delivered SQL chunk fence-safe (#78541)."""
+    adapter = FinalizeCaptureAdapter()
+    adapter.MAX_MESSAGE_LENGTH = 700
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "chat-split",
+        StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+    )
+    prefix = "Preamble\n```sql\n"
+    body = "".join(
+        f"SELECT {index} FROM things; -- padding\n" for index in range(28)
+    ) + "```\nAfter.\n"
+    complete = prefix + body
+
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta(prefix)
+    await asyncio.sleep(0.02)
+    assert adapter.sent, "expected the initial preview to establish path B"
+
+    consumer.on_delta(body)
+    await asyncio.sleep(0.02)
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=10)
+
+    safe_limit = adapter.MAX_MESSAGE_LENGTH - 100
+    sealed_head = next(edit["content"] for edit in adapter.edits if edit["finalize"])
+    tail = adapter.sent[-1]["content"]
+    assert sealed_head.count("```") % 2 == 0
+    assert tail.startswith("```sql\n")
+    assert all(len(chunk) <= safe_limit for chunk in (sealed_head, tail))
+    # The fence reopen is delivery-only markup; the canonical stream ledger
+    # must still reconcile against the model's original final response.
+    assert consumer._stream_ledger == complete
+    assert consumer.delivered_final_matches(complete) is True
+
+
+@pytest.mark.asyncio
 async def test_split_delivery_missing_tail_does_not_suppress():
     """#78541 — when the completed response exceeds what the split delivered,
     the matcher must report a mismatch so the gateway still sends it."""
