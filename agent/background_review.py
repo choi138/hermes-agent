@@ -24,6 +24,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlparse
 
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -122,6 +123,95 @@ def is_background_review_enabled(
     return enabled
 
 
+def _parent_primary_provider(agent: Any) -> str:
+    """Return the parent's configured provider, ignoring an active fallback."""
+    primary_runtime = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary_runtime, dict) and primary_runtime.get("provider"):
+        return primary_runtime["provider"]
+    return getattr(agent, "provider", None) or ""
+
+
+def _normalize_route_url(
+    base_url: Optional[str], default_query: Optional[Dict[str, Any]] = None
+) -> tuple:
+    """Return a canonical endpoint and effective query representation."""
+    if base_url is None or base_url == "":
+        return ("",)
+
+    parsed_url = urlparse(base_url)
+    query_items = set(parse_qsl(parsed_url.query, keep_blank_values=True))
+    if default_query:
+        for key, value in default_query.items():
+            if isinstance(value, (list, tuple)):
+                query_items.update((f"{key}[]", str(item)) for item in value)
+            else:
+                query_items.add((key, str(value)))
+    combined_path = parsed_url.path + (
+        ";" + parsed_url.params if parsed_url.params else ""
+    )
+    canonical_path = (
+        combined_path.rstrip("/") if not parsed_url.params else combined_path
+    )
+    return (
+        parsed_url.scheme,
+        parsed_url.netloc,
+        canonical_path,
+        frozenset(query_items),
+    )
+
+
+def _fork_matches_primary_route(agent: Any, rt: Dict[str, Any]) -> bool:
+    """Return True when the fork targets the parent's primary runtime route.
+
+    The provider family, endpoint, and credential route must all match.
+    """
+    primary_runtime = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary_runtime, dict):
+        primary_base_url = primary_runtime.get(
+            "base_url", getattr(agent, "base_url", None)
+        )
+        primary_client_kwargs = primary_runtime.get(
+            "client_kwargs", getattr(agent, "_client_kwargs", {})
+        )
+        primary_api_key = primary_runtime.get(
+            "api_key", getattr(agent, "api_key", None)
+        )
+    else:
+        primary_base_url = getattr(agent, "base_url", None)
+        primary_client_kwargs = getattr(agent, "_client_kwargs", {})
+        primary_api_key = getattr(agent, "api_key", None)
+    primary_default_query = (
+        primary_client_kwargs.get("default_query")
+        if isinstance(primary_client_kwargs, dict)
+        else None
+    )
+
+    primary_provider = _parent_primary_provider(agent)
+    fork_provider = rt.get("provider")
+    primary_family = (
+        primary_provider if primary_provider is not None else ""
+    ).split(":", 1)[0]
+    fork_family = (
+        fork_provider if fork_provider is not None else ""
+    ).split(":", 1)[0]
+    fork_base_url = rt.get("base_url")
+    fork_api_key = rt.get("api_key")
+    normalized_fork_api_key = "" if fork_api_key is None else fork_api_key
+    normalized_primary_api_key = "" if primary_api_key is None else primary_api_key
+    if isinstance(normalized_fork_api_key, str) and isinstance(
+        normalized_primary_api_key, str
+    ):
+        api_keys_match = normalized_fork_api_key == normalized_primary_api_key
+    else:
+        api_keys_match = fork_api_key is primary_api_key
+
+    return (
+        fork_family == primary_family
+        and _normalize_route_url(fork_base_url)
+        == _normalize_route_url(primary_base_url, primary_default_query)
+        and api_keys_match
+    )
+
 
 def _resolve_review_runtime(
     agent: Any,
@@ -178,11 +268,7 @@ def _resolve_review_runtime(
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
     primary_runtime = getattr(agent, "_primary_runtime", None)
-    primary_provider = (
-        primary_runtime.get("provider") or agent.provider or ""
-        if isinstance(primary_runtime, dict)
-        else agent.provider or ""
-    )
+    primary_provider = _parent_primary_provider(agent)
     primary_model = (
         primary_runtime.get("model") or agent.model or ""
         if isinstance(primary_runtime, dict)
@@ -1011,6 +1097,7 @@ def _run_review_in_thread(
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent, task_cfg=task_cfg)
             _routed = bool(_rt.get("routed"))
+            _fork_provider = _rt.get("provider") or agent.provider
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -1090,7 +1177,7 @@ def _run_review_in_thread(
                 max_iterations=_REVIEW_MAX_ITERATIONS,
                 quiet_mode=True,
                 platform=agent.platform,
-                provider=_rt.get("provider") or agent.provider,
+                provider=_fork_provider,
                 api_mode=_rt.get("api_mode"),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
@@ -1100,12 +1187,13 @@ def _run_review_in_thread(
                 # does.  Without this the fork's chain is [] (see agent_init),
                 # so _try_activate_fallback() can never succeed and a 429/503
                 # on the primary kills the review with calls=0.
-                # Same-model path only: a routed aux model may need a different
-                # chain, matching the ``not _routed`` gates above.  An empty
-                # parent chain normalizes to None so behaviour is unchanged.
+                # ``routed`` also covers a model-only change. Keep the chain
+                # only when the fork resolves to the parent's primary provider
+                # family, endpoint, and credential route. An empty parent chain
+                # normalizes to None in every branch.
                 fallback_model=(
                     (getattr(agent, "_fallback_chain", None) or None)
-                    if not _routed
+                    if (not _routed or _fork_matches_primary_route(agent, _rt))
                     else None
                 ),
                 request_overrides=_rt.get("request_overrides") or {},
