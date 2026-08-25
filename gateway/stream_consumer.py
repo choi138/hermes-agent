@@ -281,6 +281,12 @@ class GatewayStreamConsumer:
     # progressive edits for the remainder of the stream.
     _MAX_FLOOD_STRIKES = 3
 
+    # After this many consecutive overflow-split passes that deliver ZERO head
+    # chunks, stop attempting the split path.  Without the cap the run loop
+    # re-enters the same branch every tick with an unchanged buffer and no edit
+    # target, re-splitting forever at 100% CPU while nothing reaches the user.
+    _MAX_OVERFLOW_SPLIT_STRIKES = 3
+
     # Reasoning/thinking tags that models emit inline in content.
     # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
     # run_agent.py _strip_think_blocks() tag variants.
@@ -391,6 +397,10 @@ class GatewayStreamConsumer:
         # (#78541) — that combination was swallowing complete Telegram group
         # replies after an early/partial multi-message delivery.
         self._turn_split_delivery = False
+        # Consecutive overflow-split passes that delivered no head chunk.
+        # Capped by ``_MAX_OVERFLOW_SPLIT_STRIKES`` so a platform that keeps
+        # rejecting sends cannot pin the run loop re-splitting the same buffer.
+        self._overflow_split_strikes = 0
         self._delivered_commentary_texts: list[str] = []
         # Retains the finalized visible text of each streaming segment so
         # ``has_delivered_text`` can still match after ``_reset_segment_state``
@@ -687,6 +697,7 @@ class GatewayStreamConsumer:
         self._final_content_delivered = False
         self._delivered_final_text = None
         self._turn_split_delivery = False
+        self._overflow_split_strikes = 0
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -1007,6 +1018,9 @@ class GatewayStreamConsumer:
                     if (
                         _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is None
+                        and self._edit_supported
+                        and self._overflow_split_strikes
+                            < self._MAX_OVERFLOW_SPLIT_STRIKES
                     ):
                         # No existing message to edit (first message or after a
                         # segment break).  Seal only the overflowing head chunks
@@ -1042,6 +1056,28 @@ class GatewayStreamConsumer:
                                 break
                             chunks_delivered = True
                             reply_to = new_id
+
+                        if not chunks_delivered and len(chunks) > 1:
+                            # Not one head landed.  ``_accumulated`` is
+                            # unchanged and ``_message_id`` stays None, so the
+                            # next tick would re-enter this exact branch and
+                            # re-split the same buffer forever, pinning the
+                            # event loop at 100% CPU with nothing on screen.
+                            # Stop attempting the split path and let the
+                            # fallback final-send deliver the payload.
+                            self._overflow_split_strikes += 1
+                            if (self._overflow_split_strikes
+                                    >= self._MAX_OVERFLOW_SPLIT_STRIKES):
+                                logger.warning(
+                                    "Overflow split could not deliver any head "
+                                    "chunk after %d attempts; disabling the "
+                                    "split path and falling back.",
+                                    self._overflow_split_strikes,
+                                )
+                                self._edit_supported = False
+                                self._fallback_final_send = True
+                        else:
+                            self._overflow_split_strikes = 0
 
                         if all_heads_delivered:
                             self._accumulated = chunks[-1]
@@ -1106,9 +1142,22 @@ class GatewayStreamConsumer:
                         continue
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
+                    #
+                    # Sealing sets ``_message_id = None`` so the loop's own
+                    # condition would stop after ONE head.  ``source_tail`` is
+                    # the whole remaining source, though, so a payload needing
+                    # three or more chunks would leave an oversized buffer that
+                    # the send below pushes to the platform in one message.
+                    # ``sealed_any`` keeps the loop running on the fresh tail:
+                    # each pass seals one more head as a NEW message
+                    # (``_send_or_edit`` first-sends when there is no edit
+                    # target) until what remains fits the budget.  Every pass
+                    # either shrinks ``_accumulated`` or breaks, so the loop
+                    # always terminates.
+                    sealed_any = False
                     while (
                         _len_fn(self._accumulated) > _safe_limit
-                        and self._message_id is not None
+                        and (self._message_id is not None or sealed_any)
                         and self._edit_supported
                     ):
                         chunks = self._truncate_for_stream(
@@ -1172,6 +1221,12 @@ class GatewayStreamConsumer:
                         # Sealed head chunk delivered — this turn is now a
                         # multi-message delivery (#71643 record semantics).
                         self._turn_split_delivery = True
+                        # Keep looping on the fresh tail even though
+                        # ``_message_id`` is now None.  Without this the loop
+                        # stopped after one head and a payload needing 3+
+                        # chunks went out as a single oversized message the
+                        # platform rejects.
+                        sealed_any = True
 
                     display_text = self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None:

@@ -2015,3 +2015,129 @@ class TestPageIndicatorStripping:
                     assert re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", stripped), (
                         f"page indicator glued to a fence: {line!r}"
                     )
+
+
+class TestOverflowSplitTermination:
+    """The overflow-split paths must always terminate and never exceed the cap.
+
+    Both defects here predate this branch and were found while hardening the
+    fence fix:
+
+      * a payload needing 3+ chunks left an oversized tail that went out as a
+        single message the platform rejects (rvw finding 9aba3424)
+      * when every send failed the run loop re-entered the path-A split branch
+        forever with an unchanged buffer, pinning the event loop at 100% CPU
+    """
+
+    LIMIT = 2000
+
+    @staticmethod
+    def _adapter_cls(*, send_ok=True, edit_ok=True, splitter=None):
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        limit = TestOverflowSplitTermination.LIMIT
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = limit
+
+            def __init__(self):
+                self.messages = {}
+                self.order = []
+                self._n = 0
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            async def send(self, chat_id=None, content=None, reply_to=None,
+                           metadata=None, **kwargs):
+                if not send_ok:
+                    return SendResult(success=False, error="rejected")
+                self._n += 1
+                mid = f"m{self._n}"
+                self.messages[mid] = content
+                self.order.append(mid)
+                return SendResult(success=True, message_id=mid)
+
+            async def edit_message(self, chat_id=None, message_id=None,
+                                   content=None, finalize=False,
+                                   metadata=None, **kwargs):
+                if not edit_ok:
+                    return SendResult(success=False, error="rejected")
+                self.messages[message_id] = content
+                return SendResult(success=True, message_id=message_id)
+
+        if splitter is not None:
+            Adapter.truncate_message = staticmethod(splitter)
+        return Adapter
+
+    @staticmethod
+    async def _drive(adapter, payload, *, timeout=20):
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("시작.\n")
+        await asyncio.sleep(0.05)
+        consumer.on_delta(payload)
+        await asyncio.sleep(0.02)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=timeout)
+        return [
+            adapter.messages[m] for m in adapter.order if adapter.messages.get(m)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multi_chunk_payload_never_exceeds_the_limit(self):
+        """A payload needing many chunks is sealed one head at a time."""
+        payload = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 500
+        adapter = self._adapter_cls()()
+        delivered = await self._drive(adapter, payload)
+
+        assert len(delivered) > 3, "expected a multi-message split"
+        oversized = [len(m) for m in delivered if len(m) > self.LIMIT]
+        assert not oversized, f"messages above the platform cap: {oversized}"
+
+    @pytest.mark.asyncio
+    async def test_every_send_failing_terminates(self):
+        """A platform rejecting every send must not spin the run loop."""
+        payload = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 400
+        adapter = self._adapter_cls(send_ok=False)()
+        # The assertion is simply that this returns: a regression here hangs
+        # until the wait_for timeout fires.
+        delivered = await self._drive(adapter, payload, timeout=20)
+        assert delivered == []
+
+    @pytest.mark.asyncio
+    async def test_degenerate_splitters_terminate(self):
+        """Malformed splitter results must not spin the run loop either."""
+        limit = self.LIMIT
+        payload = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 400
+
+        degenerate = {
+            "single chunk": lambda content, max_length=limit, len_fn=None: [content],
+            "oversized head": lambda content, max_length=limit, len_fn=None: [content, ""],
+            "empty list": lambda content, max_length=limit, len_fn=None: [],
+        }
+        for label, splitter in degenerate.items():
+            adapter = self._adapter_cls(splitter=splitter)()
+            delivered = await self._drive(adapter, payload, timeout=20)
+            oversized = [len(m) for m in delivered if len(m) > limit]
+            assert not oversized, f"{label}: oversized {oversized}"
+
+    def test_overflow_strike_cap_is_positive(self):
+        """The cap must be a real bound, not accidentally zero/negative."""
+        from gateway.stream_consumer import GatewayStreamConsumer
+
+        assert GatewayStreamConsumer._MAX_OVERFLOW_SPLIT_STRIKES >= 1
