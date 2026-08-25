@@ -65,14 +65,19 @@ _FLUSH = object()
 # glued onto it -- "``` (1/3)".  A fence line with a non-empty info string
 # cannot CLOSE a block in Markdown, so the code block never terminates and the
 # rest of the message renders as code.
-_PAGE_INDICATOR_RE = re.compile(r"[ \t]*\(\d+/\d+\)[ \t]*$")
+_PAGE_INDICATOR_RE = re.compile(r"[ \t]*\((\d+)/(\d+)\)[ \t]*$")
 
 
 def _strip_page_indicator(chunk: str) -> str:
-    """Remove a trailing ``(i/N)`` page indicator from a splitter chunk.
+    """Remove a trailing ``(i/N)`` marker from ONE chunk, unconditionally.
 
-    Only a trailing indicator on the final line is removed, so genuine content
-    that merely contains "(1/3)" mid-text is untouched.
+    Low-level helper.  It cannot tell a synthetic splitter marker from real
+    text, so callers must not use it directly on adapter output — route
+    through :func:`_strip_splitter_page_indicators`, which only strips when
+    the whole chunk list proves the markers were generated.
+
+    Only a trailing marker on the final line is removed, so content that
+    merely contains "(1/3)" mid-text is untouched.
     """
     if not chunk:
         return chunk
@@ -81,6 +86,55 @@ def _strip_page_indicator(chunk: str) -> str:
     if stripped == last:
         return chunk
     return f"{head}{sep}{stripped}"
+
+
+def _strip_splitter_page_indicators(
+    chunks: "list[str]",
+    source: str,
+) -> "list[str]":
+    """Drop page indicators, but ONLY when the splitter demonstrably added them.
+
+    Stripping unconditionally is not safe: a legacy/non-base adapter or a
+    custom splitter has no contract to append indicators, so a genuine reply
+    that simply ends with "... (1/3)" would lose that text.
+
+    ``BasePlatformAdapter.truncate_message`` appends the indicators in one
+    pass over the finished list, so a synthetic set is recognisable:
+
+      * there is more than one chunk (a single chunk is never numbered), and
+      * EVERY chunk ends with ``(i/N)`` where ``i`` is its 1-based position
+        and ``N`` is the chunk count, and
+      * removing them yields text the source actually contains.
+
+    Real content cannot satisfy the positional numbering across every chunk by
+    accident.  When any check fails the chunks are returned untouched — a
+    stale indicator is a cosmetic flaw, deleting the user's words is not.
+    """
+    if len(chunks) < 2:
+        return chunks
+
+    total = len(chunks)
+    stripped: "list[str]" = []
+    for index, chunk in enumerate(chunks, start=1):
+        _, _, last = chunk.rpartition("\n")
+        match = _PAGE_INDICATOR_RE.search(last)
+        if match is None:
+            return chunks
+        if int(match.group(1)) != index or int(match.group(2)) != total:
+            return chunks
+        stripped.append(_strip_page_indicator(chunk))
+
+    # Final guard: the stripped text must be reconstructible from the source.
+    # Boundary fences the splitter inserted are synthetic, so compare on the
+    # source's own line content rather than the concatenation.
+    source_lines = set(source.splitlines())
+    for chunk in stripped:
+        for line in chunk.splitlines():
+            if line.strip().startswith("```"):
+                continue          # synthetic or original fence, either is fine
+            if line and line not in source_lines:
+                return chunks
+    return stripped
 
 
 def escape_code_fences_for_display(text: str) -> str:
@@ -1476,7 +1530,7 @@ class GatewayStreamConsumer:
             isinstance(chunk, str) for chunk in chunks
         ):
             return self._split_text_chunks(text, limit, len_fn)
-        return [_strip_page_indicator(chunk) for chunk in chunks]
+        return _strip_splitter_page_indicators(list(chunks), text)
 
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working.

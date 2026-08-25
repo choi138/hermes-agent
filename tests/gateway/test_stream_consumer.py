@@ -736,14 +736,14 @@ class TestInitialOverflowRollingEdit:
         # indicator lands on the synthetic closing fence ("``` (1/2)"), which
         # Markdown reads as an OPENING fence with an info string.  Compare
         # against the same normalized chunks the consumer delivers.
-        from gateway.stream_consumer import _strip_page_indicator
+        from gateway.stream_consumer import _strip_splitter_page_indicators
 
-        expected_chunks = [
-            _strip_page_indicator(chunk)
-            for chunk in adapter.truncate_message(
+        expected_chunks = _strip_splitter_page_indicators(
+            adapter.truncate_message(
                 fenced, safe_limit, len_fn=adapter.message_len_fn,
-            )
-        ]
+            ),
+            fenced,
+        )
         splitter.reset_mock()
 
         consumer.on_delta(fenced)
@@ -1642,6 +1642,100 @@ class TestPageIndicatorStripping:
         assert _strip_page_indicator("ratio (1/3)\ntail") == "ratio (1/3)\ntail"
         # Not a page indicator shape.
         assert _strip_page_indicator("value (a/b)") == "value (a/b)"
+
+    def test_list_strip_requires_generated_numbering(self):
+        """Only a fully consistent (i/N) set counts as splitter output."""
+        from gateway.stream_consumer import _strip_splitter_page_indicators
+
+        source = "alpha\nbeta\ngamma\ndelta"
+
+        # Genuine generated set -> stripped.
+        generated = ["alpha\nbeta (1/2)", "gamma\ndelta (2/2)"]
+        assert _strip_splitter_page_indicators(generated, source) == [
+            "alpha\nbeta", "gamma\ndelta",
+        ]
+
+        # Numbering that does not match position -> left alone.
+        wrong_index = ["alpha\nbeta (2/2)", "gamma\ndelta (1/2)"]
+        assert _strip_splitter_page_indicators(wrong_index, source) == wrong_index
+
+        # Total does not match the chunk count -> left alone.
+        wrong_total = ["alpha\nbeta (1/9)", "gamma\ndelta (2/9)"]
+        assert _strip_splitter_page_indicators(wrong_total, source) == wrong_total
+
+        # Only some chunks carry a marker -> left alone.
+        partial = ["alpha\nbeta", "gamma\ndelta (2/2)"]
+        assert _strip_splitter_page_indicators(partial, source) == partial
+
+        # A single chunk is never numbered by the splitter.
+        single = ["alpha (1/1)"]
+        assert _strip_splitter_page_indicators(single, "alpha (1/1)") == single
+
+    def test_list_strip_preserves_real_trailing_ratio(self):
+        """A reply that genuinely ends with "(i/N)" must not lose it.
+
+        rvw finding a02db112: stripping unconditionally deleted user content
+        for adapters whose splitter never adds indicators.
+        """
+        from gateway.stream_consumer import _strip_splitter_page_indicators
+
+        # Two chunks whose trailing text happens to look like a marker but is
+        # not positionally consistent -> untouched.
+        source = "우리 팀 승률은 (1/3)\n다음 문단입니다 (1/3)"
+        chunks = ["우리 팀 승률은 (1/3)", "다음 문단입니다 (1/3)"]
+        assert _strip_splitter_page_indicators(chunks, source) == chunks
+
+    def test_non_base_adapter_output_is_not_stripped(self):
+        """A legacy splitter has no indicator contract -- keep its text."""
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        class LegacyAdapter:
+            MAX_MESSAGE_LENGTH = 2000
+
+            @staticmethod
+            def truncate_message(content, max_length):
+                return [
+                    content[i:i + max_length]
+                    for i in range(0, len(content), max_length)
+                ]
+
+        text = "A" * 1500 + "\n마지막 줄 비율은 (1/3)"
+        consumer = GatewayStreamConsumer(
+            LegacyAdapter(), "chat", StreamConsumerConfig(cursor=""),
+        )
+        chunks = consumer._truncate_for_stream(text, 800, len)
+        assert len(chunks) > 1
+        assert chunks[-1].endswith("(1/3)"), "genuine trailing ratio was deleted"
+
+    def test_single_chunk_reply_keeps_a_trailing_ratio(self):
+        """A short reply that never splits must survive verbatim."""
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = 2000
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            async def send(self, **kwargs):
+                pass
+
+        short = "짧은 답변, 비율은 (1/3)"
+        consumer = GatewayStreamConsumer(
+            object.__new__(Adapter), "chat", StreamConsumerConfig(cursor=""),
+        )
+        assert consumer._truncate_for_stream(short, 800, len) == [short]
 
     def test_truncate_for_stream_removes_indicators(self):
         """Every chunk the streaming path receives is already normalized."""
