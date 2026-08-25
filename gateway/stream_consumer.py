@@ -111,7 +111,7 @@ def _strip_splitter_page_indicators(
       * more than one chunk (a single chunk is never numbered), and
       * EVERY chunk ends with ``(i/N)`` at its own 1-based position with ``N``
         equal to the chunk count, and
-      * the stripped lines still appear in the source text.
+      * the stripped chunks consume the source in order, left to right.
 
     When any check fails the chunks are returned untouched -- a stale indicator
     is cosmetic, deleting the user's words is not.
@@ -130,16 +130,36 @@ def _strip_splitter_page_indicators(
             return chunks
         stripped.append(_strip_page_indicator(chunk))
 
-    # Final guard: the stripped text must be reconstructible from the source.
-    # Boundary fences the splitter inserted are synthetic, so compare on the
-    # source's own line content rather than the concatenation.
-    source_lines = set(source.splitlines())
+    # Final guard: the stripped chunks must reconstruct the source in order.
+    #
+    # Walk the source left to right, consuming each chunk's own text.  Fence
+    # lines need care: the splitter INSERTS synthetic close/reopen markers at
+    # boundaries, but the model's own fences are real source text.  Try to
+    # consume a fence line like any other; only when it is absent from the
+    # remaining source is it treated as synthetic and skipped.  Whitespace the
+    # splitter consumed at the split point may be re-synchronised, but no other
+    # character may be skipped.
+    #
+    # A per-line membership test was wrong here: the base splitter forces a
+    # mid-line split when no newline or space fits the budget, and a partial
+    # line is not an element of ``source.splitlines()``.  That rejected valid
+    # splits, left the indicators visible, and pushed the caller onto its
+    # oversized fallback path with a message above the platform limit.
+    cursor = 0
     for chunk in stripped:
-        for line in chunk.splitlines():
-            if line.strip().startswith("```"):
-                continue          # synthetic or original fence, either is fine
-            if line and line not in source_lines:
+        for line in chunk.split("\n"):
+            if not line:
+                continue
+            found = source.find(line, cursor)
+            if found < 0 or source[cursor:found].strip():
+                # Not consumable in sequence.  A synthetic boundary fence is
+                # the only legitimate reason for that, so skip it and keep
+                # going; anything else means the chunks do not describe the
+                # source and must be left untouched.
+                if line.strip().startswith("```"):
+                    continue
                 return chunks
+            cursor = found + len(line)
     return stripped
 
 

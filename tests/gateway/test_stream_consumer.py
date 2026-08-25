@@ -1733,25 +1733,14 @@ class TestPageIndicatorStripping:
         """The adapter-type gate, not a content heuristic, is what protects this.
 
         rvw finding c73b6dfc: a custom splitter can return chunks whose real
-        text satisfies every content check.  The source-line guard alone is not
-        enough -- when the bare lines also occur in the source it passes, and
-        the user's own ratios would be deleted.  Refusing to strip for non-base
-        adapters is the safeguard.
+        text satisfies the shape checks.  Content checks are defence in depth
+        for the base path only -- they are not, and cannot be, proof of
+        authorship.  Refusing to strip for non-base adapters is the safeguard.
         """
         from gateway.stream_consumer import (
             GatewayStreamConsumer, StreamConsumerConfig,
-            _strip_splitter_page_indicators,
         )
 
-        # This shape DEFEATS the content-only guard: stripping yields "A"/"B",
-        # both of which really do appear as source lines.
-        source = "A\nA (1/2)\nB\nB (2/2)"
-        chunks = ["A (1/2)", "B (2/2)"]
-        assert _strip_splitter_page_indicators(list(chunks), source) == ["A", "B"], (
-            "guard assumption changed; this test must be re-derived"
-        )
-
-        # Through a non-base adapter the same shape must survive untouched.
         class LineSplitAdapter:
             MAX_MESSAGE_LENGTH = 2000
 
@@ -1759,10 +1748,120 @@ class TestPageIndicatorStripping:
             def truncate_message(content, max_length):
                 return ["A (1/2)", "B (2/2)"]
 
+        source = "A (1/2)\nB (2/2)"
         consumer = GatewayStreamConsumer(
             LineSplitAdapter(), "chat", StreamConsumerConfig(cursor=""),
         )
-        assert consumer._truncate_for_stream(source, 800, len) == chunks
+        assert consumer._truncate_for_stream(source, 800, len) == [
+            "A (1/2)", "B (2/2)",
+        ]
+
+    def test_forced_mid_line_split_is_still_recognised(self):
+        """A mid-line split must not be mistaken for foreign content.
+
+        rvw finding c2a9df9b: the base splitter forces a character split when
+        no newline or space fits the budget.  The old per-line membership guard
+        rejected the resulting partial lines, so the indicators survived AND
+        the source-tail mapping failed, pushing the caller onto its oversized
+        fallback -- a message above the platform limit.
+        """
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.stream_consumer import _strip_splitter_page_indicators
+
+        source = "```python\n" + "x" * 2000 + "\n```\n"
+        raw = BasePlatformAdapter.truncate_message(source, 500, len_fn=len)
+        assert len(raw) > 2, "expected a forced multi-way split"
+        # Precondition: the splitter really did break a line mid-way.
+        assert not all(
+            line in source.splitlines()
+            for chunk in raw
+            for line in chunk.splitlines()
+            if line and not line.strip().startswith("```")
+        )
+
+        stripped = _strip_splitter_page_indicators(list(raw), source)
+        assert stripped != list(raw), "indicators were left on a valid split"
+        for chunk in stripped:
+            assert not re.search(r"\(\d+/\d+\)$", chunk.rstrip()), chunk[-30:]
+
+    @pytest.mark.asyncio
+    async def test_forced_mid_line_split_stays_within_the_platform_limit(self):
+        """End-to-end consequence of c2a9df9b: an over-limit message.
+
+        When the guard rejected the split, the source-tail mapping also failed,
+        so nothing was sealed and the whole oversized buffer was delivered as
+        one message -- above the platform cap, which the platform rejects.
+        """
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        limit = 2000
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = limit
+
+            def __init__(self):
+                self.messages = {}
+                self.order = []
+                self._n = 0
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            async def send(self, chat_id=None, content=None, reply_to=None,
+                           metadata=None, **kwargs):
+                self._n += 1
+                mid = f"m{self._n}"
+                self.messages[mid] = content
+                self.order.append(mid)
+                return SendResult(success=True, message_id=mid)
+
+            async def edit_message(self, chat_id=None, message_id=None,
+                                   content=None, finalize=False,
+                                   metadata=None, **kwargs):
+                self.messages[message_id] = content
+                return SendResult(success=True, message_id=message_id)
+
+        # A very long single line inside a fence: no newline or space fits the
+        # budget, so the splitter must break mid-line.
+        payload = "설명.\n```python\n" + "x" * 3000 + "\n```\n뒷말.\n"
+
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("시작.\n")
+        await asyncio.sleep(0.05)
+        for i in range(0, len(payload), 300):
+            consumer.on_delta(payload[i:i + 300])
+            await asyncio.sleep(0.002)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=30)
+
+        delivered = [
+            adapter.messages[m] for m in adapter.order if adapter.messages.get(m)
+        ]
+        assert delivered, "nothing was delivered"
+        oversized = [len(m) for m in delivered if len(m) > limit]
+        assert not oversized, f"message(s) above the platform limit: {oversized}"
+        for message in delivered:
+            for line in message.splitlines():
+                stripped_line = line.strip()
+                if stripped_line.startswith("```"):
+                    assert re.fullmatch(
+                        r"```[A-Za-z0-9_+-]{0,15}", stripped_line,
+                    ), line
 
     def test_single_chunk_reply_keeps_a_trailing_ratio(self):
         """A short reply that never splits must survive verbatim."""
