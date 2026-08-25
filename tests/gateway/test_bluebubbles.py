@@ -438,3 +438,104 @@ class TestBlueBubblesWebhookRegistration:
         assert len(deleted_ids) == 2
 
 
+
+
+class TestTruncateMessageContract:
+    """Every BasePlatformAdapter subclass that overrides ``truncate_message``
+    must keep the parent's keyword contract.
+
+    ``GatewayStreamConsumer._truncate_for_stream`` selects the keyword call
+    shape purely from ``isinstance(adapter, BasePlatformAdapter)``, so an
+    override that drops ``len_fn`` raises TypeError and kills the stream
+    consumer task mid-response — the user loses the whole answer.
+    """
+
+    @staticmethod
+    def _subclass_overrides():
+        import importlib
+        import inspect
+
+        from gateway.platforms.base import BasePlatformAdapter
+
+        # Import the adapter modules so the subclasses are registered.
+        for mod in (
+            "gateway.platforms.bluebubbles",
+            "gateway.platforms.yuanbao",
+        ):
+            try:
+                importlib.import_module(mod)
+            except Exception:  # pragma: no cover - optional deps
+                continue
+
+        seen = {}
+
+        def walk(cls):
+            for sub in cls.__subclasses__():
+                own = sub.__dict__.get("truncate_message")
+                if own is not None:
+                    seen[f"{sub.__module__}.{sub.__qualname__}"] = own
+                walk(sub)
+
+        walk(BasePlatformAdapter)
+        return seen
+
+    def test_overrides_accept_len_fn_keyword(self):
+        import inspect
+
+        offenders = []
+        for name, fn in self._subclass_overrides().items():
+            target = fn.__func__ if isinstance(fn, (staticmethod, classmethod)) else fn
+            try:
+                sig = inspect.signature(target)
+            except (TypeError, ValueError):  # pragma: no cover
+                continue
+            accepts = "len_fn" in sig.parameters or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if not accepts:
+                offenders.append(f"{name}{sig}")
+        assert not offenders, (
+            "truncate_message override(s) drop the len_fn keyword required by "
+            "BasePlatformAdapter: " + ", ".join(offenders)
+        )
+
+    def test_overrides_are_callable_with_len_fn(self):
+        long_text = "hello world\n" * 400
+        for name, fn in self._subclass_overrides().items():
+            target = fn.__func__ if isinstance(fn, (staticmethod, classmethod)) else fn
+            try:
+                chunks = target(long_text, 500, len_fn=len)
+            except TypeError as exc:  # pragma: no cover - failure path
+                raise AssertionError(
+                    f"{name} rejected the len_fn keyword: {exc}"
+                ) from exc
+            assert isinstance(chunks, list)
+            assert all(isinstance(c, str) for c in chunks)
+            assert len(chunks) > 1, f"{name} did not split an oversized payload"
+
+    def test_bluebubbles_forwards_len_fn_to_base(self):
+        """The custom length unit must actually reach the base splitter."""
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        text = "x" * 900
+
+        # A length function that reports double the real length must produce
+        # more chunks than plain len -- proof the argument is forwarded, not
+        # merely accepted and discarded.
+        plain = BlueBubblesAdapter.truncate_message(text, 400, len_fn=len)
+        doubled = BlueBubblesAdapter.truncate_message(
+            text, 400, len_fn=lambda s: len(s) * 2,
+        )
+        assert len(doubled) > len(plain)
+
+    def test_bluebubbles_still_strips_page_indicators(self):
+        """The override's own behaviour is unchanged by the signature fix."""
+        import re
+
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        chunks = BlueBubblesAdapter.truncate_message("word " * 3000, 500)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert not re.search(r"\(\d+/\d+\)$", chunk.rstrip())
