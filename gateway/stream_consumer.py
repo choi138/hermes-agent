@@ -2322,6 +2322,7 @@ class GatewayStreamConsumer:
         self._final_content_delivered = False
         self._delivered_final_text = None
         self._turn_split_delivery = False
+        self._overflow_split_strikes = 0
         logger.info(
             "Suppressed streamed intentional-silence marker (chat=%s)",
             self.chat_id,

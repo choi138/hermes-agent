@@ -2141,3 +2141,31 @@ class TestOverflowSplitTermination:
         from gateway.stream_consumer import GatewayStreamConsumer
 
         assert GatewayStreamConsumer._MAX_OVERFLOW_SPLIT_STRIKES >= 1
+
+    def test_every_turn_reset_clears_the_strike_counter(self):
+        """A transient failure must not disable the split path forever.
+
+        The counter has to be cleared wherever per-turn delivery state is
+        reset, or one bad turn leaves the split path off for the rest of the
+        stream.  Assert structurally so a future reset site cannot silently
+        forget it.
+        """
+        import inspect
+        import re as _re
+
+        from gateway import stream_consumer as sc_mod
+
+        source = inspect.getsource(sc_mod)
+        lines = source.splitlines()
+
+        missing = []
+        for match in _re.finditer(r"self\._turn_split_delivery = False", source):
+            line_no = source[: match.start()].count("\n")
+            window = "\n".join(lines[line_no: line_no + 6])
+            if "_overflow_split_strikes" not in window:
+                missing.append(line_no + 1)
+
+        assert not missing, (
+            "these _turn_split_delivery resets do not clear "
+            f"_overflow_split_strikes nearby: lines {missing}"
+        )
