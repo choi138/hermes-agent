@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -51,6 +52,35 @@ _COMMENTARY = object()
 # sending a blocking interactive prompt (clarify poll) so the prompt is the
 # last thing on screen, not racing ahead of buffered prose.
 _FLUSH = object()
+
+# ``BasePlatformAdapter.truncate_message`` appends a page indicator like
+# " (1/3)" to EVERY chunk when a payload spans multiple messages.  That is
+# correct for its own one-shot send path, where all chunks are delivered
+# together and the reader needs the ordering hint.
+#
+# The streaming path is different.  It seals ONE head chunk per iteration and
+# keeps editing the tail as more deltas arrive, so the total is not final and
+# the numbering is wrong by construction.  Worse, when the split lands inside a
+# code block the head ends with a synthetic closing fence and the indicator is
+# glued onto it -- "``` (1/3)".  A fence line with a non-empty info string
+# cannot CLOSE a block in Markdown, so the code block never terminates and the
+# rest of the message renders as code.
+_PAGE_INDICATOR_RE = re.compile(r"[ \t]*\(\d+/\d+\)[ \t]*$")
+
+
+def _strip_page_indicator(chunk: str) -> str:
+    """Remove a trailing ``(i/N)`` page indicator from a splitter chunk.
+
+    Only a trailing indicator on the final line is removed, so genuine content
+    that merely contains "(1/3)" mid-text is untouched.
+    """
+    if not chunk:
+        return chunk
+    head, sep, last = chunk.rpartition("\n")
+    stripped = _PAGE_INDICATOR_RE.sub("", last)
+    if stripped == last:
+        return chunk
+    return f"{head}{sep}{stripped}"
 
 
 def escape_code_fences_for_display(text: str) -> str:
@@ -1023,7 +1053,7 @@ class GatewayStreamConsumer:
                             break
                         chunk = chunks[0]
                         source_tail = self._source_tail_after_sealed_stream_chunk(
-                            self._accumulated, chunk, len(chunks),
+                            self._accumulated, chunk,
                         )
                         if source_tail is None:
                             # Do not seal a presentation chunk unless we can
@@ -1360,7 +1390,6 @@ class GatewayStreamConsumer:
         self,
         source: str,
         chunk: str,
-        chunk_count: int,
     ) -> Optional[str]:
         """Return the source tail after one independently balanced chunk.
 
@@ -1371,12 +1400,11 @@ class GatewayStreamConsumer:
         than reconstructing a tail from later presentation chunks.
         """
         presentation_head = chunk
-        if isinstance(self.adapter, _BasePlatformAdapter) and chunk_count > 1:
-            # BasePlatformAdapter appends these only after all chunks are
-            # constructed.  They are display-only just like boundary fences.
-            indicator = f" (1/{chunk_count})"
-            if presentation_head.endswith(indicator):
-                presentation_head = presentation_head[:-len(indicator)]
+        # ``chunk`` already arrives normalized: _truncate_for_stream() strips
+        # the splitter's " (i/N)" page indicator from every chunk before the
+        # caller ever sees it, so the streamed message and this source mapping
+        # operate on the exact same text.  Re-stripping here would be dead
+        # code that could mask a future regression in that normalization.
 
         # A head can legitimately end at an original closing fence.  It is a
         # plain source prefix in that case, not a synthetic boundary closure.
@@ -1448,7 +1476,7 @@ class GatewayStreamConsumer:
             isinstance(chunk, str) for chunk in chunks
         ):
             return self._split_text_chunks(text, limit, len_fn)
-        return list(chunks)
+        return [_strip_page_indicator(chunk) for chunk in chunks]
 
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working.

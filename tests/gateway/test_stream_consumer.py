@@ -731,9 +731,19 @@ class TestInitialOverflowRollingEdit:
         consumer = GatewayStreamConsumer(adapter, "chat_fenced", config)
         fenced = "```python\n" + ("print('x')\n" * 100) + "```"
         safe_limit = raw_limit - utf16_len(config.cursor) - 100
-        expected_chunks = adapter.truncate_message(
-            fenced, safe_limit, len_fn=adapter.message_len_fn,
-        )
+        # The streaming path deliberately drops the splitter's " (i/N)" page
+        # indicator: while streaming, N is not final, and on a fenced split the
+        # indicator lands on the synthetic closing fence ("``` (1/2)"), which
+        # Markdown reads as an OPENING fence with an info string.  Compare
+        # against the same normalized chunks the consumer delivers.
+        from gateway.stream_consumer import _strip_page_indicator
+
+        expected_chunks = [
+            _strip_page_indicator(chunk)
+            for chunk in adapter.truncate_message(
+                fenced, safe_limit, len_fn=adapter.message_len_fn,
+            )
+        ]
         splitter.reset_mock()
 
         consumer.on_delta(fenced)
@@ -748,6 +758,17 @@ class TestInitialOverflowRollingEdit:
         edited_texts = [call.kwargs["content"] for call in adapter.edit_message.call_args_list]
         assert splitter.call_count >= 1
         assert all(text.count("```") % 2 == 0 for text in sent_texts + edited_texts)
+        # Balanced counts are not enough: a fence line carrying an info string
+        # ("``` (1/2)") keeps the count even while failing to close the block.
+        # The streaming cursor is appended to the in-flight preview, so strip it
+        # before judging a fence line.
+        cursor = config.cursor
+        for text in sent_texts + edited_texts:
+            body = text[:-len(cursor)] if cursor and text.endswith(cursor) else text
+            for line in body.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    assert re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", stripped), line
         assert len(sent_texts) == len(expected_chunks)
         assert sent_texts[:-1] == expected_chunks[:-1]
         assert sent_texts[-1].startswith(expected_chunks[-1])
@@ -764,7 +785,6 @@ class TestExistingMessageFenceOverflow:
         assert consumer._source_tail_after_sealed_stream_chunk(
             source,
             "```sql\nSELECT 1;\n```",
-            2,
         ) == "\nPlain prose."
 
     @pytest.mark.asyncio
@@ -1589,3 +1609,161 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
+
+
+class TestPageIndicatorStripping:
+    """The splitter's " (i/N)" page indicator must never reach a streamed chunk.
+
+    ``BasePlatformAdapter.truncate_message`` appends it to every chunk, which is
+    right for its own one-shot send but wrong while streaming: the total is not
+    final yet, and when the split lands inside a code block the indicator is
+    glued onto the synthetic closing fence ("``` (1/3)").  A fence line with a
+    non-empty info string cannot close a block, so everything after it renders
+    as code.  Found by rvw review (finding 53ebef8a).
+    """
+
+    def test_helper_strips_trailing_indicator(self):
+        from gateway.stream_consumer import _strip_page_indicator
+
+        assert _strip_page_indicator("body (1/3)") == "body"
+        assert _strip_page_indicator("a\nb (2/7)") == "a\nb"
+        assert _strip_page_indicator("code\n``` (1/2)") == "code\n```"
+        assert _strip_page_indicator("code\n```  (10/12)  ") == "code\n```"
+
+    def test_helper_leaves_genuine_content_alone(self):
+        from gateway.stream_consumer import _strip_page_indicator
+
+        # No indicator at all.
+        assert _strip_page_indicator("plain text") == "plain text"
+        assert _strip_page_indicator("") == ""
+        # A ratio in the middle of the text is real content.
+        assert _strip_page_indicator("see (1/3) below") == "see (1/3) below"
+        # A ratio on an earlier line is real content.
+        assert _strip_page_indicator("ratio (1/3)\ntail") == "ratio (1/3)\ntail"
+        # Not a page indicator shape.
+        assert _strip_page_indicator("value (a/b)") == "value (a/b)"
+
+    def test_truncate_for_stream_removes_indicators(self):
+        """Every chunk the streaming path receives is already normalized."""
+        import re
+
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.stream_consumer import GatewayStreamConsumer
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = 2000
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            async def send(self, **kwargs):
+                pass
+
+        text = (
+            "intro\n```sql\n"
+            + "\n".join(f"SELECT col_{i};" for i in range(200))
+            + "\n```\noutro\n"
+        )
+
+        # The raw splitter DOES add indicators -- that is the upstream behaviour
+        # this test is guarding against, so assert it is actually present.
+        raw = BasePlatformAdapter.truncate_message(text, 600, len_fn=len)
+        assert len(raw) > 1
+        assert any(re.search(r"\(\d+/\d+\)$", c.rstrip()) for c in raw)
+
+        consumer = GatewayStreamConsumer(object.__new__(Adapter), "chat")
+        chunks = consumer._truncate_for_stream(text, 600, len)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert not re.search(r"\(\d+/\d+\)$", chunk.rstrip()), chunk[-40:]
+            for line in chunk.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    # A fence line carries at most a bare language tag.
+                    assert re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", stripped), line
+
+    @pytest.mark.asyncio
+    async def test_streamed_split_delivers_no_indicator_on_a_fence(self):
+        """End-to-end: drive the consumer and inspect what actually lands."""
+        import re
+
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = 2000
+
+            def __init__(self):
+                self.messages = {}
+                self.order = []
+                self._n = 0
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            async def send(self, chat_id=None, content=None, reply_to=None,
+                           metadata=None, **kwargs):
+                self._n += 1
+                mid = f"m{self._n}"
+                self.messages[mid] = content
+                self.order.append(mid)
+                return SendResult(success=True, message_id=mid)
+
+            async def edit_message(self, chat_id=None, message_id=None,
+                                   content=None, finalize=False,
+                                   metadata=None, **kwargs):
+                self.messages[message_id] = content
+                return SendResult(success=True, message_id=message_id)
+
+        payload = (
+            "도입 문단입니다.\n" * 12
+            + "```sql\n"
+            + "\n".join(
+                f"SELECT col_{i} FROM verification_code_consumption "
+                f"WHERE id = {i};"
+                for i in range(60)
+            )
+            + "\n```\n"
+            + "마무리 문단입니다.\n" * 25
+        )
+
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("시작합니다.\n")     # establish path B
+        await asyncio.sleep(0.05)
+        for i in range(0, len(payload), 200):
+            consumer.on_delta(payload[i:i + 200])
+            await asyncio.sleep(0.002)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=30)
+
+        delivered = [
+            adapter.messages[m] for m in adapter.order if adapter.messages.get(m)
+        ]
+        assert len(delivered) > 1, "payload did not split"
+        for message in delivered:
+            for line in message.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    assert re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", stripped), (
+                        f"page indicator glued to a fence: {line!r}"
+                    )
