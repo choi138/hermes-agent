@@ -1625,10 +1625,30 @@ class TestPageIndicatorStripping:
     def test_helper_strips_trailing_indicator(self):
         from gateway.stream_consumer import _strip_page_indicator
 
+        # BasePlatformAdapter writes exactly f"{chunk} ({i}/{total})":
+        # one space, the ratio, nothing after it.
         assert _strip_page_indicator("body (1/3)") == "body"
         assert _strip_page_indicator("a\nb (2/7)") == "a\nb"
         assert _strip_page_indicator("code\n``` (1/2)") == "code\n```"
-        assert _strip_page_indicator("code\n```  (10/12)  ") == "code\n```"
+        assert _strip_page_indicator("code\n``` (10/12)") == "code\n```"
+
+    def test_helper_preserves_markdown_hard_line_break(self):
+        """Two trailing spaces are a hard line break -- only eat the marker's own.
+
+        rvw finding f527f227: a greedy ``[ \\t]*`` prefix swallowed whitespace
+        the model wrote, silently joining two lines in the delivered message.
+        """
+        from gateway.stream_consumer import _strip_page_indicator
+
+        hard_break = "설명 문장입니다.  "        # user's two-space hard break
+        chunked = hard_break + " (1/2)"          # base appends exactly " (1/2)"
+        assert _strip_page_indicator(chunked) == hard_break
+
+        # Trailing whitespace AFTER the ratio is not part of the marker shape,
+        # so such a string is left alone entirely.
+        assert _strip_page_indicator("body (1/3)  ") == "body (1/3)  "
+        # A tab before the ratio is not the marker shape either.
+        assert _strip_page_indicator("body\t(1/3)") == "body\t(1/3)"
 
     def test_helper_leaves_genuine_content_alone(self):
         from gateway.stream_consumer import _strip_page_indicator
@@ -1708,6 +1728,41 @@ class TestPageIndicatorStripping:
         chunks = consumer._truncate_for_stream(text, 800, len)
         assert len(chunks) > 1
         assert chunks[-1].endswith("(1/3)"), "genuine trailing ratio was deleted"
+
+    def test_non_base_adapter_keeps_positionally_numbered_user_text(self):
+        """The adapter-type gate, not a content heuristic, is what protects this.
+
+        rvw finding c73b6dfc: a custom splitter can return chunks whose real
+        text satisfies every content check.  The source-line guard alone is not
+        enough -- when the bare lines also occur in the source it passes, and
+        the user's own ratios would be deleted.  Refusing to strip for non-base
+        adapters is the safeguard.
+        """
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+            _strip_splitter_page_indicators,
+        )
+
+        # This shape DEFEATS the content-only guard: stripping yields "A"/"B",
+        # both of which really do appear as source lines.
+        source = "A\nA (1/2)\nB\nB (2/2)"
+        chunks = ["A (1/2)", "B (2/2)"]
+        assert _strip_splitter_page_indicators(list(chunks), source) == ["A", "B"], (
+            "guard assumption changed; this test must be re-derived"
+        )
+
+        # Through a non-base adapter the same shape must survive untouched.
+        class LineSplitAdapter:
+            MAX_MESSAGE_LENGTH = 2000
+
+            @staticmethod
+            def truncate_message(content, max_length):
+                return ["A (1/2)", "B (2/2)"]
+
+        consumer = GatewayStreamConsumer(
+            LineSplitAdapter(), "chat", StreamConsumerConfig(cursor=""),
+        )
+        assert consumer._truncate_for_stream(source, 800, len) == chunks
 
     def test_single_chunk_reply_keeps_a_trailing_ratio(self):
         """A short reply that never splits must survive verbatim."""

@@ -65,7 +65,12 @@ _FLUSH = object()
 # glued onto it -- "``` (1/3)".  A fence line with a non-empty info string
 # cannot CLOSE a block in Markdown, so the code block never terminates and the
 # rest of the message renders as code.
-_PAGE_INDICATOR_RE = re.compile(r"[ \t]*\((\d+)/(\d+)\)[ \t]*$")
+# ``BasePlatformAdapter.truncate_message`` builds each indicator as exactly
+# ``f"{chunk} ({i}/{total})"`` -- ONE space, then the parenthesised ratio, and
+# nothing after it.  Match that shape precisely.  A greedy ``[ \t]*`` prefix
+# would also eat whitespace the model wrote: two trailing spaces are Markdown's
+# hard line break, so swallowing them silently joins two lines.
+_PAGE_INDICATOR_RE = re.compile(r" \((\d+)/(\d+)\)$")
 
 
 def _strip_page_indicator(chunk: str) -> str:
@@ -92,23 +97,24 @@ def _strip_splitter_page_indicators(
     chunks: "list[str]",
     source: str,
 ) -> "list[str]":
-    """Drop page indicators, but ONLY when the splitter demonstrably added them.
+    """Drop page indicators the base splitter generated.
 
-    Stripping unconditionally is not safe: a legacy/non-base adapter or a
-    custom splitter has no contract to append indicators, so a genuine reply
-    that simply ends with "... (1/3)" would lose that text.
+    Callers MUST only reach this for a splitter that is contractually known to
+    append indicators (``BasePlatformAdapter.truncate_message``).  A legacy or
+    custom splitter has no such contract, so a genuine reply ending with
+    "... (1/3)" must keep that text -- see ``_truncate_for_stream``.
 
-    ``BasePlatformAdapter.truncate_message`` appends the indicators in one
-    pass over the finished list, so a synthetic set is recognisable:
+    Even for the base splitter the shape is verified rather than assumed, so a
+    future change upstream degrades to "indicator left visible" instead of
+    "user text deleted":
 
-      * there is more than one chunk (a single chunk is never numbered), and
-      * EVERY chunk ends with ``(i/N)`` where ``i`` is its 1-based position
-        and ``N`` is the chunk count, and
-      * removing them yields text the source actually contains.
+      * more than one chunk (a single chunk is never numbered), and
+      * EVERY chunk ends with ``(i/N)`` at its own 1-based position with ``N``
+        equal to the chunk count, and
+      * the stripped lines still appear in the source text.
 
-    Real content cannot satisfy the positional numbering across every chunk by
-    accident.  When any check fails the chunks are returned untouched — a
-    stale indicator is a cosmetic flaw, deleting the user's words is not.
+    When any check fails the chunks are returned untouched -- a stale indicator
+    is cosmetic, deleting the user's words is not.
     """
     if len(chunks) < 2:
         return chunks
@@ -1530,7 +1536,17 @@ class GatewayStreamConsumer:
             isinstance(chunk, str) for chunk in chunks
         ):
             return self._split_text_chunks(text, limit, len_fn)
-        return _strip_splitter_page_indicators(list(chunks), text)
+        chunks = list(chunks)
+
+        # Only the base splitter contractually appends " (i/N)" markers.  A
+        # legacy or custom splitter returns the model's text as-is, so a reply
+        # that genuinely ends with "... (1/3)" must keep it.  Deciding from the
+        # adapter type rather than the content is what makes that safe: no
+        # content heuristic can prove authorship of a string the user may have
+        # written themselves.
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return chunks
+        return _strip_splitter_page_indicators(chunks, text)
 
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working.
