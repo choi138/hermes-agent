@@ -1521,6 +1521,22 @@ class GatewayStreamConsumer:
             balance_fences=True,
         )
 
+    @staticmethod
+    def _consume_split_boundary(tail: str) -> str:
+        """Drop the newline the splitter consumed at a split point.
+
+        ``BasePlatformAdapter.truncate_message`` never puts the newline it
+        split on into the sealed head, and strips it from its own continuation
+        with ``remaining[split_at:].lstrip()``.  Slicing the source instead
+        returns that newline, so without this the next streamed message starts
+        with a blank line (rvw finding 4a37051c).
+
+        Only leading NEWLINES are consumed, and only up to the first line of
+        real content: spaces and tabs are meaningful indentation inside a code
+        block, and dropping them would corrupt the continuation.
+        """
+        return tail.lstrip("\n")
+
     def _source_tail_after_sealed_stream_chunk(
         self,
         source: str,
@@ -1544,7 +1560,9 @@ class GatewayStreamConsumer:
         # A head can legitimately end at an original closing fence.  It is a
         # plain source prefix in that case, not a synthetic boundary closure.
         if source.startswith(presentation_head):
-            return source[len(presentation_head):]
+            return self._consume_split_boundary(
+                source[len(presentation_head):]
+            )
 
         if not presentation_head.endswith("\n```"):
             logger.warning(
@@ -2154,6 +2172,107 @@ class GatewayStreamConsumer:
                 return cap
         return base
 
+    def _adapter_splits_oversized_edits(self) -> bool:
+        """True when the adapter delivers an over-limit edit as several messages.
+
+        Such adapters report the split back via
+        ``raw_response["partial_overflow"]`` / ``continuation_message_ids``
+        (see ``SendResult``), and the consumer already has handling for that.
+        They must keep receiving the full text — pre-splitting here would
+        fragment a reply the adapter could deliver better itself.
+
+        Opt in with ``splits_oversized_edits = True`` on the adapter class.
+        """
+        adapter_cls = type(self.adapter)
+        flag = getattr(adapter_cls, "splits_oversized_edits", None)
+        if isinstance(flag, bool):
+            return flag
+        flag = getattr(self.adapter, "__dict__", {}).get(
+            "splits_oversized_edits"
+        )
+        return flag is True
+
+    def _message_len_fn(self) -> "Callable[[str], int]":
+        """Length function in the adapter's own units (UTF-16 on some platforms)."""
+        if isinstance(self.adapter, _BasePlatformAdapter):
+            try:
+                return self.adapter.message_len_fn_for_chat(self.chat_id)
+            except Exception as e:
+                logger.debug("message_len_fn_for_chat failed: %s", e)
+        return len
+
+    def _message_length(self, text: str) -> int:
+        try:
+            return self._message_len_fn()(text)
+        except Exception:
+            return len(text)
+
+    def _safe_message_limit(self) -> int:
+        """Per-message budget used by the last-resort oversized-send guard.
+
+        Mirrors the ``_safe_limit`` the run loop computes, minus the cursor and
+        the same headroom, so the guard and the split paths agree on what
+        "too large" means.
+        """
+        try:
+            raw = self._raw_message_limit()
+        except Exception as e:
+            logger.debug("raw message limit lookup failed: %s", e)
+            return 0
+        if not isinstance(raw, int) or raw <= 0:
+            return 0
+        return max(500, raw - self._message_length(self.cfg.cursor) - 100)
+
+    async def _send_oversized_in_parts(
+        self, text: str, *, finalize: bool = False,
+    ) -> bool:
+        """Deliver an over-limit body as sequential messages.
+
+        Reached only when the normal split paths bailed out (strike cap, or a
+        splitter whose head cannot be mapped back to the source).  Sending the
+        whole body would be rejected by the platform and the user would get
+        nothing, so split it here rather than dropping the answer.
+
+        Returns True when every part landed.
+        """
+        limit = self._safe_message_limit()
+        if not limit:
+            return False
+        len_fn = self._message_len_fn()
+        parts = self._truncate_for_stream(text, limit, len_fn)
+        if len(parts) <= 1 or any(len_fn(p) > limit for p in parts):
+            parts = self._split_text_chunks(text, limit, len_fn)
+        if len(parts) <= 1:
+            # Nothing better to do; let the caller's normal failure handling
+            # take over rather than silently dropping the text.
+            return False
+
+        logger.warning(
+            "Oversized streaming payload (%d > %d) reached the send guard; "
+            "delivering it as %d messages.",
+            len_fn(text), limit, len(parts),
+        )
+        reply_to = self._initial_reply_to_id
+        delivered = 0
+        for index, part in enumerate(parts):
+            is_last = index == len(parts) - 1
+            new_id = await self._send_new_chunk(
+                part, reply_to, final=finalize and is_last,
+            )
+            if new_id is None or new_id == reply_to:
+                break
+            delivered += 1
+            reply_to = new_id
+            self._message_id = new_id
+
+        if delivered:
+            # Multiple sealed messages hold the answer now, so the fresh-final
+            # route must not replace them with a single message (#78541).
+            self._turn_split_delivery = True
+            self._already_sent = True
+            self._last_sent_text = parts[delivered - 1]
+        return delivered == len(parts)
+
     def _track_preview_id(self, message_id: Optional[str]) -> None:
         """Record a real preview message id for finalization cleanup."""
         if message_id and message_id != "__no_edit__":
@@ -2473,6 +2592,40 @@ class GatewayStreamConsumer:
                     ):
                         return True
                     # Edit existing message
+                    #
+                    # Last-resort size guard, mirroring the first-send branch
+                    # below.  A splitter that NORMALIZES text (Yuanbao collapses
+                    # blank-line runs) yields a head that is not a source
+                    # prefix, so the tail mapping returns None, the split loop
+                    # breaks, and this edit would carry the still-oversized
+                    # buffer (rvw finding 1d5379cb).
+                    #
+                    # Adapters that split oversized edits themselves advertise
+                    # it by accepting the edit and reporting
+                    # raw_response["partial_overflow"].  We cannot know that
+                    # before calling, so ask the adapter first and only step in
+                    # when it neither succeeded nor reported an overflow split.
+                    _guard_limit = self._safe_message_limit()
+                    if (
+                        _guard_limit
+                        and self._message_length(text) > _guard_limit
+                        and not self._adapter_splits_oversized_edits()
+                    ):
+                        # Do not put an over-limit body on the wire at all:
+                        # the platform rejects it, and a permissive adapter
+                        # would leave an unreadable message on screen.
+                        logger.warning(
+                            "Oversized streaming edit (%d > %d); delivering "
+                            "as separate messages instead.",
+                            self._message_length(text), _guard_limit,
+                        )
+                        _prev_id = self._message_id
+                        self._message_id = None
+                        if await self._send_oversized_in_parts(
+                            text, finalize=finalize,
+                        ):
+                            return True
+                        self._message_id = _prev_id
                     result = await self._edit_message(
                         message_id=self._message_id,
                         content=text,
@@ -2635,6 +2788,23 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
+                #
+                # Last-resort size guard.  The split paths above normally keep
+                # every payload under the platform cap, but they can bail out:
+                # the strike cap disables them after repeated failures, and a
+                # splitter whose head is not a source prefix (a normalizing
+                # splitter such as Yuanbao's) makes the tail mapping return
+                # None.  Sending an over-limit body is rejected outright, so
+                # the user loses the whole answer.  Deliver it as sequential
+                # messages instead (rvw findings 8745dc6e, 1d5379cb).
+                _guard_limit = self._safe_message_limit()
+                if (
+                    _guard_limit
+                    and self._message_length(text) > _guard_limit
+                ):
+                    return await self._send_oversized_in_parts(
+                        text, finalize=finalize,
+                    )
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,

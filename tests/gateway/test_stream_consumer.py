@@ -785,7 +785,7 @@ class TestExistingMessageFenceOverflow:
         assert consumer._source_tail_after_sealed_stream_chunk(
             source,
             "```sql\nSELECT 1;\n```",
-        ) == "\nPlain prose."
+        ) == "Plain prose."
 
     @pytest.mark.asyncio
     async def test_sealed_head_keeps_source_tail_and_code_state(self):
@@ -2169,3 +2169,175 @@ class TestOverflowSplitTermination:
             "these _turn_split_delivery resets do not clear "
             f"_overflow_split_strikes nearby: lines {missing}"
         )
+
+
+class TestOversizedSendGuard:
+    """No over-limit body may reach the platform, whatever the split path does.
+
+    rvw round 7 found three ways the buffer stayed oversized:
+
+      8745dc6e  after the strike cap disables the split path, later ticks kept
+                pushing the whole buffer through _send_or_edit
+      1d5379cb  a NORMALIZING splitter (Yuanbao collapses blank-line runs)
+                produces a head that is not a source prefix, so the tail
+                mapping bails and the oversized original is sent as-is
+      4a37051c  the mapped tail kept the boundary newline the base splitter
+                drops, so every continuation started with a blank line
+    """
+
+    LIMIT = 2000
+
+    @staticmethod
+    def _recorder(*, send_ok=True, splitter=None, splits_oversized=False):
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        limit = TestOversizedSendGuard.LIMIT
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = limit
+            splits_oversized_edits = splits_oversized
+
+            def __init__(self):
+                self.messages = {}
+                self.order = []
+                self.wire = []
+                self._n = 0
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            async def send(self, chat_id=None, content=None, reply_to=None,
+                           metadata=None, **kwargs):
+                self.wire.append(("send", len(content or "")))
+                if not send_ok:
+                    return SendResult(success=False, error="rejected")
+                self._n += 1
+                mid = f"m{self._n}"
+                self.messages[mid] = content
+                self.order.append(mid)
+                return SendResult(success=True, message_id=mid)
+
+            async def edit_message(self, chat_id=None, message_id=None,
+                                   content=None, finalize=False,
+                                   metadata=None, **kwargs):
+                self.wire.append(("edit", len(content or "")))
+                self.messages[message_id] = content
+                return SendResult(success=True, message_id=message_id)
+
+        if splitter is not None:
+            Adapter.truncate_message = staticmethod(splitter)
+        return Adapter()
+
+    @staticmethod
+    async def _drive(adapter, payload, *, delta=400, timeout=40):
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("시작.\n")
+        await asyncio.sleep(0.05)
+        for i in range(0, len(payload), delta):
+            consumer.on_delta(payload[i:i + delta])
+            await asyncio.sleep(0.002)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=timeout)
+        return consumer
+
+    @staticmethod
+    def _normalizing_splitter(content, max_length=2000, len_fn=None):
+        """Rejoin paragraphs with exactly one blank line, like Yuanbao does."""
+        atoms = [a for a in re.split(r"\n\s*\n", content) if a.strip()]
+        out, current = [], []
+        for atom in atoms:
+            if current and len("\n\n".join(current + [atom])) > max_length - 40:
+                out.append("\n\n".join(current))
+                current = [atom]
+            else:
+                current.append(atom)
+        if current:
+            out.append("\n\n".join(current))
+        return out or [content]
+
+    @pytest.mark.asyncio
+    async def test_strike_cap_does_not_leave_oversized_sends(self):
+        """8745dc6e: after the cap fires, nothing over-limit goes on the wire."""
+        adapter = self._recorder(send_ok=False)
+        payload = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 400
+        await self._drive(adapter, payload)
+
+        oversized = [(kind, n) for kind, n in adapter.wire if n > self.LIMIT]
+        assert not oversized, f"over-limit requests: {oversized[:4]}"
+
+    @pytest.mark.asyncio
+    async def test_normalizing_splitter_still_stays_within_the_limit(self):
+        """1d5379cb: an unmappable head must not send the oversized original."""
+        adapter = self._recorder(splitter=self._normalizing_splitter)
+        paragraph = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 12
+        payload = (paragraph + "\n\n\n\n") * 8
+        await self._drive(adapter, payload)
+
+        delivered = [
+            adapter.messages[m] for m in adapter.order if adapter.messages.get(m)
+        ]
+        assert len(delivered) > 1, "expected the guard to split the payload"
+        oversized = [len(m) for m in delivered if len(m) > self.LIMIT]
+        assert not oversized, f"over-limit messages: {oversized}"
+        wire_oversized = [n for _, n in adapter.wire if n > self.LIMIT]
+        assert not wire_oversized, f"over-limit requests: {wire_oversized[:4]}"
+
+    @pytest.mark.asyncio
+    async def test_continuations_do_not_start_with_a_blank_line(self):
+        """4a37051c: the boundary newline belongs to neither message."""
+        adapter = self._recorder()
+        payload = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 240
+        await self._drive(adapter, payload)
+
+        delivered = [
+            adapter.messages[m] for m in adapter.order if adapter.messages.get(m)
+        ]
+        assert len(delivered) > 1, "expected a multi-message split"
+        leading = [
+            i for i, m in enumerate(delivered, 1) if m.startswith("\n")
+        ]
+        assert not leading, f"messages starting with a blank line: {leading}"
+
+    def test_boundary_consumer_keeps_code_indentation(self):
+        """Only newlines are consumed -- indentation inside code must survive."""
+        from gateway.stream_consumer import GatewayStreamConsumer
+
+        consume = GatewayStreamConsumer._consume_split_boundary
+        assert consume("\nnext line") == "next line"
+        assert consume("\n\n\nnext") == "next"
+        assert consume("    indented") == "    indented"
+        assert consume("\n    indented") == "    indented"
+        assert consume("no newline") == "no newline"
+        assert consume("") == ""
+
+    def test_adapter_can_opt_out_of_the_guard(self):
+        """An adapter that splits oversized edits itself keeps the full text."""
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        opted_in = self._recorder(splits_oversized=True)
+        plain = self._recorder()
+
+        cfg = StreamConsumerConfig(cursor="")
+        assert GatewayStreamConsumer(
+            opted_in, "chat", cfg,
+        )._adapter_splits_oversized_edits() is True
+        assert GatewayStreamConsumer(
+            plain, "chat", cfg,
+        )._adapter_splits_oversized_edits() is False
