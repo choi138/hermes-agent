@@ -16,7 +16,7 @@ import re
 import uuid
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
@@ -525,10 +525,22 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def truncate_message(content: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
+    def truncate_message(
+        content: str,
+        max_length: int = MAX_TEXT_LENGTH,
+        len_fn: Optional["Callable[[str], int]"] = None,
+    ) -> List[str]:
         # Use the base splitter but skip pagination indicators — iMessage
         # bubbles flow naturally without "(1/3)" suffixes.
-        chunks = BasePlatformAdapter.truncate_message(content, max_length)
+        #
+        # ``len_fn`` must be accepted and forwarded: callers that resolve the
+        # splitter through ``isinstance(adapter, BasePlatformAdapter)`` pass it
+        # as a keyword (see GatewayStreamConsumer._truncate_for_stream), so
+        # dropping it from this override raises TypeError and kills the stream
+        # consumer task mid-response.
+        chunks = BasePlatformAdapter.truncate_message(
+            content, max_length, len_fn=len_fn,
+        )
         return [re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks]
 
     async def send(

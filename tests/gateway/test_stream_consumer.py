@@ -1,6 +1,7 @@
 """Tests for GatewayStreamConsumer — media directive stripping in streaming."""
 
 import asyncio
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -754,6 +755,107 @@ class TestInitialOverflowRollingEdit:
         assert all(utf16_len(text) <= safe_limit for text in sent_texts)
 
 
+class TestExistingMessageFenceOverflow:
+    """Regression coverage for sealing a fence-balanced stream head."""
+
+    def test_original_closing_fence_is_not_reopened(self):
+        consumer = GatewayStreamConsumer(MagicMock(), "chat")
+        source = "```sql\nSELECT 1;\n```\nPlain prose."
+        assert consumer._source_tail_after_sealed_stream_chunk(
+            source,
+            "```sql\nSELECT 1;\n```",
+            2,
+        ) == "\nPlain prose."
+
+    @pytest.mark.asyncio
+    async def test_sealed_head_keeps_source_tail_and_code_state(self):
+        class Adapter:
+            MAX_MESSAGE_LENGTH = 2000
+
+            def __init__(self):
+                self.messages = {}
+                self.order = []
+                self._next_id = 0
+
+            async def send(self, chat_id=None, content=None, **kwargs):
+                self._next_id += 1
+                message_id = f"m{self._next_id}"
+                self.messages[message_id] = content
+                self.order.append(message_id)
+                return SimpleNamespace(success=True, message_id=message_id)
+
+            async def edit_message(self, chat_id=None, message_id=None, content=None,
+                                   **kwargs):
+                self.messages[message_id] = content
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        def render_state(chunks):
+            states = {}
+            for chunk in chunks:
+                in_code = False
+                for line in chunk.splitlines():
+                    if line.strip().startswith("```"):
+                        in_code = not in_code
+                    else:
+                        previous = states.setdefault(line, in_code)
+                        assert previous == in_code, f"conflicting state for {line!r}"
+            return states
+
+        seed = "Opening prose.\n"
+        sql_lines = [f"SELECT col_{i} FROM source_table WHERE id = {i};" for i in range(40)]
+        payload = (
+            "Intro line.\n" * 10
+            + "```sql\n"
+            + "\n".join(sql_lines)
+            + "\n```\n"
+            + "Closing prose.\n" * 10
+        )
+        expected = seed + payload
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1, cursor=""),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(seed)  # Establish _message_id so the next delta uses Path B.
+        await asyncio.sleep(0.1)
+        for offset in range(0, len(payload), 100):
+            consumer.on_delta(payload[offset:offset + 100])
+            await asyncio.sleep(0.005)
+        consumer.finish()
+        await task
+
+        delivered = [adapter.messages[message_id] for message_id in adapter.order]
+        assert len(delivered) > 1
+        assert all(len(chunk) <= adapter.MAX_MESSAGE_LENGTH for chunk in delivered)
+
+        # Remove only the close/reopen fences inserted between independently
+        # rendered messages, then prove every source line remains verbatim.
+        source_view = []
+        for index, message in enumerate(delivered):
+            lines = message.splitlines()
+            if index and lines and re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", lines[0].strip()):
+                lines = lines[1:]
+            if index < len(delivered) - 1 and lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            source_view.append("\n".join(lines))
+        reconstructed = "\n".join(source_view)
+        assert all(line in reconstructed for line in expected.splitlines() if line)
+
+        # A synthetic fence must always occupy its own line: never overwrite
+        # user text such as `````ECT col_30 ...``.
+        for message in delivered:
+            for line in message.splitlines():
+                if line.strip().startswith("```"):
+                    assert re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", line.strip())
+
+        expected_state = render_state([expected])
+        assert render_state(delivered) == expected_state
+        assert consumer.delivered_final_matches(expected) is True
+
+
 class TestEditOverflowSplitAndDeliver:
     """When edit_message split-and-delivers an oversized payload across the
     original message + N continuations (Telegram >4096 UTF-16), the consumer
@@ -1488,3 +1590,137 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
+
+class TestMinimalReviewFindings:
+    """Regression tests for the two real defects rvw found on this branch.
+
+    ef669d50 -- a NORMALIZING adapter splitter (e.g. Yuanbao rejoins
+    paragraphs with exactly one blank line) produces a head that is not a
+    source prefix.  The tail mapping fails, and the loop used to break with
+    the oversized buffer still in ``_accumulated``, handing it to the edit
+    below -- which the platform rejects.
+
+    ebc5cfbe -- a synthetic three-backtick close is also a string PREFIX of
+    an original four-or-more-backtick close, so the generic prefix branch
+    consumed three of the four ticks and left a stray backtick corrupting
+    the continuation.
+    """
+
+    LIMIT = 2000
+
+    @staticmethod
+    def _consumer(adapter=None):
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        if adapter is None:
+            class A(BasePlatformAdapter):
+                MAX_MESSAGE_LENGTH = TestMinimalReviewFindings.LIMIT
+
+                async def connect(self): pass
+                async def disconnect(self): pass
+                async def get_chat_info(self, chat_id): return {}
+                async def send(self, **kwargs): pass
+
+            adapter = object.__new__(A)
+        return GatewayStreamConsumer(
+            adapter, "chat", StreamConsumerConfig(cursor=""),
+        )
+
+    def test_backtick_run_is_never_split_by_the_prefix_branch(self):
+        """ebc5cfbe: a 3-tick synthetic close must not eat a 4-tick close."""
+        consumer = self._consumer()
+        source = "````python\ncode line\n````\nprose after\n"
+        head = "````python\ncode line\n```"
+
+        tail = consumer._source_tail_after_sealed_stream_chunk(source, head, 2)
+
+        # Either refuse the mapping (full buffer preserved) or return a tail
+        # whose content is intact.  A stray lone-backtick line is the bug.
+        if tail is not None:
+            assert not tail.startswith("`\n"), tail[:20]
+            assert "prose after" in tail
+            assert "\n````\n" in tail or tail.startswith("````"), tail[:40]
+
+    def test_plain_prefix_mapping_still_works(self):
+        """The backtick guard must not break the ordinary prefix case."""
+        consumer = self._consumer()
+        source = "```sql\nSELECT 1;\n```\nPlain prose.\n"
+        head = "```sql\nSELECT 1;\n```"
+
+        tail = consumer._source_tail_after_sealed_stream_chunk(source, head, 2)
+        assert tail == "\nPlain prose.\n"
+
+    @pytest.mark.asyncio
+    async def test_normalizing_splitter_does_not_send_oversized(self):
+        """ef669d50: an unmappable adapter head must not leak an oversized edit."""
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        limit = self.LIMIT
+
+        def normalizing(content, max_length=limit, len_fn=None):
+            atoms = [a for a in re.split(r"\n\s*\n", content) if a.strip()]
+            out, cur = [], []
+            for a in atoms:
+                if cur and len("\n\n".join(cur + [a])) > max_length - 40:
+                    out.append("\n\n".join(cur))
+                    cur = [a]
+                else:
+                    cur.append(a)
+            if cur:
+                out.append("\n\n".join(cur))
+            return out or [content]
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = limit
+            truncate_message = staticmethod(normalizing)
+
+            def __init__(self):
+                self.messages, self.order, self.wire, self._n = {}, [], [], 0
+
+            async def connect(self): pass
+            async def disconnect(self): pass
+            async def get_chat_info(self, chat_id): return {}
+
+            async def send(self, chat_id=None, content=None, reply_to=None,
+                           metadata=None, **kwargs):
+                self.wire.append(("send", len(content or "")))
+                self._n += 1
+                mid = f"m{self._n}"
+                self.messages[mid] = content
+                self.order.append(mid)
+                return SendResult(success=True, message_id=mid)
+
+            async def edit_message(self, chat_id=None, message_id=None,
+                                   content=None, finalize=False,
+                                   metadata=None, **kwargs):
+                self.wire.append(("edit", len(content or "")))
+                self.messages[message_id] = content
+                return SendResult(success=True, message_id=message_id)
+
+        adapter = Adapter.__new__(Adapter)
+        adapter.messages, adapter.order, adapter.wire, adapter._n = {}, [], [], 0
+        consumer = GatewayStreamConsumer(
+            adapter, "chat",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+
+        paragraph = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 12
+        payload = (paragraph + "\n\n\n\n") * 8
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("시작.\n")
+        await asyncio.sleep(0.05)
+        for i in range(0, len(payload), 400):
+            consumer.on_delta(payload[i:i + 400])
+            await asyncio.sleep(0.002)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=40)
+
+        oversized = [(k, n) for k, n in adapter.wire if n > limit]
+        assert not oversized, f"over-limit requests reached the wire: {oversized[:4]}"
