@@ -1026,6 +1026,30 @@ class GatewayStreamConsumer:
                             self._accumulated, chunk, len(chunks),
                         )
                         if source_tail is None:
+                            # The adapter splitter NORMALIZED the text (e.g.
+                            # Yuanbao rejoins paragraphs with exactly one blank
+                            # line), so its head is not a source prefix and
+                            # cannot be mapped.  Breaking here used to hand the
+                            # unchanged oversized buffer to the send/edit below
+                            # -- the platform rejects it and the answer is
+                            # lost.  Retry ONCE with the consumer's own
+                            # splitter: its heads are literal source slices
+                            # (plus at most a synthetic close), so the mapping
+                            # cannot fail for the same reason (rvw ef669d50).
+                            retry = self._split_text_chunks(
+                                self._accumulated, _safe_limit, _len_fn,
+                            )
+                            if (
+                                len(retry) > 1
+                                and _len_fn(retry[0]) <= _safe_limit
+                            ):
+                                chunk = retry[0]
+                                source_tail = (
+                                    self._source_tail_after_sealed_stream_chunk(
+                                        self._accumulated, chunk, len(retry),
+                                    )
+                                )
+                        if source_tail is None:
                             # Do not seal a presentation chunk unless we can
                             # account for exactly which source characters it
                             # consumes.  Otherwise the normal send/edit path
@@ -1380,8 +1404,19 @@ class GatewayStreamConsumer:
 
         # A head can legitimately end at an original closing fence.  It is a
         # plain source prefix in that case, not a synthetic boundary closure.
+        #
+        # The boundary must not split a backtick run: a synthetic three-tick
+        # close is also a PREFIX of an original four-or-more-tick close
+        # ("````"), and slicing there leaves stray backticks at the start of
+        # the tail, corrupting the continuation (rvw ebc5cfbe).
         if source.startswith(presentation_head):
-            return source[len(presentation_head):]
+            cut = len(presentation_head)
+            if not (
+                presentation_head.endswith("`")
+                and cut < len(source)
+                and source[cut] == "`"
+            ):
+                return source[cut:]
 
         if not presentation_head.endswith("\n```"):
             logger.warning(

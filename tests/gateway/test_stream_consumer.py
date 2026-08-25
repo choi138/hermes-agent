@@ -1589,3 +1589,138 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
+
+
+class TestMinimalReviewFindings:
+    """Regression tests for the two real defects rvw found on this branch.
+
+    ef669d50 -- a NORMALIZING adapter splitter (e.g. Yuanbao rejoins
+    paragraphs with exactly one blank line) produces a head that is not a
+    source prefix.  The tail mapping fails, and the loop used to break with
+    the oversized buffer still in ``_accumulated``, handing it to the edit
+    below -- which the platform rejects.
+
+    ebc5cfbe -- a synthetic three-backtick close is also a string PREFIX of
+    an original four-or-more-backtick close, so the generic prefix branch
+    consumed three of the four ticks and left a stray backtick corrupting
+    the continuation.
+    """
+
+    LIMIT = 2000
+
+    @staticmethod
+    def _consumer(adapter=None):
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        if adapter is None:
+            class A(BasePlatformAdapter):
+                MAX_MESSAGE_LENGTH = TestMinimalReviewFindings.LIMIT
+
+                async def connect(self): pass
+                async def disconnect(self): pass
+                async def get_chat_info(self, chat_id): return {}
+                async def send(self, **kwargs): pass
+
+            adapter = object.__new__(A)
+        return GatewayStreamConsumer(
+            adapter, "chat", StreamConsumerConfig(cursor=""),
+        )
+
+    def test_backtick_run_is_never_split_by_the_prefix_branch(self):
+        """ebc5cfbe: a 3-tick synthetic close must not eat a 4-tick close."""
+        consumer = self._consumer()
+        source = "````python\ncode line\n````\nprose after\n"
+        head = "````python\ncode line\n```"
+
+        tail = consumer._source_tail_after_sealed_stream_chunk(source, head, 2)
+
+        # Either refuse the mapping (full buffer preserved) or return a tail
+        # whose content is intact.  A stray lone-backtick line is the bug.
+        if tail is not None:
+            assert not tail.startswith("`\n"), tail[:20]
+            assert "prose after" in tail
+            assert "\n````\n" in tail or tail.startswith("````"), tail[:40]
+
+    def test_plain_prefix_mapping_still_works(self):
+        """The backtick guard must not break the ordinary prefix case."""
+        consumer = self._consumer()
+        source = "```sql\nSELECT 1;\n```\nPlain prose.\n"
+        head = "```sql\nSELECT 1;\n```"
+
+        tail = consumer._source_tail_after_sealed_stream_chunk(source, head, 2)
+        assert tail == "\nPlain prose.\n"
+
+    @pytest.mark.asyncio
+    async def test_normalizing_splitter_does_not_send_oversized(self):
+        """ef669d50: an unmappable adapter head must not leak an oversized edit."""
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer, StreamConsumerConfig,
+        )
+
+        limit = self.LIMIT
+
+        def normalizing(content, max_length=limit, len_fn=None):
+            atoms = [a for a in re.split(r"\n\s*\n", content) if a.strip()]
+            out, cur = [], []
+            for a in atoms:
+                if cur and len("\n\n".join(cur + [a])) > max_length - 40:
+                    out.append("\n\n".join(cur))
+                    cur = [a]
+                else:
+                    cur.append(a)
+            if cur:
+                out.append("\n\n".join(cur))
+            return out or [content]
+
+        class Adapter(BasePlatformAdapter):
+            MAX_MESSAGE_LENGTH = limit
+            truncate_message = staticmethod(normalizing)
+
+            def __init__(self):
+                self.messages, self.order, self.wire, self._n = {}, [], [], 0
+
+            async def connect(self): pass
+            async def disconnect(self): pass
+            async def get_chat_info(self, chat_id): return {}
+
+            async def send(self, chat_id=None, content=None, reply_to=None,
+                           metadata=None, **kwargs):
+                self.wire.append(("send", len(content or "")))
+                self._n += 1
+                mid = f"m{self._n}"
+                self.messages[mid] = content
+                self.order.append(mid)
+                return SendResult(success=True, message_id=mid)
+
+            async def edit_message(self, chat_id=None, message_id=None,
+                                   content=None, finalize=False,
+                                   metadata=None, **kwargs):
+                self.wire.append(("edit", len(content or "")))
+                self.messages[message_id] = content
+                return SendResult(success=True, message_id=message_id)
+
+        adapter = Adapter.__new__(Adapter)
+        adapter.messages, adapter.order, adapter.wire, adapter._n = {}, [], [], 0
+        consumer = GatewayStreamConsumer(
+            adapter, "chat",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+
+        paragraph = "본문 문단입니다. 충분히 길게 채웁니다.\n" * 12
+        payload = (paragraph + "\n\n\n\n") * 8
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("시작.\n")
+        await asyncio.sleep(0.05)
+        for i in range(0, len(payload), 400):
+            consumer.on_delta(payload[i:i + 400])
+            await asyncio.sleep(0.002)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=40)
+
+        oversized = [(k, n) for k, n in adapter.wire if n > limit]
+        assert not oversized, f"over-limit requests reached the wire: {oversized[:4]}"
