@@ -1022,6 +1022,15 @@ class GatewayStreamConsumer:
                             # for its existing fallback handling.
                             break
                         chunk = chunks[0]
+                        source_tail = self._source_tail_after_sealed_stream_chunk(
+                            self._accumulated, chunk, len(chunks),
+                        )
+                        if source_tail is None:
+                            # Do not seal a presentation chunk unless we can
+                            # account for exactly which source characters it
+                            # consumes.  Otherwise the normal send/edit path
+                            # below retains the full text for fallback handling.
+                            break
                         # finalize=True so the adapter applies platform-specific
                         # rich-text markup (e.g. Telegram MarkdownV2). This
                         # sealed chunk will never be edited again — _message_id
@@ -1042,16 +1051,12 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        # Keep the canonical splitter's fence-reopened tail as
-                        # the active preview.  It may contain further balanced
-                        # chunks from an adapter-specific splitter; joining them
-                        # preserves every character for the normal send/edit
-                        # path rather than discarding an oversized remainder.
-                        # ``_stream_ledger`` intentionally remains the logical
-                        # model stream: these synthetic fence boundary markers
-                        # have no counterpart in ``final_response``, and the
-                        # recorder reconciles the canonical source text.
-                        self._accumulated = "".join(chunks[1:])
+                        # ``chunks`` are independently renderable presentation
+                        # messages, so every later chunk can contain synthetic
+                        # fence close/reopen pairs.  Keep the untouched source
+                        # tail instead; only add the one reopening fence needed
+                        # to continue the code block after the sealed head.
+                        self._accumulated = source_tail
                         self._message_id = None
                         self._last_sent_text = ""
                         # Sealed head chunk delivered — this turn is now a
@@ -1350,6 +1355,73 @@ class GatewayStreamConsumer:
             prefer_paragraphs=False,
             balance_fences=True,
         )
+
+    def _source_tail_after_sealed_stream_chunk(
+        self,
+        source: str,
+        chunk: str,
+        chunk_count: int,
+    ) -> Optional[str]:
+        """Return the source tail after one independently balanced chunk.
+
+        The stream splitter closes an open fence on a sealed head and reopens
+        it on the next *presentation* chunk.  Those markers do not belong in
+        the model's source buffer.  This method identifies the source prefix
+        represented by ``chunk``, then slices the original ``source`` rather
+        than reconstructing a tail from later presentation chunks.
+        """
+        presentation_head = chunk
+        if isinstance(self.adapter, _BasePlatformAdapter) and chunk_count > 1:
+            # BasePlatformAdapter appends these only after all chunks are
+            # constructed.  They are display-only just like boundary fences.
+            indicator = f" (1/{chunk_count})"
+            if presentation_head.endswith(indicator):
+                presentation_head = presentation_head[:-len(indicator)]
+
+        # A head can legitimately end at an original closing fence.  It is a
+        # plain source prefix in that case, not a synthetic boundary closure.
+        if source.startswith(presentation_head):
+            return source[len(presentation_head):]
+
+        if not presentation_head.endswith("\n```"):
+            logger.warning(
+                "Cannot map stream split head back to source; preserving full buffer"
+            )
+            return None
+
+        source_head = presentation_head[:-4]
+        carry_lang = self._open_fence_language(source_head)
+        if carry_lang is None or not source.startswith(source_head):
+            logger.warning(
+                "Cannot map stream split head back to source; preserving full buffer"
+            )
+            return None
+
+        source_tail = source[len(source_head):]
+        # The source tail usually begins with the newline at the split
+        # boundary.  Let that original byte terminate the reopening fence
+        # rather than adding another newline that would turn a prose blank
+        # line into a code blank line.
+        separator = "" if source_tail.startswith("\n") else "\n"
+        return f"```{carry_lang}{separator}{source_tail}"
+
+    @staticmethod
+    def _open_fence_language(text: str) -> Optional[str]:
+        """Return the open fence language, or ``None`` when prose is active."""
+        in_code = False
+        language = ""
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("```"):
+                continue
+            if in_code:
+                in_code = False
+                language = ""
+            else:
+                in_code = True
+                tag = stripped[3:].strip()
+                language = tag.split()[0] if tag else ""
+        return language if in_code else None
 
     def _truncate_for_stream(
         self,

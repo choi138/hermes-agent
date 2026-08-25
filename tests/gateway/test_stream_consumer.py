@@ -1,6 +1,7 @@
 """Tests for GatewayStreamConsumer — media directive stripping in streaming."""
 
 import asyncio
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -754,6 +755,107 @@ class TestInitialOverflowRollingEdit:
         assert all(utf16_len(text) <= safe_limit for text in sent_texts)
 
 
+class TestExistingMessageFenceOverflow:
+    """Regression coverage for sealing a fence-balanced stream head."""
+
+    def test_original_closing_fence_is_not_reopened(self):
+        consumer = GatewayStreamConsumer(MagicMock(), "chat")
+        source = "```sql\nSELECT 1;\n```\nPlain prose."
+        assert consumer._source_tail_after_sealed_stream_chunk(
+            source,
+            "```sql\nSELECT 1;\n```",
+            2,
+        ) == "\nPlain prose."
+
+    @pytest.mark.asyncio
+    async def test_sealed_head_keeps_source_tail_and_code_state(self):
+        class Adapter:
+            MAX_MESSAGE_LENGTH = 2000
+
+            def __init__(self):
+                self.messages = {}
+                self.order = []
+                self._next_id = 0
+
+            async def send(self, chat_id=None, content=None, **kwargs):
+                self._next_id += 1
+                message_id = f"m{self._next_id}"
+                self.messages[message_id] = content
+                self.order.append(message_id)
+                return SimpleNamespace(success=True, message_id=message_id)
+
+            async def edit_message(self, chat_id=None, message_id=None, content=None,
+                                   **kwargs):
+                self.messages[message_id] = content
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        def render_state(chunks):
+            states = {}
+            for chunk in chunks:
+                in_code = False
+                for line in chunk.splitlines():
+                    if line.strip().startswith("```"):
+                        in_code = not in_code
+                    else:
+                        previous = states.setdefault(line, in_code)
+                        assert previous == in_code, f"conflicting state for {line!r}"
+            return states
+
+        seed = "Opening prose.\n"
+        sql_lines = [f"SELECT col_{i} FROM source_table WHERE id = {i};" for i in range(40)]
+        payload = (
+            "Intro line.\n" * 10
+            + "```sql\n"
+            + "\n".join(sql_lines)
+            + "\n```\n"
+            + "Closing prose.\n" * 10
+        )
+        expected = seed + payload
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0, buffer_threshold=1, cursor=""),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(seed)  # Establish _message_id so the next delta uses Path B.
+        await asyncio.sleep(0.1)
+        for offset in range(0, len(payload), 100):
+            consumer.on_delta(payload[offset:offset + 100])
+            await asyncio.sleep(0.005)
+        consumer.finish()
+        await task
+
+        delivered = [adapter.messages[message_id] for message_id in adapter.order]
+        assert len(delivered) > 1
+        assert all(len(chunk) <= adapter.MAX_MESSAGE_LENGTH for chunk in delivered)
+
+        # Remove only the close/reopen fences inserted between independently
+        # rendered messages, then prove every source line remains verbatim.
+        source_view = []
+        for index, message in enumerate(delivered):
+            lines = message.splitlines()
+            if index and lines and re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", lines[0].strip()):
+                lines = lines[1:]
+            if index < len(delivered) - 1 and lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            source_view.append("\n".join(lines))
+        reconstructed = "\n".join(source_view)
+        assert all(line in reconstructed for line in expected.splitlines() if line)
+
+        # A synthetic fence must always occupy its own line: never overwrite
+        # user text such as `````ECT col_30 ...``.
+        for message in delivered:
+            for line in message.splitlines():
+                if line.strip().startswith("```"):
+                    assert re.fullmatch(r"```[A-Za-z0-9_+-]{0,15}", line.strip())
+
+        expected_state = render_state([expected])
+        assert render_state(delivered) == expected_state
+        assert consumer.delivered_final_matches(expected) is True
+
+
 class TestEditOverflowSplitAndDeliver:
     """When edit_message split-and-delivers an oversized payload across the
     original message + N continuations (Telegram >4096 UTF-16), the consumer
@@ -1487,4 +1589,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-
