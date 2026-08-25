@@ -859,8 +859,10 @@ def _record_review_usage_to_parent(
         )
 
 
-def _classify_review_result(actions: List[str]) -> str:
-    """Map a review action summary to ``none`` / ``skill`` / ``memory`` / both.
+def _classify_review_result(
+    actions: List[str], *, usage: Optional[Dict[str, Any]] = None
+) -> str:
+    """Map a review action summary to ``error`` / ``none`` / action categories.
 
     Matching is prefix-based on the formats
     :func:`summarize_background_review_actions` emits
@@ -869,6 +871,13 @@ def _classify_review_result(actions: List[str]) -> str:
     ``Skipped: no skill worth saving`` stays ``none``.
     """
     if not actions:
+        # A successful completion with no actions is meaningful only after the
+        # fork reached the provider.  The usage snapshot is captured before
+        # teardown, so its API-call count is the authoritative signal here.
+        # Keep omitted usage backward compatible for callers that only have
+        # an action summary.
+        if usage is not None and int(usage.get("api_calls") or 0) == 0:
+            return "error"
         return "none"
     has_skill = False
     has_memory = False
@@ -1073,6 +1082,19 @@ def _run_review_in_thread(
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
+                # Inherit the parent's fallback chain so a review can survive a
+                # primary-provider outage exactly like the main conversation
+                # does.  Without this the fork's chain is [] (see agent_init),
+                # so _try_activate_fallback() can never succeed and a 429/503
+                # on the primary kills the review with calls=0.
+                # Same-model path only: a routed aux model may need a different
+                # chain, matching the ``not _routed`` gates above.  An empty
+                # parent chain normalizes to None so behaviour is unchanged.
+                fallback_model=(
+                    (getattr(agent, "_fallback_chain", None) or None)
+                    if not _routed
+                    else None
+                ),
                 request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -1312,7 +1334,7 @@ def _run_review_in_thread(
             actions = []
 
         _log_review_completion(
-            review_usage, _classify_review_result(actions)
+            review_usage, _classify_review_result(actions, usage=review_usage)
         )
 
         if actions:
