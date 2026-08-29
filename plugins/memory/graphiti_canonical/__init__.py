@@ -56,6 +56,7 @@ _MAX_RESPONSE_FACTS = 64
 _MAX_INPUT_FACT_CHARS = 10_000
 _MAX_QUERY_CHARS = 4_000
 _MIN_RECALL_CHARS = 2
+_STRONG_OVERLAP_MIN = 2
 _PREFETCH_TIMEOUT_SECONDS = 15.0
 # unrestricted recall (user directive 2026-08-07): single-user Discord bot.
 # Personal-scope filters disabled. Credential/threat guards remain active.
@@ -820,20 +821,27 @@ def _lookup_status_block(
 ) -> str:
     safe_status = (
         status
-        if status in {"ok", "empty", "filtered", "timeout", "error"}
+        if status
+        in {"ok", "ok_low_relevance", "empty", "filtered", "timeout", "error"}
         else "error"
     )
     safe_routing_policy = (
         "graphiti_first" if routing_policy == "graphiti_first" else "advisory"
     )
-    return (
-        "# Graphiti Lookup Status\n"
-        f"source: {_MODEL_SEARCH_SOURCE}\n"
-        f"routing_policy: {safe_routing_policy}\n"
-        f"status: {safe_status}\n"
-        f"candidate_count: {max(0, candidate_count)}\n"
-        f"fallback_allowed: {'false' if safe_status == 'ok' else 'true'}"
-    )
+    lines = [
+        "# Graphiti Lookup Status",
+        f"source: {_MODEL_SEARCH_SOURCE}",
+        f"routing_policy: {safe_routing_policy}",
+        f"status: {safe_status}",
+        f"candidate_count: {max(0, candidate_count)}",
+        f"fallback_allowed: {'false' if safe_status == 'ok' else 'true'}",
+    ]
+    if safe_status == "ok_low_relevance":
+        lines.append(
+            "note: recall returned facts but none share strong anchors with the "
+            "query; treat as possibly irrelevant and fall back if unhelpful"
+        )
+    return "\n".join(lines)
 
 
 def _normalize_text(value: Any) -> str:
@@ -1061,10 +1069,13 @@ def _fact_is_relevant(
     relation: str,
     query_anchors: set[str],
     identity_terms: set[str],
+    *,
+    fact_anchors: set[str] | None = None,
 ) -> bool:
     if _UNRESTRICTED_RECALL:
         return True
-    fact_anchors = _anchor_tokens(fact)
+    if fact_anchors is None:
+        fact_anchors = _anchor_tokens(fact)
     if relation in _HIGH_SIGNAL_RELATIONS:
         if not identity_terms:
             return False
@@ -1227,12 +1238,13 @@ def _format_facts_with_count(
     max_facts: int = _DEFAULT_MAX_FACTS,
     max_chars: int = _DEFAULT_MAX_CHARS,
     max_fact_chars: int = _DEFAULT_MAX_FACT_CHARS,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     lines = [
         "# Graphiti Recall (read-only historical context)",
         "Current user instructions and built-in USER/MEMORY override conflicts.",
     ]
     seen_facts = set()
+    strong_overlap_count = 0
     query_anchors = _anchor_tokens(query)
     scoped_identities = {
         normalized
@@ -1281,7 +1293,14 @@ def _format_facts_with_count(
             continue
         if not _personal_predicates_have_trusted_subject(fact, scoped_identities):
             continue
-        if not _fact_is_relevant(fact, relation, query_anchors, scoped_identities):
+        fact_anchors = None if _UNRESTRICTED_RECALL else _anchor_tokens(fact)
+        if not _fact_is_relevant(
+            fact,
+            relation,
+            query_anchors,
+            scoped_identities,
+            fact_anchors=fact_anchors,
+        ):
             continue
         normalized_fact = _normalize_text(fact)
         if (
@@ -1300,6 +1319,11 @@ def _format_facts_with_count(
         if len(candidate) > max_chars:
             break
         lines.append(line)
+        if (
+            fact_anchors is not None
+            and len(query_anchors & fact_anchors) >= _STRONG_OVERLAP_MIN
+        ):
+            strong_overlap_count += 1
         if len(lines) - 2 >= max_facts:
             break
     returned_count = max(0, len(lines) - 2)
@@ -1307,7 +1331,11 @@ def _format_facts_with_count(
         _log_zero_kept_rejections(
             facts, scoped_identities, query_anchors, builtin_memory
         )
-    return ("\n".join(lines) if returned_count else "", returned_count)
+    return (
+        "\n".join(lines) if returned_count else "",
+        returned_count,
+        strong_overlap_count,
+    )
 
 
 def _format_facts(
@@ -1633,7 +1661,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             return _lookup_status_block(
                 search_status, routing_policy=routing_policy
             )
-        context = _format_facts(
+        context, _, strong_overlap_count = _format_facts_with_count(
             facts,
             query=search_query,
             builtin_memory=self._builtin_memory,
@@ -1654,8 +1682,17 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             return _lookup_status_block("timeout", routing_policy=routing_policy)
         if context:
             if routing_policy == "graphiti_first":
+                recall_status = "ok"
+                try:
+                    if not _UNRESTRICTED_RECALL and strong_overlap_count == 0:
+                        recall_status = "ok_low_relevance"
+                except Exception:
+                    logger.debug(
+                        "Graphiti overlap strength classification failed open",
+                        exc_info=True,
+                    )
                 return context + "\n\n" + _lookup_status_block(
-                    "ok",
+                    recall_status,
                     candidate_count=len(facts),
                     routing_policy=routing_policy,
                 )
@@ -1784,7 +1821,11 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                 if not found:
                     return
                 candidate_count = len(facts)
-                recall, returned_count = _format_facts_with_count(
+                (
+                    recall,
+                    returned_count,
+                    _strong_overlap_count,
+                ) = _format_facts_with_count(
                     facts,
                     query=query,
                     builtin_memory=self._builtin_memory,

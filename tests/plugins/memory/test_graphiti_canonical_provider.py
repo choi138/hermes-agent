@@ -316,6 +316,107 @@ def test_prefetch_allows_fallback_for_any_non_ok_graphiti_result(
     assert "candidate_count: 1" in filtered
 
 
+def test_prefetch_keeps_ok_when_a_kept_fact_has_strong_overlap(
+    monkeypatch, tmp_path
+):
+    fact = "Graphiti reliability anchors improve recall."
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "facts": [
+                {
+                    "uuid": "strong-overlap-edge",
+                    "name": "RELATED_TO",
+                    "fact": fact,
+                }
+            ]
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+
+    result = provider.prefetch("Graphiti reliability anchors history")
+
+    assert fact in result
+    assert "\nstatus: ok\n" in result
+    assert "status: ok_low_relevance" not in result
+    assert "fallback_allowed: false" in result
+
+
+def test_prefetch_exposes_kept_weak_facts_and_allows_fallback(
+    monkeypatch, tmp_path
+):
+    fact = "Graphiti Discord reaction handling details."
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "facts": [
+                {
+                    "uuid": "weak-overlap-edge",
+                    "name": "RELATED_TO",
+                    "fact": fact,
+                }
+            ]
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+
+    result = provider.prefetch("Graphiti metamemory reliability history")
+
+    assert fact in result
+    assert "status: ok_low_relevance" in result
+    assert "fallback_allowed: true" in result
+    assert (
+        "note: recall returned facts but none share strong anchors with the query; "
+        "treat as possibly irrelevant and fall back if unhelpful"
+    ) in result
+
+
+def test_low_relevance_lookup_status_is_not_downgraded_to_error():
+    block = graphiti_module._lookup_status_block(
+        "ok_low_relevance",
+        candidate_count=1,
+        routing_policy="graphiti_first",
+    )
+
+    assert "status: ok_low_relevance" in block
+    assert "fallback_allowed: true" in block
+    assert "status: error" not in block
+    assert "note: recall returned facts" in block
+
+
+def test_unrestricted_prefetch_skips_overlap_strength_and_stays_ok(
+    monkeypatch, tmp_path
+):
+    fact = "Discord requires reaction and pin handling."
+    monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", True)
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {
+            "facts": [
+                {
+                    "uuid": "unrestricted-edge",
+                    "name": "RELATED_TO",
+                    "fact": fact,
+                }
+            ]
+        },
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+
+    result = provider.prefetch("Graphiti metamemory reliability history")
+
+    assert fact in result
+    assert "\nstatus: ok\n" in result
+    assert "status: ok_low_relevance" not in result
+    assert "fallback_allowed: false" in result
+
+
 def test_prefetch_reports_application_error_and_allows_fallback(
     monkeypatch, tmp_path
 ):
@@ -1111,9 +1212,9 @@ def test_continuity_request_recalls_fact_through_read_only_search(
     ]
     assert "real verification before completion" in result
     assert "edge-1" in result
-    assert "status: ok" in result
+    assert "status: ok_low_relevance" in result
     assert "routing_policy: graphiti_first" in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed: true" in result
 
 
 def test_recall_parses_structured_mcp_content(monkeypatch, tmp_path):
@@ -3169,7 +3270,11 @@ def test_model_search_tool_maps_supported_empty_mcp_envelopes_to_empty(
 
 
 def test_formatter_returns_count_without_reparsing_rendered_text():
-    recall, returned_count = graphiti_module._format_facts_with_count(
+    (
+        recall,
+        returned_count,
+        strong_overlap_count,
+    ) = graphiti_module._format_facts_with_count(
         [
             {
                 "uuid": "edge-format-count",
@@ -3182,6 +3287,7 @@ def test_formatter_returns_count_without_reparsing_rendered_text():
     )
 
     assert returned_count == 1
+    assert strong_overlap_count == 1
     assert "edge-format-count" in recall
 
 
@@ -3268,6 +3374,6 @@ def test_mixed_language_empty_search_retries_once_with_graphiti_anchor(
 
     calls.clear()
     prefetched = provider.prefetch(query)
-    assert "status: ok" in prefetched
-    assert "fallback_allowed: false" in prefetched
+    assert "status: ok_low_relevance" in prefetched
+    assert "fallback_allowed: true" in prefetched
     assert calls == [query, "Instagram"]

@@ -101,7 +101,15 @@ _GRAPHITI_FALLBACK_TOOL_NAMES = frozenset(
     {"web_search", "web_extract", "session_search", "computer_use"}
 )
 _GRAPHITI_ROUTING_STATUSES = frozenset(
-    {"ok", "empty", "filtered", "timeout", "error", "missing"}
+    {
+        "ok",
+        "ok_low_relevance",
+        "empty",
+        "filtered",
+        "timeout",
+        "error",
+        "missing",
+    }
 )
 
 # Per-turn budget for the explicit Graphiti-irrelevance escape hatch. The

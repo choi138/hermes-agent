@@ -401,7 +401,14 @@ class StreamingContextScrubber:
 
 _GRAPHITI_STATUS_MARKER = "# Graphiti Lookup Status"
 _GRAPHITI_STATUS_FIELD_NAMES = frozenset(
-    {"source", "routing_policy", "status", "candidate_count", "fallback_allowed"}
+    {
+        "source",
+        "routing_policy",
+        "status",
+        "candidate_count",
+        "fallback_allowed",
+        "note",
+    }
 )
 
 
@@ -441,9 +448,18 @@ def graphiti_first_status_from_context(raw_context: str) -> Optional[str]:
         if fields.get("routing_policy") != "graphiti_first":
             continue
         status = fields.get("status")
-        if status not in {"ok", "empty", "filtered", "timeout", "error"}:
+        if status not in {
+            "ok",
+            "ok_low_relevance",
+            "empty",
+            "filtered",
+            "timeout",
+            "error",
+        }:
             return "missing"
-        expected_fallback = "true" if status == "empty" else "false"
+        expected_fallback = (
+            "true" if status in {"empty", "ok_low_relevance"} else "false"
+        )
         if fields.get("fallback_allowed") != expected_fallback:
             return "missing"
         return status
@@ -466,7 +482,8 @@ def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
         valid_block = (
             fields.get("source") == "graphiti_historical_memory"
             and fields.get("routing_policy") in {"graphiti_first", "advisory"}
-            and fields.get("status") in {"ok", "empty", "filtered", "timeout", "error"}
+            and fields.get("status")
+            in {"ok", "ok_low_relevance", "empty", "filtered", "timeout", "error"}
             and fields.get("fallback_allowed") in {"true", "false"}
         )
         if not valid_block:

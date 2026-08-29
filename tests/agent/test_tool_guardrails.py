@@ -210,6 +210,15 @@ def test_graphiti_ok_blocks_external_fallback_but_non_ok_statuses_allow_it():
     assert controller.before_call("web_search", {"query": "new turn"}).action == "allow"
 
 
+def test_graphiti_low_relevance_allows_session_search_fallback():
+    controller = ToolCallGuardrailController()
+    controller.set_graphiti_routing_status("ok_low_relevance")
+
+    decision = controller.before_call("session_search", {"query": "fallback"})
+
+    assert decision.action == "allow"
+
+
 def test_graphiti_irrelevant_fallback_config_defaults_off_and_reads_memory_key():
     default_cfg = ToolCallGuardrailConfig.from_mapping(
         DEFAULT_CONFIG["tool_loop_guardrails"],
