@@ -316,10 +316,11 @@ def test_prefetch_allows_fallback_for_any_non_ok_graphiti_result(
     assert "candidate_count: 1" in filtered
 
 
-def test_prefetch_keeps_ok_when_a_kept_fact_has_strong_overlap(
+def test_unrestricted_prefetch_keeps_ok_when_a_kept_fact_has_strong_overlap(
     monkeypatch, tmp_path
 ):
     fact = "Graphiti reliability anchors improve recall."
+    monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", True)
     monkeypatch.setattr(
         graphiti_module,
         "_dispatch_tool",
@@ -388,7 +389,7 @@ def test_low_relevance_lookup_status_is_not_downgraded_to_error():
     assert "note: recall returned facts" in block
 
 
-def test_unrestricted_prefetch_skips_overlap_strength_and_stays_ok(
+def test_unrestricted_prefetch_marks_weak_overlap_low_relevance(
     monkeypatch, tmp_path
 ):
     fact = "Discord requires reaction and pin handling."
@@ -412,9 +413,8 @@ def test_unrestricted_prefetch_skips_overlap_strength_and_stays_ok(
     result = provider.prefetch("Graphiti metamemory reliability history")
 
     assert fact in result
-    assert "\nstatus: ok\n" in result
-    assert "status: ok_low_relevance" not in result
-    assert "fallback_allowed: false" in result
+    assert "status: ok_low_relevance" in result
+    assert "fallback_allowed: true" in result
 
 
 def test_prefetch_reports_application_error_and_allows_fallback(
