@@ -55,6 +55,17 @@ logger = logging.getLogger(__name__)
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
+_GATEWAY_INJECTED_PREFIX_LINE_RE = re.compile(
+    r"(?:"
+    r"\[Triggering message id: [^\r\n]*\]"
+    r'|\[Replying to: "[^\r\n]*"\]'
+    r'|\[Replying to your previous message: "[^\r\n]*"\]'
+    r"|\[Routing directive: [^\r\n]*\]"
+    r"|\[Note: model was just switched from [^\r\n]* "
+    r"by the model router[^\r\n]*\]"
+    r")"
+)
+
 # Origin tag for memory READS issued by machinery rather than the live agent
 # (ADR-004 §⑤: the plugin-side retrieval ledger feeds the dream-promotion
 # "explicit memory_search hit" signal, which must exclude curator/prefetch
@@ -671,6 +682,38 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
+    @staticmethod
+    def _strip_gateway_injected_prefixes(text: str) -> Optional[str]:
+        """Strip the leading block of volatile gateway-injected lines.
+
+        Gateway reply/routing metadata rides the user turn to preserve the
+        cached system prompt, but it is not durable user intent and must not
+        enter memory journals or providers. Only consecutive recognized lines
+        at the very start are removed; matching text later in the user's
+        message is preserved. Blank separator lines between the injected
+        block and the user's content are removed with the block.
+        """
+        if not isinstance(text, str):
+            return None
+
+        lines = text.splitlines(keepends=True)
+        if not lines or not _GATEWAY_INJECTED_PREFIX_LINE_RE.fullmatch(
+            lines[0].rstrip("\r\n")
+        ):
+            return text
+
+        index = 0
+        while index < len(lines):
+            line = lines[index].rstrip("\r\n")
+            if not _GATEWAY_INJECTED_PREFIX_LINE_RE.fullmatch(line):
+                break
+            index += 1
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+
+        clean_text = "".join(lines[index:])
+        return clean_text or None
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.
 
@@ -849,6 +892,9 @@ class MemoryManager:
             return
 
         clean_user_content = self._strip_skill_scaffolding(user_content)
+        if not clean_user_content:
+            return
+        clean_user_content = self._strip_gateway_injected_prefixes(clean_user_content)
         if not clean_user_content:
             return
         user_content = clean_user_content
