@@ -127,6 +127,9 @@ def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
         "source": "graphiti_historical_memory",
         "returned_count": 1,
         "candidate_count": 2,
+        "gate_kept_count": 2,
+        "gate_dropped_count": 0,
+        "gate_floor": 0.42,
         "fetch_limit": 24,
         "reached_fetch_limit": False,
         "has_more": True,
@@ -146,6 +149,7 @@ def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
         "query": "What answer style does Alice prefer?",
         "max_facts": 24,
         "group_ids": ["mnemos"],
+        "temporal_mode": "current",
     }
     assert deadline > time.monotonic()
     assert hermes_home == str(tmp_path.resolve())
@@ -207,6 +211,9 @@ def test_model_search_tool_distinguishes_empty_results_from_failures(
         "source": "graphiti_historical_memory",
         "returned_count": 0,
         "candidate_count": 0,
+        "gate_kept_count": 0,
+        "gate_dropped_count": 0,
+        "gate_floor": 0.42,
         "fetch_limit": 24,
         "reached_fetch_limit": False,
         "has_more": False,
@@ -267,6 +274,9 @@ def test_model_search_tool_reports_filtered_candidates_and_allows_fallback(
         "source": "graphiti_historical_memory",
         "returned_count": 0,
         "candidate_count": 1,
+        "gate_kept_count": 1,
+        "gate_dropped_count": 0,
+        "gate_floor": 0.42,
         "fetch_limit": 24,
         "reached_fetch_limit": False,
         "has_more": True,
@@ -1036,7 +1046,9 @@ def test_dispatch_uses_exact_bound_readonly_mcp_capability_not_registry(
         "server_name": "graphiti_canonical",
         "tool_name": "search_memory_facts",
         "allowed_tools": graphiti_module._READ_ONLY_MCP_TOOLS,
-        "allowed_argument_keys": frozenset({"query", "max_facts", "group_ids"}),
+        "allowed_argument_keys": frozenset(
+            {"query", "max_facts", "group_ids", "temporal_mode"}
+        ),
         "profile_home": str(tmp_path),
         "max_timeout": 15.0,
         "max_response_chars": 262_144,
@@ -1207,6 +1219,7 @@ def test_continuity_request_recalls_fact_through_read_only_search(
                 "query": "하던 작업 계속 진행해줘",
                 "max_facts": 24,
                 "group_ids": ["mnemos"],
+                "temporal_mode": "current",
             },
         )
     ]
@@ -2079,10 +2092,38 @@ def test_preference_dependent_request_triggers_selective_recall(monkeypatch, tmp
                 "query": "내 선호에 맞는 방식으로 보고해줘",
                 "max_facts": 24,
                 "group_ids": ["mnemos"],
+                "temporal_mode": "current",
             },
         )
     ]
     assert "preference-edge" in result
+
+
+def test_history_intent_search_omits_current_temporal_filter(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+
+    result = provider.prefetch("예전에 P1 프로젝트는 어떤 상태였어?")
+
+    assert "status: empty" in result
+    assert calls == [
+        (
+            "mcp__graphiti_canonical__search_memory_facts",
+            {
+                "query": "예전에 P1 프로젝트는 어떤 상태였어?",
+                "max_facts": 24,
+                "group_ids": ["mnemos"],
+            },
+        )
+    ]
 
 
 def test_unrelated_temporal_question_reports_confirmed_empty(monkeypatch, tmp_path):
