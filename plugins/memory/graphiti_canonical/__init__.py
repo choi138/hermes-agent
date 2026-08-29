@@ -64,6 +64,63 @@ _UNRESTRICTED_RECALL = True
 # 주의: 존재하지 않는 group을 목록에 넣으면 검색 결과가 전면 0이 된다(합집합 아님).
 # 새 그룹은 실제로 데이터가 쌓인 뒤에만 추가할 것.
 _RECALL_GROUP_IDS = ["mnemos"]
+
+# Graphiti invalidates facts instead of deleting them ("query what's true now,
+# or what was true at any point in time"). Normal queries ask the server for
+# currently-true facts only (temporal_mode="current"); measured 52.7% of the
+# top-24 candidate window was invalidated facts before this. History-intent
+# queries keep the full record and surface dead facts with an explicit label.
+_TEMPORAL_HISTORY_TERMS = (
+    "예전에",
+    "예전엔",
+    "과거",
+    "원래는",
+    "당시",
+    "이력",
+    "히스토리",
+    "바뀌었",
+    "바뀌기 전",
+    "변경되기 전",
+    "변경 이력",
+    "무효화",
+    "이전에는",
+    "전에는",
+    "전엔",
+    "였었",
+    "history",
+    "previously",
+    "used to",
+    "invalidated",
+)
+# History-intent recall reserves this many slots for invalidated facts so the
+# temporal record is actually visible within the max_facts budget.
+_HISTORY_RESERVED_SLOTS = 2
+# Semantic relevance gate. The server scores facts by cosine similarity when
+# GRAPHITI_FACT_SCORE_MODE=semantic; bm25 selects the candidate window, so the
+# score is an independent relevance signal rather than the ranking key.
+# Live measurement 2026-08-28 (80 queries, hand-adjudicated ground truth:
+# 24 queries the graph can answer, 56 it cannot):
+#   no gate -> useful 24/24, noise 49/56 recalled (178 noise facts exposed)
+#   0.42    -> useful 24/24, noise  2/56 recalled (  2 noise facts exposed)
+# Loss-free threshold band was 0.404..0.439 (noise top 0.4033 /
+# useful floor 0.4394); 0.42 is the max-margin point inside it.
+# A relative max_score ratio gate was measured and rejected: at ratio 0.80 it
+# cut 0 queries and 2 facts, because bm25 candidate windows are score-tight
+# (useful/noise ratio p50 = 0.685 / 0.691). Revisit if search_mode leaves bm25.
+_SCORE_GATE_FLOOR = 0.42
+# M1 recall log (project: 사람 같은 기억 — 연상·중요도). One JSONL line per
+# recall that reached the prompt; consumed by the M2 salience prototype
+# (recall frequency per edge). Failures are swallowed: recall must never
+# break because its own logging did.
+_RECALL_LOG_PATH = Path.home() / ".hermes" / "state" / "recall-log.jsonl"
+_RECALL_LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _wants_temporal_history(query: Any) -> bool:
+    normalized = " ".join(str(query or "").lower().split())
+    if not normalized:
+        return False
+    return any(term in normalized for term in _TEMPORAL_HISTORY_TERMS)
 _MODEL_SEARCH_SCHEMA = {
     "name": _MODEL_SEARCH_TOOL,
     "description": (
@@ -616,7 +673,9 @@ def _dispatch_tool(
         server_name=_SERVER_NAME,
         tool_name=_REQUIRED_SEARCH_TOOL,
         allowed_tools=_READ_ONLY_MCP_TOOLS,
-        allowed_argument_keys=frozenset({"query", "max_facts", "group_ids"}),
+        allowed_argument_keys=frozenset(
+            {"query", "max_facts", "group_ids", "temporal_mode"}
+        ),
         profile_home=hermes_home,
         max_timeout=_PREFETCH_TIMEOUT_SECONDS,
         max_response_chars=_MAX_RAW_RESPONSE_CHARS,
@@ -769,12 +828,27 @@ def _fallback_anchor_query(query: str) -> str:
     return ""
 
 
+def _search_args(query_text: str, original_query: str) -> Dict[str, Any]:
+    args: Dict[str, Any] = {
+        "query": query_text,
+        "max_facts": _FETCH_LIMIT,
+        "group_ids": list(_RECALL_GROUP_IDS),
+    }
+    # Requires the deployed mnemos/graphiti-mcp image to support
+    # temporal_mode (temporal-mode-4f8febf or newer); the server rejects
+    # unknown values, so a downgrade surfaces immediately instead of
+    # silently returning stale facts.
+    if not _wants_temporal_history(original_query):
+        args["temporal_mode"] = "current"
+    return args
+
+
 def _dispatch_search_with_anchor_fallback(
     query: str, *, deadline: float, hermes_home: str
 ) -> str | dict:
     raw = _dispatch_tool(
         _SEARCH_TOOL,
-        {"query": query, "max_facts": _FETCH_LIMIT, "group_ids": list(_RECALL_GROUP_IDS)},
+        _search_args(query, query),
         deadline=deadline,
         hermes_home=hermes_home,
     )
@@ -788,7 +862,7 @@ def _dispatch_search_with_anchor_fallback(
         return raw
     return _dispatch_tool(
         _SEARCH_TOOL,
-        {"query": anchor, "max_facts": _FETCH_LIMIT, "group_ids": list(_RECALL_GROUP_IDS)},
+        _search_args(anchor, query),
         deadline=deadline,
         hermes_home=hermes_home,
     )
@@ -1218,6 +1292,54 @@ def _log_zero_kept_rejections(
         logger.debug("zero-kept rejection histogram failed", exc_info=True)
 
 
+def _log_recall(query: Any, edge_ids: List[str]) -> None:
+    try:
+        if _RECALL_LOG_PATH.exists() and (
+            _RECALL_LOG_PATH.stat().st_size > _RECALL_LOG_MAX_BYTES
+        ):
+            return
+        entry = {
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "query": str(query or "")[:200],
+            "edges": edge_ids[:24],
+        }
+        _RECALL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _RECALL_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _is_real_score(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _score_gate(facts: Any) -> Any:
+    """Drop facts whose semantic score falls below _SCORE_GATE_FLOOR.
+
+    Fail-open in two ways on purpose:
+      * if NO fact carries a score, the deployed server is not in semantic
+        score mode -- keep everything rather than silently emptying recall.
+      * an individual fact without a score is kept, so a partial server
+        regression degrades precision instead of dropping real memory.
+    """
+    if not isinstance(facts, list):
+        return facts
+    if not any(
+        isinstance(item, dict) and _is_real_score(item.get("score"))
+        for item in facts
+    ):
+        return facts
+    kept: List[Dict[str, Any]] = []
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        score = item.get("score")
+        if not _is_real_score(score) or float(score) >= _SCORE_GATE_FLOOR:
+            kept.append(item)
+    return kept
+
+
 def _format_facts_with_count(
     facts: List[Dict[str, Any]],
     *,
@@ -1233,15 +1355,42 @@ def _format_facts_with_count(
         "Current user instructions and built-in USER/MEMORY override conflicts.",
     ]
     seen_facts = set()
+    kept_edge_ids: List[str] = []
     query_anchors = _anchor_tokens(query)
     scoped_identities = {
         normalized
         for term in (identity_terms or set())
         if (normalized := _normalize_text(term))
     }
-    for item in facts:
+    include_history = _wants_temporal_history(query)
+    # Gate BEFORE the history reordering: the reserved history slots must not
+    # let low-relevance dead facts bypass the relevance gate.
+    gated_facts = _score_gate(facts)
+    ordered_facts = gated_facts
+    if include_history:
+        live_items = [f for f in gated_facts if _fact_is_current(f)]
+        dead_items = [f for f in gated_facts if not _fact_is_current(f)]
+        dead_items.sort(
+            key=lambda f: str(f.get("invalid_at") or f.get("expired_at") or ""),
+            reverse=True,
+        )
+        live_budget = max(1, max_facts - _HISTORY_RESERVED_SLOTS)
+        ordered_facts = (
+            live_items[:live_budget]
+            + dead_items[:_HISTORY_RESERVED_SLOTS]
+            + live_items[live_budget:]
+            + dead_items[_HISTORY_RESERVED_SLOTS:]
+        )
+    for item in ordered_facts:
+        history_stamp = ""
         if not _fact_is_current(item):
-            continue
+            if not include_history:
+                continue
+            history_stamp = str(
+                item.get("invalid_at") or item.get("expired_at") or ""
+            )[:10]
+            if not history_stamp:
+                continue
         raw_fact = item.get("fact")
         if not isinstance(raw_fact, str) or len(raw_fact) > _MAX_INPUT_FACT_CHARS:
             continue
@@ -1295,11 +1444,15 @@ def _format_facts_with_count(
         display_fact = " ".join(fact.split())
         if len(display_fact) > max_fact_chars:
             display_fact = display_fact[: max_fact_chars - 1].rstrip() + "…"
-        line = f"- [{relation}; edge={edge_id}] {display_fact}"
+        history_prefix = (
+            f"[과거·{history_stamp} 무효화] " if history_stamp else ""
+        )
+        line = f"- [{relation}; edge={edge_id}] {history_prefix}{display_fact}"
         candidate = "\n".join([*lines, line])
         if len(candidate) > max_chars:
             break
         lines.append(line)
+        kept_edge_ids.append(edge_id)
         if len(lines) - 2 >= max_facts:
             break
     returned_count = max(0, len(lines) - 2)
@@ -1307,6 +1460,8 @@ def _format_facts_with_count(
         _log_zero_kept_rejections(
             facts, scoped_identities, query_anchors, builtin_memory
         )
+    if returned_count:
+        _log_recall(query, kept_edge_ids)
     return ("\n".join(lines) if returned_count else "", returned_count)
 
 
@@ -1795,10 +1950,14 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                     result[0] = timeout_result
                     return
                 reached_fetch_limit = candidate_count >= _FETCH_LIMIT
+                gate_kept = len(_score_gate(facts))
                 metadata = {
                     "source": _MODEL_SEARCH_SOURCE,
                     "returned_count": returned_count,
                     "candidate_count": candidate_count,
+                    "gate_kept_count": gate_kept,
+                    "gate_dropped_count": max(0, candidate_count - gate_kept),
+                    "gate_floor": _SCORE_GATE_FLOOR,
                     "fetch_limit": _FETCH_LIMIT,
                     "reached_fetch_limit": reached_fetch_limit,
                     "has_more": (
