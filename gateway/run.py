@@ -22184,9 +22184,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the specific prior same-channel session so it recalls that context
             # via session_search instead of an unrelated recent session.  Returns
             # None (appends nothing) for other platforms or when there's no prior
-            # activity to recall.  Deterministic — no extra API/DB calls (#36220).
+            # activity to recall. A bounded SessionDB tail enriches the pointer;
+            # failures retain the original pointer-only note (#36220).
             try:
-                continuity_note = build_channel_continuity_note(session_entry, source)
+                continuity_note = build_channel_continuity_note(
+                    session_entry,
+                    source,
+                    session_store=self.session_store,
+                )
             except Exception:
                 continuity_note = None
             if continuity_note:

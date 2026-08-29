@@ -1044,23 +1044,26 @@ class SessionEntry:
 def build_channel_continuity_note(
     entry: "SessionEntry",
     source: SessionSource,
+    *,
+    session_store: Any = None,
 ) -> Optional[str]:
     """Build a lightweight session-continuity hint for Slack/Discord channels.
 
     Slack and Discord channels/threads are long-lived: when the daily/idle
     reset policy starts a fresh session, the agent loses the thread's prior
     context and can mistakenly bind a new request to an unrelated recent
-    session.  This deterministic one-line hint points the agent at the
-    specific prior session in *this* channel/thread so it recalls that
-    context via ``session_search`` before acting.
+    session. This deterministic hint points the agent at the specific prior
+    session in *this* channel/thread and, when available, includes a bounded
+    digest of its last three user/assistant exchanges.
 
     Returns ``None`` (and the caller adds nothing) unless **all** hold:
       - the source platform is Slack or Discord,
       - this session was created by an auto-reset that had real activity,
       - the previous session_id was recorded on the entry.
 
-    No LLM calls, no extra API/DB lookups — the previous session id is
-    already known from :meth:`SessionStore.get_or_create_session`.
+    No LLM calls. The optional digest uses one bounded read from the existing
+    SessionDB owned by ``session_store``. Any read or formatting failure is
+    fail-open: the original pointer-only note is returned instead.
     """
     if source.platform not in (Platform.SLACK, Platform.DISCORD):
         return None
@@ -1071,13 +1074,72 @@ def build_channel_continuity_note(
         return None
 
     where = "thread" if source.thread_id else "channel"
-    return (
+    pointer_body = (
         f"[System note: This {where} had an earlier Hermes session "
         f"(session_id: {prev}) that was auto-reset. If the user refers to "
         f"earlier work here, or the request depends on this {where}'s history, "
         f"use the session_search tool to recall that prior session before "
         f"acting — do not assume an unrelated recent session is the right "
-        f"context.]"
+        f"context."
+    )
+    pointer_only = pointer_body + "]"
+    if session_store is None:
+        return pointer_only
+
+    try:
+        db = getattr(session_store, "_db", None)
+        if db is None:
+            return pointer_only
+        messages = db.get_recent_dialogue_messages(prev, 6)
+
+        # Import locally so gateway.session keeps its existing import shape;
+        # gateway -> agent is acyclic, and any unexpected import failure still
+        # degrades to the pointer-only note below.
+        from agent.memory_manager import MemoryManager
+
+        digest_lines = []
+        for message in list(messages or [])[-6:]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").lower()
+            if role not in {"user", "assistant"}:
+                continue
+
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content
+            elif content is None:
+                text = ""
+            else:
+                try:
+                    text = json.dumps(content, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    text = str(content)
+
+            if role == "user":
+                text = MemoryManager._strip_gateway_injected_prefixes(text) or ""
+            one_line = " ".join(text.split())
+            if not one_line:
+                continue
+            limit = 200 if role == "user" else 300
+            if len(one_line) > limit:
+                one_line = one_line[: limit - 1].rstrip() + "…"
+            digest_lines.append(f"{role.upper()}: {one_line}")
+    except Exception:
+        logger.debug(
+            "Failed to load previous session %s for continuity digest",
+            prev,
+            exc_info=True,
+        )
+        return pointer_only
+
+    if not digest_lines:
+        return pointer_only
+    return (
+        pointer_body
+        + "\nLast exchanges before reset:\n"
+        + "\n".join(digest_lines)
+        + "\n]"
     )
 
 

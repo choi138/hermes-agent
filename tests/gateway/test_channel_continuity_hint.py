@@ -48,6 +48,24 @@ def _slack_source(thread_id=None):
     )
 
 
+class _DialogueDB:
+    def __init__(self, messages=None, error=None):
+        self.messages = list(messages or [])
+        self.error = error
+        self.calls = []
+
+    def get_recent_dialogue_messages(self, session_id, limit):
+        self.calls.append((session_id, limit))
+        if self.error is not None:
+            raise self.error
+        return self.messages
+
+
+class _StoreWithDB:
+    def __init__(self, db):
+        self._db = db
+
+
 # ---------------------------------------------------------------------------
 # SessionStore records prev_session_id on auto-reset
 # ---------------------------------------------------------------------------
@@ -102,3 +120,89 @@ class TestBuildChannelContinuityNote:
         entry = _reset_entry(Platform.SLACK, had_activity=False)
         assert build_channel_continuity_note(entry, _slack_source()) is None
 
+    def test_success_appends_bounded_last_exchange_digest(
+        self, _isolated_db, tmp_path
+    ):
+        triggering_prefix = (
+            "[Triggering message id: `1542732296973647893` — use as `message_id` "
+            "for reply/react/pin via the discord tools.]"
+        )
+        messages = [
+            {"role": "user", "content": "old user exchange"},
+            {"role": "assistant", "content": "old assistant exchange"},
+            {
+                "role": "user",
+                "content": f"{triggering_prefix}\n\n" + "u" * 205 + "\ncontinued",
+            },
+            {"role": "assistant", "content": "a" * 305 + "\ncontinued"},
+            {"role": "user", "content": "second user\nmessage"},
+            {"role": "assistant", "content": "second assistant\nmessage"},
+            {"role": "user", "content": "third user message"},
+            {"role": "assistant", "content": "third assistant message"},
+        ]
+        entry = _reset_entry(Platform.SLACK)
+        store = _make_store(tmp_path)
+        try:
+            db = store._db
+            assert db is not None
+            db.create_session(entry.prev_session_id, "slack")
+            for message in messages:
+                db.append_message(
+                    entry.prev_session_id,
+                    message["role"],
+                    message["content"],
+                )
+            note = build_channel_continuity_note(
+                entry,
+                _slack_source(),
+                session_store=store,
+            )
+        finally:
+            store.close_all_db_handles()
+
+        assert note is not None
+        assert "Last exchanges before reset:" in note
+        assert "old user exchange" not in note
+        assert triggering_prefix not in note
+        assert "USER: second user message" in note
+        assert "ASSISTANT: second assistant message" in note
+        digest_lines = note.splitlines()[2:-1]
+        assert len(digest_lines) == 6
+        first_user = digest_lines[0].removeprefix("USER: ")
+        first_assistant = digest_lines[1].removeprefix("ASSISTANT: ")
+        assert len(first_user) == 200 and first_user.endswith("…")
+        assert len(first_assistant) == 300 and first_assistant.endswith("…")
+
+    def test_message_load_failure_returns_pointer_only_note(self):
+        entry = _reset_entry(Platform.SLACK)
+        pointer_only = build_channel_continuity_note(entry, _slack_source())
+        db = _DialogueDB(error=RuntimeError("state db unavailable"))
+
+        note = build_channel_continuity_note(
+            entry,
+            _slack_source(),
+            session_store=_StoreWithDB(db),
+        )
+
+        assert note == pointer_only
+        assert "Last exchanges before reset:" not in note
+
+    def test_platform_mismatch_returns_none_without_loading(self):
+        entry = _reset_entry(Platform.TELEGRAM)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="group",
+            user_id="U1",
+        )
+        db = _DialogueDB(error=AssertionError("must not load"))
+
+        assert (
+            build_channel_continuity_note(
+                entry,
+                source,
+                session_store=_StoreWithDB(db),
+            )
+            is None
+        )
+        assert db.calls == []
