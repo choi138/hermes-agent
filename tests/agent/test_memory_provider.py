@@ -1401,6 +1401,18 @@ class TestMemoryInjectionRejectsMalformedSchema:
             "ok",
         ),
         (
+            "# Graphiti Recall (read-only historical context)\n- weak remembered fact\n\n"
+            "# Graphiti Lookup Status\n"
+            "source: graphiti_historical_memory\n"
+            "routing_policy: graphiti_first\n"
+            "status: ok_low_relevance\n"
+            "candidate_count: 1\n"
+            "fallback_allowed: true\n"
+            "note: recall returned facts but none share strong anchors with the query; "
+            "treat as possibly irrelevant and fall back if unhelpful",
+            "ok_low_relevance",
+        ),
+        (
             "# Graphiti Lookup Status\n"
             "routing_policy: graphiti_first\n"
             "status: filtered\n"
@@ -1456,8 +1468,19 @@ def test_graphiti_lookup_status_is_removed_before_memory_context_persistence():
         "fallback_allowed: false"
     )
     recall = "# Graphiti Recall (read-only historical context)\n- remembered fact"
+    low_relevance_status = (
+        "# Graphiti Lookup Status\n"
+        "source: graphiti_historical_memory\n"
+        "routing_policy: graphiti_first\n"
+        "status: ok_low_relevance\n"
+        "candidate_count: 1\n"
+        "fallback_allowed: true\n"
+        "note: recall returned facts but none share strong anchors with the query; "
+        "treat as possibly irrelevant and fall back if unhelpful"
+    )
 
     assert strip_graphiti_lookup_status_blocks(status) == ""
+    assert strip_graphiti_lookup_status_blocks(low_relevance_status) == ""
     assert strip_graphiti_lookup_status_blocks(recall + "\n\n" + status) == recall
     assert strip_graphiti_lookup_status_blocks(recall) == recall
 class TestTrivialPromptClassifier:
