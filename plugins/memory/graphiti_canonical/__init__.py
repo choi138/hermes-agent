@@ -1442,7 +1442,7 @@ def _format_facts_with_count(
             continue
         if not _personal_predicates_have_trusted_subject(fact, scoped_identities):
             continue
-        fact_anchors = None if _UNRESTRICTED_RECALL else _anchor_tokens(fact)
+        fact_anchors = _anchor_tokens(fact)
         if not _fact_is_relevant(
             fact,
             relation,
@@ -1839,7 +1839,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             if routing_policy == "graphiti_first":
                 recall_status = "ok"
                 try:
-                    if not _UNRESTRICTED_RECALL and strong_overlap_count == 0:
+                    if strong_overlap_count == 0:
                         recall_status = "ok_low_relevance"
                 except Exception:
                     logger.debug(
