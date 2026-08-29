@@ -41,6 +41,12 @@ _BARE_SKILL_TURN = (
     "Large skill body, no user instruction."
 )
 
+_TRIGGERING_PREFIX = (
+    "[Triggering message id: `1542732296973647893` — use as `message_id` for "
+    "reply/react/pin via the discord tools.]"
+)
+_REPLYING_PREFIX = '[Replying to: "the earlier deployment note"]'
+
 
 class _RecordingProvider(MemoryProvider):
     """Captures exactly what user text each fan-out method received."""
@@ -51,6 +57,7 @@ class _RecordingProvider(MemoryProvider):
         self.prefetched = []
         self.queued = []
         self.synced = []
+        self.synced_assistant = []
 
     @property
     def name(self) -> str:
@@ -74,6 +81,7 @@ class _RecordingProvider(MemoryProvider):
 
     def sync_turn(self, user_content, assistant_content, *, session_id: str = "", messages=None) -> None:
         self.synced.append(user_content)
+        self.synced_assistant.append(assistant_content)
 
     def get_tool_schemas(self):
         return []
@@ -125,3 +133,64 @@ class TestMemoryManagerStripsScaffolding:
         mgr.flush_pending(timeout=5.0)
         assert provider.synced == []
 
+
+class TestMemoryManagerStripsGatewayPrefixes:
+    def test_sync_all_strips_one_leading_prefix(self):
+        prefixes = (
+            _TRIGGERING_PREFIX,
+            _REPLYING_PREFIX,
+            '[Replying to your previous message: "the earlier deployment note"]',
+            '[Routing directive: label=SYSTEM_DEV target=openai/gpt-5/high]',
+            "[Note: model was just switched from model-a to model-b by the model "
+            "router (route 'coding'). Adjust your self-identification accordingly.]",
+        )
+        for prefix in prefixes:
+            mgr, provider = _manager_with_recorder()
+            mgr.sync_all(f"{prefix}\n\nship the retrieval fix", "Done.")
+            mgr.flush_pending(timeout=5.0)
+            assert provider.synced == ["ship the retrieval fix"], prefix
+
+    def test_sync_all_strips_multiple_leading_prefixes(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.sync_all(
+            f"{_TRIGGERING_PREFIX}\n\n{_REPLYING_PREFIX}\n\ncontinue the rollout",
+            "Done.",
+        )
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == ["continue the rollout"]
+
+    def test_sync_all_preserves_prefix_shape_in_message_body(self):
+        mgr, provider = _manager_with_recorder()
+        user_content = f"Keep this example:\n{_TRIGGERING_PREFIX}\nIt is user-authored."
+        mgr.sync_all(user_content, "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == [user_content]
+
+    def test_sync_all_preserves_plain_message(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.sync_all("ordinary user message", "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == ["ordinary user message"]
+
+    def test_sync_all_strips_skill_scaffolding_then_gateway_prefix(self):
+        mgr, provider = _manager_with_recorder()
+        combined = _SINGLE_SKILL_TURN.replace(
+            "make a skill for release triage",
+            f"{_TRIGGERING_PREFIX}\n\nmake a skill for release triage",
+        )
+        mgr.sync_all(combined, "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == ["make a skill for release triage"]
+
+    def test_sync_all_skips_prefix_only_message(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.sync_all(_TRIGGERING_PREFIX, "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == []
+
+    def test_sync_all_does_not_strip_assistant_content(self):
+        mgr, provider = _manager_with_recorder()
+        assistant_content = f"{_TRIGGERING_PREFIX}\n\nassistant-authored example"
+        mgr.sync_all("ordinary user message", assistant_content)
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced_assistant == [assistant_content]
