@@ -17,6 +17,21 @@ _RUNTIME_UNRESTRICTED_RECALL = graphiti_module._UNRESTRICTED_RECALL
 
 
 @pytest.fixture(autouse=True)
+def _isolate_recall_log(monkeypatch, tmp_path):
+    """Never let this test file's recall-log writes touch the real Hermes
+    home. `_log_recall` always resolves the module-level `_RECALL_LOG_PATH`
+    global, independent of any `hermes_home=tmp_path` passed to
+    `provider.initialize()` -- so without this, every test that reaches a
+    non-empty `_format_facts_with_count` result appends fixture edge ids
+    (e.g. "safe-edge", "edge-0") into the operator's real
+    ~/.hermes/state/recall-log.jsonl on every test run."""
+    monkeypatch.setattr(
+        graphiti_module, "_RECALL_LOG_PATH", tmp_path / "test-recall-log.jsonl"
+    )
+
+
+
+@pytest.fixture(autouse=True)
 def _restricted_recall_for_legacy_filter_contract(monkeypatch):
     """Keep the legacy filter matrix explicit while rollout defaults unrestricted."""
     monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", False)
