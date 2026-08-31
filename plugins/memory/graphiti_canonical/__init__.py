@@ -730,11 +730,40 @@ def _dispatch_tool(
     return result
 
 
+# Gateway-injected conversation digest. When a turn arrives in a shared
+# channel the gateway may prepend recent messages and mark the actual new turn
+# with [New message]. Measured 2026-08-31: without stripping this, a 2-char
+# "하이" turn defeated the smalltalk/length gate and recalled four unrelated
+# Gmail edges, because the whole digest became the outbound query.
+_RECENT_MESSAGES_MARKER = "[Recent channel messages]"
+_NEW_MESSAGE_MARKER = "[New message]"
+
+
 def _automatic_user_turn_text(
     value: Any, identity_terms: set[str] | None = None
 ) -> str:
     """Strip only the recognized leading Discord envelope used by prefetch."""
     text = str(value or "")
+
+    # A recent-messages digest is transport scaffolding, not user intent. The
+    # real turn is whatever follows the LAST [New message] marker; earlier
+    # markers belong to quoted history.
+    if text.lstrip().startswith(_RECENT_MESSAGES_MARKER):
+        marker_at = text.rfind(_NEW_MESSAGE_MARKER)
+        if marker_at != -1:
+            text = text[marker_at + len(_NEW_MESSAGE_MARKER) :].lstrip("\r\n")
+        else:
+            # Digest with no new-message marker carries no fresh user text.
+            return ""
+        sender_label = _DISCORD_SENDER_LABEL_PATTERN.match(text)
+        if (
+            sender_label is not None
+            and _normalize_text(sender_label.group(1))
+            in (identity_terms or set())
+        ):
+            text = text[sender_label.end() :]
+        return text
+
     lines = text.splitlines(keepends=True)
     if not lines or not _AUTOMATIC_TRIGGERING_MESSAGE_LINE_PATTERN.fullmatch(
         lines[0].rstrip("\r\n")
