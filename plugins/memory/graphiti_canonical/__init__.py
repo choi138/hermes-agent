@@ -121,9 +121,13 @@ _ASSOCIATION_MODE_ENV = "GRAPHITI_ASSOCIATION_MODE"
 # median-sized neighbourhoods and exclude hubs; admit at most two neighbours.
 _ASSOCIATION_DEGREE_CAP = 10
 _ASSOCIATION_K = 2
-# The capped one-hop query measured 768 ms p50 over a pooled connection.
-_ASSOCIATION_QUERY_BUDGET_SECONDS = 0.8
-_ASSOCIATION_MIN_REMAINING_SECONDS = 1.0
+# Measured through this code path with auth injected (18 anchor sets):
+# p50 805 ms, min 783 ms, max 1344 ms. An earlier 0.8 s budget sat on the
+# median and timed out 16 of 18 queries, so the budget must clear the tail.
+# 1.8 s is above the measured max and still far inside the effective prefetch
+# ceiling (_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0 in agent/memory_manager.py).
+_ASSOCIATION_QUERY_BUDGET_SECONDS = 1.8
+_ASSOCIATION_MIN_REMAINING_SECONDS = 2.2
 _ASSOCIATION_EMBEDDING_MODEL = "text-embedding-3-small"
 _ASSOCIATION_QUERY_URL = "http://127.0.0.1:7474/db/neo4j/query/v2"
 _ASSOCIATION_CYPHER = """MATCH (s)-[r]->(t)
