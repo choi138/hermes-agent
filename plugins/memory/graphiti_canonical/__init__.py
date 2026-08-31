@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import base64
 import json
 import logging
 import math
@@ -15,6 +16,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+import urllib.request
 from urllib.parse import urlsplit
 
 from agent.memory_provider import MemoryProvider
@@ -141,7 +143,6 @@ WHERE e.invalid_at IS NULL
 RETURN DISTINCT e.uuid AS uuid, e.name AS name, e.fact AS fact,
   e.fact_embedding AS emb, e.invalid_at AS invalid_at, degree
 """
-_ASSOCIATION_HTTP_SESSION: Any = None
 _ASSOCIATION_HTTP_LOCK = threading.Lock()
 # M1 recall log (project: 사람 같은 기억 — 연상·중요도). One JSONL line per
 # recall that reached the prompt; consumed by the M2 salience prototype
@@ -1514,13 +1515,6 @@ def _embed_association_query(query: str, *, timeout: float) -> List[float]:
     return list(embedding) if isinstance(embedding, (list, tuple)) else []
 
 
-def _association_http_session():
-    global _ASSOCIATION_HTTP_SESSION
-    if _ASSOCIATION_HTTP_SESSION is None:
-        import requests
-
-        _ASSOCIATION_HTTP_SESSION = requests.Session()
-    return _ASSOCIATION_HTTP_SESSION
 
 
 def _query_association_edges(
@@ -1557,15 +1551,26 @@ def _query_association_edges(
             "degree_cap": _ASSOCIATION_DEGREE_CAP,
         },
     }
+    body = json.dumps(request_body).encode("utf-8")
+    credentials = base64.b64encode(
+        f"{username}:{password}".encode("utf-8")
+    ).decode("ascii")
+    request = urllib.request.Request(
+        query_url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Basic {credentials}",
+        },
+    )
+    # Serialized: one association query at a time, so a slow graph cannot
+    # multiply into concurrent sync sockets on the recall path.
     with _ASSOCIATION_HTTP_LOCK:
-        response = _association_http_session().post(
-            query_url,
-            auth=(username, password),
-            json=request_body,
-            timeout=timeout,
-        )
-    response.raise_for_status()
-    payload = response.json()
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_payload = response.read()
+    payload = json.loads(raw_payload.decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("errors"):
         return []
     data = payload.get("data")
