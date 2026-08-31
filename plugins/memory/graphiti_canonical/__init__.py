@@ -6,6 +6,8 @@ import contextvars
 import copy
 import json
 import logging
+import math
+import os
 import re
 import threading
 import time
@@ -13,6 +15,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 
 from agent.memory_provider import MemoryProvider
 from tools.threat_patterns import first_threat_message
@@ -109,6 +112,37 @@ _HISTORY_RESERVED_SLOTS = 2
 # cut 0 queries and 2 facts, because bm25 candidate windows are score-tight
 # (useful/noise ratio p50 = 0.685 / 0.691). Revisit if search_mode leaves bm25.
 _SCORE_GATE_FLOOR = 0.42
+# GRAPHITI_ASSOCIATION_MODE is an opt-in prototype gate. Unset and all
+# unrecognized values keep the existing automatic recall path byte-identical.
+_ASSOCIATION_MODE_ENV = "GRAPHITI_ASSOCIATION_MODE"
+# Measured endpoint degree distribution: median 9, p90 80, max 979. Keep
+# median-sized neighbourhoods and exclude hubs; admit at most two neighbours.
+_ASSOCIATION_DEGREE_CAP = 10
+_ASSOCIATION_K = 2
+# The capped one-hop query measured 768 ms p50 over a pooled connection.
+_ASSOCIATION_QUERY_BUDGET_SECONDS = 0.8
+_ASSOCIATION_MIN_REMAINING_SECONDS = 1.0
+_ASSOCIATION_EMBEDDING_MODEL = "text-embedding-3-small"
+_ASSOCIATION_QUERY_URL = "http://127.0.0.1:7474/db/neo4j/query/v2"
+_ASSOCIATION_CYPHER = """MATCH (s)-[r]->(t)
+WHERE r.uuid IN $anchor_uuids
+WITH s, t
+UNWIND [s, t] AS n
+WITH DISTINCT n
+CALL (n) {
+  MATCH (n)-[d]-()
+  WHERE d.invalid_at IS NULL
+  RETURN count(d) AS degree
+}
+WITH n, degree WHERE degree <= $degree_cap
+MATCH (n)-[e]-()
+WHERE e.invalid_at IS NULL
+  AND NOT e.uuid IN $anchor_uuids
+RETURN DISTINCT e.uuid AS uuid, e.name AS name, e.fact AS fact,
+  e.fact_embedding AS emb, e.invalid_at AS invalid_at, degree
+"""
+_ASSOCIATION_HTTP_SESSION: Any = None
+_ASSOCIATION_HTTP_LOCK = threading.Lock()
 # M1 recall log (project: 사람 같은 기억 — 연상·중요도). One JSONL line per
 # recall that reached the prompt; consumed by the M2 salience prototype
 # (recall frequency per edge). Failures are swallowed: recall must never
@@ -1382,6 +1416,172 @@ def _score_gate(facts: Any) -> Any:
     return kept
 
 
+def _association_mode_enabled() -> bool:
+    return os.environ.get(_ASSOCIATION_MODE_ENV, "").strip().lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
+
+
+def _cosine_similarity(left: Any, right: Any) -> float | None:
+    if (
+        not isinstance(left, (list, tuple))
+        or not isinstance(right, (list, tuple))
+        or not left
+        or len(left) != len(right)
+    ):
+        return None
+    try:
+        left_values = [float(value) for value in left]
+        right_values = [float(value) for value in right]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in [*left_values, *right_values]):
+        return None
+    left_norm = math.sqrt(sum(value * value for value in left_values))
+    right_norm = math.sqrt(sum(value * value for value in right_values))
+    if not left_norm or not right_norm:
+        return None
+    return sum(
+        left_value * right_value
+        for left_value, right_value in zip(left_values, right_values)
+    ) / (left_norm * right_norm)
+
+
+def _rank_association_candidates(
+    query_embedding: Any, candidates: Any
+) -> List[Dict[str, Any]]:
+    if not isinstance(candidates, list):
+        return []
+    scored: List[tuple[float, Dict[str, Any]]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("invalid_at") not in (None, ""):
+            continue
+        degree = candidate.get("degree")
+        if (
+            isinstance(degree, bool)
+            or not isinstance(degree, (int, float))
+            or degree > _ASSOCIATION_DEGREE_CAP
+        ):
+            continue
+        score = _cosine_similarity(
+            query_embedding,
+            candidate.get("emb", candidate.get("fact_embedding")),
+        )
+        if score is None:
+            continue
+        scored.append((score, candidate))
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    ranked: List[Dict[str, Any]] = []
+    seen_uuids = set()
+    for _score, candidate in scored:
+        edge_id = candidate.get("uuid")
+        if not isinstance(edge_id, str) or not edge_id or edge_id in seen_uuids:
+            continue
+        seen_uuids.add(edge_id)
+        admitted = dict(candidate)
+        admitted["_association_expansion"] = True
+        ranked.append(admitted)
+        if len(ranked) >= _ASSOCIATION_K:
+            break
+    return ranked
+
+
+def _embed_association_query(query: str, *, timeout: float) -> List[float]:
+    from agent.secret_scope import get_secret
+    from openai import OpenAI
+
+    api_key = (get_secret("OPENAI_API_KEY", "") or "").strip()
+    if not api_key or timeout <= 0:
+        return []
+    client = OpenAI(
+        api_key=api_key,
+        timeout=timeout,
+        max_retries=0,
+    )
+    response = client.embeddings.create(
+        input=query,
+        model=_ASSOCIATION_EMBEDDING_MODEL,
+    )
+    if not response.data:
+        return []
+    embedding = response.data[0].embedding
+    return list(embedding) if isinstance(embedding, (list, tuple)) else []
+
+
+def _association_http_session():
+    global _ASSOCIATION_HTTP_SESSION
+    if _ASSOCIATION_HTTP_SESSION is None:
+        import requests
+
+        _ASSOCIATION_HTTP_SESSION = requests.Session()
+    return _ASSOCIATION_HTTP_SESSION
+
+
+def _query_association_edges(
+    anchor_uuids: List[str], *, timeout: float
+) -> List[Dict[str, Any]]:
+    """Run the fixed, read-only one-hop query through Neo4j Query API v2."""
+    from agent.secret_scope import get_secret
+
+    raw_auth = (
+        get_secret("GRAPHITI_NEO4J_AUTH", "")
+        or get_secret("NEO4J_AUTH", "")
+        or ""
+    ).strip()
+    query_url = (
+        get_secret("GRAPHITI_NEO4J_QUERY_URL", _ASSOCIATION_QUERY_URL)
+        or _ASSOCIATION_QUERY_URL
+    ).strip()
+    parsed_url = urlsplit(query_url)
+    if (
+        timeout <= 0
+        or "/" not in raw_auth
+        or parsed_url.scheme != "http"
+        or parsed_url.hostname not in {"127.0.0.1", "::1"}
+    ):
+        return []
+    username, password = raw_auth.split("/", 1)
+    if not username or not password:
+        return []
+
+    request_body = {
+        "statement": _ASSOCIATION_CYPHER,
+        "parameters": {
+            "anchor_uuids": anchor_uuids,
+            "degree_cap": _ASSOCIATION_DEGREE_CAP,
+        },
+    }
+    with _ASSOCIATION_HTTP_LOCK:
+        response = _association_http_session().post(
+            query_url,
+            auth=(username, password),
+            json=request_body,
+            timeout=timeout,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("errors"):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    fields = data.get("fields")
+    values = data.get("values")
+    if not isinstance(fields, list) or not isinstance(values, list):
+        return []
+    return [
+        dict(zip(fields, row))
+        for row in values
+        if isinstance(row, list) and len(row) == len(fields)
+    ]
+
+
 def _format_facts_with_count(
     facts: List[Dict[str, Any]],
     *,
@@ -1391,6 +1591,9 @@ def _format_facts_with_count(
     max_facts: int = _DEFAULT_MAX_FACTS,
     max_chars: int = _DEFAULT_MAX_CHARS,
     max_fact_chars: int = _DEFAULT_MAX_FACT_CHARS,
+    kept_facts_out: List[Dict[str, Any]] | None = None,
+    log_recall: bool = True,
+    allow_association_expansion: bool = False,
 ) -> tuple[str, int, int]:
     lines = [
         "# Graphiti Recall (read-only historical context)",
@@ -1474,7 +1677,9 @@ def _format_facts_with_count(
         if not _personal_predicates_have_trusted_subject(fact, scoped_identities):
             continue
         fact_anchors = _anchor_tokens(fact)
-        if not _fact_is_relevant(
+        if not (
+            allow_association_expansion and item.get("_association_expansion")
+        ) and not _fact_is_relevant(
             fact,
             relation,
             query_anchors,
@@ -1503,6 +1708,8 @@ def _format_facts_with_count(
             break
         lines.append(line)
         kept_edge_ids.append(edge_id)
+        if kept_facts_out is not None:
+            kept_facts_out.append(item)
         if (
             fact_anchors is not None
             and len(query_anchors & fact_anchors) >= _STRONG_OVERLAP_MIN
@@ -1515,7 +1722,7 @@ def _format_facts_with_count(
         _log_zero_kept_rejections(
             facts, scoped_identities, query_anchors, builtin_memory
         )
-    if returned_count:
+    if returned_count and log_recall:
         _log_recall(query, kept_edge_ids)
     return (
         "\n".join(lines) if returned_count else "",
@@ -1795,6 +2002,37 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             )
             return _SearchFacts([], status="error")
 
+    def _association_expansion_candidates(
+        self, query: str, anchor_uuids: List[str], *, deadline: float
+    ) -> List[Dict[str, Any]]:
+        """Return ranked one-hop neighbours, or no candidates on any failure."""
+        remaining = deadline - time.monotonic()
+        if not anchor_uuids or remaining < _ASSOCIATION_MIN_REMAINING_SECONDS:
+            return []
+        try:
+            embedding_timeout = remaining - _ASSOCIATION_QUERY_BUDGET_SECONDS
+            if embedding_timeout <= 0:
+                return []
+            query_embedding = _embed_association_query(
+                query,
+                timeout=embedding_timeout,
+            )
+            if not query_embedding:
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining < _ASSOCIATION_QUERY_BUDGET_SECONDS:
+                return []
+            candidates = _query_association_edges(
+                anchor_uuids,
+                timeout=remaining,
+            )
+            if time.monotonic() >= deadline:
+                return []
+            return _rank_association_candidates(query_embedding, candidates)
+        except Exception:
+            logger.debug("Graphiti association expansion failed open", exc_info=True)
+            return []
+
     def _record_topic(self, query_text: str) -> None:
         snippet = _topic_snippet(query_text)
         if not snippet:
@@ -1816,6 +2054,9 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
         self, query_text: str, *, session_id: str, deadline: float
     ) -> str:
         started = time.monotonic()
+        # Resolve the prototype gate before any recall/search-mode branch so
+        # the default mode cannot silently bypass or accidentally enable it.
+        association_enabled = _association_mode_enabled()
         routing_policy = (
             "graphiti_first" if _requires_graphiti_first(query_text) else "advisory"
         )
@@ -1847,12 +2088,54 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             return _lookup_status_block(
                 search_status, routing_policy=routing_policy
             )
-        context, _, strong_overlap_count = _format_facts_with_count(
-            facts,
-            query=search_query,
-            builtin_memory=self._builtin_memory,
-            identity_terms=self._identity_terms,
-        )
+        if not association_enabled:
+            context, _, strong_overlap_count = _format_facts_with_count(
+                facts,
+                query=search_query,
+                builtin_memory=self._builtin_memory,
+                identity_terms=self._identity_terms,
+            )
+        else:
+            kept_anchor_facts: List[Dict[str, Any]] = []
+            (
+                context,
+                anchor_count,
+                strong_overlap_count,
+            ) = _format_facts_with_count(
+                facts,
+                query=search_query,
+                builtin_memory=self._builtin_memory,
+                identity_terms=self._identity_terms,
+                kept_facts_out=kept_anchor_facts,
+                log_recall=False,
+            )
+            anchor_uuids = [
+                edge_id
+                for item in kept_anchor_facts
+                if isinstance((edge_id := item.get("uuid")), str) and edge_id
+            ]
+            expansion_facts: List[Dict[str, Any]] = []
+            if (
+                anchor_count < _DEFAULT_MAX_FACTS
+                and anchor_uuids
+                and deadline - time.monotonic()
+                >= _ASSOCIATION_MIN_REMAINING_SECONDS
+            ):
+                expansion_facts = self._association_expansion_candidates(
+                    search_query,
+                    anchor_uuids,
+                    deadline=deadline,
+                )
+            if expansion_facts:
+                context, _, strong_overlap_count = _format_facts_with_count(
+                    [*kept_anchor_facts, *expansion_facts],
+                    query=search_query,
+                    builtin_memory=self._builtin_memory,
+                    identity_terms=self._identity_terms,
+                    allow_association_expansion=True,
+                )
+            elif anchor_uuids:
+                _log_recall(search_query, anchor_uuids)
         self._record_topic(query_text)
         expired = time.monotonic() >= deadline
         logger.info(

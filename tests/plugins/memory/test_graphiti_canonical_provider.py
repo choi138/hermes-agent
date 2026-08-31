@@ -3583,3 +3583,333 @@ def test_mixed_language_empty_search_retries_once_with_graphiti_anchor(
     assert "status: ok_low_relevance" in prefetched
     assert "fallback_allowed: true" in prefetched
     assert calls == [query, "Instagram"]
+
+
+# --- M3 association prototype -------------------------------------------------
+
+
+def _m3_fact(edge_id, text, *, embedding=None, invalid_at=None, degree=1):
+    fact = {
+        "uuid": edge_id,
+        "name": "RELATES_TO_REPO",
+        "fact": text,
+        "invalid_at": invalid_at,
+        "expired_at": None,
+        "degree": degree,
+    }
+    if embedding is not None:
+        fact["emb"] = embedding
+    return fact
+
+
+def _m3_provider(monkeypatch, tmp_path, anchor_facts, calls):
+    monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", True)
+
+    def fake_dispatch(tool_name, args, **_kwargs):
+        calls.append((tool_name, args))
+        return {"facts": anchor_facts}
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", fake_dispatch)
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("m3-session", hermes_home=str(tmp_path))
+    return provider
+
+
+def test_association_feature_flag_defaults_off_and_preserves_recall_bytes_and_query(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("GRAPHITI_ASSOCIATION_MODE", raising=False)
+    calls = []
+    anchor = _m3_fact(
+        "anchor-1", "P1 association verification keeps the existing recall path."
+    )
+    server_supplied_marker = _m3_fact(
+        "unrelated-marker",
+        "Watering orchids on the balcony happens on Thursday.",
+    )
+    server_supplied_marker["_association_expansion"] = True
+    provider = _m3_provider(
+        monkeypatch, tmp_path, [anchor, server_supplied_marker], calls
+    )
+    monkeypatch.setattr(graphiti_module, "_UNRESTRICTED_RECALL", False)
+
+    def unexpected_expansion(*_args, **_kwargs):
+        raise AssertionError("default-off recall must not enter association expansion")
+
+    monkeypatch.setattr(
+        provider,
+        "_association_expansion_candidates",
+        unexpected_expansion,
+        raising=False,
+    )
+
+    result = provider.prefetch("P1 association verification")
+
+    assert result == (
+        "# Graphiti Recall (read-only historical context)\n"
+        "Current user instructions and built-in USER/MEMORY override conflicts.\n"
+        "- [RELATES_TO_REPO; edge=anchor-1] "
+        "P1 association verification keeps the existing recall path."
+    )
+    assert calls == [
+        (
+            "mcp__graphiti_canonical__search_memory_facts",
+            {
+                "query": "P1 association verification",
+                "max_facts": 24,
+                "group_ids": ["mnemos"],
+                "temporal_mode": "current",
+            },
+        )
+    ]
+
+
+def test_association_combined_output_never_exceeds_default_four_fact_cap(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRAPHITI_ASSOCIATION_MODE", "on")
+    calls = []
+    anchors = [
+        _m3_fact(
+            f"anchor-{index}",
+            f"P1 association verification anchor fact {index} remains available.",
+        )
+        for index in range(3)
+    ]
+    expansions = [
+        _m3_fact(
+            f"expansion-{index}",
+            f"P1 association verification expansion fact {index} is nearby.",
+            embedding=[1.0, 0.0],
+        )
+        for index in range(2)
+    ]
+    provider = _m3_provider(monkeypatch, tmp_path, anchors, calls)
+    monkeypatch.setattr(
+        provider,
+        "_association_expansion_candidates",
+        lambda _query, _anchor_uuids, *, deadline: expansions,
+        raising=False,
+    )
+
+    result = provider.prefetch("P1 association verification")
+
+    assert result.count("\n- ") == graphiti_module._DEFAULT_MAX_FACTS == 4
+    assert "edge=anchor-0" in result
+    assert "edge=anchor-1" in result
+    assert "edge=anchor-2" in result
+    assert "edge=expansion-0" in result
+    assert "edge=expansion-1" not in result
+
+
+def test_association_never_displaces_or_reorders_four_available_anchor_facts(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRAPHITI_ASSOCIATION_MODE", "on")
+    calls = []
+    anchors = [
+        _m3_fact(
+            f"anchor-{index}",
+            f"P1 association verification anchor fact {index} keeps its rank.",
+        )
+        for index in range(4)
+    ]
+    provider = _m3_provider(monkeypatch, tmp_path, anchors, calls)
+
+    def unexpected_expansion(*_args, **_kwargs):
+        raise AssertionError("no expansion slot remains after four anchor facts")
+
+    monkeypatch.setattr(
+        provider,
+        "_association_expansion_candidates",
+        unexpected_expansion,
+        raising=False,
+    )
+
+    result = provider.prefetch("P1 association verification")
+
+    positions = [result.index(f"edge=anchor-{index}") for index in range(4)]
+    assert positions == sorted(positions)
+    assert result.count("\n- ") == 4
+    assert "expansion" not in result
+
+
+def test_association_invalidated_edges_never_enter_expansion_even_with_top_score():
+    candidates = [
+        _m3_fact(
+            "invalid-high",
+            "P1 association invalidated high score.",
+            embedding=[1.0, 0.0],
+            invalid_at="2026-08-30T00:00:00Z",
+        ),
+        _m3_fact(
+            "valid-lower",
+            "P1 association valid lower score.",
+            embedding=[0.8, 0.2],
+        ),
+    ]
+
+    ranked = graphiti_module._rank_association_candidates([1.0, 0.0], candidates)
+
+    assert [fact["uuid"] for fact in ranked] == ["valid-lower"]
+
+
+def test_association_degree_cap_excludes_neighbour_from_endpoint_above_ten():
+    candidates = [
+        _m3_fact(
+            "hub-only",
+            "P1 association hub-only neighbour.",
+            embedding=[1.0, 0.0],
+            degree=11,
+        ),
+        _m3_fact(
+            "bounded",
+            "P1 association bounded neighbour.",
+            embedding=[0.8, 0.2],
+            degree=10,
+        ),
+    ]
+
+    ranked = graphiti_module._rank_association_candidates([1.0, 0.0], candidates)
+
+    assert [fact["uuid"] for fact in ranked] == ["bounded"]
+    assert graphiti_module._ASSOCIATION_DEGREE_CAP == 10
+    assert "CALL (n) {" in graphiti_module._ASSOCIATION_CYPHER
+    assert "CALL {" not in graphiti_module._ASSOCIATION_CYPHER
+    assert "degree <= $degree_cap" in graphiti_module._ASSOCIATION_CYPHER
+
+
+def test_association_k_cap_admits_at_most_two_expansion_candidates_per_turn():
+    candidates = [
+        _m3_fact(
+            f"candidate-{index}",
+            f"P1 association candidate {index}.",
+            embedding=embedding,
+        )
+        for index, embedding in enumerate(
+            ([1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3])
+        )
+    ]
+
+    ranked = graphiti_module._rank_association_candidates([1.0, 0.0], candidates)
+
+    assert graphiti_module._ASSOCIATION_K == 2
+    assert [fact["uuid"] for fact in ranked] == ["candidate-0", "candidate-1"]
+
+
+@pytest.mark.parametrize("association_mode", [None, "on"])
+def test_association_explicit_search_memory_facts_contract_and_format_are_unchanged(
+    monkeypatch, tmp_path, association_mode
+):
+    if association_mode is None:
+        monkeypatch.delenv("GRAPHITI_ASSOCIATION_MODE", raising=False)
+    else:
+        monkeypatch.setenv("GRAPHITI_ASSOCIATION_MODE", association_mode)
+    calls = []
+    anchor = _m3_fact(
+        "explicit-anchor",
+        "P1 association explicit search keeps its contract and formatting.",
+    )
+    provider = _m3_provider(monkeypatch, tmp_path, [anchor], calls)
+
+    def unexpected_expansion(*_args, **_kwargs):
+        raise AssertionError("explicit search must never enter automatic expansion")
+
+    monkeypatch.setattr(
+        provider,
+        "_association_expansion_candidates",
+        unexpected_expansion,
+        raising=False,
+    )
+
+    schema = provider.get_tool_schemas()
+    result = json.loads(
+        provider.handle_tool_call(
+            "search_memory_facts",
+            {"query": "P1 association explicit search", "max_facts": 4},
+        )
+    )
+
+    assert [item["name"] for item in schema] == ["search_memory_facts"]
+    assert schema[0]["parameters"]["properties"]["max_facts"]["default"] == 4
+    assert result["status"] == "ok"
+    assert result["returned_count"] == 1
+    assert result["recall"] == (
+        "# Graphiti Recall (read-only historical context)\n"
+        "Current user instructions and built-in USER/MEMORY override conflicts.\n"
+        "- [RELATES_TO_REPO; edge=explicit-anchor] "
+        "P1 association explicit search keeps its contract and formatting."
+    )
+    assert calls == [
+        (
+            "mcp__graphiti_canonical__search_memory_facts",
+            {
+                "query": "P1 association explicit search",
+                "max_facts": 24,
+                "group_ids": ["mnemos"],
+                "temporal_mode": "current",
+            },
+        )
+    ]
+
+
+def test_association_expansion_is_skipped_when_prefetch_budget_is_insufficient(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRAPHITI_ASSOCIATION_MODE", "on")
+    monkeypatch.setattr(
+        graphiti_module, "_ASSOCIATION_MIN_REMAINING_SECONDS", 1_000.0, raising=False
+    )
+    calls = []
+    anchor = _m3_fact(
+        "anchor-budget", "P1 association verification keeps deadline headroom."
+    )
+    provider = _m3_provider(monkeypatch, tmp_path, [anchor], calls)
+
+    def unexpected_expansion(*_args, **_kwargs):
+        raise AssertionError("insufficient prefetch budget must skip expansion")
+
+    monkeypatch.setattr(
+        provider,
+        "_association_expansion_candidates",
+        unexpected_expansion,
+        raising=False,
+    )
+
+    result = provider.prefetch("P1 association verification")
+
+    assert "edge=anchor-budget" in result
+
+
+def test_association_query_embedding_failure_fails_open_to_zero_candidates(
+    monkeypatch, tmp_path
+):
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("m3-session", hermes_home=str(tmp_path))
+
+    def embedding_failure(_query, *, timeout):
+        raise RuntimeError("offline")
+
+    def unexpected_query(*_args, **_kwargs):
+        raise AssertionError("Neo4j query must not run without query embedding")
+
+    monkeypatch.setattr(
+        graphiti_module,
+        "_embed_association_query",
+        embedding_failure,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        graphiti_module,
+        "_query_association_edges",
+        unexpected_query,
+        raising=False,
+    )
+
+    candidates = provider._association_expansion_candidates(
+        "P1 association verification",
+        ["anchor-1"],
+        deadline=time.monotonic() + 5,
+    )
+
+    assert candidates == []
