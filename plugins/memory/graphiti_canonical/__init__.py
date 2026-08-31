@@ -744,44 +744,40 @@ def _automatic_user_turn_text(
 ) -> str:
     """Strip only the recognized leading Discord envelope used by prefetch."""
     text = str(value or "")
+    terms = identity_terms or set()
 
-    # A recent-messages digest is transport scaffolding, not user intent. The
-    # real turn is whatever follows the LAST [New message] marker; earlier
+    def _drop_trusted_sender_label(candidate: str) -> str:
+        """Remove a leading [Name] only when Name is a trusted identity."""
+        stripped = candidate.lstrip()
+        match = _DISCORD_SENDER_LABEL_PATTERN.match(stripped)
+        if match is not None and _normalize_text(match.group(1)) in terms:
+            return stripped[match.end() :]
+        return candidate
+
+    # Stage 1: drop a leading [Triggering message id: ...] line if present.
+    # This must run FIRST, because the gateway can prepend it in front of a
+    # recent-messages digest; measured live, a digest that was not leading
+    # survived normalization entirely and inflated Gmail scores past the gate.
+    lines = text.splitlines(keepends=True)
+    if lines and _AUTOMATIC_TRIGGERING_MESSAGE_LINE_PATTERN.fullmatch(
+        lines[0].rstrip("\r\n")
+    ):
+        index = 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        text = "".join(lines[index:])
+
+    # Stage 2: a recent-messages digest is transport scaffolding, not user
+    # intent. The real turn follows the LAST [New message] marker; earlier
     # markers belong to quoted history.
     if text.lstrip().startswith(_RECENT_MESSAGES_MARKER):
         marker_at = text.rfind(_NEW_MESSAGE_MARKER)
-        if marker_at != -1:
-            text = text[marker_at + len(_NEW_MESSAGE_MARKER) :].lstrip("\r\n")
-        else:
+        if marker_at == -1:
             # Digest with no new-message marker carries no fresh user text.
             return ""
-        sender_label = _DISCORD_SENDER_LABEL_PATTERN.match(text)
-        if (
-            sender_label is not None
-            and _normalize_text(sender_label.group(1))
-            in (identity_terms or set())
-        ):
-            text = text[sender_label.end() :]
-        return text
+        text = text[marker_at + len(_NEW_MESSAGE_MARKER) :].lstrip("\r\n")
 
-    lines = text.splitlines(keepends=True)
-    if not lines or not _AUTOMATIC_TRIGGERING_MESSAGE_LINE_PATTERN.fullmatch(
-        lines[0].rstrip("\r\n")
-    ):
-        return text
-
-    index = 1
-    while index < len(lines) and not lines[index].strip():
-        index += 1
-    user_text = "".join(lines[index:])
-
-    sender_label = _DISCORD_SENDER_LABEL_PATTERN.match(user_text)
-    if (
-        sender_label is not None
-        and _normalize_text(sender_label.group(1)) in (identity_terms or set())
-    ):
-        user_text = user_text[sender_label.end() :]
-    return user_text
+    return _drop_trusted_sender_label(text)
 
 
 def _topic_snippet(value: Any) -> str:
@@ -1422,6 +1418,7 @@ def _log_recall(query: Any, edge_ids: List[str]) -> None:
 
 def _is_real_score(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
 
 
 def _score_gate(facts: Any) -> Any:

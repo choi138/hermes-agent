@@ -3913,3 +3913,65 @@ def test_association_query_embedding_failure_fails_open_to_zero_candidates(
     )
 
     assert candidates == []
+
+
+def test_trigger_line_before_recent_messages_digest_strips_both_envelopes():
+    """Measured live defect: digest survived when not the leading text.
+
+    score-diag.jsonl 10:25:04 recorded the outbound query as
+    '[Recent channel messages] [최근원] 완료했낲 [New message] [최근원] ? Session scope: ...'
+    and 18 of 24 candidates cleared the 0.42 floor because the repeated
+    '[최근원]' labels lifted "Gmail ... mentions 최근원" facts from ~0.32 to
+    ~0.55. The same turn without the envelope kept 0 of 22.
+    """
+    decorated = (
+        "[Triggering message id: 1543929259066658861]\n"
+        "\n"
+        "[Recent channel messages]\n"
+        "[최근원] 완료했낲\n"
+        "\n"
+        "[New message]\n"
+        "[최근원] ?"
+    )
+    result = graphiti_module._automatic_user_turn_text(decorated, {"최근원"})
+    assert result == "?"
+    assert "[Recent channel messages]" not in result
+    assert "[New message]" not in result
+
+
+def test_single_line_digest_form_drops_the_trusted_sender_label():
+    decorated = (
+        "[Recent channel messages] [최근원] 완료했낲 [New message] [최근원] ?"
+    )
+    assert graphiti_module._automatic_user_turn_text(decorated, {"최근원"}) == "?"
+
+
+def test_digest_normalization_preserves_untrusted_and_user_authored_brackets():
+    """Only exact markers and trusted labels may be consumed."""
+    terms = {"최근원"}
+
+    dm_body = "[중요] 이전 작업 기억해줘"
+    assert graphiti_module._automatic_user_turn_text(dm_body, terms) == dm_body
+
+    reply = (
+        "[Recent channel messages]\n[최근원] a\n\n"
+        "[New message]\n[최근원] [Replying to: x] 이거 어떻게 됐어"
+    )
+    assert (
+        graphiti_module._automatic_user_turn_text(reply, terms)
+        == "[Replying to: x] 이거 어떻게 됐어"
+    )
+
+    untrusted = (
+        "[Recent channel messages]\n[someone] a\n\n"
+        "[New message]\n[Shinei] 확인해줘"
+    )
+    assert (
+        graphiti_module._automatic_user_turn_text(untrusted, terms)
+        == "[Shinei] 확인해줘"
+    )
+
+
+def test_digest_without_new_message_marker_yields_no_user_text():
+    digest_only = "[Recent channel messages]\n[최근원] 하이\n[최근원] 하이"
+    assert graphiti_module._automatic_user_turn_text(digest_only, {"최근원"}) == ""
