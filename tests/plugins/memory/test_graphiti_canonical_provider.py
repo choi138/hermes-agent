@@ -3975,3 +3975,49 @@ def test_digest_normalization_preserves_untrusted_and_user_authored_brackets():
 def test_digest_without_new_message_marker_yields_no_user_text():
     digest_only = "[Recent channel messages]\n[최근원] 하이\n[최근원] 하이"
     assert graphiti_module._automatic_user_turn_text(digest_only, {"최근원"}) == ""
+
+
+def _assoc_candidate(uuid, emb, *, degree=3, fact="f"):
+    return {"uuid": uuid, "emb": emb, "degree": degree, "fact": fact,
+            "invalid_at": None}
+
+
+def test_association_expansion_below_the_score_floor_is_rejected():
+    """Measured live: 6/6 admitted expansions were unrelated Gmail metadata.
+
+    K=2 admitted the top two neighbours regardless of similarity, so a
+    1-anchor turn always gained 2 expansions -- e.g. "all-work 통합임" pulled
+    in a CEO newsletter. An expansion must clear the same floor as a directly
+    retrieved fact.
+    """
+    query = [1.0, 0.0]
+    orthogonal = [0.0, 1.0]  # cosine 0.0, far below the 0.42 floor
+    ranked = graphiti_module._rank_association_candidates(
+        query, [_assoc_candidate("weak", orthogonal)]
+    )
+    assert ranked == []
+
+
+def test_association_expansion_keeps_its_score_for_the_downstream_gate():
+    """_score_gate keeps unscored facts, so a dropped score bypasses it."""
+    query = [1.0, 0.0]
+    ranked = graphiti_module._rank_association_candidates(
+        query, [_assoc_candidate("strong", [1.0, 0.0])]
+    )
+    assert len(ranked) == 1
+    admitted = ranked[0]
+    assert admitted["_association_expansion"] is True
+    assert "score" in admitted
+    assert admitted["score"] >= graphiti_module._SCORE_GATE_FLOOR
+    # Must survive the same gate the direct path applies.
+    assert graphiti_module._score_gate([admitted]) == [admitted]
+
+
+def test_association_expansion_admits_only_the_strongest_within_the_floor():
+    query = [1.0, 0.0]
+    strong = _assoc_candidate("strong", [1.0, 0.0], fact="strong")
+    weak = _assoc_candidate("weak", [0.0, 1.0], fact="weak")
+    ranked = graphiti_module._rank_association_candidates(
+        query, [weak, strong]
+    )
+    assert [item["uuid"] for item in ranked] == ["strong"]

@@ -1505,18 +1505,29 @@ def _rank_association_candidates(
         )
         if score is None:
             continue
+        # An expansion must clear the SAME relevance floor as a directly
+        # retrieved fact. Without this, K=2 admitted the top two neighbours
+        # regardless of strength: measured live, 6/6 admitted expansions were
+        # unrelated Gmail metadata (e.g. "all-work 통합임" pulled in a CEO
+        # newsletter). Expansion is opportunistic, not guaranteed.
+        if score < _SCORE_GATE_FLOOR:
+            continue
         scored.append((score, candidate))
     scored.sort(key=lambda item: item[0], reverse=True)
 
     ranked: List[Dict[str, Any]] = []
     seen_uuids = set()
-    for _score, candidate in scored:
+    for score, candidate in scored:
         edge_id = candidate.get("uuid")
         if not isinstance(edge_id, str) or not edge_id or edge_id in seen_uuids:
             continue
         seen_uuids.add(edge_id)
         admitted = dict(candidate)
         admitted["_association_expansion"] = True
+        # Preserve the computed score. _score_gate deliberately keeps facts
+        # that carry no score, so dropping it here would let expansions bypass
+        # the downstream gate entirely.
+        admitted["score"] = round(float(score), 6)
         ranked.append(admitted)
         if len(ranked) >= _ASSOCIATION_K:
             break
