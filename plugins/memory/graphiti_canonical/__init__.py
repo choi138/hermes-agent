@@ -319,6 +319,10 @@ _SMALLTALK_TERMS = (
     "thanks",
     "thank you",
 )
+_AUTOMATIC_TRIGGERING_MESSAGE_LINE_PATTERN = re.compile(
+    r"\[Triggering message id: [^\r\n]*\][ \t]*"
+)
+_DISCORD_SENDER_LABEL_PATTERN = re.compile(r"\[[^\[\]\r\n]{1,200}\][ \t]+")
 _IDENTITY_QUESTION_PATTERN = re.compile(
     r"(?:너|당신|you)\s*(?:는|은)?\s*(?:어떤\s*)?(?:모델|model)"
     r"|what\s+model\b"
@@ -687,6 +691,26 @@ def _dispatch_tool(
     return result
 
 
+def _automatic_user_turn_text(value: Any) -> str:
+    """Strip only the recognized leading Discord envelope used by prefetch."""
+    text = str(value or "")
+    lines = text.splitlines(keepends=True)
+    if not lines or not _AUTOMATIC_TRIGGERING_MESSAGE_LINE_PATTERN.fullmatch(
+        lines[0].rstrip("\r\n")
+    ):
+        return text
+
+    index = 1
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    user_text = "".join(lines[index:])
+
+    sender_label = _DISCORD_SENDER_LABEL_PATTERN.match(user_text)
+    if sender_label is not None:
+        user_text = user_text[sender_label.end() :]
+    return user_text
+
+
 def _topic_snippet(value: Any) -> str:
     text = " ".join(str(value or "").split())
     if len(text) < _MIN_TOPIC_CHARS:
@@ -697,7 +721,9 @@ def _topic_snippet(value: Any) -> str:
 def _is_smalltalk(text: str) -> bool:
     if len(text.replace(" ", "")) > _SMALLTALK_MAX_CHARS:
         return False
-    return any(term in text for term in _SMALLTALK_TERMS)
+    # Keep the terse acknowledgement exact so an instruction following it
+    # remains substantive and recallable.
+    return text == "ㅇㅇ" or any(term in text for term in _SMALLTALK_TERMS)
 
 
 def _should_recall(query: str) -> bool:
@@ -1860,7 +1886,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         deadline = time.monotonic() + _PREFETCH_TIMEOUT_SECONDS
-        query_text = str(query or "")
+        query_text = _automatic_user_turn_text(query)
         routing_policy = (
             "graphiti_first" if _requires_graphiti_first(query_text) else "advisory"
         )

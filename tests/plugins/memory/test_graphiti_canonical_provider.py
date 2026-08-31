@@ -2164,6 +2164,7 @@ def test_gate_admits_subject_bearing_requests_and_drops_unusable_turns():
         "이어서 진행해",
     )
     dropped = (
+        "ㅇㅇ",
         "안녕",
         "고마워",
         "너 모델 뭐야?",
@@ -2175,6 +2176,89 @@ def test_gate_admits_subject_bearing_requests_and_drops_unusable_turns():
 
     assert [q for q in admitted if not graphiti_module._should_recall(q)] == []
     assert [q for q in dropped if graphiti_module._should_recall(q)] == []
+
+
+def test_automatic_prefetch_rejects_decorated_short_ack_without_topic(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+    decorated_ack = (
+        "[Triggering message id: `1543779438670651403` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        "[최근원] ㅇㅇ"
+    )
+
+    result = provider.prefetch(decorated_ack)
+
+    assert (result, calls, provider._recent_topics) == ("", [], [])
+
+
+def test_decorated_continuity_query_uses_clean_turn_scope_and_recent_topic(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize(
+        "session-1",
+        hermes_home=str(tmp_path),
+        session_title="Graphiti 기억 주입 작업 재개",
+    )
+    clean_topic = "neo4j 백업 유닛 컨테이너 이름을 고쳐야 해"
+    decorated_followup = (
+        "[Triggering message id: `1543779438670651403` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        "[최근원] 2번이 뭐였더라?"
+    )
+
+    provider.prefetch(clean_topic)
+    provider.prefetch(decorated_followup)
+
+    assert [call[1]["query"] for call in calls] == [
+        clean_topic + "\nSession scope: Graphiti 기억 주입 작업 재개",
+        (
+            "2번이 뭐였더라?\n"
+            "Session scope: Graphiti 기억 주입 작업 재개\n"
+            f"Recent topics: {clean_topic}"
+        ),
+    ]
+    assert provider._recent_topics == [clean_topic, "2번이 뭐였더라?"]
+
+
+def test_automatic_prefetch_preserves_ordinary_bracket_leading_content(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+    query = "[최근원] 대괄호로 시작한 P1 사용자 내용을 기억해줘"
+
+    provider.prefetch(query)
+
+    assert [call[1]["query"] for call in calls] == [query]
+    assert provider._recent_topics == [query]
 
 
 def test_contentless_followup_carries_session_scope_and_recent_topics(
