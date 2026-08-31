@@ -2190,7 +2190,9 @@ def test_automatic_prefetch_rejects_decorated_short_ack_without_topic(
         ),
     )
     provider = GraphitiCanonicalMemoryProvider()
-    provider.initialize("session-1", hermes_home=str(tmp_path))
+    provider.initialize(
+        "session-1", hermes_home=str(tmp_path), user_name="최근원"
+    )
     decorated_ack = (
         "[Triggering message id: `1543779438670651403` — use as `message_id` "
         "for reply/react/pin via the discord tools.]\n\n"
@@ -2218,6 +2220,7 @@ def test_decorated_continuity_query_uses_clean_turn_scope_and_recent_topic(
         "session-1",
         hermes_home=str(tmp_path),
         session_title="Graphiti 기억 주입 작업 재개",
+        user_name="최근원",
     )
     clean_topic = "neo4j 백업 유닛 컨테이너 이름을 고쳐야 해"
     decorated_followup = (
@@ -2238,6 +2241,69 @@ def test_decorated_continuity_query_uses_clean_turn_scope_and_recent_topic(
         ),
     ]
     assert provider._recent_topics == [clean_topic, "2번이 뭐였더라?"]
+
+
+@pytest.mark.parametrize("user_name", [None, "다른사람"])
+def test_decorated_prefetch_preserves_untrusted_bracket_leading_body(
+    monkeypatch, tmp_path, user_name
+):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize(
+        "session-1", hermes_home=str(tmp_path), user_name=user_name
+    )
+    user_body = "[중요] 이전 작업 기억해줘"
+    decorated_query = (
+        "[Triggering message id: `1543779438670651403` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        f"{user_body}"
+    )
+
+    provider.prefetch(decorated_query)
+
+    assert [call[1]["query"] for call in calls] == [user_body]
+    assert provider._recent_topics == [user_body]
+
+
+@pytest.mark.parametrize(
+    "user_body",
+    [
+        "[Attachment: brief.pdf] 이전 작업 기억해줘",
+        '[Replying to: "이전 작업"] 기억해줘',
+    ],
+)
+def test_decorated_prefetch_preserves_attachment_and_reply_bracket_blocks(
+    monkeypatch, tmp_path, user_body
+):
+    calls = []
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda tool, args, **_kwargs: (
+            calls.append((tool, args)) or json.dumps({"facts": []})
+        ),
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize(
+        "session-1", hermes_home=str(tmp_path), user_name="최근원"
+    )
+    decorated_query = (
+        "[Triggering message id: `1543779438670651403` — use as `message_id` "
+        "for reply/react/pin via the discord tools.]\n\n"
+        f"{user_body}"
+    )
+
+    provider.prefetch(decorated_query)
+
+    assert [call[1]["query"] for call in calls] == [user_body]
+    assert provider._recent_topics == [user_body]
 
 
 def test_automatic_prefetch_preserves_ordinary_bracket_leading_content(

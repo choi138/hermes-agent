@@ -322,7 +322,7 @@ _SMALLTALK_TERMS = (
 _AUTOMATIC_TRIGGERING_MESSAGE_LINE_PATTERN = re.compile(
     r"\[Triggering message id: [^\r\n]*\][ \t]*"
 )
-_DISCORD_SENDER_LABEL_PATTERN = re.compile(r"\[[^\[\]\r\n]{1,200}\][ \t]+")
+_DISCORD_SENDER_LABEL_PATTERN = re.compile(r"\[([^\[\]\r\n]{1,200})\][ \t]+")
 _IDENTITY_QUESTION_PATTERN = re.compile(
     r"(?:너|당신|you)\s*(?:는|은)?\s*(?:어떤\s*)?(?:모델|model)"
     r"|what\s+model\b"
@@ -691,7 +691,9 @@ def _dispatch_tool(
     return result
 
 
-def _automatic_user_turn_text(value: Any) -> str:
+def _automatic_user_turn_text(
+    value: Any, identity_terms: set[str] | None = None
+) -> str:
     """Strip only the recognized leading Discord envelope used by prefetch."""
     text = str(value or "")
     lines = text.splitlines(keepends=True)
@@ -706,7 +708,10 @@ def _automatic_user_turn_text(value: Any) -> str:
     user_text = "".join(lines[index:])
 
     sender_label = _DISCORD_SENDER_LABEL_PATTERN.match(user_text)
-    if sender_label is not None:
+    if (
+        sender_label is not None
+        and _normalize_text(sender_label.group(1)) in (identity_terms or set())
+    ):
         user_text = user_text[sender_label.end() :]
     return user_text
 
@@ -1886,7 +1891,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         deadline = time.monotonic() + _PREFETCH_TIMEOUT_SECONDS
-        query_text = _automatic_user_turn_text(query)
+        query_text = _automatic_user_turn_text(query, self._identity_terms)
         routing_policy = (
             "graphiti_first" if _requires_graphiti_first(query_text) else "advisory"
         )
