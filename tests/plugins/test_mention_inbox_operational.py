@@ -22,6 +22,7 @@ from plugins.mention_inbox.operational import (
     MentionInboxConfig,
     MentionInboxGatewayService,
     MentionInboxRuntime,
+    NotionInboxConfig,
     parse_mention_inbox_config,
     render_discord_event,
 )
@@ -1429,3 +1430,34 @@ def test_collector_bounds_external_title_body_before_persistence() -> None:
     assert collected is not None
     assert len(collected.event.untrusted.title) <= 500
     assert len(collected.event.untrusted.body) <= 4000
+
+
+def test_config_accepts_bounded_nested_notion_pilot_and_rejects_unsafe_scope() -> None:
+    page_id = "11111111-1111-1111-1111-111111111111"
+    config = parse_mention_inbox_config({
+        "mention_inbox": {
+            "notion": {
+                "enabled": True,
+                "credential_env": "NOTION_TOKEN",
+                "page_ids": [page_id],
+                "poll_interval_seconds": 180,
+            }
+        }
+    })
+
+    assert config.notion == NotionInboxConfig(
+        enabled=True,
+        credential_env="NOTION_TOKEN",
+        page_ids=(page_id,),
+        poll_interval_seconds=180,
+    )
+    for notion in (
+        {"enabled": True, "credential_env": "NOTION_OTHER", "page_ids": [page_id]},
+        {"enabled": True, "page_ids": []},
+        {"enabled": True, "page_ids": ["not-a-notion-id"]},
+        {"enabled": True, "page_ids": [page_id, page_id]},
+        {"enabled": True, "page_ids": [page_id], "poll_interval_seconds": 60},
+        {"enabled": True, "page_ids": [page_id], "recursive_workspace_scan": True},
+    ):
+        with pytest.raises(ValueError):
+            parse_mention_inbox_config({"mention_inbox": {"notion": notion}})

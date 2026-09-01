@@ -40,6 +40,10 @@ from plugins.mention_inbox.workspace import RepositoryWorktreeManager
 
 _ALLOWED_REPOSITORY = "silviahealth/content"
 _ALLOWED_ENV = "GITHUB_PAT_TOKEN"
+_ALLOWED_NOTION_ENV = "NOTION_TOKEN"
+_NOTION_OBJECT_ID = re.compile(
+    r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+)
 _COLLECTOR_KEY = "github.notifications"
 _DISCORD_MAX_SNOWFLAKE = (1 << 64) - 1
 _ALLOWED_MENTIONS_NONE: dict[str, Any] = {
@@ -57,6 +61,14 @@ def _is_discord_snowflake(value: object) -> bool:
 
 class _DeliveryLeaseLostError(RuntimeError):
     """The durable outbox claim was reclaimed by another delivery worker."""
+
+
+@dataclass(frozen=True)
+class NotionInboxConfig:
+    enabled: bool = False
+    credential_env: str = _ALLOWED_NOTION_ENV
+    page_ids: tuple[str, ...] = ()
+    poll_interval_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,7 @@ class MentionInboxConfig:
     # permits — and it stays off by default because the call can add tens of
     # seconds to a delivery.
     advisory_summary: bool = False
+    notion: NotionInboxConfig = NotionInboxConfig()
 
 
 class DiscordDeliveryTransport(Protocol):
@@ -107,6 +120,53 @@ def _positive_int(value: object, name: str, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"mention_inbox.{name} must be a positive integer")
     return value
+
+
+def _parse_notion_config(raw: object) -> NotionInboxConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("mention_inbox.notion must be an object")
+    allowed_keys = {
+        "enabled",
+        "credential_env",
+        "page_ids",
+        "poll_interval_seconds",
+    }
+    unknown = set(raw) - allowed_keys
+    if unknown:
+        raise ValueError("mention_inbox.notion contains unsupported keys")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("mention_inbox.notion.enabled must be a boolean")
+    credential_env = raw.get("credential_env", _ALLOWED_NOTION_ENV)
+    if credential_env != _ALLOWED_NOTION_ENV:
+        raise ValueError("mention_inbox.notion.credential_env is not allowed")
+    page_ids = raw.get("page_ids", [])
+    if not isinstance(page_ids, list) or any(
+        not isinstance(value, str) or _NOTION_OBJECT_ID.fullmatch(value) is None
+        for value in page_ids
+    ):
+        raise ValueError("mention_inbox.notion.page_ids must contain only Notion UUIDs")
+    if len(page_ids) > 20 or len(set(page_ids)) != len(page_ids):
+        raise ValueError("mention_inbox.notion.page_ids must contain 0 to 20 unique IDs")
+    if enabled and not page_ids:
+        raise ValueError("mention_inbox.notion.page_ids is required when enabled")
+    poll_interval = raw.get("poll_interval_seconds", 300)
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, int)
+        or not 120 <= poll_interval <= 300
+    ):
+        raise ValueError(
+            "mention_inbox.notion.poll_interval_seconds must be between 120 and 300"
+        )
+    return NotionInboxConfig(
+        enabled=enabled,
+        credential_env=credential_env,
+        page_ids=tuple(page_ids),
+        poll_interval_seconds=poll_interval,
+    )
 
 
 def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
@@ -269,6 +329,7 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         execution_workspace_root=execution_workspace_root,
         terminal_cwd=terminal_cwd,
         advisory_summary=advisory_summary,
+        notion=_parse_notion_config(raw.get("notion")),
     )
 
 
