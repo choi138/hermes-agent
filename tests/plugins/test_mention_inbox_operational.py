@@ -16,6 +16,7 @@ from plugins.mention_inbox.operational import (
     MentionInboxConfig,
     MentionInboxGatewayService,
     MentionInboxRuntime,
+    NotionInboxConfig,
     parse_mention_inbox_config,
     render_discord_event,
 )
@@ -39,6 +40,31 @@ def _event(*, title: str = "Review requested", body: str = "Please review", even
             "action_detail": "review_requested",
             "source_url": "https://github.com/silviahealth/content/pull/7",
             "metadata": {"repository": "silviahealth/content"},
+        },
+    })
+
+
+def _notion_event():
+    return ingest_event({
+        "schema_version": "1",
+        "source": {"platform": "notion", "event_id": "comment:private-comment"},
+        "actor": {"actor_id": "private-actor-id", "kind": "user"},
+        "target": {"target_id": "private-target-user-id", "kind": "user"},
+        "thread": {
+            "thread_id": "private-discussion-id",
+            "container_id": "11111111-1111-1111-1111-111111111111",
+        },
+        "requested_action": "reply",
+        "deadline": None,
+        "untrusted": {
+            "title": "private page title",
+            "body": "private raw body @everyone <@123>",
+            "action_detail": "notion_user_mention",
+            "source_url": None,
+            "metadata": {
+                "coverage": "selected accessible pages / polling / best-effort",
+                "object_kind": "comment",
+            },
         },
     })
 
@@ -75,6 +101,37 @@ def test_config_defaults_disabled_and_validates_fail_closed() -> None:
             parse_mention_inbox_config({"mention_inbox": invalid})
 
 
+def test_config_accepts_bounded_nested_notion_pilot_and_rejects_unsafe_scope() -> None:
+    page_id = "11111111-1111-1111-1111-111111111111"
+    config = parse_mention_inbox_config({
+        "mention_inbox": {
+            "notion": {
+                "enabled": True,
+                "credential_env": "NOTION_TOKEN",
+                "page_ids": [page_id],
+                "poll_interval_seconds": 180,
+            }
+        }
+    })
+
+    assert config.notion == NotionInboxConfig(
+        enabled=True,
+        credential_env="NOTION_TOKEN",
+        page_ids=(page_id,),
+        poll_interval_seconds=180,
+    )
+    for notion in (
+        {"enabled": True, "credential_env": "NOTION_OTHER", "page_ids": [page_id]},
+        {"enabled": True, "page_ids": []},
+        {"enabled": True, "page_ids": ["not-a-notion-id"]},
+        {"enabled": True, "page_ids": [page_id, page_id]},
+        {"enabled": True, "page_ids": [page_id], "poll_interval_seconds": 60},
+        {"enabled": True, "page_ids": [page_id], "recursive_workspace_scan": True},
+    ):
+        with pytest.raises(ValueError):
+            parse_mention_inbox_config({"mention_inbox": {"notion": notion}})
+
+
 def test_renderer_bounds_untrusted_text_escapes_mentions_and_has_marker() -> None:
     event = _event(
         title="@everyone **title** " + "x" * 1000,
@@ -91,6 +148,32 @@ def test_renderer_bounds_untrusted_text_escapes_mentions_and_has_marker() -> Non
     assert rendered.marker.startswith("[hermes-inbox:")
     assert rendered.marker in rendered.content
     assert rendered.allowed_mentions == {"parse": [], "users": [], "roles": [], "replied_user": False}
+
+
+def test_notion_renderer_withholds_raw_content_and_identifiers() -> None:
+    rendered = render_discord_event(
+        _notion_event(),
+        revision_number=1,
+        destination=DESTINATION,
+    )
+
+    assert "Notion mention inbox" in rendered.content
+    assert "Source: Notion" in rendered.content
+    assert "Coverage: selected accessible pages / polling / best" in rendered.content
+    assert "effort" in rendered.content
+    assert "Object: comment" in rendered.content
+    assert "Requested action: reply" in rendered.content
+    for private in (
+        "private page title",
+        "private raw body",
+        "private-actor-id",
+        "private-target-user-id",
+        "private-discussion-id",
+        "11111111-1111-1111-1111-111111111111",
+    ):
+        assert private not in rendered.content
+    assert rendered.marker in rendered.content
+    assert rendered.allowed_mentions["parse"] == []
 
 
 def test_outbox_first_send_same_revision_retry_and_changed_revision(tmp_path: Path) -> None:
@@ -194,6 +277,20 @@ class _Poller:
     def poll_once(self):
         self.calls += 1
         self.store.record_poll_success("github.notifications", next_poll_at=NOW + timedelta(hours=1))
+
+
+class _KeyedPoller:
+    def __init__(self, store: MentionInboxStore, collector_key: str):
+        self.store = store
+        self.collector_key = collector_key
+        self.calls = 0
+
+    def poll_once(self):
+        self.calls += 1
+        self.store.record_poll_success(
+            self.collector_key,
+            next_poll_at=NOW + timedelta(hours=1),
+        )
 
 
 class _Delivery:

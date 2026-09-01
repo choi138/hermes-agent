@@ -23,10 +23,22 @@ from plugins.mention_inbox.store import DEFAULT_DESTINATION, MentionInboxStore
 
 _ALLOWED_REPOSITORY = "silviahealth/content"
 _ALLOWED_ENV = "GITHUB_PAT_TOKEN"
+_ALLOWED_NOTION_ENV = "NOTION_TOKEN"
+_NOTION_OBJECT_ID = re.compile(
+    r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+)
 _COLLECTOR_KEY = "github.notifications"
 _ALLOWED_MENTIONS_NONE: dict[str, Any] = {
     "parse": [], "users": [], "roles": [], "replied_user": False,
 }
+
+
+@dataclass(frozen=True)
+class NotionInboxConfig:
+    enabled: bool = False
+    credential_env: str = _ALLOWED_NOTION_ENV
+    page_ids: tuple[str, ...] = ()
+    poll_interval_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -37,7 +49,7 @@ class MentionInboxConfig:
     destination: str = DEFAULT_DESTINATION
     retention_days: int = 30
     lease_seconds: int = 60
-
+    notion: NotionInboxConfig = NotionInboxConfig()
 
 @dataclass(frozen=True)
 class RenderedDiscordEvent:
@@ -56,6 +68,53 @@ def _positive_int(value: object, name: str, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"mention_inbox.{name} must be a positive integer")
     return value
+
+
+def _parse_notion_config(raw: object) -> NotionInboxConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("mention_inbox.notion must be an object")
+    allowed_keys = {
+        "enabled",
+        "credential_env",
+        "page_ids",
+        "poll_interval_seconds",
+    }
+    unknown = set(raw) - allowed_keys
+    if unknown:
+        raise ValueError("mention_inbox.notion contains unsupported keys")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("mention_inbox.notion.enabled must be a boolean")
+    credential_env = raw.get("credential_env", _ALLOWED_NOTION_ENV)
+    if credential_env != _ALLOWED_NOTION_ENV:
+        raise ValueError("mention_inbox.notion.credential_env is not allowed")
+    page_ids = raw.get("page_ids", [])
+    if not isinstance(page_ids, list) or any(
+        not isinstance(value, str) or _NOTION_OBJECT_ID.fullmatch(value) is None
+        for value in page_ids
+    ):
+        raise ValueError("mention_inbox.notion.page_ids must contain only Notion UUIDs")
+    if len(page_ids) > 20 or len(set(page_ids)) != len(page_ids):
+        raise ValueError("mention_inbox.notion.page_ids must contain 0 to 20 unique IDs")
+    if enabled and not page_ids:
+        raise ValueError("mention_inbox.notion.page_ids is required when enabled")
+    poll_interval = raw.get("poll_interval_seconds", 300)
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, int)
+        or not 120 <= poll_interval <= 300
+    ):
+        raise ValueError(
+            "mention_inbox.notion.poll_interval_seconds must be between 120 and 300"
+        )
+    return NotionInboxConfig(
+        enabled=enabled,
+        credential_env=credential_env,
+        page_ids=tuple(page_ids),
+        poll_interval_seconds=poll_interval,
+    )
 
 
 def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
@@ -87,6 +146,7 @@ def parse_mention_inbox_config(config: Mapping[str, Any]) -> MentionInboxConfig:
         destination=destination,
         retention_days=_positive_int(raw.get("retention_days"), "retention_days", 30),
         lease_seconds=_positive_int(raw.get("lease_seconds"), "lease_seconds", 60),
+        notion=_parse_notion_config(raw.get("notion")),
     )
 
 
@@ -108,20 +168,34 @@ def render_discord_event(
     event: MentionEvent, *, revision_number: int, destination: str
 ) -> RenderedDiscordEvent:
     metadata = event.untrusted.metadata
-    repository = metadata.get("repository") if isinstance(metadata, Mapping) else None
-    repository = repository if isinstance(repository, str) else "unknown"
     marker = _marker(event, revision_number, destination)
-    lines = [
-        "GitHub mention inbox",
-        f"Source: GitHub",
-        f"Repository: {_neutralize(repository, 160)}",
-        f"Requested action: {event.requested_action.value}",
-        f"Title (untrusted data): {_neutralize(event.untrusted.title, 400)}",
-        f"Body preview (untrusted data): {_neutralize(event.untrusted.body, 900)}",
-    ]
-    if event.untrusted.source_url:
-        safe_url = event.untrusted.source_url.replace("@", "@\u200b")[:300]
-        lines.append(f"Source URL: {safe_url}")
+    if event.source.platform.value == "notion":
+        coverage = metadata.get("coverage") if isinstance(metadata, Mapping) else None
+        object_kind = metadata.get("object_kind") if isinstance(metadata, Mapping) else None
+        coverage = coverage if isinstance(coverage, str) else "selected pages / best-effort"
+        object_kind = object_kind if isinstance(object_kind, str) else "unknown"
+        lines = [
+            "Notion mention inbox",
+            "Source: Notion",
+            f"Coverage: {_neutralize(coverage, 160)}",
+            f"Object: {_neutralize(object_kind, 40)}",
+            f"Requested action: {event.requested_action.value}",
+            "Raw Notion content withheld from Discord.",
+        ]
+    else:
+        repository = metadata.get("repository") if isinstance(metadata, Mapping) else None
+        repository = repository if isinstance(repository, str) else "unknown"
+        lines = [
+            "GitHub mention inbox",
+            "Source: GitHub",
+            f"Repository: {_neutralize(repository, 160)}",
+            f"Requested action: {event.requested_action.value}",
+            f"Title (untrusted data): {_neutralize(event.untrusted.title, 400)}",
+            f"Body preview (untrusted data): {_neutralize(event.untrusted.body, 900)}",
+        ]
+        if event.untrusted.source_url:
+            safe_url = event.untrusted.source_url.replace("@", "@\u200b")[:300]
+            lines.append(f"Source URL: {safe_url}")
     lines.append(marker)
     content = "\n".join(lines)
     if len(content) > 1900:
