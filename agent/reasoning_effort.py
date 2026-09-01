@@ -36,7 +36,13 @@ Rules for call sites:
 
 from __future__ import annotations
 
+import re
 from typing import Optional, Sequence
+
+#: K3 slug detector — matches ``k3`` as a delimited token (``k3``,
+#: ``k3-256k``, ``kimi-k3``, ``kimi-k3-cot``) without matching K2-era names
+#: (``kimi-k2.6``). From #76427 by @ruizanthony.
+_KIMI_K3_SLUG_RE = re.compile(r"(?:^|[^a-z0-9])k3(?:[^a-z0-9]|$)")
 
 # Canonical low→high ordering used for nearest-level clamping. Superset of
 # hermes_constants.VALID_REASONING_EFFORTS ("none" included so an explicit
@@ -55,10 +61,27 @@ OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = (
     "none", "minimal", "low", "medium", "high", "xhigh", "max",
 )
 
-#: OpenAI/Codex Responses backend (``minimal`` is rejected → clamps to low).
-CODEX_RESPONSES_EFFORTS: tuple[str, ...] = (
-    "low", "medium", "high", "xhigh", "max",
+#: OpenAI/Codex Responses backend — per-model vocabulary, live-verified
+#: (Aug 2026): ``minimal`` is rejected by both generations (clamps to low);
+#: ``max`` is gpt-5.6-only — gpt-5.5 rejects it with "Supported values are:
+#: 'none', 'low', 'medium', 'high', 'xhigh'" (#68365's premise, confirmed).
+CODEX_GPT56_EFFORTS: tuple[str, ...] = (
+    "none", "low", "medium", "high", "xhigh", "max",
 )
+CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
+    "none", "low", "medium", "high", "xhigh",
+)
+
+
+def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
+    """Supported effort set for an OpenAI/Codex Responses model."""
+    if "gpt-5.6" in (model or "").lower():
+        return CODEX_GPT56_EFFORTS
+    return CODEX_LEGACY_EFFORTS
+
+
+#: Backward-compat alias (pre-#68365-verification name).
+CODEX_RESPONSES_EFFORTS: tuple[str, ...] = CODEX_GPT56_EFFORTS
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
@@ -71,6 +94,13 @@ ACTUAL_RELAY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
 KIMI_K3_EFFORTS: tuple[str, ...] = ("low", "high", "max")
 #: Moonshot/Kimi K2-era models: low/medium/high.
 KIMI_K2_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+
+#: OpenCode "Ox Alpha" stealth model (x-preview-f-free): thinking is always
+#: on and the wire accepts exactly low/high/max — medium/none/xhigh 400 with
+#: "This model always engages in thinking and cannot be disabled; please use
+#: low, high, or max" (verified live 2026-08-21). xhigh rounds up to max.
+OX_ALPHA_EFFORTS: tuple[str, ...] = ("low", "high", "max")
+OX_ALPHA_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
 #: Tencent TokenHub: low/medium/high.
 TOKENHUB_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
@@ -107,11 +137,14 @@ SOLAR_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for a Moonshot/Kimi model slug.
 
-    K3 is served as the bare slug ``k3`` and the ``kimi-k3*`` aliases; its
-    documented set is low/high/max. Everything earlier speaks low/medium/high.
+    K3 is served as the bare slug ``k3``, plan variants like ``k3-256k``,
+    and the ``kimi-k3*`` aliases; its documented set is low/high/max.
+    Everything earlier speaks low/medium/high. Boundary-matched so K2-era
+    names (``kimi-k2.6``) never match (detection regex from #76427 by
+    @ruizanthony).
     """
     m = (model or "").strip().lower().split("/")[-1]
-    if m == "k3" or m.startswith("kimi-k3"):
+    if _KIMI_K3_SLUG_RE.search(m):
         return KIMI_K3_EFFORTS
     return KIMI_K2_EFFORTS
 
