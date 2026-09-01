@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "active_work_id": null,
+  "works": {
+    "work-inbox-thread-membership": {
+      "work_id": "work-inbox-thread-membership",
+      "active_plan": ".omo/plans/work-inbox-thread-membership.md",
+      "plan_name": "work-inbox-thread-membership",
+      "session_ids": [
+        "senpi:019fc5b4-fc1b-7e68-80a6-b481fe4d5ecb",
+        "senpi:019fc711-07dd-7c6e-9684-095ae0c4a001"
+      ],
+      "status": "completed",
+      "worktree_path": "/Users/choegeun-won/Documents/hermes-agent-worktrees/work-inbox-external-pr"
+    }
+  }
+}
