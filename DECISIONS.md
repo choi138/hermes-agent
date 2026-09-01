@@ -304,3 +304,45 @@ manifest의 pinned base를
 명확한 기준점을 얻고, 이미 흡수된 topic의 상호 의존성과 merge ancestry를 매번 다시
 해석할 필요가 없어진다. 이후 upstream sync에서는 legacy integration 기준점과 소수의
 outstanding 독립 topic만 검토·replay하면 된다.
+
+## ADR-003 — 단일 트렁크 `hermes/all-work`로 수렴, 패치 스택 은퇴
+
+- **상태:** 채택
+- **결정일:** 2026-09-01
+- **범위:** `choi138/hermes-agent`의 브랜치 구조와 배포 기준
+
+### 맥락
+
+ADR-001의 패치 스택(`hermes/production` + `hermes/patches/*`)은 도입 이후 실제
+배포 조립에 쓰이지 않았다. 2026-09-01 시점의 라이브 게이트웨이는
+`hermes/production`이 아니라 `wip/graphiti-guardrail-continuation-20260824`
+워크트리에서 editable install로 돌고 있었고, 그 워킹트리에는 커밋되지 않은 편집이
+포함돼 있었다. 동시에 브랜치는 Mac 88개 · 배포 호스트 44개 · origin 35개로 늘어나
+계보가 둘로 갈라졌다.
+
+전수 감사 결과(`hermes-lineage-audit/M1-REPORT.md`, `M2-REPORT.md`) 계보 A 고유
+커밋 123건 중 이식이 필요한 것은 없었고, 브랜치 124개 중 95개는 내용이 라이브 계보에
+재현돼 있었다. `hermes/production`과 활성 패치 3개
+(`mood-routing`, `mention-inbox-multi-repo`, `config-set-json`) 및 pinned base
+`legacy-integration`은 모두 새 트렁크의 조상이다 — 즉 패치 스택이 운반하던 내용은
+이미 트렁크 안에 있다.
+
+### 결정
+
+`hermes/all-work`를 유일한 장기 브랜치로 삼는다. `main`은 upstream 추적용으로만
+남기고, 그 외 모든 브랜치는 삭제한다. 삭제 전 각 저장소를 번들로 덤프하고, 어떤
+커밋의 유일한 도달 경로였던 ref는 `archive/*` 태그로 전환한다.
+
+`hermes/production`과 `hermes/patches/*`를 삭제하므로 `bin/hermes-patches`는
+동작하지 않는다(`hermes/production is missing while N patches are enabled`).
+스크립트와 `PATCHES.md`는 이력으로 남긴다.
+
+### 결과
+
+- 기능 단위 rollback과 upstream 기여 단위 분리 능력을 잃는다. ADR-001이 원했던
+  이점이며, 실제로 그 워크플로가 쓰이지 않았다는 관찰과 교환한 것이다.
+- upstream 동기화는 이제 트렁크 하나를 리베이스하거나 머지하는 문제로 단순해진다.
+- 배포는 브랜치가 아니라 경로로 고정돼 있다. 라이브 워크트리
+  `/home/justin/hermes-main-runtime-reintegration-20260803`가 `hermes/all-work`를
+  체크아웃하며, systemd drop-in과 editable venv는 그 경로를 그대로 가리킨다.
+- 앞으로 hermes 변경은 `hermes/all-work`에서 분기해 `hermes/all-work`로 되돌린다.

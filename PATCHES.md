@@ -13,6 +13,11 @@
 > `hermes/patches/legacy-integration`을 새 pinned base로 삼는다. 기존에 별도 패치로
 > 기록했던 6개 topic은 모두 이 기준점 안에 포함되므로 더 이상 독립 entry로 관리하지 않는다.
 
+> **은퇴 메모(2026-09-01):** ADR-003으로 패치 스택을 은퇴시켰다. `hermes/production`과
+> `hermes/patches/*`는 삭제됐고 이 매니페스트가 가리키는 브랜치는 더 이상 존재하지
+> 않으므로 `bin/hermes-patches`는 동작하지 않는다. 아래 내용은 이력으로만 남긴다.
+> 활성 패치 3개와 pinned base는 모두 `hermes/all-work`의 조상이므로 내용은 보존돼 있다.
+
 ## Pinned Base
 
 - **upstream:** `NousResearch/hermes-agent`
