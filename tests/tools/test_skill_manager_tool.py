@@ -1413,4 +1413,13 @@ def test_skill_manage_schema_declares_structured_reason():
     # `reason` itself must stay OPTIONAL at the schema level: only
     # create/edit/patch are gated, and enforcement belongs to the gate
     # (fail-closed plugin), not to top-level JSON-Schema `required`.
-    assert SKILL_MANAGE_SCHEMA["parameters"]["required"] == ["action", "name"]
+    # Upstream moved the advertised surface to batch `operations` (the
+    # handler still accepts the legacy flat shape for replay compat), so
+    # the top-level required is now the batch contract.
+    assert SKILL_MANAGE_SCHEMA["parameters"]["required"] == ["operations"]
+    # The gate's vocabulary must also ride the batch surface: each
+    # operation item advertises the structured `reason` object.
+    op_props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]["operations"][
+        "items"
+    ]["properties"]
+    assert op_props["reason"]["type"] == "object"

@@ -2189,6 +2189,25 @@ SKILL_MANAGE_SCHEMA = {
                         "file_content": {
                             "type": "string",
                             "description": "Content for write_file."
+                        },
+                        "absorbed_into": {
+                            "type": "string",
+                            "description": (
+                                "For delete ops: umbrella skill that absorbed "
+                                "this skill's content, or empty string for a "
+                                "pure prune."
+                            )
+                        },
+                        "reason": {
+                            "type": "object",
+                            "description": (
+                                "Structured write rationale — required by the "
+                                "skills admission gate for create/edit/patch "
+                                "ops. Same shape as the top-level `reason` "
+                                "parameter (claim_kind/execution_evidence/"
+                                "evidence/target/neighbor_skills_checked, "
+                                "plus verified_by for tier-C)."
+                            )
                         }
                     },
                     "required": ["name", "action"]

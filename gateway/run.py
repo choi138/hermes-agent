@@ -22781,7 +22781,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
-        self._turn_started_at[_quick_key] = _claim_state.turn.started_ts
+        # Defensive like every _turn_started_at READ site (getattr): test
+        # harnesses build the runner via object.__new__ without __init__.
+        _turn_starts = getattr(self, "_turn_started_at", None)
+        if _turn_starts is None:
+            _turn_starts = self._turn_started_at = {}
+        _turn_starts[_quick_key] = _claim_state.turn.started_ts
         # Make A's deadline path routable even if the turn wedges during early
         # preprocessing before the later session-source cache point.
         self._cache_session_source(_quick_key, source)

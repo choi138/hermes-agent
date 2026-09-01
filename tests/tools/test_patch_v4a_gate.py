@@ -45,13 +45,15 @@ class TestPatchV4AGate(unittest.TestCase):
         ]:
             self.assertEqual(_family(prov, model), want, (prov, model))
 
-    def test_base_schema_is_replace_only(self):
+    def test_base_schema_advertises_fork_modes(self):
+        # Fork base schema advertises replace/append/patch to every model
+        # (append is a fork feature); required stays the replace contract.
         props = ft.PATCH_SCHEMA["parameters"]["properties"]
-        self.assertNotIn("mode", props)
-        self.assertNotIn("patch", props)
+        self.assertIn("mode", props)
+        self.assertIn("patch", props)
         self.assertEqual(ft.PATCH_SCHEMA["parameters"]["required"],
                          ["path", "old_string", "new_string"])
-        self.assertNotIn("V4A", ft.PATCH_SCHEMA["description"])
+        self.assertIn("V4A", ft.PATCH_SCHEMA["description"])
 
     def test_openai_family_gets_v4a_layer(self):
         o = _override("openai", "gpt-5.2")

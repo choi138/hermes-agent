@@ -212,7 +212,11 @@ def test_committed_batch_attempt_records_one_duration_and_token_pair(observation
         with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
             compress_context(
                 agent,
-                _messages(),
+                # Upstream compaction adds fixed overhead (checkpoint block),
+                # so the shrink assertion below needs a transcript large
+                # enough that summarization actually wins — pad each message
+                # well past the overhead instead of using the tiny default.
+                _messages(secret_text="TOPSECRET_TRANSCRIPT_TEXT " + "x" * 2000),
                 "system prompt",
                 approx_tokens=75_000,
                 force=True,
