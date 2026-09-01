@@ -331,6 +331,31 @@ def test_nudge_attempts_are_bounded(tmp_path, monkeypatch):
     ) is None
 
 
+def test_external_temp_artifact_does_not_reopen_passed_workspace(tmp_path, monkeypatch):
+    """A throwaway temp project is not treated as a second deliverable workspace."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path / "project"
+    scratch = tmp_path / "somi-lint-tools"
+    _make_project(project)
+    _make_project(scratch)
+
+    changed = str(project / "src" / "app.ts")
+    scratch_manifest = str(scratch / "package.json")
+    record_terminal_result(
+        command="pnpm test",
+        cwd=project,
+        session_id="s1",
+        exit_code=0,
+        output="green",
+    )
+
+    assert build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[changed, scratch_manifest],
+        workspace_cwd=project,
+    ) is None
+
+
 # ---------------------------------------------------------------------------
 # Fix C: documentation/prose edits carry no verifiable behavior and must never
 # trip the nudge, even on an unverified workspace.

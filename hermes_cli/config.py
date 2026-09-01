@@ -1161,8 +1161,9 @@ DEFAULT_CONFIG = {
         # tsc/lint/test before visual approval) and clean-diff expectations.
         # Set false to keep the evidence nudge terse.
         "verify_guidance": True,
-        # Upper bound on consecutive `pre_verify` "continue" nudges in a single
-        # turn, so a user/plugin hook can never trap the loop.
+        # Upper bound on consecutive verification-stop and `pre_verify`
+        # continuation nudges in a single turn, so either gate stays bounded.
+        # Verification-stop also retains its stricter built-in cap of 2.
         "max_verify_nudges": 3,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists

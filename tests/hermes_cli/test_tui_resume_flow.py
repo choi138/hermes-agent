@@ -1172,9 +1172,11 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
 
     closed = []
     shutdown_messages = []
+    constructed = []
 
     class FakeAgent:
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
@@ -1195,7 +1197,10 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
     )
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
-        lambda: {"model": {"default": "gpt-test", "provider": "openai"}},
+        lambda: {
+            "model": {"default": "gpt-test", "provider": "openai"},
+            "agent": {"max_turns": 7},
+        },
     )
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -1215,6 +1220,7 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
         )
         == ("done", {"final_response": "done"})
     )
+    assert constructed[0]["max_iterations"] == 7
     assert closed == [True]
     assert shutdown_messages == [[{"role": "user", "content": "hello"}]]
 
