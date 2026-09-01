@@ -130,7 +130,7 @@ _ASSOCIATION_QUERY_BUDGET_SECONDS = 1.8
 _ASSOCIATION_MIN_REMAINING_SECONDS = 2.2
 _ASSOCIATION_EMBEDDING_MODEL = "text-embedding-3-small"
 _ASSOCIATION_QUERY_URL = "http://127.0.0.1:7474/db/neo4j/query/v2"
-_ASSOCIATION_CYPHER = """MATCH (s)-[r]->(t)
+_ASSOCIATION_CYPHER = """MATCH (s)-[r:RELATES_TO]->(t)
 WHERE r.uuid IN $anchor_uuids
 WITH s, t
 UNWIND [s, t] AS n
@@ -141,7 +141,7 @@ CALL (n) {
   RETURN count(d) AS degree
 }
 WITH n, degree WHERE degree <= $degree_cap
-MATCH (n)-[e]-()
+MATCH (n)-[e:RELATES_TO]-()
 WHERE e.invalid_at IS NULL
   AND NOT e.uuid IN $anchor_uuids
 RETURN DISTINCT e.uuid AS uuid, e.name AS name, e.fact AS fact,
