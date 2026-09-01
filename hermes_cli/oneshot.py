@@ -490,6 +490,20 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
+    # Oneshot bypasses HermesCLI, which normally translates
+    # ``agent.max_turns`` into AIAgent.max_iterations. Keep the same bound here
+    # instead of silently falling back to AIAgent's constructor default (90).
+    default_max_iterations = 90
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    try:
+        configured_max_iterations = int(
+            agent_cfg.get("max_turns", default_max_iterations)
+        )
+    except (TypeError, ValueError):
+        configured_max_iterations = default_max_iterations
+    if configured_max_iterations < 1:
+        configured_max_iterations = default_max_iterations
+
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
@@ -508,6 +522,7 @@ def _run_agent(
             provider=runtime.get("provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            max_iterations=configured_max_iterations,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",

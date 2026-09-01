@@ -14,6 +14,7 @@ from typing import Any, Iterable
 
 
 _MAX_CHANGED_PATHS_IN_NUDGE = 8
+VERIFY_ON_STOP_NUDGE_CAP = 2
 
 # Non-code file extensions whose edits carry no verifiable runtime behavior:
 # documentation, prose, and data/markup that no test/build exercises. When a
@@ -70,6 +71,90 @@ def _is_non_code_path(raw: str) -> bool:
 def _filter_verifiable_paths(paths: Iterable[str]) -> list[str]:
     """Drop documentation/prose paths; keep paths that could have verifiable behavior."""
     return [p for p in paths if p and not _is_non_code_path(p)]
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """Return whether ``path`` is ``root`` or one of its descendants."""
+    return path == root or root in path.parents
+
+
+def _temp_roots() -> tuple[Path, ...]:
+    """Return canonical OS temp roots, including common POSIX aliases."""
+    candidates = [Path(tempfile.gettempdir())]
+    for raw in ("/tmp", "/var/tmp", "/private/tmp"):
+        candidate = Path(raw)
+        if candidate.exists():
+            candidates.append(candidate)
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except Exception:
+            continue
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def _filter_external_temp_paths(
+    paths: Iterable[str],
+    *,
+    workspace_cwd: str | Path | None,
+) -> list[str]:
+    """Drop temp artifacts outside the primary workspace.
+
+    Verification nudges may ask the model to create an ad-hoc script or even a
+    small throwaway project under ``/tmp``. File tools record those writes in
+    the same per-turn mutation set as deliverable edits. Without this filter a
+    passing workspace can immediately become "unverified" again because the
+    throwaway project's manifest is treated as a second edited workspace.
+
+    Only external *temporary* paths are ignored. Edits in another ordinary
+    workspace remain eligible, and a real project rooted under the OS temp
+    directory keeps every path inside its own root.
+    """
+    values = [str(path) for path in paths if path]
+    if workspace_cwd is None:
+        return values
+
+    try:
+        from agent.coding_context import project_facts_for
+
+        facts = project_facts_for(workspace_cwd)
+        root_value = facts.get("root") if isinstance(facts, dict) else None
+        if not root_value:
+            return values
+        workspace_root = Path(str(root_value)).expanduser().resolve()
+        base = Path(workspace_cwd).expanduser().resolve()
+    except Exception:
+        return values
+
+    temp_roots = _temp_roots()
+    if not temp_roots:
+        return values
+
+    kept: list[str] = []
+    for raw in values:
+        try:
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = base / candidate
+            resolved = candidate.resolve()
+        except Exception:
+            kept.append(raw)
+            continue
+
+        if _is_within(resolved, workspace_root):
+            kept.append(raw)
+            continue
+        if any(_is_within(resolved, temp_root) for temp_root in temp_roots):
+            continue
+        kept.append(raw)
+    return kept
 
 
 # Session identities (platform or source) that are NOT human conversational
@@ -247,13 +332,19 @@ def build_verify_on_stop_nudge(
     session_id: str | None,
     changed_paths: Iterable[str],
     attempts: int = 0,
-    max_attempts: int = 2,
+    max_attempts: int = VERIFY_ON_STOP_NUDGE_CAP,
+    workspace_cwd: str | Path | None = None,
 ) -> str | None:
     """Return a synthetic follow-up when edited code lacks fresh verification."""
     # Drop documentation/prose paths (markdown, skills, README, LICENSE, ...) —
     # they carry no verifiable behavior, so a turn that touched only those has
     # nothing to verify and must not nudge.
-    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
+    verifiable_paths = _filter_verifiable_paths(changed_paths)
+    verifiable_paths = _filter_external_temp_paths(
+        verifiable_paths,
+        workspace_cwd=workspace_cwd,
+    )
+    paths = sorted(set(verifiable_paths))
     if not paths or attempts >= max_attempts:
         return None
 
@@ -310,4 +401,8 @@ def build_verify_on_stop_nudge(
     )
 
 
-__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]
+__all__ = [
+    "VERIFY_ON_STOP_NUDGE_CAP",
+    "build_verify_on_stop_nudge",
+    "verify_on_stop_enabled",
+]

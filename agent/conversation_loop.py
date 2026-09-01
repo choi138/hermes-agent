@@ -5637,15 +5637,23 @@ def run_conversation(
 
                 try:
                     from agent.verification_stop import (
+                        VERIFY_ON_STOP_NUDGE_CAP,
                         build_verify_on_stop_nudge,
                         verify_on_stop_enabled,
                     )
+                    from agent.runtime_cwd import resolve_agent_cwd
+                    from agent.verify_hooks import max_verify_nudges
 
                     if verify_on_stop_enabled():
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            max_attempts=min(
+                                VERIFY_ON_STOP_NUDGE_CAP,
+                                max_verify_nudges(),
+                            ),
+                            workspace_cwd=resolve_agent_cwd(),
                         )
                     else:
                         _verify_nudge = None
@@ -5658,12 +5666,11 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Persist the candidate for provider role alternation and
+                    # budget-exhaustion recovery, but do not emit it as an
+                    # interim assistant message. It is not final yet: showing a
+                    # completed-looking report here makes every later verify
+                    # tool call appear to happen *after* completion.
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
@@ -5684,9 +5691,10 @@ def run_conversation(
                     # continuation-budget exhaustion.  ``final_response`` itself
                     # must be cleared so the finalizer can distinguish this gate
                     # from unrelated error/recovery exits. (#61631)
-                    # Track whether this candidate was already streamed so the
-                    # finalizer can mark the turn previewed only if the
-                    # candidate is actually reused as the final response.
+                    # A provider stream may already have exposed the candidate
+                    # before this local gate ran. Track that independently so
+                    # the finalizer only suppresses a duplicate when the same
+                    # candidate is reused at budget exhaustion.
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
@@ -5729,12 +5737,8 @@ def run_conversation(
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Like verify-on-stop above, this is a durable continuation
+                    # candidate, not a completed UI response.
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
