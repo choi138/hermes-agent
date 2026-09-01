@@ -274,6 +274,16 @@ def _resolve_review_runtime(
         if isinstance(primary_runtime, dict)
         else agent.model or ""
     )
+    # TEMP DIAGNOSTIC (remove once the fork fallback path is confirmed).
+    logger.info(
+        "REVIEW-RUNTIME-DIAG task=%r/%r live=%r/%r primary=%r/%r "
+        "primary_runtime_present=%s -> routed=%s",
+        task_provider, task_model,
+        getattr(agent, "provider", None), getattr(agent, "model", None),
+        primary_provider, primary_model,
+        isinstance(primary_runtime, dict),
+        not (task_provider == primary_provider and task_model == primary_model),
+    )
     # Aux config asks whether this is the configured main model; a fallback is
     # transient, not a reconfiguration. This also applies to ingest-curator.
     if task_provider == primary_provider and task_model == primary_model:
@@ -1203,6 +1213,19 @@ def _run_review_in_thread(
                 skip_memory=True,
                 **_fork_kwargs,
             )
+            # TEMP DIAGNOSTIC (remove once the fork fallback path is confirmed).
+            try:
+                logger.info(
+                    "REVIEW-FORK-DIAG parent_chain=%d fork_chain=%d routed=%s "
+                    "fork_provider=%r parent_provider=%r",
+                    len(getattr(agent, "_fallback_chain", []) or []),
+                    len(getattr(review_agent, "_fallback_chain", []) or []),
+                    _routed,
+                    getattr(review_agent, "provider", None),
+                    getattr(agent, "provider", None),
+                )
+            except Exception:
+                pass
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # ADR-004 Phase 0: systematic guarantee against graph-write leaks.
