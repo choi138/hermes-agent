@@ -35,6 +35,10 @@ def _runner(store: SessionStore) -> gateway_run.GatewayRunner:
 
 def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypatch):
     # Given
+    # Upstream #66887 pins the routing index to get_hermes_home()/state.db at
+    # store construction, so the test home must move too — DEFAULT_DB_PATH
+    # alone would split reads (tmp) from routing writes (real home).
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     sessions_dir = tmp_path / "sessions"
     config = GatewayConfig(write_sessions_json=False)
