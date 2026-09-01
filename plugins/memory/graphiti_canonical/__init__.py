@@ -712,6 +712,8 @@ def _extract_facts_with_presence(raw: Any) -> tuple[bool, List[Dict[str, Any]]]:
             parsed = [
                 item for item in facts[:_MAX_RESPONSE_FACTS] if isinstance(item, dict)
             ]
+            if facts and not parsed:
+                return False, []
             return True, parsed
         for key in ("structuredContent", "result", "content"):
             if key not in payload:
@@ -788,10 +790,10 @@ def _requires_graphiti_first(query: Any) -> bool:
     normalized = " ".join(str(query or "").lower().split())
     if not normalized:
         return False
-    if "graphiti" in normalized or "그래프티" in normalized:
-        return True
     if any(term in normalized for term in _EXPLICIT_ALTERNATE_SOURCE_TERMS):
         return False
+    if "graphiti" in normalized or "그래프티" in normalized:
+        return True
     has_history = any(term in normalized for term in _GRAPHITI_FIRST_HISTORY_TERMS)
     if not has_history:
         return False
@@ -1444,20 +1446,25 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
         routing_policy = (
             "graphiti_first" if _requires_graphiti_first(query_text) else "advisory"
         )
+        skipped_result = (
+            _lookup_status_block("error", routing_policy=routing_policy)
+            if routing_policy == "graphiti_first"
+            else ""
+        )
         if len(query_text) > _MAX_QUERY_CHARS:
             logger.info(
                 "Graphiti recall skipped: query is %d chars (limit %d)",
                 len(query_text), _MAX_QUERY_CHARS,
             )
-            return ""
+            return skipped_result
         if session_id and session_id != self._session_id:
             self.on_session_switch(session_id)
         if self._scope_blocked_by_credentials:
             logger.info("Graphiti recall skipped: session scope blocked by credentials")
-            return ""
+            return skipped_result
         if not _should_recall(query_text):
             logger.info("Graphiti recall skipped: gate rejected this turn")
-            return ""
+            return skipped_result
         self._refresh_builtin_memory()
         search_query = self._build_search_query(query_text)
         if len(search_query) > _MAX_QUERY_CHARS:
@@ -1465,7 +1472,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                 "Graphiti recall skipped: final query is %d chars (limit %d)",
                 len(search_query), _MAX_QUERY_CHARS,
             )
-            return ""
+            return skipped_result
         facts = self._bounded_search(search_query, deadline=deadline)
         search_status = getattr(facts, "status", "ok")
         if search_status != "ok":

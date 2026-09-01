@@ -1181,27 +1181,36 @@ class TestMemoryInjectionRejectsMalformedSchema:
             "routing_policy: graphiti_first\n"
             "status: filtered\n"
             "fallback_allowed: false",
-            "filtered",
+            None,
         ),
         (
             "# Graphiti Lookup Status\n"
             "routing_policy: graphiti_first\n"
             "status: timeout\n"
             "fallback_allowed: false",
-            "timeout",
+            None,
         ),
         (
             "# Graphiti Lookup Status\n"
             "routing_policy: graphiti_first\n"
             "status: error\n"
             "fallback_allowed: false",
-            "error",
+            None,
         ),
         (
             "# Graphiti Lookup Status\n"
+            "source: graphiti_historical_memory\n"
             "routing_policy: graphiti_first\n"
             "fallback_allowed: false",
             "missing",
+        ),
+        (
+            "# Graphiti Lookup Status\n"
+            "source: builtin_memory\n"
+            "routing_policy: graphiti_first\n"
+            "status: empty\n"
+            "fallback_allowed: true",
+            None,
         ),
         (
             "# Graphiti Lookup Status\n"

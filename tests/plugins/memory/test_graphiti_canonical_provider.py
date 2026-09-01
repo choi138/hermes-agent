@@ -1164,7 +1164,10 @@ def test_current_correction_suppresses_conflicting_historical_recall(
     alternate_result = provider.prefetch("하던 작업 계속하되 이번에는 Kanban은 빼줘")
 
     assert result == ""
-    assert alternate_result == ""
+    assert "source: graphiti_historical_memory" in alternate_result
+    assert "routing_policy: graphiti_first" in alternate_result
+    assert "status: error" in alternate_result
+    assert "fallback_allowed: false" in alternate_result
     assert calls == []
 
 
@@ -1869,7 +1872,11 @@ def test_recall_rejects_overlong_final_query_after_scope_append(monkeypatch, tmp
     query = ("continue previous P1 project " + ("x" * 4_000))[:4_000]
 
     assert len(query) == 4_000
-    assert provider.prefetch(query) == ""
+    result = provider.prefetch(query)
+    assert "source: graphiti_historical_memory" in result
+    assert "routing_policy: graphiti_first" in result
+    assert "status: error" in result
+    assert "fallback_allowed: false" in result
     assert calls == []
 
 
@@ -2802,7 +2809,11 @@ def test_credential_intent_in_session_title_never_reaches_transport(monkeypatch,
         session_title="P1 credential dump",
     )
 
-    assert provider.prefetch("continue the previous P1 project") == ""
+    result = provider.prefetch("continue the previous P1 project")
+    assert "source: graphiti_historical_memory" in result
+    assert "routing_policy: graphiti_first" in result
+    assert "status: error" in result
+    assert "fallback_allowed: false" in result
     assert calls == []
 
 
@@ -3090,6 +3101,8 @@ def test_ephemeral_status_fact_cannot_ride_along_with_a_durable_fact():
         ("최근 뉴스 알려줘", False),
         ("지난밤 서울 날씨", False),
         ("Instagram 실시간 화면에서 마지막 연락 상대를 직접 확인해", False),
+        ("Graphiti 말고 브라우저에서 직접 확인해줘", False),
+        ("Graphiti 말고 웹에서 검색해줘", False),
         ("전에 하던 작업을 확인하고 웹 문서도 검색해", False),
         ("파이썬 테스트 고쳐줘", False),
         ("안녕", False),
@@ -3232,3 +3245,79 @@ def test_mixed_language_empty_search_retries_once_with_graphiti_anchor(
     assert "status: ok" in prefetched
     assert "fallback_allowed: false" in prefetched
     assert calls == [query, "Instagram"]
+
+
+def test_nonempty_malformed_fact_list_fails_closed_across_search_interfaces(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        graphiti_module,
+        "_dispatch_tool",
+        lambda *args, **kwargs: {"facts": ["invalid", 7, None]},
+    )
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    direct = json.loads(
+        provider.handle_tool_call("search_memory_facts", {"query": "P1 history"})
+    )
+    prefetched = provider.prefetch("Graphiti에서 지난 P1 작업을 찾아줘")
+
+    assert direct == {
+        "status": "error",
+        "source": "graphiti_historical_memory",
+        "fallback_allowed": False,
+        "error": "Graphiti search failed",
+    }
+    assert "source: graphiti_historical_memory" in prefetched
+    assert "routing_policy: graphiti_first" in prefetched
+    assert "status: error" in prefetched
+    assert "fallback_allowed: false" in prefetched
+
+
+def test_graphiti_first_prefetch_skip_paths_always_emit_fail_closed_status(
+    monkeypatch, tmp_path
+):
+    dispatch_calls = []
+
+    def unexpected_dispatch(_tool, args, **_kwargs):
+        dispatch_calls.append(args["query"])
+        raise AssertionError("skip path must not dispatch Graphiti")
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", unexpected_dispatch)
+
+    normal = GraphitiCanonicalMemoryProvider()
+    normal.initialize("session-1", hermes_home=str(tmp_path), user_name="Alice")
+
+    unsafe_scope = GraphitiCanonicalMemoryProvider()
+    unsafe_scope.initialize(
+        "session-1",
+        hermes_home=str(tmp_path),
+        user_name="Alice",
+        session_title="API key credential history",
+    )
+
+    scoped = GraphitiCanonicalMemoryProvider()
+    scoped.initialize(
+        "session-1",
+        hermes_home=str(tmp_path),
+        user_name="Alice",
+        session_title="Graphiti P1 repository history",
+    )
+    max_length_query = "Graphiti " + "x" * (
+        graphiti_module._MAX_QUERY_CHARS - len("Graphiti ")
+    )
+
+    results = [
+        normal.prefetch("Graphiti에서 저장된 api 키를 알려줘"),
+        unsafe_scope.prefetch("Graphiti에서 지난 P1 작업을 찾아줘"),
+        normal.prefetch("Graphiti " + "x" * graphiti_module._MAX_QUERY_CHARS),
+        scoped.prefetch(max_length_query),
+    ]
+
+    for result in results:
+        assert "source: graphiti_historical_memory" in result
+        assert "routing_policy: graphiti_first" in result
+        assert "status: error" in result
+        assert "fallback_allowed: false" in result
+    assert dispatch_calls == []

@@ -385,6 +385,8 @@ def graphiti_first_status_from_context(raw_context: str) -> Optional[str]:
         if line.strip() != _GRAPHITI_STATUS_MARKER:
             continue
         _, fields = _graphiti_status_block_at(lines, index)
+        if fields.get("source") != "graphiti_historical_memory":
+            continue
         if fields.get("routing_policy") != "graphiti_first":
             continue
         status = fields.get("status")
