@@ -14453,6 +14453,10 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # ``_HERMES_GATEWAY`` is process-role state, not profile configuration. A
+    # worker that inherits it is treated as living inside a gateway by cli.py's
+    # terminal bridge, which then skips the TERMINAL_CWD export the worker needs.
+    env.pop("_HERMES_GATEWAY", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -14475,7 +14479,24 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
-    env["HERMES_KANBAN_WORKSPACE"] = workspace
+
+    # Identity comes from the assignee profile, but execution follows the
+    # workspace. The dispatcher materializes scratch/dir/worktree on this host
+    # and starts the child there, so file and terminal must both be local even
+    # when the assignee profile's backend is SSH. cli.py reapplies this private
+    # contract after profile config loading; without the binding here the
+    # contract is never written and the worker runs on the profile's host.
+    from hermes_cli.kanban_runtime import bind_local_worker_execution
+
+    execution_contract = bind_local_worker_execution(env, workspace)
+    workspace = execution_contract.workspace
+    _log.info(
+        "kanban worker execution bound: task=%s profile=%s backend=%s workspace=%s",
+        task.id,
+        profile_arg,
+        execution_contract.backend,
+        workspace,
+    )
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
