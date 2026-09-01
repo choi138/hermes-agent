@@ -1125,6 +1125,9 @@ RETRY_REASONS: frozenset[str] = frozenset({
     "content_policy_blocked",
     "context_overflow",
     "format_error",
+    # Upstream v2026.8.31: provider says the image bytes are undecodable —
+    # classified as its own failover reason (strip-and-retry path).
+    "image_corrupt",
     "image_too_large",
     "invalid_encrypted_content",
     "invalid_response",

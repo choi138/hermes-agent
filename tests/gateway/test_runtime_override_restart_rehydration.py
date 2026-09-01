@@ -122,12 +122,19 @@ def test_persisted_runtime_route_rehydrates_one_keyed_bundle(monkeypatch):
     # Then
     assert calls == [{"requested": "target-provider", "target_model": "target-model"}]
     assert model == "target-model"
+    # Upstream's provider-bundle enrichment rides along: requested_provider /
+    # request_overrides pass through (None from this mock) and capabilities
+    # normalizes to a dict.
     assert runtime == _runtime_bundle(
         api_key="target-secret",
         provider="target-provider",
         base_url="https://target.example/v1",
         api_mode="codex_responses",
-    )
+    ) | {
+        "requested_provider": None,
+        "request_overrides": None,
+        "capabilities": {},
+    }
 
 
 def test_persisted_runtime_route_accepts_atomic_keyless_bundle(monkeypatch):
