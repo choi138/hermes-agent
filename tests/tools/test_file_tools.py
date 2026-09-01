@@ -567,28 +567,42 @@ class TestSensitivePathCheck:
 
 
 class TestPatchSchemaShape:
-    """PATCH_SCHEMA must advertise per-mode required params via description
-    text (not JSON-schema ``required``), so strict models like kimi-k2.x stop
-    silently omitting old_string / new_string / patch content."""
+    """The fork's BASE schema advertises all three modes (replace/append/
+    patch) — append is a fork feature every model should see. Upstream's V4A
+    layer (_patch_schema_overrides — see test_patch_v4a_gate.py) still
+    composes for OpenAI-family mains; with the modes already on the base it
+    is a description upgrade, not a capability gate."""
 
-    def test_per_mode_required_params_documented_in_descriptions(self):
+    def test_base_schema_documents_per_mode_required_params(self):
         desc = PATCH_SCHEMA["description"]
         assert "REQUIRED PARAMETERS: mode, path, old_string, new_string" in desc
         assert "REQUIRED PARAMETERS: mode, patch" in desc
         assert "REQUIRED PARAMETERS: mode, path, content" in desc
         props = PATCH_SCHEMA["parameters"]["properties"]
-        for name in ("path", "old_string", "new_string"):
-            assert "REQUIRED when mode='replace'" in props[name]["description"]
-        assert "REQUIRED when mode='patch'" in props["patch"]["description"]
+        assert "mode" in props and "patch" in props
+        # JSON-schema ``required`` stays the replace contract; append/patch
+        # requirements live in description text so strict models (kimi-k2.x)
+        # don't silently omit old_string/new_string on replace.
+        assert PATCH_SCHEMA["parameters"]["required"] == ["path", "old_string", "new_string"]
         assert "must differ from old_string" in props["new_string"]["description"]
         assert "REQUIRED when mode='append'" in props["content"]["description"]
         assert "append" in props["mode"]["enum"]
 
-    def test_no_anyof_required_stays_mode_only(self):
-        # anyOf/oneOf at parameters level break Anthropic, Fireworks, and the
-        # Moonshot/Kimi schema sanitizer — description-level guidance is the
-        # only provider-safe signalling mechanism.
-        params = PATCH_SCHEMA["parameters"]
+    def test_v4a_layer_keeps_per_mode_documentation(self):
+        """When the V4A layer IS rendered (OpenAI-family), the strict-model
+        guidance survives: per-mode requirements in description text, no
+        anyOf/oneOf (breaks Anthropic/Fireworks/Kimi sanitizers)."""
+        from unittest.mock import patch as _p
+
+        import tools.file_tools as ft
+
+        with _p("agent.auxiliary_client._read_main_provider", return_value="openai"), \
+             _p("agent.auxiliary_client._read_main_model", return_value="gpt-5.2"):
+            o = ft._patch_schema_overrides()
+        desc = o["description"]
+        assert "REQUIRED PARAMETERS: mode, path, old_string, new_string" in desc
+        assert "REQUIRED PARAMETERS: mode, patch" in desc
+        params = o["parameters"]
         assert params["required"] == ["mode"]
         assert "anyOf" not in params and "oneOf" not in params
 

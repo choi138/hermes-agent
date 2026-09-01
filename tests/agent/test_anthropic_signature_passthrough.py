@@ -5,7 +5,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import agent.anthropic_adapter as adapter
+# The passthrough helpers moved with _manage_thinking_signatures into
+# agent.anthropic_message_convert during upstream's adapter split (v2026.8.31);
+# patch the module that actually owns the cache global.
+import agent.anthropic_message_convert as adapter
 from agent.anthropic_adapter import convert_messages_to_anthropic
 from agent.transports import get_transport
 
