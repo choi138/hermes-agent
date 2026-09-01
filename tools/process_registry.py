@@ -44,6 +44,10 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+# systemd transient scopes exist only on Linux. Gate every scope-path branch
+# on this constant (not merely "not Windows") so macOS and other POSIX
+# platforms provably never touch systemd code (#70716 cross-platform audit).
+_IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import (
     _find_shell,
     _nice_argv,
@@ -224,7 +228,7 @@ def _systemd_run_user_scope_available() -> bool:
             return False
 
         available = False
-        if not _IS_WINDOWS:
+        if _IS_LINUX:
             try:
                 import shutil
 
@@ -1306,7 +1310,7 @@ class ProcessRegistry:
                 # Wrap the PTY command in a systemd scope so interactive
                 # executors get their own cgroup, same as pipe mode.
                 pty_in_supervised_gateway = (
-                    not _IS_WINDOWS and _is_supervised_gateway_process()
+                    _IS_LINUX and _is_supervised_gateway_process()
                 )
                 pty_use_systemd_scope = (
                     pty_in_supervised_gateway and _systemd_run_user_scope_available()
@@ -1386,7 +1390,7 @@ class ProcessRegistry:
         shell_argv = _nice_argv(
             [user_shell, "-lic", f"set +m; {safe_command}"]
         )
-        in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
+        in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         use_systemd_scope = (
             in_supervised_gateway and _systemd_run_user_scope_available()
         )
