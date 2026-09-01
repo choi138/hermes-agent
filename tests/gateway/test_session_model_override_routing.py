@@ -15,8 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import GatewayConfig, Platform
-from gateway.session import SessionSource, SessionStore
+from gateway.config import Platform
+from gateway.session import SessionSource
 
 
 class _CapturingAgent:
@@ -82,87 +82,6 @@ def _explode_runtime_resolution():
     )
 
 
-def _session_store(tmp_path):
-    config = GatewayConfig()
-    config.sessions_dir = tmp_path
-    store = SessionStore(sessions_dir=tmp_path, config=config)
-    store._db = None
-    return store
-
-
-def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypatch):
-    source = SessionSource(
-        platform=Platform.LOCAL,
-        chat_id="cli",
-        chat_name="CLI",
-        chat_type="dm",
-        user_id="user-1",
-    )
-    first_store = _session_store(tmp_path)
-    entry = first_store.get_or_create_session(source)
-    assert first_store.update_runtime_override(
-        entry.session_key,
-        model="gpt-5.5",
-        provider="codex-nekos",
-        reasoning_effort="high",
-    )
-
-    restarted_store = _session_store(tmp_path)
-    runner = _make_runner()
-    runner.session_store = restarted_store
-    runner._load_reasoning_config = MagicMock(
-        return_value={"enabled": True, "effort": "low"}
-    )
-    def resolve_persisted_runtime(provider, *, target_model=None):
-        assert provider == "codex-nekos"
-        assert target_model == "gpt-5.5"
-        return {
-            "api_key": "runtime-secret",
-            "base_url": "https://codex.nekos.me/v1",
-            "provider": provider,
-            "requested_provider": provider,
-            "api_mode": "codex_responses",
-            "command": None,
-            "args": [],
-            "credential_pool": None,
-        }
-
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs_for_provider",
-        resolve_persisted_runtime,
-    )
-
-    model, runtime = runner._resolve_session_agent_runtime(
-        session_key=entry.session_key,
-        user_config={
-            "model": {"default": "base-model", "provider": "base-provider"}
-        },
-    )
-    reasoning = runner._resolve_session_reasoning_config(
-        session_key=entry.session_key,
-        model=model,
-    )
-
-    assert model == "gpt-5.5"
-    assert runtime["provider"] == "codex-nekos"
-    assert runtime["api_key"] == "runtime-secret"
-    assert runtime["base_url"] == "https://codex.nekos.me/v1"
-    assert runtime["api_mode"] == "codex_responses"
-    assert reasoning == {"enabled": True, "effort": "high"}
-    runner._load_reasoning_config.assert_not_called()
-
-    restored = restarted_store.get_entry(entry.session_key)
-    assert restored is not None
-    persisted = restored.to_dict()
-    assert persisted["runtime_model"] == "gpt-5.5"
-    assert persisted["runtime_provider"] == "codex-nekos"
-    assert persisted["runtime_reasoning_effort"] == "high"
-    assert "api_key" not in persisted
-    assert "base_url" not in persisted
-    assert "api_mode" not in persisted
-
-
 def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
     """Regression: fallback provider must not inherit the primary model.
 
@@ -216,3 +135,5 @@ fallback_providers:
     assert model == "minimax/minimax-m2.7"
     assert runtime_kwargs["provider"] == "openrouter"
     assert runtime_kwargs["api_key"] == "sk-openrouter"
+
+

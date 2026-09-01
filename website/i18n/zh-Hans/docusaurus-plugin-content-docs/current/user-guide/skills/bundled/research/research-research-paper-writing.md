@@ -2213,7 +2213,7 @@ for paper in results:
 
 ### 使用 `memory` 和 `todo` 进行状态管理
 
-**`memory` 工具**——持久化关键决策（有限：MEMORY.md 约 2750 字符）：
+**`memory` 工具**——持久化关键决策（有限：MEMORY.md 约 2200 字符）：
 
 ```
 memory("add", "Paper: autoreason. Venue: NeurIPS 2025 (9 pages). 

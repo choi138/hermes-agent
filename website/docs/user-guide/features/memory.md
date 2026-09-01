@@ -14,8 +14,8 @@ Two files make up the agent's memory:
 
 | File | Purpose | Char Limit |
 |------|---------|------------|
-| **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 2,750 chars (~1,000 tokens) |
-| **USER.md** | User profile — your preferences, communication style, expectations | 2,750 chars (~1,000 tokens) |
+| **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 2,200 chars (~800 tokens) |
+| **USER.md** | User profile — your preferences, communication style, expectations | 1,375 chars (~500 tokens) |
 
 Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, replace, or remove entries.
 
@@ -39,7 +39,7 @@ At the start of every session, memory entries are loaded from disk and rendered 
 
 ```
 ══════════════════════════════════════════════
-MEMORY (your personal notes) [54% — 1,474/2,750 chars]
+MEMORY (your personal notes) [67% — 1,474/2,200 chars]
 ══════════════════════════════════════════════
 User's project is a Rust web service at ~/code/myapi using Axum + SQLx
 §
@@ -128,8 +128,8 @@ Memory has strict character limits to keep system prompts bounded:
 
 | Store | Limit | Typical entries |
 |-------|-------|----------------|
-| memory | 2,750 chars | 8-15 entries |
-| user | 2,750 chars | 5-10 entries |
+| memory | 2,200 chars | 8-15 entries |
+| user | 1,375 chars | 5-10 entries |
 
 ### What Happens When Memory is Full
 
@@ -138,9 +138,9 @@ When you try to add an entry that would exceed the limit, the tool returns an er
 ```json
 {
   "success": false,
-  "error": "Memory at 2,650/2,750 chars. Adding this entry (250 chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.",
+  "error": "Memory at 2,100/2,200 chars. Adding this entry (250 chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.",
   "current_entries": ["..."],
-  "usage": "2,650/2,750"
+  "usage": "2,100/2,200"
 }
 ```
 
@@ -235,8 +235,8 @@ The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2750   # ~1,000 tokens
-  user_char_limit: 2750     # ~1,000 tokens
+  memory_char_limit: 2200   # ~800 tokens
+  user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
 ```
 

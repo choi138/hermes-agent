@@ -41,7 +41,6 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
-from agent import turn_trace
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -90,7 +89,6 @@ from agent.retry_utils import (
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
 )
-from agent.refusal_history import current_user_ordinal_from_tail, user_anchor_from_tail
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -101,35 +99,6 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 _CODEX_STREAM_RECOVERY_LIMIT = 2
-
-
-_ANTHROPIC_THINKING_REPLAY_KEYS = (
-    "reasoning_details",
-    "anthropic_content_blocks",
-)
-
-
-def _strip_anthropic_thinking_replay_channels(api_messages: List[Any]) -> int:
-    """Remove every Anthropic thinking replay channel from send-time messages.
-
-    ``anthropic_content_blocks`` is the ordered interleaved-thinking channel and
-    takes precedence over ``reasoning_details`` during Anthropic conversion.
-    Reactive invalid-signature recovery therefore has to remove both.  Returns
-    the number of messages changed and never mutates the canonical history when
-    the caller passes its normal shallow send-time copies.
-    """
-    stripped = 0
-    for message in api_messages:
-        if not isinstance(message, dict):
-            continue
-        had_replay_data = any(
-            key in message for key in _ANTHROPIC_THINKING_REPLAY_KEYS
-        )
-        for key in _ANTHROPIC_THINKING_REPLAY_KEYS:
-            message.pop(key, None)
-        if had_replay_data:
-            stripped += 1
-    return stripped
 
 
 def _restore_user_after_reference_handoff(
@@ -1141,66 +1110,12 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        from agent.system_prompt import compose_effective_system_prompt
-
-        effective = compose_effective_system_prompt(agent, sp)
+        effective = sp
+        if agent.ephemeral_system_prompt:
+            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
-
-
-def _apply_refusal_clean_fork(
-    agent, messages, api_messages, current_turn_user_idx: int,
-) -> int:
-    """Clean both durable and in-flight history after a refusal fallback.
-
-    ``api_messages`` is a provider-shaped copy built before the retry loop, so
-    cleaning only ``messages`` would still resend the refusal-contaminated
-    request on an in-block ``continue``. Keep every completed earlier turn and
-    truncate only rows generated after this turn's real user anchor.
-
-    Returns the number of durable messages dropped, or zero when disabled.
-    """
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.model_routes import load_routes
-
-        refusal = load_routes(load_config() or {}).router.refusal
-        clean_fork = bool(refusal.clean_fork)
-        keep_user_turns = int(refusal.keep_user_turns)
-    except Exception:
-        logger.debug("Refusal clean-fork config load failed; using defaults", exc_info=True)
-        clean_fork = True
-        keep_user_turns = 5
-
-    if not clean_fork:
-        return 0
-
-    user_from_tail = current_user_ordinal_from_tail(
-        messages,
-        current_turn_user_idx,
-        keep_user_turns=keep_user_turns,
-    )
-    if user_from_tail is None:
-        return 0
-    api_anchor = user_anchor_from_tail(
-        api_messages,
-        user_from_tail,
-        keep_user_turns=keep_user_turns,
-    )
-    if api_anchor is None:
-        return 0
-
-    original_count = len(messages)
-    messages[:] = messages[: current_turn_user_idx + 1]
-    api_messages[:] = api_messages[: api_anchor + 1]
-
-    agent._session_messages = messages
-    agent._refusal_clean_fork_active = True
-    agent._refusal_recall_quarantine = True
-    dropped = original_count - len(messages)
-    agent._buffer_status(f"⚠️ Refusal fallback clean_fork=yes dropped={dropped}")
-    return dropped
 
 
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
@@ -1446,7 +1361,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def _run_conversation_impl(
+def run_conversation(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1458,8 +1373,6 @@ def _run_conversation_impl(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
-    resume_turn: bool = False,
-    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1489,7 +1402,7 @@ def _run_conversation_impl(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None and not resume_turn:
+    if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -1502,37 +1415,12 @@ def _run_conversation_impl(
         except Exception:
             pass
 
-    # Normalize an interrupted transcript before rebuilding the turn context.
-    # A completed assistant tail is deliverable without another provider call.
-    _resume_composed_final: Optional[str] = None
-    if resume_turn:
-        from agent.turn_resume import prepare_resume_history, resume_entry_reason
-
-        conversation_history, _resume_composed_final = prepare_resume_history(
-            list(conversation_history or [])
-        )
-        user_message = ""
-        persist_user_message = None
-        persist_user_timestamp = None
-        logger.info(
-            "same-turn resume: session=%s turn_id=%s tail=%s composed_final=%s",
-            agent.session_id or "none",
-            turn_id or "(new)",
-            resume_entry_reason(conversation_history),
-            _resume_composed_final is not None,
-        )
-
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
-    agent._refusal_clean_fork_active = False
-    agent._refusal_recall_quarantine = bool(
-        getattr(agent, "_refusal_recall_quarantine_pending", False)
-    )
-    agent._refusal_recall_quarantine_pending = False
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -1571,8 +1459,6 @@ def _run_conversation_impl(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
-        resume_turn=resume_turn,
-        turn_id_override=turn_id,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1593,22 +1479,9 @@ def _run_conversation_impl(
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
 
-    _tt = turn_trace.safe_get_bound(agent)
-    _iter_started = None
-    _iter_pass = 0
-
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
-    # Same-turn resume of a turn that had already finished generating: the
-    # composed answer was persisted but never delivered/finalized.  Seed it as
-    # the final response and skip the loop entirely — the normal
-    # finalize/delivery path still runs.  The transcript already ends with
-    # that assistant row, so nothing is appended twice.
-    _resume_skip_loop = False
-    if resume_turn and _resume_composed_final is not None:
-        final_response = _resume_composed_final
-        _resume_skip_loop = True
     interrupted = False
     failed = False
     codex_ack_continuations = 0
@@ -1626,11 +1499,7 @@ def _run_conversation_impl(
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
-    _turn_exit_reason = (
-        "resume_composed_final"
-        if resume_turn and _resume_composed_final is not None
-        else "unknown"
-    )  # Diagnostic: why the loop ended
+    _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -1675,22 +1544,7 @@ def _run_conversation_impl(
             should_review_memory=_should_review_memory,
         )
 
-    while not _resume_skip_loop and (
-        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
-        or agent._budget_grace_call
-    ):
-        if _tt is not None:
-            now = time.time()
-            if _iter_started is not None:
-                turn_trace.safe_add_span(
-                    _tt, "iteration", _iter_started, now, i=_iter_pass
-                )
-            _iter_started = now
-            _iter_pass += 1
-            try:
-                _tt._pending_iteration = (_iter_started, _iter_pass)
-            except Exception:
-                pass
+    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1811,7 +1665,6 @@ def _run_conversation_impl(
         # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
-        _ctx_asm_started = time.time() if _tt is not None else None
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
         # Per-agent validation cursor: skips re-json.loads-ing tool_call
         # arguments on history messages already validated in a previous
@@ -1984,11 +1837,9 @@ def _run_conversation_impl(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        from agent.system_prompt import compose_effective_system_prompt
-
-        effective_system = compose_effective_system_prompt(
-            agent, active_system_prompt or ""
-        )
+        effective_system = active_system_prompt or ""
+        if agent.ephemeral_system_prompt:
+            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2210,10 +2061,6 @@ def _run_conversation_impl(
             )
             agent._first_request_footprint_logged = True
         total_chars = approx_tokens * 4
-        if _ctx_asm_started is not None:
-            turn_trace.safe_add_span(
-                _tt, "iteration.context_assemble", _ctx_asm_started, time.time()
-            )
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
         # anchor behind should_defer_preflight_to_real_usage()'s projection.
@@ -2477,7 +2324,6 @@ def _run_conversation_impl(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
-        _llm_call_started = None
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -2533,7 +2379,6 @@ def _run_conversation_impl(
                     pass  # Never let rate guard break the agent loop
 
             try:
-                _req_setup_started = time.time() if _tt is not None else None
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
@@ -2663,14 +2508,6 @@ def _run_conversation_impl(
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
-
-                if _req_setup_started is not None:
-                    turn_trace.safe_add_span(
-                        _tt,
-                        "iteration.request_setup",
-                        _req_setup_started,
-                        time.time(),
-                    )
 
                 # This object is private to the in-process MoA facade.  Add it
                 # only after middleware, hooks, and debug dumps so none of them
@@ -2819,19 +2656,6 @@ def _run_conversation_impl(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                _attempt_started = time.time()
-                _llm_call_started = time.time() if _tt is not None else None
-                _pfp_tags = None
-                if _llm_call_started is not None:
-                    try:
-                        agent._last_stream_diag = None
-                    except Exception:
-                        pass
-                    try:
-                        if turn_trace.prefix_fingerprint_enabled():
-                            _pfp_tags = turn_trace.prefix_fingerprint(api_kwargs)
-                    except Exception:
-                        _pfp_tags = None
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2870,34 +2694,6 @@ def _run_conversation_impl(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
-                if _llm_call_started is not None:
-                    llm_tags = {
-                        "api_request_id": api_request_id,
-                        "model": getattr(agent, "model", ""),
-                    }
-                    try:
-                        stream_diag = getattr(agent, "_last_stream_diag", None)
-                        if isinstance(stream_diag, dict) and stream_diag.get("first_chunk_at"):
-                            llm_tags["ttft_ms"] = round(
-                                (
-                                    stream_diag["first_chunk_at"]
-                                    - stream_diag["started_at"]
-                                )
-                                * 1000.0,
-                                1,
-                            )
-                    except Exception:
-                        pass
-                    if _pfp_tags:
-                        llm_tags.update(_pfp_tags)
-                    turn_trace.safe_add_span(
-                        _tt,
-                        "llm.call",
-                        _llm_call_started,
-                        time.time(),
-                        **llm_tags,
-                    )
-                    _llm_call_started = None
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -3308,10 +3104,7 @@ def _run_conversation_impl(
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
-                        _apply_refusal_clean_fork(
-                            agent, messages, api_messages, current_turn_user_idx,
-                        )
+                    if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3480,17 +3273,13 @@ def _run_conversation_impl(
                             agent._emit_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
+                            if agent._try_activate_fallback():
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
                                 # gets a coherent continuation point.
                                 if truncated_response_parts:
                                     messages = agent._get_messages_up_to_last_assistant(messages)
-                                _apply_refusal_clean_fork(
-                                    agent, messages, api_messages,
-                                    current_turn_user_idx,
-                                )
                                 agent._session_messages = messages
                                 length_continue_retries = 0
                                 truncated_response_parts = []
@@ -3684,7 +3473,6 @@ def _run_conversation_impl(
                         }
                 
                 # Track actual token usage from response for context management
-                _acct_started = time.time() if _tt is not None else None
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
@@ -3962,31 +3750,6 @@ def _run_conversation_impl(
                                 e,
                             )
                 
-                if _acct_started is not None:
-                    _acct_tags = {}
-                    try:
-                        if (
-                            hasattr(response, "usage")
-                            and response.usage
-                            and canonical_usage.cache_read_tokens
-                            and prompt_tokens
-                        ):
-                            _acct_tags["cache_pct"] = round(
-                                100.0
-                                * canonical_usage.cache_read_tokens
-                                / prompt_tokens,
-                                1,
-                            )
-                    except Exception:
-                        pass
-                    turn_trace.safe_add_span(
-                        _tt,
-                        "llm.accounting",
-                        _acct_started,
-                        time.time(),
-                        **_acct_tags,
-                    )
-
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
@@ -4012,17 +3775,6 @@ def _run_conversation_impl(
                 break  # Success, exit retry loop
 
             except InterruptedError:
-                if _llm_call_started is not None:
-                    turn_trace.safe_add_span(
-                        _tt,
-                        "llm.call",
-                        _llm_call_started,
-                        time.time(),
-                        api_request_id=api_request_id,
-                        model=getattr(agent, "model", ""),
-                        error="InterruptedError",
-                    )
-                    _llm_call_started = None
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -4057,17 +3809,6 @@ def _run_conversation_impl(
                 break
 
             except Exception as api_error:
-                if _llm_call_started is not None:
-                    turn_trace.safe_add_span(
-                        _tt,
-                        "llm.call",
-                        _llm_call_started,
-                        time.time(),
-                        api_request_id=api_request_id,
-                        model=getattr(agent, "model", ""),
-                        error=type(api_error).__name__,
-                    )
-                    _llm_call_started = None
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -4618,9 +4359,9 @@ def _run_conversation_impl(
                 # content. Any upstream mutation (context compression,
                 # session truncation, message merging) invalidates the
                 # signature and the API replies HTTP 400 ("invalid
-                # signature" or "cannot be modified"). Recovery strips both
-                # replay channels so the retry sends no thinking blocks at
-                # all. One-shot per outer loop.
+                # signature" or "cannot be modified"). Recovery strips
+                # ``reasoning_details`` so the retry sends no thinking
+                # blocks at all. One-shot per outer loop.
                 #
                 # The strip targets ``api_messages``, which is the
                 # API-call-time list that ``_build_api_kwargs`` consumes
@@ -4645,18 +4386,19 @@ def _run_conversation_impl(
                     and not _retry.thinking_sig_retry_attempted
                 ):
                     _retry.thinking_sig_retry_attempted = True
-                    _api_stripped = _strip_anthropic_thinking_replay_channels(
-                        api_messages
-                    )
+                    _api_stripped = 0
+                    for _m in api_messages:
+                        if isinstance(_m, dict) and "reasoning_details" in _m:
+                            _m.pop("reasoning_details", None)
+                            _api_stripped += 1
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
-                        f"stripped thinking replay data from api_messages for retry...",
+                        f"stripped reasoning_details from api_messages for retry...",
                         force=True,
                     )
                     logger.warning(
                         "%sThinking block signature recovery: stripped "
-                        "reasoning_details/anthropic_content_blocks from "
-                        "%d api_messages "
+                        "reasoning_details from %d api_messages "
                         "(canonical messages unchanged)",
                         agent.log_prefix, _api_stripped,
                     )
@@ -4993,10 +4735,6 @@ def _run_conversation_impl(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
-                if _is_transport_failure and (time.time() - _attempt_started) < 2.0:
-                    _retry.fast_transport_failures += 1
-                else:
-                    _retry.fast_transport_failures = 0
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
@@ -5056,51 +4794,6 @@ def _run_conversation_impl(
                             _retry.primary_recovery_attempted = False
                             continue
 
-                # A consecutive streak of near-immediate transport failures
-                # means the active endpoint is down. Once the fallback chain
-                # has had its chance, stop extending user-visible silence with
-                # a normal multi-minute retry cycle. Zero disables the cutoff.
-                try:
-                    _fast_limit = int(
-                        os.environ.get("HERMES_FAST_CONN_FAIL_LIMIT", "3") or 3
-                    )
-                except ValueError:
-                    _fast_limit = 3
-                if (
-                    _is_transport_failure
-                    and _fast_limit > 0
-                    and _retry.fast_transport_failures >= _fast_limit
-                    and not agent._has_pending_fallback()
-                ):
-                    agent._flush_status_buffer()
-                    _fail_summary = agent._summarize_api_error(api_error)
-                    _msg = (
-                        f"Provider unreachable: {_retry.fast_transport_failures} "
-                        f"consecutive instant connection failures "
-                        f"({_fail_summary}). Giving up early — the endpoint "
-                        "appears to be down and no fallback provider is available."
-                    )
-                    agent._emit_status(f"❌ {_msg}")
-                    logger.error(
-                        "Fail-fast after %d instant transport failures %s error=%s",
-                        _retry.fast_transport_failures,
-                        agent._client_log_context(),
-                        api_error,
-                    )
-                    close_interrupted_tool_sequence(
-                        messages, f"[System: API call aborted — {_msg}]"
-                    )
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": _msg,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "failed": True,
-                        "error": _msg,
-                        "failure_reason": classified.reason.value,
-                    }
-
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
                 # attempt above (each guarded by its own
@@ -5127,11 +4820,6 @@ def _run_conversation_impl(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
-                        if classified.reason == FailoverReason.content_policy_blocked:
-                            _apply_refusal_clean_fork(
-                                agent, messages, api_messages,
-                                current_turn_user_idx,
-                            )
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5738,7 +5426,7 @@ def _run_conversation_impl(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5957,7 +5645,6 @@ def _run_conversation_impl(
                         _retry.has_retried_429 = False
                         agent._fallback_index = 0
                         agent._fallback_activated = False
-                        agent._fallback_reason = None
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
@@ -6308,10 +5995,6 @@ def _run_conversation_impl(
             api_call_count -= 1
             agent.iteration_budget.refund()
             _retry.restart_with_rebuilt_messages = False
-            current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, user_message
-            )
-            agent._persist_user_message_idx = current_turn_user_idx
             continue
 
         if _retry.restart_with_length_continuation:
@@ -7693,7 +7376,6 @@ def _run_conversation_impl(
                 ):
                     messages.pop()
 
-                _verify_gate_started = time.time() if _tt is not None else None
                 try:
                     from agent.verification_stop import (
                         VERIFY_ON_STOP_NUDGE_CAP,
@@ -7758,14 +7440,6 @@ def _run_conversation_impl(
                         agent._interim_content_was_streamed(final_response or "")
                     )
                     final_response = None
-                    if _verify_gate_started is not None:
-                        turn_trace.safe_add_span(
-                            _tt,
-                            "turn.verify_gate",
-                            _verify_gate_started,
-                            time.time(),
-                            nudge_fired=True,
-                        )
                     continue
 
                 # User verification-loop gate: when the agent edited code this
@@ -7824,23 +7498,7 @@ def _run_conversation_impl(
                         agent._interim_content_was_streamed(final_response or "")
                     )
                     final_response = None
-                    if _verify_gate_started is not None:
-                        turn_trace.safe_add_span(
-                            _tt,
-                            "turn.verify_gate",
-                            _verify_gate_started,
-                            time.time(),
-                            nudge_fired=True,
-                        )
                     continue
-
-                if _verify_gate_started is not None:
-                    turn_trace.safe_add_span(
-                        _tt,
-                        "turn.verify_gate",
-                        _verify_gate_started,
-                        time.time(),
-                    )
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
@@ -8075,17 +7733,6 @@ def _run_conversation_impl(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
-    if _tt is not None:
-        if _iter_started is not None:
-            turn_trace.safe_add_span(
-                _tt, "iteration", _iter_started, time.time(), i=_iter_pass
-            )
-        try:
-            _tt._pending_iteration = None
-        except Exception:
-            pass
-        turn_trace.safe_tag(_tt, exit_reason=_turn_exit_reason)
-
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
@@ -8108,90 +7755,6 @@ def _run_conversation_impl(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
-
-
-def run_conversation(
-    agent,
-    user_message: Any,
-    system_message: str = None,
-    conversation_history: List[Dict[str, Any]] = None,
-    task_id: str = None,
-    stream_callback: Optional[callable] = None,
-    persist_user_message: Optional[Any] = None,
-    persist_user_timestamp: Optional[float] = None,
-    persist_user_display_kind: Optional[str] = None,
-    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
-    moa_config: Optional[dict[str, Any]] = None,
-    resume_turn: bool = False,
-    turn_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Run one turn, owning a waterfall trace for direct callers."""
-    trace = turn_trace.safe_get_bound(agent)
-    owner = False
-    if trace is None and turn_trace.safe_enabled():
-        trace = turn_trace.safe_begin(
-            key=getattr(agent, "session_id", None) or None,
-            platform=getattr(agent, "platform", None) or "cli",
-            session_key=getattr(agent, "session_id", None) or "",
-        )
-        owner = trace is not None
-        if owner:
-            turn_trace.safe_bind(agent, trace)
-    elif trace is not None:
-        turn_trace.safe_adopt(trace)
-
-    started = time.time()
-    result = None
-    try:
-        result = _run_conversation_impl(
-            agent,
-            user_message,
-            system_message,
-            conversation_history,
-            task_id,
-            stream_callback,
-            persist_user_message,
-            persist_user_timestamp,
-            persist_user_display_kind,
-            persist_user_display_metadata,
-            moa_config,
-            resume_turn,
-            turn_id,
-        )
-        return result
-    finally:
-        if trace is not None:
-            try:
-                pending = getattr(trace, "_pending_iteration", None)
-                if pending:
-                    turn_trace.safe_add_span(
-                        trace, "iteration", pending[0], time.time(), i=pending[1]
-                    )
-                    trace._pending_iteration = None
-                if "exit_reason" not in trace.tags:
-                    turn_trace.safe_tag(
-                        trace,
-                        exit_reason="exception" if result is None else "early_return",
-                    )
-                tags = {
-                    "model": getattr(agent, "model", ""),
-                    "iterations": getattr(agent, "_api_call_count", 0),
-                    "turn_id": getattr(agent, "_current_turn_id", "") or "",
-                }
-                for key in ("tool_calls", "exit_reason"):
-                    if key in trace.tags:
-                        tags[key] = trace.tags[key]
-                turn_trace.safe_add_span(trace, "turn", started, time.time(), **tags)
-            except Exception:
-                pass
-        if owner:
-            turn_trace.safe_finish(trace)
-            turn_trace.safe_bind(agent, None)
-            turn_trace.safe_adopt(None)
-
-
-# Preserve source/signature inspection behavior for tests and integrations.
-run_conversation.__wrapped__ = _run_conversation_impl
 
 
 __all__ = ["run_conversation"]

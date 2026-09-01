@@ -33,21 +33,12 @@ from concurrent.futures.thread import _worker
 
 __all__ = ["DaemonThreadPoolExecutor"]
 
-# CPython 3.14 reworked ThreadPoolExecutor internals: per-worker state
-# (initializer/initargs) moved into a WorkerContext built by the new
-# ``prepare_context()`` classmethod, and ``_worker`` now takes
-# ``(executor_ref, ctx, work_queue)`` instead of
-# ``(executor_ref, work_queue, initializer, initargs)``.  Without this
-# branch every ``submit()`` on 3.14 dies with ``AttributeError:
-# '_initializer'``.
-_HAS_WORKER_CONTEXT = hasattr(ThreadPoolExecutor, "prepare_context")
-
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.14) with two changes:
+        # Mirrors CPython's implementation (3.8–3.13) with two changes:
         # daemon=True and no _threads_queues registration.
         if self._idle_semaphore.acquire(timeout=0):
             return
@@ -58,27 +49,15 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            if _HAS_WORKER_CONTEXT:
-                # CPython 3.14+ worker signature.  ``_create_worker_context``
-                # is the factory ``prepare_context()`` handed the executor in
-                # ``__init__``.
-                worker_args = (
-                    weakref.ref(self, weakref_cb),
-                    self._create_worker_context(),
-                    self._work_queue,
-                )
-            else:
-                # CPython 3.8–3.13 worker signature.
-                worker_args = (
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(
                     weakref.ref(self, weakref_cb),
                     self._work_queue,
                     self._initializer,
                     self._initargs,
-                )
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=worker_args,
+                ),
                 daemon=True,
             )
             t.start()

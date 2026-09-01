@@ -23,9 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
-import time
 
-from agent import turn_trace
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.background_review_policy import is_successful_review_outcome
 from agent.message_content import flatten_message_text
@@ -93,9 +91,6 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
-
-    _tt = turn_trace.safe_get_bound(agent)
-    _finalize_started = time.time() if _tt is not None else None
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -234,7 +229,6 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    _hooks_started = time.time() if _tt is not None else None
     if final_response and not interrupted:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
@@ -387,36 +381,23 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    with turn_trace.safe_span("finalize.trajectory", trace=_tt):
-        try:
-            agent._save_trajectory(
-                messages, _summarize_user_message_for_log(user_message), completed
-            )
-        except Exception as _save_err:
-            _cleanup_errors.append(f"save_trajectory: {_save_err}")
-            logger.error(
-                "finalize_turn: _save_trajectory failed: %s",
-                _save_err,
-                exc_info=True,
-            )
+    try:
+        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+    except Exception as _save_err:
+        _cleanup_errors.append(f"save_trajectory: {_save_err}")
+        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
-    with turn_trace.safe_span("finalize.resource_cleanup", trace=_tt):
-        try:
-            agent._cleanup_task_resources(effective_task_id)
-        except Exception as _cleanup_err:
-            _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-            logger.error(
-                "finalize_turn: _cleanup_task_resources failed: %s",
-                _cleanup_err,
-                exc_info=True,
-            )
+    try:
+        agent._cleanup_task_resources(effective_task_id)
+    except Exception as _cleanup_err:
+        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
-    _persist_started = time.time() if _tt is not None else None
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -565,10 +546,6 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
-    if _persist_started is not None:
-        turn_trace.safe_add_span(
-            _tt, "finalize.persist", _persist_started, time.time()
-        )
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -801,7 +778,6 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
-        "turn_id": turn_id,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -830,10 +806,6 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
-    if _hooks_started is not None:
-        turn_trace.safe_add_span(
-            _tt, "finalize.post_hooks", _hooks_started, time.time()
-        )
     if kanban_terminal_response:
         result["kanban_terminal"] = True
         result["kanban_terminal_transition"] = getattr(
@@ -902,7 +874,6 @@ def finalize_turn(
     _should_review_memory = bool(_should_review_memory and _review_eligible)
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    _md_started = time.time() if _tt is not None else None
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
         final_response=final_response,
@@ -999,18 +970,6 @@ def finalize_turn(
                 _r5_park_failed()
             except Exception:
                 pass
-    # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW). Pure
-    # O(turn-slice) arithmetic inline; any curator run spawns on a daemon
-    # thread. No-op unless curator.ingest_enabled; fail-open.
-    if final_response and not interrupted:
-        try:
-            from agent.ingest_curator import observe_turn_completed
-            observe_turn_completed(agent, messages)
-        except Exception:
-            logger.debug(
-                "ingest-curator turn observation failed (fail-open)",
-                exc_info=True,
-            )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -1061,14 +1020,5 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
-
-    if _md_started is not None:
-        turn_trace.safe_add_span(
-            _tt, "finalize.memory_dispatch", _md_started, time.time()
-        )
-    if _finalize_started is not None:
-        turn_trace.safe_add_span(
-            _tt, "turn.finalize", _finalize_started, time.time()
-        )
 
     return result

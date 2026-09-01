@@ -631,48 +631,6 @@ def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
 
 
 
-def test_providers_dict_named_provider_preserves_runtime_label_for_session_rehydrate(
-    monkeypatch,
-):
-    """Session override rehydration keeps user provider slugs."""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.setenv("CODEX_NEKOS_API_KEY", "codex-secret")
-    monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {
-            "providers": {
-                "codex-nekos": {
-                    "base_url": "http://10.0.0.113:2455/v1",
-                    "default_model": "gpt-5.5",
-                    "key_env": "CODEX_NEKOS_API_KEY",
-                    "name": "Codex Nekos",
-                    "api_mode": "chat_completions",
-                }
-            }
-        },
-    )
-    monkeypatch.setattr(
-        rp,
-        "resolve_provider",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError(
-                "resolve_provider should not be called for named custom providers"
-            )
-        ),
-    )
-
-    resolved = rp.resolve_runtime_provider(requested="codex-nekos")
-
-    assert resolved["provider"] == "codex-nekos"
-    assert resolved["requested_provider"] == "codex-nekos"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "http://10.0.0.113:2455/v1"
-    assert resolved["api_key"] == "codex-secret"
-    assert resolved["model"] == "gpt-5.5"
-
-
 def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monkeypatch):
     """Named custom providers on one gateway must keep their own credentials and protocol."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

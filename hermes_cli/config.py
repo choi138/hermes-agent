@@ -1327,9 +1327,6 @@ def _normalize_custom_provider_entry(
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
-        # Read directly from raw config.yaml by agent.anthropic_adapter; this
-        # trust flag intentionally does not enter the normalized runtime entry.
-        "anthropic_signature_passthrough",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -2056,15 +2053,6 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
             ))
-
-    # Deferred import avoids config.py <-> model_routes.py import cycles while
-    # still making `hermes doctor` the single validation surface.
-    try:
-        from hermes_cli.model_routes import validate_model_routes
-
-        issues.extend(validate_model_routes(config))
-    except Exception:
-        logger.debug("model_routes config validation failed", exc_info=True)
 
     return issues
 

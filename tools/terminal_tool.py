@@ -1081,9 +1081,7 @@ After starting a server, verify readiness with a health check or log signal, the
 For bounded background work, continue useful work or end the turn and let
 notify_on_complete resume you. Do not loop short poll/wait calls. If the next step
 truly depends on completion, call process(action="wait") once with timeout omitted;
-it uses the configured terminal timeout and still returns immediately on exit. Use
-at most one blocking wait per process; after a timeout, end the turn and rely on
-notify_on_complete instead of chaining waits.
+it uses the configured terminal timeout and still returns immediately on exit.
 Working directory: Use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 

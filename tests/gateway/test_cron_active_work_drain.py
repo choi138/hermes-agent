@@ -89,11 +89,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         sched._running_job_ids.add("job-1")
 
-        monkeypatch.setattr(
-            _pr.process_registry,
-            "kill_all",
-            lambda task_id=None, **kwargs: 1,
-        )
+        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
         monkeypatch.setattr(_tt, "cleanup_all_environments", lambda **_kwargs: None)
         monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
 
@@ -113,60 +109,4 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
-
-    @pytest.mark.asyncio
-    async def test_cron_job_marked_interrupted_even_when_only_durable_survive(self, monkeypatch):
-        """#60432 must not regress when durable background processes exist.
-
-        A durable tool subprocess survives the restart in its own systemd
-        scope, but the cron job's AGENT is a thread inside this gateway
-        process (cron/scheduler.py uses ThreadPoolExecutor) and dies with it.
-        So the run is still interrupted and must never be reported as success,
-        even when ``kill_all`` killed nothing because every live process was
-        durable.
-        """
-        import cron.scheduler as sched
-        import tools.process_registry as _pr
-        import tools.terminal_tool as _tt
-        import tools.browser_tool as _bt
-
-        runner, adapter = make_restart_runner()
-        runner._restart_drain_timeout = 0.01  # force the timeout path
-        adapter.disconnect = _make_async_noop()
-
-        sched._running_job_ids.add("job-durable")
-
-        # Every live process was durable: nothing to kill, one skipped.
-        monkeypatch.setattr(
-            _pr.process_registry,
-            "kill_all",
-            lambda task_id=None, **kwargs: 0,
-        )
-        monkeypatch.setattr(
-            _pr.process_registry,
-            "count_durable_running",
-            lambda: 1,
-        )
-        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
-        monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
-
-        marked_calls = []
-        real_mark = sched.mark_running_jobs_interrupted
-
-        def _spy(reason):
-            result = real_mark(reason)
-            marked_calls.append((reason, result))
-            return result
-
-        monkeypatch.setattr(sched, "mark_running_jobs_interrupted", _spy)
-
-        with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"), \
-             patch("cron.scheduler.mark_job_run"):
-            await runner.stop()
-
-        assert marked_calls, (
-            "in-flight cron job must still be marked interrupted when only "
-            "durable processes survived — its agent thread dies with this process"
-        )
-        assert any(result == ["job-durable"] for _reason, result in marked_calls)
 

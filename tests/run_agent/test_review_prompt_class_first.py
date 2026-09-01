@@ -1,15 +1,14 @@
-"""Behavior tests for the memory / skill / combined review prompts.
+"""Behavior tests for the skill review / combined review prompts.
 
-The review prompts steer the background review agent toward calibrated updates:
+The review prompts require transcript evidence before updating the skill
+library, with a preference for:
   1. Patching currently-loaded skills first,
   2. Patching existing umbrellas next,
   3. Adding references/ files under an existing umbrella,
   4. Creating a new class-level umbrella only when nothing else fits.
 
 User-preference corrections (style, format, verbosity, legibility) are
-first-class skill signals, not just memory signals. Ordinary turns and weak
-signals should produce "Nothing to save." rather than synthetic memory or skill
-churn.
+first-class skill signals, not just memory signals.
 
 These tests assert behavioral *instructions* are present — they do NOT
 snapshot the full prompt text (change-detector).
@@ -35,16 +34,6 @@ def test_skill_review_prompt_requires_evidence_before_updates():
     assert "do not manufacture" in lower, (
         "must reject updates inferred from activity rather than evidence"
     )
-
-
-def test_skill_review_prompt_is_calibrated_not_eager():
-    """Prompt must tell the reviewer to be selective, not manufacture updates."""
-    prompt = AIAgent._SKILL_REVIEW_PROMPT
-    lower = prompt.lower()
-    assert "be selective" in lower or "concrete reusable" in lower
-    assert "do not create work" in lower
-    assert "nothing to save" in lower
-    assert "missed learning opportunity" not in lower
 
 
 def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
@@ -84,23 +73,10 @@ def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
 # ---------------------------------------------------------------------------
 
 def test_combined_review_prompt_has_memory_section():
-    """Memory half must carry the structured always-injected memory contract."""
+    """Memory half must still cover user facts and preferences."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
     assert "**Memory**" in prompt
-    assert "memory(add|replace)" in prompt
-    assert "declared_scope" in prompt
-    assert "declared_category" in prompt
-    assert "why_always_injected" in prompt
-
-
-def test_combined_review_prompt_skills_are_calibrated_not_eager():
-    """Skills half must carry the selective-update calibration."""
-    prompt = AIAgent._COMBINED_REVIEW_PROMPT
-    lower = prompt.lower()
-    assert "**Skills**" in prompt
-    assert "be selective" in lower or "concrete reusable" in lower
-    assert "do not create work" in lower
-    assert "missed learning opportunity" not in lower
+    assert "memory tool" in prompt
 
 
 
@@ -176,26 +152,5 @@ def test_combined_review_prompt_rejects_unresolved_failures():
 
 
 # ---------------------------------------------------------------------------
-# _MEMORY_REVIEW_PROMPT — memory contract
+# _MEMORY_REVIEW_PROMPT — unchanged, still memory-focused
 # ---------------------------------------------------------------------------
-def test_memory_review_prompt_still_focused_on_user_facts():
-    """Memory-only review prompt stays focused on durable user/global facts."""
-    prompt = AIAgent._MEMORY_REVIEW_PROMPT
-    assert "skills_list" not in prompt
-    assert "SURVEY" not in prompt
-    assert "memory" in prompt.lower()
-
-
-def test_memory_review_prompt_requires_structured_reason_contract():
-    """Background memory review must know the foreground rationale gate."""
-    prompt = AIAgent._MEMORY_REVIEW_PROMPT
-    assert "USER.md and MEMORY.md are always-injected" in prompt
-    assert "memory(add|replace)" in prompt
-    assert "declared_scope" in prompt
-    assert "declared_category" in prompt
-    assert "why_always_injected" in prompt
-    assert "why_not_skill" in prompt
-    assert "why_not_graphiti" in prompt
-    assert "applies_to" in prompt
-    assert "ordinary_chat" in prompt
-    assert "Graphiti/session history" in prompt

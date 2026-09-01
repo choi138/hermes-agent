@@ -54,9 +54,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "delegate_task",  # no recursive delegation
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
-        "notes_write",  # no writes to the shared notes tier (ADR-004)
-        "notes_read",  # keeps the memory toolset fully blocked for children
-        "memory_propose",  # no queueing curator proposals in the parent's name
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
     ]
@@ -1582,9 +1579,6 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # Route-resolved reasoning effort. A declared route effort beats the
-    # delegation.reasoning_effort setting for this child only.
-    override_reasoning_effort: Optional[Any] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1809,18 +1803,14 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: route override > delegation config > parent.
+    # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = (
-            override_reasoning_effort
-            if override_reasoning_effort not in (None, "")
-            else delegation_cfg.get("reasoning_effort")
-        )
+        delegation_effort = delegation_cfg.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -3273,13 +3263,7 @@ def _finalize_child_results(
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 
-        from agent.memory_manager import memory_ingest_allowed
-
-        if (
-            parent_agent
-            and getattr(parent_agent, "_memory_manager", None)
-            and memory_ingest_allowed(parent_agent)
-        ):
+        if parent_agent and getattr(parent_agent, "_memory_manager", None):
             for entry in results:
                 try:
                     task_index = entry.get("task_index", -1)
@@ -3406,28 +3390,18 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
-    *,
-    route: Optional[str] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, route, and role)
-      - Batch:  provide tasks array [{goal, context, route, role}, ...]
+      - Single: provide goal (+ optional context and role)
+      - Batch:  provide tasks array [{goal, context, role}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
-
-    The model-facing runtime selector is ``route`` when a model-routes catalog
-    is installed. Precedence is per-task route > top-level route >
-    delegation.default_route. Explicit model/provider overrides remain
-    accepted for programmatic and cached-schema compatibility when no route is
-    selected for that task.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3484,6 +3458,16 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
+    # Resolve delegation credentials (provider:model pair).
+    # When delegation.provider is configured, this resolves the full credential
+    # bundle (base_url, api_key, api_mode) via the same runtime provider system
+    # used by CLI/gateway startup.  When unconfigured, returns None values so
+    # children inherit from the parent.
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3518,77 +3502,6 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
-
-    # Resolve every task's runtime BEFORE creating live logs, reservations, or
-    # child agents. One bad route/provider therefore fails the whole call
-    # without leaving half-built children behind.
-    #
-    # Specific per-task selectors beat top-level selectors. At the same level,
-    # a route beats raw model/provider values. A configured default route is
-    # used only when the caller supplied neither selector, preserving explicit
-    # model/provider compatibility while making route names the advertised
-    # model-facing surface.
-    top_route = str(route or "").strip()
-    top_model = str(model or "").strip()
-    top_provider = str(provider or "").strip()
-    default_route = str(cfg.get("default_route") or "").strip()
-
-    def _selector_text(value: Any) -> str:
-        return str(value or "").strip()
-
-    def _task_runtime_selection(task: Dict[str, Any]) -> tuple:
-        task_route = _selector_text(task.get("route"))
-        if task_route:
-            return ("route", task_route, "")
-
-        has_task_raw = "model" in task or "provider" in task
-        task_model = _selector_text(
-            task.get("model") if "model" in task else model
-        )
-        task_provider = _selector_text(
-            task.get("provider") if "provider" in task else provider
-        )
-        if has_task_raw:
-            return ("explicit", task_model, task_provider)
-        if top_route:
-            return ("route", top_route, "")
-        if top_model or top_provider:
-            return ("explicit", top_model, top_provider)
-        if default_route:
-            return ("route", default_route, "")
-        return ("config", "", "")
-
-    selections = [_task_runtime_selection(task) for task in task_list]
-    route_overrides: Dict[str, tuple] = {}
-    default_creds: Optional[Dict[str, Any]] = None
-    task_runtime_overrides: List[tuple] = []
-    try:
-        for selection, first, second in selections:
-            if selection == "route":
-                route_key = first.casefold()
-                if route_key not in route_overrides:
-                    route_overrides[route_key] = _resolve_route_override(
-                        first, cfg, parent_agent
-                    )
-                task_runtime_overrides.append(route_overrides[route_key])
-            elif selection == "explicit":
-                task_runtime_overrides.append(
-                    (
-                        _resolve_delegation_credentials(
-                            cfg,
-                            parent_agent,
-                            model_override=first,
-                            provider_override=second,
-                        ),
-                        "",
-                    )
-                )
-            else:
-                if default_creds is None:
-                    default_creds = _resolve_delegation_credentials(cfg, parent_agent)
-                task_runtime_overrides.append((default_creds, ""))
-    except ValueError as exc:
-        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -3642,6 +3555,12 @@ def delegate_task(
     _fp_session_id = _fingerprint_text(getattr(parent_agent, "session_id", ""))
     _fp_turn_id = _fingerprint_text(getattr(parent_agent, "_current_turn_id", ""))
     _fp_workspace = _resolve_workspace_identity(parent_agent)
+    _fp_base_url = creds["base_url"] or getattr(parent_agent, "base_url", None)
+    _fp_api_key = creds["api_key"] or getattr(parent_agent, "api_key", None)
+    if not _fp_api_key:
+        _client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+        if isinstance(_client_kwargs, dict):
+            _fp_api_key = _client_kwargs.get("api_key")
     # Base identity -> count of equivalent entries already seen in THIS call.
     # The ordinal preserves explicit same-text N-sample batches, while a
     # concurrent call's first equivalent entry still uses ordinal zero and
@@ -3741,17 +3660,6 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            task_creds, task_effort = task_runtime_overrides[i]
-            task_base_url = task_creds["base_url"] or getattr(
-                parent_agent, "base_url", None
-            )
-            task_api_key = task_creds["api_key"] or getattr(
-                parent_agent, "api_key", None
-            )
-            if not task_api_key:
-                _client_kwargs = getattr(parent_agent, "_client_kwargs", None)
-                if isinstance(_client_kwargs, dict):
-                    task_api_key = _client_kwargs.get("api_key")
             # Claim the fingerprint BEFORE building: a concurrent caller that
             # loses this race must not construct or run a second child.
             identity = _delegation_fingerprint(
@@ -3761,11 +3669,10 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 role=effective_role,
-                provider=task_creds["provider"]
-                or getattr(parent_agent, "provider", None),
-                model=task_creds["model"] or getattr(parent_agent, "model", None),
-                base_url=task_base_url,
-                api_key=task_api_key,
+                provider=creds["provider"] or getattr(parent_agent, "provider", None),
+                model=creds["model"] or getattr(parent_agent, "model", None),
+                base_url=_fp_base_url,
+                api_key=_fp_api_key,
             )
             sibling_ordinal = _sibling_ordinals.get(identity, 0)
             _sibling_ordinals[identity] = sibling_ordinal + 1
@@ -3776,11 +3683,10 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 role=effective_role,
-                provider=task_creds["provider"]
-                or getattr(parent_agent, "provider", None),
-                model=task_creds["model"] or getattr(parent_agent, "model", None),
-                base_url=task_base_url,
-                api_key=task_api_key,
+                provider=creds["provider"] or getattr(parent_agent, "provider", None),
+                model=creds["model"] or getattr(parent_agent, "model", None),
+                base_url=_fp_base_url,
+                api_key=_fp_api_key,
                 sibling_ordinal=sibling_ordinal,
             )
             owner_id = _new_reservation_owner_id()
@@ -3807,19 +3713,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=task_creds["model"],
+                model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=task_creds["provider"],
-                override_base_url=task_creds["base_url"],
-                override_api_key=task_creds["api_key"],
-                override_api_mode=task_creds["api_mode"],
-                override_request_overrides=task_creds.get("request_overrides"),
-                override_max_tokens=task_creds.get("max_output_tokens"),
-                override_acp_command=task_creds.get("command"),
-                override_acp_args=task_creds.get("args"),
-                override_reasoning_effort=task_effort or None,
+                override_provider=creds["provider"],
+                override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"],
+                override_api_mode=creds["api_mode"],
+                override_request_overrides=creds.get("request_overrides"),
+                override_max_tokens=creds.get("max_output_tokens"),
+                override_acp_command=creds.get("command"),
+                override_acp_args=creds.get("args"),
                 role=effective_role,
             )
             # The child now exists — report its id to anyone we suppress.
@@ -4256,18 +4161,6 @@ def delegate_task(
         # in-flight duplicates must not inflate the dispatched count or the
         # async completion block.
         _goals = [_t["goal"] for (_i, _t, _c) in children]
-        _child_models = {
-            str(
-                task_runtime_overrides[_i][0].get("model")
-                or getattr(parent_agent, "model", "")
-                or ""
-            ).strip()
-            for _i, _t, _c in children
-        }
-        _child_models.discard("")
-        _dispatch_model = (
-            next(iter(_child_models)) if len(_child_models) == 1 else None
-        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4275,7 +4168,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=_dispatch_model,
+            model=creds["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4446,13 +4339,7 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(
-    cfg: dict,
-    parent_agent,
-    *,
-    model_override: Optional[str] = None,
-    provider_override: Optional[str] = None,
-) -> dict:
+def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -4468,37 +4355,15 @@ def _resolve_delegation_credentials(
     provider system — the same path used by CLI/gateway startup. This lets
     subagents run on a completely different provider:model pair.
 
-    Explicit model/provider overrides (route-resolved or programmatic) beat
-    ``delegation.model`` / ``delegation.provider``. A provider override also
-    bypasses the static delegation endpoint/key so it cannot hijack a resolved
-    route. If neither base_url nor provider is configured, returns None values
-    so the child inherits everything from the parent agent.
+    If neither base_url nor provider is configured, returns None values so the
+    child inherits everything from the parent agent.
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    override_model = str(model_override or "").strip() or None
-    override_provider = str(provider_override or "").strip() or None
-    has_explicit_override = (
-        override_model is not None or override_provider is not None
-    )
-    configured_model = (
-        override_model
-        if has_explicit_override
-        else str(cfg.get("model") or "").strip() or None
-    )
-    configured_provider = (
-        override_provider or str(cfg.get("provider") or "").strip() or None
-    )
-    configured_base_url = (
-        None
-        if override_provider
-        else str(cfg.get("base_url") or "").strip() or None
-    )
-    configured_api_key = (
-        None
-        if override_provider
-        else str(cfg.get("api_key") or "").strip() or None
-    )
+    configured_model = str(cfg.get("model") or "").strip() or None
+    configured_provider = str(cfg.get("provider") or "").strip() or None
+    configured_base_url = str(cfg.get("base_url") or "").strip() or None
+    configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
@@ -4642,132 +4507,6 @@ def _load_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Model-route delegation (ADR-003 Phase 3a)
-# ---------------------------------------------------------------------------
-
-
-def _load_full_config() -> dict:
-    """Load the active full config for optional model-route resolution.
-
-    ``_load_config`` intentionally returns only ``delegation``. Route lookup
-    also needs top-level ``model_routes`` and ``providers``. Keep the loader
-    preference identical so profile and ``--ignore-user-config`` behavior do
-    not diverge between the two paths.
-    """
-    prefer_legacy = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
-    if not prefer_legacy:
-        try:
-            from hermes_cli.config import load_config_readonly
-
-            full = load_config_readonly()
-            if isinstance(full, dict):
-                return full
-        except Exception:
-            pass
-    try:
-        from cli import CLI_CONFIG
-
-        return CLI_CONFIG if isinstance(CLI_CONFIG, dict) else {}
-    except Exception:
-        return {}
-
-
-def _route_catalog_pairs() -> List[tuple]:
-    """Return declared ``(name, description)`` pairs, or ``[]`` when dormant."""
-    try:
-        from hermes_cli.model_routes import route_catalog_for_schema
-
-        return list(route_catalog_for_schema(_load_full_config()))
-    except Exception:
-        # The module is deliberately absent on runtime-control-only builds.
-        # Dynamic schema construction must stay byte-equivalent to the
-        # route-less surface in that case.
-        logger.debug("delegate_task: route catalog unavailable", exc_info=True)
-        return []
-
-
-def _resolve_route_override(route_name: str, cfg: dict, parent_agent) -> tuple:
-    """Resolve a route to ``(credential bundle, reasoning effort)``.
-
-    The model-routes catalog is optional on this branch. A stale/direct call
-    that supplies ``route`` while it is absent receives a teaching error rather
-    than an import failure or a silent fallback to the configured child model.
-    """
-    name = str(route_name or "").strip()
-    try:
-        from hermes_cli.model_routes import load_routes, resolve_route
-    except Exception as exc:
-        logger.debug("delegate_task: route resolver unavailable", exc_info=True)
-        raise ValueError(
-            "Route-based delegation is unavailable on this build; "
-            f"unknown parameter route={name!r}. Omit 'route' to use an explicit "
-            "model/provider override or delegation.model/delegation.provider."
-        ) from exc
-
-    full_cfg = _load_full_config()
-    try:
-        catalog = load_routes(full_cfg)
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot load the delegation route catalog for route {name!r}: {exc}."
-        ) from exc
-
-    declared = [
-        str(getattr(spec, "name", key) or key).strip()
-        for key, spec in catalog.routes.items()
-    ]
-    declared = [candidate for candidate in declared if candidate]
-    declared_text = ", ".join(declared) or "(none declared)"
-    matched = next(
-        (
-            candidate
-            for candidate in declared
-            if candidate.casefold() == name.casefold()
-        ),
-        None,
-    )
-    if matched is None:
-        raise ValueError(
-            f"Unknown delegation route {name!r}. Declared routes: {declared_text}."
-        )
-
-    try:
-        resolved = resolve_route(matched, full_cfg, catalog=catalog)
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation route {matched!r}: {exc}. "
-            f"Declared routes: {declared_text}."
-        ) from exc
-    if resolved is None:
-        raise ValueError(
-            f"Delegation route {matched!r} has no healthy runtime (its default "
-            "and every fallback failed the provider health check). Declared "
-            f"routes: {declared_text}. Retry with a different route, or omit "
-            "'route' to use an explicit model/provider override."
-        )
-    if not isinstance(resolved, dict):
-        raise ValueError(
-            f"Delegation route {matched!r} returned an invalid runtime. "
-            f"Declared routes: {declared_text}."
-        )
-
-    resolved_model = str(resolved.get("model") or "").strip()
-    resolved_provider = str(resolved.get("provider") or "").strip()
-    if not resolved_model or not resolved_provider:
-        raise ValueError(
-            f"Delegation route {matched!r} resolved to an incomplete runtime. "
-            f"Declared routes: {declared_text}."
-        )
-    creds = _resolve_delegation_credentials(
-        cfg,
-        parent_agent,
-        model_override=resolved_model,
-        provider_override=resolved_provider,
-    )
-    return creds, str(resolved.get("reasoning_effort") or "")
-
-
-# ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
 
@@ -4871,19 +4610,6 @@ def _build_role_param_description() -> str:
     )
 
 
-def _build_route_param_schema(route_pairs: List[tuple]) -> dict:
-    """Build the config-derived route enum shown to the model."""
-    catalog_lines = "\n".join(
-        f"{name}: {description}" if description else str(name)
-        for name, description in route_pairs
-    )
-    return {
-        "type": "string",
-        "enum": [name for name, _description in route_pairs],
-        "description": "Delegation runtime route. " + catalog_lines,
-    }
-
-
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -4901,34 +4627,8 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
-    description = _build_top_level_description()
-    route_pairs = _route_catalog_pairs()
-    if route_pairs:
-        route_schema = _build_route_param_schema(route_pairs)
-        overrides_params["properties"]["route"] = route_schema
-
-        # ``tasks.items`` is shared by the shallow property copy above. Copy
-        # both levels before injection so DELEGATE_TASK_SCHEMA stays immutable
-        # across repeated per-turn schema builds.
-        tasks_property = overrides_params["properties"]["tasks"]
-        task_items = dict(tasks_property["items"])
-        task_items["properties"] = dict(task_items["properties"])
-        task_items["properties"]["route"] = {
-            **route_schema,
-            "description": (
-                "Per-task route override; wins over the top-level 'route'. "
-                "See the top-level route parameter for the catalog."
-            ),
-        }
-        tasks_property["items"] = task_items
-        description += (
-            "\n- This install declares delegation routes. Pass 'route' at the "
-            "top level, or per task in tasks[], to select a purpose-specific "
-            "provider/model; a per-task route wins."
-        )
-
     return {
-        "description": description,
+        "description": _build_top_level_description(),
         "parameters": overrides_params,
     }
 
@@ -5068,9 +4768,6 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
-        route=args.get("route"),
-        model=args.get("model"),
-        provider=args.get("provider"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

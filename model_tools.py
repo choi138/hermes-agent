@@ -336,7 +336,7 @@ def get_tool_definitions(
 
     Args:
         enabled_toolsets: Only include tools from these toolsets.
-        disabled_toolsets: Exclude tools named directly or belonging to these toolsets.
+        disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
         skip_tool_search_assembly: When True, return the pre-assembly tool list
             (raw schemas for every enabled tool). Used internally by the
@@ -456,7 +456,6 @@ def _compute_tool_definitions(
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
-    individual_tool_denies: set[str] = set()
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
@@ -493,24 +492,15 @@ def _compute_tool_definitions(
                 tools_to_include.difference_update(legacy_tools)
                 if not quiet_mode:
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
-            elif registry.get_entry(toolset_name) is not None:
-                # Toolset names take precedence above. Otherwise, a registered
-                # tool name is an exact one-tool subtraction from the resolved
-                # surface, including catalogs rebuilt by the tool-search bridge.
-                individual_tool_denies.add(toolset_name)
-                tools_to_include.discard(toolset_name)
-                if not quiet_mode:
-                    print(f"🚫 Disabled tool '{toolset_name}'")
             elif not quiet_mode:
-                print(f"⚠️  Unknown toolset or tool: {toolset_name}")
+                print(f"⚠️  Unknown toolset: {toolset_name}")
 
     if os.environ.get("HERMES_KANBAN_TASK"):
         # Task workers inherit the assignee profile's normal tools, but their
         # Kanban authority is always the task-scoped lifecycle surface. Apply
         # this after enabled/disabled resolution so a profile-level `kanban`,
-        # `kanban_submit`, composite toolset, or toolset deny cannot either
-        # restore orchestrator/intake tools or strip completion handoff. Exact
-        # individual-tool denies are reapplied below as the final user veto.
+        # `kanban_submit`, composite toolset, or explicit deny cannot either
+        # restore orchestrator/intake tools or strip completion handoff.
         worker_tools = set(resolve_toolset("kanban_worker"))
         non_worker_kanban_tools = (
             set(resolve_toolset("kanban"))
@@ -518,11 +508,6 @@ def _compute_tool_definitions(
         ) - worker_tools
         tools_to_include.difference_update(non_worker_kanban_tools)
         tools_to_include.update(worker_tools)
-
-    # Session-specific augmentation must never resurrect an exact tool name
-    # that the user explicitly disabled. Whole-toolset behavior stays unchanged:
-    # bundle-level Kanban denies still preserve the worker lifecycle surface.
-    tools_to_include.difference_update(individual_tool_denies)
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
@@ -727,14 +712,7 @@ def _resolve_active_context_length() -> int:
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {
-    "todo",
-    "memory",
-    "session_search",
-    "delegate_task",
-    "model_status",
-    "model_switch",
-}
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -1212,8 +1190,8 @@ def handle_function_call(
                        tools the session was actually granted.  ``None`` means
                        "no restriction" (the caller scopes to every toolset),
                        matching ``get_tool_definitions`` semantics.
-        disabled_toolsets: The session's disabled toolsets or individual tools,
-                       applied as a subtraction when scoping the bridge catalog.
+        disabled_toolsets: The session's disabled toolsets, applied as a
+                       subtraction when scoping the bridge catalog.
 
     Returns:
         Function result as a JSON string.

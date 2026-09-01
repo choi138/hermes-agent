@@ -99,21 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {
-        "model_status",
-        "model_switch",
-        "todo",
-        "session_search",
-        "memory",
-        "notes_write",
-        "notes_read",
-        "memory_propose",
-        "curator_verdict",
-        "clarify",
-        "read_terminal",
-        "read_preview",
-        "delegate_task",
-    }
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "delegate_task"}
 )
 
 
@@ -1742,7 +1728,6 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
-        agent._fallback_reason = None
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -1759,15 +1744,6 @@ def restore_primary_runtime(agent) -> bool:
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
         )
-        # Publish the restore on the runtime_state hook so guardrail plugins
-        # (skill-gate) drop the fallback_reason from their cache when the
-        # primary returns.  Best-effort — restore must not fail on a hook.
-        try:
-            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
-
-            _emit_runtime_state_event(agent, event="restore", state=get_runtime_state(agent))
-        except Exception as _hook_err:
-            logger.debug("runtime_state restore event failed: %s", _hook_err)
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
@@ -2888,7 +2864,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # ── Reset fallback state ──
     agent._fallback_activated = False
     agent._fallback_index = 0
-    agent._fallback_reason = None
 
     # When the user deliberately swaps primary providers (e.g. openrouter
     # → anthropic), drop any fallback entries that target the OLD primary
@@ -3038,20 +3013,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
-    if function_name == "model_status":
-        def _execute(next_args: dict) -> Any:
-            from agent.runtime_control import model_status as _model_status
-
-            return _finish_agent_tool(_model_status(agent), next_args)
-    elif function_name == "model_switch":
-        def _execute(next_args: dict) -> Any:
-            from agent.runtime_control import dispatch_model_switch
-
-            return _finish_agent_tool(
-                dispatch_model_switch(agent, next_args),
-                next_args,
-            )
-    elif function_name == "todo":
+    if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
             return _finish_agent_tool(
@@ -3094,16 +3056,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 content=next_args.get("content"),
                 old_text=next_args.get("old_text"),
                 operations=operations,
-                reason=next_args.get("reason", ""),
                 store=agent._memory_store,
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
-            # (MemoryManager.notify_memory_tool_write). Skipped for
-            # ingest-disabled forks (ADR-004 Phase 0) — their built-in
-            # MEMORY.md writes must not fan out to the external graph.
-            from agent.memory_manager import memory_ingest_allowed
-            if agent._memory_manager and memory_ingest_allowed(agent):
+            # (MemoryManager.notify_memory_tool_write).
+            if agent._memory_manager:
                 agent._memory_manager.notify_memory_tool_write(
                     result,
                     next_args,
@@ -3113,64 +3071,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
-    elif function_name == "notes_write":
-        # Notes tier (ADR-004 Phase 1) — agent-state resolution (session id,
-        # ingest-allowed MemoryManager for the flag-gated backfill) lives in
-        # tools.notes_tool.dispatch_notes_tool_for_agent, shared with the
-        # sequential path.
-        def _execute(next_args: dict) -> Any:
-            from tools.notes_tool import dispatch_notes_tool_for_agent
-            return _finish_agent_tool(
-                dispatch_notes_tool_for_agent(agent, "notes_write", next_args),
-                next_args,
-            )
-    elif function_name == "notes_read":
-        def _execute(next_args: dict) -> Any:
-            from tools.notes_tool import dispatch_notes_tool_for_agent
-            return _finish_agent_tool(
-                dispatch_notes_tool_for_agent(agent, "notes_read", next_args),
-                next_args,
-            )
-    elif function_name == "memory_propose":
-        def _execute(next_args: dict) -> Any:
-            from tools.notes_tool import dispatch_notes_tool_for_agent
-            return _finish_agent_tool(
-                dispatch_notes_tool_for_agent(agent, "memory_propose", next_args),
-                next_args,
-            )
-    elif function_name == "curator_verdict":
-        # Ingest-curator verdict submission (ADR-004 Phase 2) — agent-scoped:
-        # only a curator fork carries the verdict sink; other agents are
-        # refused inside the handler.
-        def _execute(next_args: dict) -> Any:
-            from agent.ingest_curator import dispatch_curator_verdict_for_agent
-            return _finish_agent_tool(
-                dispatch_curator_verdict_for_agent(agent, next_args),
-                next_args,
-            )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
-            result = agent._memory_manager.handle_tool_call(function_name, next_args)
-            # ADR-004 §① origin-taint (Phase 2): mirror of the sequential
-            # registration site in tool_executor — memory-provider results
-            # returned via THIS dispatch path must land in the injected-span
-            # registry too, or one _PARALLEL_SAFE_TOOLS allowlist edit would
-            # silently reopen the echo-chamber bypass. Gated on
-            # memory_ingest_allowed for the same fork-isolation reason
-            # (shared live session registry). Fail-open, never raises.
-            if result:
-                try:
-                    from agent.memory_manager import memory_ingest_allowed
-                    if memory_ingest_allowed(agent):
-                        from agent import memory_taint
-                        memory_taint.record_injected_tool_result(
-                            getattr(agent, "session_id", "") or "",
-                            str(result),
-                            source=function_name,
-                        )
-                except Exception:
-                    pass
-            return _finish_agent_tool(result, next_args)
+            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool

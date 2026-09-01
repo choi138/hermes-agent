@@ -23,7 +23,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from agent import turn_trace
 from agent.display import (
     KawaiiSpinner,
     build_tool_preview as _build_tool_preview,
@@ -46,7 +45,6 @@ from tools.terminal_tool import (
     get_active_env,
 )
 from tools.thread_context import propagate_context_to_thread
-from tools.perf_advisor import perf_advisory
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -825,12 +823,6 @@ def _begin_tool_execution(
             pass
 
 
-def _dispatch_notes_tool(agent, function_name: str, args: dict) -> str:
-    """Dispatch a notes-tier tool with agent-level state (ADR-004 Phase 1)."""
-    from tools.notes_tool import dispatch_notes_tool_for_agent
-    return dispatch_notes_tool_for_agent(agent, function_name, args)
-
-
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> bool:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1048,8 +1040,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     agent._current_tool = tool_names_str
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
-    _tt_batch = turn_trace.safe_get_bound(agent)
-
     def _run_tool(
         index,
         tool_call,
@@ -1179,15 +1169,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     False,
                     middleware_trace,
                 )
-                turn_trace.safe_add_span(
-                    _tt_batch,
-                    "tools.call",
-                    start,
-                    time.time(),
-                    tool=function_name,
-                    execute_ms=round(duration * 1000.0, 1),
-                    error="cancelled",
-                )
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
@@ -1217,15 +1198,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 is_error,
                 blocked,
                 middleware_trace,
-            )
-            turn_trace.safe_add_span(
-                _tt_batch,
-                "tools.call",
-                start,
-                time.time(),
-                tool=function_name,
-                execute_ms=round(duration * 1000.0, 1),
-                **({"error": "tool_failed"} if is_error else {}),
             )
         finally:
             # Teardown advance: keep the counter moving for any later-ordered
@@ -1626,13 +1598,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             else:
                 function_result += subdir_hints
 
-        perf_hint = perf_advisory(name, args, tool_duration)
-        if perf_hint:
-            if _is_multimodal_tool_result(function_result):
-                _append_subdir_hint_to_multimodal(function_result, perf_hint)
-            elif isinstance(function_result, str):
-                function_result += perf_hint
-
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
         # rather than a raw Python dict.  The Anthropic adapter already
@@ -1763,7 +1728,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
-    _tt = turn_trace.safe_get_bound(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if _tool_persistence_failed(agent):
             _append_persistence_failed_tool_results(
@@ -1809,7 +1773,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
         function_name = tool_call.function.name
-        _call_started = time.time() if _tt is not None else None
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -1882,48 +1845,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_blocked = False
         _execution_dispatched = False
 
-        _ckpt_started = time.time() if _tt is not None else None
         tool_start_time = time.time()
 
-        if function_name == "model_status":
-            def _execute(next_args: dict) -> Any:
-                from agent.runtime_control import model_status as _model_status
-
-                return _model_status(agent)
-
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
-        elif function_name == "model_switch":
-            def _execute(next_args: dict) -> Any:
-                from agent.runtime_control import dispatch_model_switch
-
-                return dispatch_model_switch(agent, next_args)
-
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
-        elif function_name == "todo":
+        if function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(
@@ -1986,16 +1910,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     content=next_args.get("content"),
                     old_text=next_args.get("old_text"),
                     operations=operations,
-                    reason=next_args.get("reason", ""),
                     store=agent._memory_store,
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager
-                # interface (MemoryManager.notify_memory_tool_write). Skipped
-                # for ingest-disabled forks (ADR-004 Phase 0) — their built-in
-                # MEMORY.md writes must not fan out to the external graph.
-                from agent.memory_manager import memory_ingest_allowed
-                if agent._memory_manager and memory_ingest_allowed(agent):
+                # interface (MemoryManager.notify_memory_tool_write).
+                if agent._memory_manager:
                     agent._memory_manager.notify_memory_tool_write(
                         result,
                         next_args,
@@ -2018,79 +1938,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
-        elif function_name == "notes_write":
-            # Notes tier (ADR-004 Phase 1) — dispatched inline (like `memory`)
-            # so the handler gets the session id and, for the flag-gated
-            # notes→graph backfill, this agent's MemoryManager (withheld from
-            # ingest-disabled forks for the same reason built-in memory writes
-            # don't fan out there, Phase 0).
-            def _execute(next_args: dict) -> Any:
-                return _dispatch_notes_tool(agent, "notes_write", next_args)
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
-        elif function_name == "notes_read":
-            def _execute(next_args: dict) -> Any:
-                return _dispatch_notes_tool(agent, "notes_read", next_args)
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
-        elif function_name == "memory_propose":
-            def _execute(next_args: dict) -> Any:
-                return _dispatch_notes_tool(agent, "memory_propose", next_args)
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
-        elif function_name == "curator_verdict":
-            # Ingest-curator verdict submission (ADR-004 Phase 2). Dispatched
-            # inline because it is agent-scoped: only a curator fork carries
-            # the verdict sink; every other agent is refused by the handler.
-            def _execute(next_args: dict) -> Any:
-                from agent.ingest_curator import dispatch_curator_verdict_for_agent
-                return dispatch_curator_verdict_for_agent(agent, next_args)
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                execute=_execute,
-                scope_block=_ts_scope_block,
-                display_index=i,
-            ))
-            tool_duration = time.time() - tool_start_time
-            if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif function_name == "clarify":
             def _execute(next_args: dict) -> Any:
                 from tools.clarify_tool import clarify_tool as _clarify_tool
@@ -2256,30 +2103,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     display_index=i,
                 ))
                 _mem_result = function_result
-                # ADR-004 §① origin-taint (Phase 2): memory-provider tool
-                # results (memory_search etc.) hand memory-derived text back
-                # to the agent — register them in the session's injected-span
-                # registry so assistant paraphrases are taint-tagged at WAL
-                # time. Gated on memory_ingest_allowed: an ingest-disabled
-                # fork (curator/background review) shares the parent's LIVE
-                # session_id, so its whitelisted reads must not mutate the
-                # shared registry — the shadow observer's reads would change
-                # live confirm-time admission outcomes. The fork's own spans
-                # are never journaled (sync_all is gated on the same flag),
-                # so skipping registration loses no taint coverage.
-                # Fail-open, never raises.
-                if _mem_result:
-                    try:
-                        from agent.memory_manager import memory_ingest_allowed
-                        if memory_ingest_allowed(agent):
-                            from agent import memory_taint
-                            memory_taint.record_injected_tool_result(
-                                getattr(agent, "session_id", "") or "",
-                                str(_mem_result),
-                                source=function_name,
-                            )
-                    except Exception:
-                        pass
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -2551,13 +2374,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             else:
                 function_result += subdir_hints
 
-        perf_hint = perf_advisory(function_name, function_args, tool_duration)
-        if perf_hint:
-            if _is_multimodal_tool_result(function_result):
-                _append_subdir_hint_to_multimodal(function_result, perf_hint)
-            elif isinstance(function_result, str):
-                function_result += perf_hint
-
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
@@ -2569,18 +2385,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
-        _flush_started = time.time() if _tt is not None else None
         if not _flush_session_db_after_tool_progress(
             agent,
             messages,
             stage=f"tool result {function_name}",
         ):
             return
-        _flush_ms = (
-            round((time.time() - _flush_started) * 1000.0, 1)
-            if _flush_started is not None
-            else None
-        )
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
@@ -2625,20 +2435,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
-
-        if _call_started is not None:
-            turn_trace.safe_add_span(
-                _tt,
-                "tools.call",
-                _call_started,
-                time.time(),
-                tool=function_name,
-                checkpoint_ms=round(
-                    (tool_start_time - _ckpt_started) * 1000.0, 1
-                ),
-                execute_ms=round(tool_duration * 1000.0, 1),
-                flush_ms=_flush_ms,
-            )
 
         terminal_marker = raw_terminal_marker
         if terminal_marker is not None:

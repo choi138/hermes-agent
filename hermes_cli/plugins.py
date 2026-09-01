@@ -157,9 +157,6 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
-    # Effective runtime/model state notifications emitted by core runtime
-    # control seams. Payloads are secret-free telemetry snapshots.
-    "runtime_state",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",

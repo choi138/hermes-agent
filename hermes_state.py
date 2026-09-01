@@ -27,7 +27,6 @@ import sqlite3
 import sys
 import threading
 import time
-import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -2117,24 +2116,6 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
-def _db_maintenance_loop(
-    db_ref: "weakref.ReferenceType[SessionDB]",
-    stop_event: threading.Event,
-    interval: float,
-) -> None:
-    """Drive checkpoint/FTS maintenance without retaining the SessionDB."""
-    while not stop_event.wait(interval):
-        db = db_ref()
-        if db is None:
-            return
-        try:
-            db._db_maintenance_tick()
-        except Exception:
-            logger.debug("db maintenance tick failed", exc_info=True)
-        finally:
-            del db
-
-
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -2302,10 +2283,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = False
         self._token_writer_busy = False
-        self._last_checkpoint_write_count = 0
-        self._last_fts_merge_write_count = 0
-        self._maint_stop = threading.Event()
-        self._maint_thread: Optional[threading.Thread] = None
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -2481,8 +2458,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise
                 _connect_and_init_with_lock_patience()
 
-            self._start_db_maintenance_thread()
-
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
             # v22 inline FTS untouched here; only the explicit foreground
@@ -2505,38 +2480,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
-
-    # ── Background DB maintenance ──
-
-    _MAINT_INTERVAL_S = 5.0
-
-    def _start_db_maintenance_thread(self) -> None:
-        if self.read_only or self._maint_thread is not None:
-            return
-        thread = threading.Thread(
-            target=_db_maintenance_loop,
-            args=(weakref.ref(self), self._maint_stop, self._MAINT_INTERVAL_S),
-            name="session-db-maintenance",
-            daemon=True,
-        )
-        self._maint_thread = thread
-        thread.start()
-
-    def _db_maintenance_tick(self) -> None:
-        """Run due maintenance outside the caller's write transaction."""
-        write_count = self._write_count
-        if (
-            write_count - self._last_checkpoint_write_count
-            >= self._CHECKPOINT_EVERY_N_WRITES
-        ):
-            self._last_checkpoint_write_count = write_count
-            self._try_wal_checkpoint()
-        if (
-            write_count - self._last_fts_merge_write_count
-            >= self._FTS_MERGE_EVERY_N_WRITES
-        ):
-            self._last_fts_merge_write_count = write_count
-            self._try_incremental_merge_fts()
 
     # ── Read-path split ──
 
@@ -3026,9 +2969,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except Exception:
                             pass
                         raise
-                # Maintenance is driven by the dedicated DB thread; the write
-                # hot path only advances the cadence counter.
+                # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
+                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                    self._try_wal_checkpoint()
+                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                    self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor
@@ -3225,10 +3171,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         checkpoint so exiting writer processes help shrink the WAL file.
         Read-only connections never request a checkpoint.
         """
-        self._maint_stop.set()
-        maint = self._maint_thread
-        if maint is not None and maint.is_alive():
-            maint.join(timeout=2.0)
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
         # method); without unregistering, every closed SessionDB stays
@@ -7428,46 +7370,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def deactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
-        """Hide the listed active message rows without deleting or archiving them.
-
-        This is a narrow, reversible mask.  In particular, it deliberately
-        leaves ``compacted`` untouched so refusal masking keeps the same
-        ``active=0, compacted=0`` meaning as rewind/undo rather than becoming a
-        compaction archive.  Returns the number of rows flipped.
-        """
-        if not message_ids:
-            return 0
-        ids = [int(message_id) for message_id in message_ids]
-        placeholders = ", ".join("?" for _ in ids)
-
-        def _do(conn):
-            cursor = conn.execute(
-                f"UPDATE messages SET active = 0 WHERE session_id = ? "
-                f"AND id IN ({placeholders}) AND active = 1",
-                (session_id, *ids),
-            )
-            return cursor.rowcount
-
-        return int(self._execute_write(_do) or 0)
-
-    def reactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
-        """Reverse :meth:`deactivate_messages` for the explicitly listed rows."""
-        if not message_ids:
-            return 0
-        ids = [int(message_id) for message_id in message_ids]
-        placeholders = ", ".join("?" for _ in ids)
-
-        def _do(conn):
-            cursor = conn.execute(
-                f"UPDATE messages SET active = 1 WHERE session_id = ? "
-                f"AND id IN ({placeholders}) AND active = 0",
-                (session_id, *ids),
-            )
-            return cursor.rowcount
-
-        return int(self._execute_write(_do) or 0)
-
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
 
@@ -7809,44 +7711,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 current = child_id
 
             return best if best is not None else session_id
-
-    def get_recent_dialogue_messages(
-        self,
-        session_id: str,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        """Load the newest user/assistant rows with a query-level limit.
-
-        This is the lightweight context path for classifiers that need only a
-        small dialogue tail. Rows are selected newest-first so SQLite can stop
-        at ``limit``, then restored to insertion order for prompt construction.
-        """
-        try:
-            bounded_limit = int(limit)
-        except (TypeError, ValueError):
-            return []
-        if bounded_limit <= 0:
-            return []
-
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT id, role, content FROM ("
-                "SELECT id, role, content FROM messages "
-                "WHERE session_id = ? AND active = 1 "
-                "AND role IN ('user', 'assistant') "
-                "ORDER BY id DESC LIMIT ?"
-                ") ORDER BY id",
-                (session_id, bounded_limit),
-            ).fetchall()
-
-        messages: List[Dict[str, Any]] = []
-        for row in rows:
-            content = self._decode_content(row["content"])
-            if isinstance(content, str):
-                content = sanitize_context(content).strip()
-            messages.append({"role": row["role"], "content": content})
-        messages = _strip_background_review_harness(messages)
-        return _strip_stale_tool_call_markers(messages)
 
     def get_messages_as_conversation(
         self,

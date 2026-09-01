@@ -423,16 +423,10 @@ class TestHTTP413Compression:
         assert result["completed"] is True
         assert len(request_payloads) == 2
         assert len(request_payloads[1]["messages"]) < len(request_payloads[0]["messages"])
-        # Runtime-route-awareness composes the rebuilt system message through
-        # compose_effective_system_prompt, which appends live API-call-time
-        # runtime state after the compressed cached prompt body.
-        compressed_system = request_payloads[1]["messages"][0]
-        assert compressed_system["role"] == "system"
-        assert compressed_system["content"].startswith(
-            "compressed prompt\n\n# Runtime/Route State"
-        )
-        runtime_extra = compressed_system["content"][len("compressed prompt") :]
-        assert "\nCurrentRuntime:" in runtime_extra
+        assert request_payloads[1]["messages"][0] == {
+            "role": "system",
+            "content": "compressed prompt",
+        }
         assert request_payloads[1]["messages"][1] == {
             "role": "user",
             "content": "compressed summary",

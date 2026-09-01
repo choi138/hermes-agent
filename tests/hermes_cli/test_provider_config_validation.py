@@ -50,23 +50,8 @@ class TestNormalizeCustomProviderEntry:
         ]
         assert len(unknown_warnings) == 1
 
-    def test_anthropic_signature_passthrough_is_a_known_provider_key(self, caplog):
-        entry = {
-            "base_url": "https://claude.nekos.me",
-            "anthropic_signature_passthrough": True,
-        }
 
-        with caplog.at_level(logging.WARNING):
-            normalized = _normalize_custom_provider_entry(
-                entry,
-                provider_key="claude-nekos",
-            )
 
-        assert normalized is not None
-        assert not any(
-            "unknown config keys" in record.message.lower()
-            for record in caplog.records
-        )
 
     def test_env_var_placeholder_in_base_url_not_rejected(self):
         """A base_url that is an un-expanded ${ENV_VAR} placeholder must not be
@@ -81,4 +66,5 @@ class TestNormalizeCustomProviderEntry:
         result = _normalize_custom_provider_entry(entry, provider_key="PROVIDER_A")
         assert result is not None
         assert result["base_url"] == "${PROVIDER_A_BASE_URL}"
+
 

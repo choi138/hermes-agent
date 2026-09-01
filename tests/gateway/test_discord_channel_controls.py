@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from gateway.config import HomeChannel, Platform, PlatformConfig
+from gateway.config import PlatformConfig
 
 
 def _ensure_discord_mock():
@@ -77,7 +77,6 @@ class FakeThread:
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
-    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
 
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = DiscordAdapter(config)
@@ -178,55 +177,6 @@ async def test_no_thread_channel_skips_auto_thread(adapter, monkeypatch):
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "group"
-
-
-@pytest.mark.asyncio
-async def test_home_channel_is_free_response_but_still_auto_threads(adapter, monkeypatch):
-    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
-    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
-    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
-    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
-    adapter.config.home_channel = HomeChannel(
-        platform=Platform.DISCORD,
-        chat_id="1497151051676123237",
-        name="Home",
-    )
-    adapter._auto_create_thread = AsyncMock(
-        return_value=FakeThread(channel_id=999, name="home-thread")
-    )
-
-    message = make_message(
-        channel=FakeTextChannel(channel_id=1497151051676123237),
-        content="home message without mention",
-    )
-    await adapter._handle_message(message)
-
-    adapter._auto_create_thread.assert_awaited_once()
-    assert adapter.handle_message.await_args.args[0].source.chat_type == "thread"
-
-
-@pytest.mark.asyncio
-async def test_home_channel_auto_thread_can_be_disabled(adapter, monkeypatch):
-    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
-    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
-    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
-    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
-    adapter.config.home_channel = HomeChannel(
-        platform=Platform.DISCORD,
-        chat_id="1497151051676123237",
-        name="Home",
-        auto_thread=False,
-    )
-    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
-
-    message = make_message(
-        channel=FakeTextChannel(channel_id=1497151051676123237),
-        content="home message without mention",
-    )
-    await adapter._handle_message(message)
-
-    adapter._auto_create_thread.assert_not_awaited()
-    assert adapter.handle_message.await_args.args[0].source.chat_type == "group"
 
 
 # ── auto-thread failure must not silently fall back to inline (#20243) ──

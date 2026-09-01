@@ -9,7 +9,6 @@ from agent.display import (
     build_tool_preview,
     capture_local_edit_snapshot,
     extract_edit_diff,
-    format_todo_result_for_progress,
     get_cute_tool_message,
     prepare_tool_preview,
     redact_tool_args_for_display,
@@ -144,51 +143,6 @@ class TestPrepareToolPreview:
 
         assert preview.truncated is True
         assert preview.url is None
-
-
-class TestFormatTodoResultForProgress:
-    def test_formats_summary_and_status_lines(self):
-        result = json.dumps({
-            "todos": [
-                {"content": "Inspect gateway todo progress", "status": "in_progress"},
-                {"content": "Add formatter tests", "status": "pending"},
-                {"content": "Verify focused suite", "status": "completed"},
-                {"content": "Discard stale approach", "status": "cancelled"},
-            ],
-            "summary": {"total": 4, "pending": 1, "in_progress": 1,
-                        "completed": 1, "cancelled": 1},
-        })
-        line = format_todo_result_for_progress(result)
-        assert line.startswith("📋 tasks: 4 total")
-        assert "1 doing" in line and "1 todo" in line
-        assert "1 done" in line and "1 cancelled" in line
-        assert "▸ doing" in line and "○ todo" in line
-        assert "✓ done" in line and "✕ cancelled" in line
-
-    def test_returns_none_for_non_todo_json(self):
-        assert format_todo_result_for_progress('{"ok": true}') is None
-        assert format_todo_result_for_progress("not json") is None
-
-    def test_truncates_long_lists(self):
-        result = json.dumps({
-            "todos": [
-                {"content": f"Task {i}", "status": "pending"}
-                for i in range(3)
-            ],
-            "summary": {"total": 3, "pending": 3},
-        })
-        line = format_todo_result_for_progress(result, max_items=2)
-        assert "Task 0" in line and "Task 1" in line
-        assert "Task 2" not in line and "… +1 more" in line
-
-    def test_escapes_task_code_fences_inside_markdown_block(self):
-        result = json.dumps({
-            "todos": [{"content": "Do not break ``` fences", "status": "pending"}],
-            "summary": {"total": "bad", "pending": 1},
-        })
-        line = format_todo_result_for_progress(result)
-        assert line.count("```") == 2
-        assert "`\u200b`` fences" in line
 
 
 class TestCuteToolMessagePreviewLength:

@@ -639,58 +639,30 @@ def _pre_v2_shadow_repos(base: Path) -> List[Dict]:
 
 
 def _dir_file_count(path: str) -> int:
-    """Quick file count estimate (stops early if over _MAX_FILES).
-
-    os.scandir instead of Path.rglob: this runs on worker threads inside the
-    gateway process, and rglob's per-entry Path materialization over a large
-    tree (node_modules and friends) burns GIL time the event loop needs
-    (2026-08-05 loop-stall incident, 2 threads mid-walk). Semantics are
-    unchanged: every entry counts, directory symlinks are not followed.
-    """
+    """Quick file count estimate (stops early if over _MAX_FILES)."""
     count = 0
-    stack = [path]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    count += 1
-                    if count > _MAX_FILES:
-                        return count
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                    except OSError:
-                        continue
-        except (PermissionError, OSError):
-            continue
+    try:
+        for _ in Path(path).rglob("*"):
+            count += 1
+            if count > _MAX_FILES:
+                return count
+    except (PermissionError, OSError):
+        pass
     return count
 
 
 def _dir_size_bytes(path: Path) -> int:
-    """Best-effort recursive size in bytes.  Returns 0 on error.
-
-    os.scandir for the same reason as ``_dir_file_count``. ``entry.is_file()``
-    follows symlinks (matching rglob + ``Path.is_file``) while recursion
-    deliberately does not, so symlinked files are still sized once and
-    directory symlink loops stay impossible.
-    """
+    """Best-effort recursive size in bytes.  Returns 0 on error."""
     total = 0
-    stack = [str(path)]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_file():
-                            total += entry.stat().st_size
-                        elif entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                    except OSError:
-                        continue
-        except OSError:
-            continue
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
     return total
 
 

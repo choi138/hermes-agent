@@ -66,15 +66,6 @@ MEMORY_BLOCK_HEADERS = {
 
 ENTRY_DELIMITER = "\n§\n"
 
-# Code-default char caps for MEMORY.md / USER.md. Config
-# (``memory.memory_char_limit`` / ``memory.user_char_limit``) is the single
-# source of truth; these constants exist ONLY as the fallback when config is
-# absent and must be imported everywhere a default is needed — never re-typed
-# as a literal (ADR-004 Phase 0 unified the drifted 2200/1375 literals against
-# the deployed 2750/2750 config).
-DEFAULT_MEMORY_CHAR_LIMIT = 2750
-DEFAULT_USER_CHAR_LIMIT = 2750
-
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -171,11 +162,7 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(
-        self,
-        memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
-        user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
-    ):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -902,8 +889,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = DEFAULT_MEMORY_CHAR_LIMIT
-    user_char_limit = DEFAULT_USER_CHAR_LIMIT
+    memory_char_limit = 2200
+    user_char_limit = 1375
     try:
         from hermes_cli.config import load_config
 
@@ -1063,7 +1050,6 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
-    reason: str = "",
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -1073,11 +1059,6 @@ def memory_tool(
       - Single op: action + (content / old_text).
       - Batch:     operations=[{action, content?, old_text?}, ...] applied
                    atomically against the final char budget in ONE call.
-
-    ``reason`` is a suitability guardrail required for 'add'/'replace': the
-    caller must say why USER/MEMORY is the right store rather than a skill,
-    Graphiti, or session history. It is validated at this boundary only and is
-    deliberately NOT persisted with the entry.
 
     Returns JSON string with results.
     """
@@ -1097,10 +1078,6 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        if any(op.get("action") in {"add", "replace"} for op in operations if isinstance(op, dict)):
-            reason_error = _validate_memory_write_reason(reason)
-            if reason_error:
-                return tool_error(reason_error, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1124,15 +1101,6 @@ def memory_tool(
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
 
-    # Suitability guardrail for durable writes. Checked here — after the
-    # required-param validation (so the more actionable missing-field error
-    # still wins) and BEFORE the gate, for the same reason the params are:
-    # a write that will be refused must not be staged for approval first.
-    if action in {"add", "replace"}:
-        reason_error = _validate_memory_write_reason(reason)
-        if reason_error:
-            return tool_error(reason_error, success=False)
-
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
     gate_result = _apply_write_gate(action, target, content, old_text)
@@ -1154,40 +1122,6 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
-def _validate_memory_write_reason(reason: str = "") -> Optional[str]:
-    """Validate the suitability reason required for memory add/replace.
-
-    The reason is a tool-boundary guardrail only; it is intentionally not
-    persisted with the memory entry. Keep this deliberately simple: require a
-    real sentence and reject the most common vacuous justifications. Semantic
-    routing between memory/skills remains the caller's responsibility and can be
-    further guarded by profile-local skill-gate rules.
-    """
-    normalized = " ".join(str(reason or "").strip().split())
-    generic_reasons = {
-        "important",
-        "user asked",
-        "remember this",
-        "durable",
-        "useful",
-        "preference",
-        "the user asked me to remember this",
-    }
-    if normalized.casefold() in generic_reasons:
-        return (
-            "reason is too generic for memory add/replace: explain why USER/MEMORY is "
-            "the right store instead of a skill, Graphiti, or session history."
-        )
-
-    if len(normalized) < 20:
-        return (
-            "reason is required for memory add/replace: briefly explain why this belongs "
-            "in USER/MEMORY rather than a skill, Graphiti, or session history."
-        )
-
-    return None
-
-
 def check_memory_requirements() -> bool:
     """Memory tool has no external requirements -- always available."""
     return True
@@ -1199,12 +1133,6 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 
     Returns the store's result dict.
     """
-    # Notes-tier staged writes share the memory subsystem's pending store
-    # (one memory.write_approval switch covers both durable tiers) but apply
-    # to the NotesStore, not MEMORY.md — route them to their own applier.
-    if payload.get("tool") == "notes_write":
-        from agent.memory_pipeline import apply_notes_pending
-        return apply_notes_pending(payload)
     action = payload.get("action")
     target = payload.get("target", "memory")
     content = payload.get("content") or ""
@@ -1283,14 +1211,6 @@ MEMORY_SCHEMA = {
                     "required": ["action"],
                 },
             },
-            "reason": {
-                "type": "string",
-                "description": (
-                    "Required for 'add' and 'replace'. Briefly explain why this belongs in "
-                    "USER/MEMORY rather than a skill, Graphiti, or session history. This "
-                    "reason is used only as a guardrail and is not stored."
-                )
-            },
         },
         "required": ["target"],
     },
@@ -1310,7 +1230,6 @@ registry.register(
         content=args.get("content"),
         old_text=args.get("old_text"),
         operations=args.get("operations"),
-        reason=args.get("reason", ""),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

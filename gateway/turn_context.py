@@ -35,7 +35,6 @@ class TurnContext:
     """Closed-over locals of ``_run_agent_inner`` needed by ``TurnRunner``."""
 
     # --- read-only turn identity / wiring -------------------------------
-    event: Any = None
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
@@ -103,8 +102,6 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
-    turn_resume_marker: Optional[dict] = None
-    turn_trace_obj: Any = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

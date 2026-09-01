@@ -119,7 +119,7 @@ If you find a task that takes 5+ steps and you'll do it again, ask the agent to 
 
 ### Managing Memory Capacity
 
-Memory is intentionally bounded (~2,750 chars for MEMORY.md, ~2,750 chars for USER.md). When it fills up, the agent consolidates entries. You can help by saying "clean up your memory" or "replace the old Python 3.9 note — we're on 3.12 now."
+Memory is intentionally bounded (~2,200 chars for MEMORY.md, ~1,375 chars for USER.md). When it fills up, the agent consolidates entries. You can help by saying "clean up your memory" or "replace the old Python 3.9 note — we're on 3.12 now."
 
 ### Let the Agent Remember
 

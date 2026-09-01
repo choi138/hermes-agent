@@ -9,47 +9,11 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
-import sys
-import types
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
     _signature_from_schema,
 )
-
-
-class _FakeFastMCP:
-    def __init__(self, *_args, **_kwargs):
-        self.tools = {}
-
-    def add_tool(self, handler, *, name, description):
-        self.tools[name] = {
-            "handler": handler,
-            "description": description,
-        }
-
-
-def _install_fake_mcp(monkeypatch):
-    mcp_module = types.ModuleType("mcp")
-    server_module = types.ModuleType("mcp.server")
-    fastmcp_module = types.ModuleType("mcp.server.fastmcp")
-    fastmcp_module.FastMCP = _FakeFastMCP
-    server_module.fastmcp = fastmcp_module
-    mcp_module.server = server_module
-    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
-    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
-
-
-def _tool_definition(name):
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": f"{name} description",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }
 
 
 class TestSignatureFromSchema:
@@ -111,76 +75,6 @@ class TestSignatureFromSchema:
         assert annots["b"] == bool
         assert annots["a"] == list
         assert annots["o"] == dict
-
-
-class TestBuildServer:
-    def test_disabled_tool_is_neither_registered_nor_callable(self, monkeypatch):
-        import model_tools
-        from hermes_cli import config
-        from agent.transports import hermes_tools_mcp_server as m
-
-        _install_fake_mcp(monkeypatch)
-        monkeypatch.setattr(
-            config,
-            "load_config",
-            lambda: {"agent": {"disabled_toolsets": ["text_to_speech"]}},
-        )
-        seen = []
-
-        def fake_get_tool_definitions(**kwargs):
-            seen.append(kwargs)
-            disabled = set(kwargs.get("disabled_toolsets") or [])
-            return [
-                _tool_definition(name)
-                for name in ("web_search", "text_to_speech")
-                if name not in disabled
-            ]
-
-        monkeypatch.setattr(
-            model_tools,
-            "get_tool_definitions",
-            fake_get_tool_definitions,
-        )
-
-        server = m._build_server()
-
-        assert seen == [
-            {
-                "disabled_toolsets": ["text_to_speech"],
-                "quiet_mode": True,
-            }
-        ]
-        assert set(server.tools) == {"web_search"}
-        assert callable(server.tools["web_search"]["handler"])
-        assert "text_to_speech" not in server.tools
-
-    def test_config_read_failure_fails_open(self, monkeypatch):
-        import model_tools
-        from hermes_cli import config
-        from agent.transports import hermes_tools_mcp_server as m
-
-        _install_fake_mcp(monkeypatch)
-
-        def fail_to_load_config():
-            raise OSError("config unavailable")
-
-        monkeypatch.setattr(config, "load_config", fail_to_load_config)
-        seen = []
-
-        def fake_get_tool_definitions(**kwargs):
-            seen.append(kwargs)
-            return [_tool_definition("web_search")]
-
-        monkeypatch.setattr(
-            model_tools,
-            "get_tool_definitions",
-            fake_get_tool_definitions,
-        )
-
-        server = m._build_server()
-
-        assert seen == [{"disabled_toolsets": None, "quiet_mode": True}]
-        assert set(server.tools) == {"web_search"}
 
 
 

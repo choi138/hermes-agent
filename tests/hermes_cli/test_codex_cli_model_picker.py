@@ -132,58 +132,6 @@ def test_claude_code_file_detected_by_model_picker(claude_code_only_env):
     assert anthropic["total_models"] > 0
 
 
-@pytest.mark.parametrize("suppressed_source", ["claude_code", "hermes_pkce"])
-def test_suppressed_anthropic_file_source_stays_hidden(
-    tmp_path, monkeypatch, suppressed_source
-):
-    """A suppressed file source must not restore built-in Anthropic in /model."""
-    hermes_home = tmp_path / ".hermes"
-    hermes_home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    (hermes_home / "auth.json").write_text(
-        json.dumps({"version": 2, "providers": {}})
-    )
-
-    for var in [
-        "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-    ]:
-        monkeypatch.delenv(var, raising=False)
-
-    import agent.anthropic_adapter as anthropic_adapter
-    from hermes_cli.auth import suppress_credential_source
-    from hermes_cli.model_switch import list_authenticated_providers
-
-    creds = {"accessToken": "test-token"}
-    monkeypatch.setattr(
-        anthropic_adapter,
-        "read_claude_code_credentials",
-        lambda: creds if suppressed_source == "claude_code" else None,
-    )
-    monkeypatch.setattr(
-        anthropic_adapter,
-        "read_hermes_oauth_credentials",
-        lambda: creds if suppressed_source == "hermes_pkce" else None,
-    )
-    suppress_credential_source("anthropic", suppressed_source)
-
-    providers = list_authenticated_providers(
-        current_provider="claude-lb",
-        user_providers={
-            "claude-lb": {
-                "name": "Claude LB",
-                "base_url": "http://claude-lb.test",
-                "default_model": "claude-test",
-            }
-        },
-        custom_providers=[],
-        max_models=10,
-        probe_custom_providers=False,
-    )
-    slugs = [provider["slug"] for provider in providers]
-    assert "anthropic" not in slugs
-    assert "claude-lb" in slugs
-
-
 def test_no_codex_when_no_credentials(tmp_path, monkeypatch):
     """openai-codex should NOT appear when no credentials exist anywhere."""
     hermes_home = tmp_path / ".hermes"

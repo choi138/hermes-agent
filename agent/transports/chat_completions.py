@@ -17,7 +17,6 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
-from utils import base_url_host_matches
 
 
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
@@ -205,19 +204,6 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
-def _base_url_consumes_reasoning_details(base_url: Any) -> bool:
-    """Return whether an endpoint consumes replayed ``reasoning_details``.
-
-    OpenRouter and the OpenRouter-compatible Nous portal use this field for
-    signed multi-turn reasoning continuity. It is outside the OpenAI Chat
-    Completions schema, so strict and unknown endpoints must not receive it.
-    """
-    url = str(base_url or "")
-    return base_url_host_matches(url, "openrouter.ai") or base_url_host_matches(
-        url, "nousresearch.com"
-    )
-
-
 class ChatCompletionsTransport(ProviderTransport):
     """Transport for api_mode='chat_completions'.
 
@@ -238,12 +224,6 @@ class ChatCompletionsTransport(ProviderTransport):
         - Codex Responses API fields: ``codex_reasoning_items`` /
           ``codex_message_items`` on the message, ``call_id`` /
           ``response_item_id`` on ``tool_calls`` entries.
-        - ``reasoning`` on assistant messages — Hermes trajectory text, not a
-          provider replay field, so it is always stripped.
-        - ``reasoning_details`` on assistant messages — preserved only for
-          OpenRouter/Nous endpoints that consume the structured replay state;
-          strict and unknown endpoints reject it as an extra input. Persisted
-          history is never mutated.
         - ``extra_content`` on ``tool_calls`` (Gemini thought_signature) —
           stripped unless the outgoing ``model`` is itself Gemini-family.
           Gemini 3 thinking models attach it for replay, but strict providers
@@ -273,9 +253,6 @@ class ChatCompletionsTransport(ProviderTransport):
         strip_extra_content = not _model_consumes_thought_signature(
             kwargs.get("model")
         )
-        strip_reasoning_details = not _base_url_consumes_reasoning_details(
-            kwargs.get("base_url")
-        )
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
@@ -287,8 +264,6 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — strict providers reject this
                 or "api_content" in msg  # persist-what-you-send sidecar
-                or "reasoning" in msg
-                or (strip_reasoning_details and "reasoning_details" in msg)
             ):
                 needs_sanitize = True
                 break
@@ -332,8 +307,6 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — leak into strict providers
                 or "api_content" in msg  # persist-what-you-send sidecar
-                or "reasoning" in msg
-                or (strip_reasoning_details and "reasoning_details" in msg)
             ):
                 out_msg = mutable_msg()
                 out_msg.pop("codex_reasoning_items", None)
@@ -342,9 +315,6 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
-                out_msg.pop("reasoning", None)
-                if strip_reasoning_details:
-                    out_msg.pop("reasoning_details", None)
 
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
@@ -400,7 +370,6 @@ class ChatCompletionsTransport(ProviderTransport):
             reasoning_config: dict | None
             request_overrides: dict | None
             session_id: str | None
-            base_url: str | None — target endpoint used to scope replay fields
             model_lower: str — lowercase model name for pattern matching
             # Provider profile path (all per-provider quirks live in providers/)
             provider_profile: ProviderProfile | None — when present, delegates to
@@ -437,12 +406,10 @@ class ChatCompletionsTransport(ProviderTransport):
             supports_prompt_cache_key: bool — explicit endpoint capability for
                 the top-level Chat Completions request field; defaults off.
         """
-        # Wire sanitization: drop internal and endpoint-incompatible replay fields.
-        # Pass model/base URL so provider-specific replay fields are retained
-        # only by endpoints that consume them.
-        sanitized = self.convert_messages(
-            messages, model=model, base_url=params.get("base_url")
-        )
+        # Codex sanitization: drop reasoning_items / call_id / response_item_id.
+        # Pass model so the Gemini thought_signature (extra_content) is kept for
+        # Gemini targets and stripped for strict non-Gemini providers.
+        sanitized = self.convert_messages(messages, model=model)
 
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")

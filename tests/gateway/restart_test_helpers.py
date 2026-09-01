@@ -151,10 +151,6 @@ def make_restart_runner(
     )
     runner.request_restart = GatewayRunner.request_restart.__get__(runner, GatewayRunner)
     runner._is_user_authorized = lambda _source: True
-    runner._boot_id = "test-boot-current"
-    # The real dispatch path records its start clock before entering the
-    # agent runner; object.__new__ test runners must provide the current map.
-    runner._turn_started_at = {}
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.pairing_store = MagicMock()

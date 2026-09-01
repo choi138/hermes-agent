@@ -91,79 +91,6 @@ class TestStrictApiValidation:
         assert tool_call["id"] == "call_123"
         assert tool_call["function"]["name"] == "terminal"
 
-    def test_mixed_anthropic_history_stripped_for_strict_chat_fallback(
-        self, monkeypatch
-    ):
-        """Anthropic replay state must not leak into a strict chat fallback."""
-        agent = _make_agent(
-            monkeypatch,
-            "codex-lb",
-            api_mode="chat_completions",
-            base_url="https://codex-lb.example/v1",
-        )
-        reasoning_details = [
-            {
-                "type": "thinking",
-                "thinking": "signed Anthropic reasoning",
-                "signature": "anthropic-signature",
-            }
-        ]
-        history = [
-            {"role": "user", "content": "Investigate the failure."},
-            {
-                "role": "assistant",
-                "content": "I found the first clue.",
-                "reasoning": "trajectory-only reasoning",
-                "reasoning_content": "provider-facing reasoning",
-                "reasoning_details": reasoning_details,
-            },
-            {"role": "user", "content": "Continue with the fallback."},
-        ]
-
-        kwargs = agent._build_api_kwargs(history)
-
-        wire_assistant = kwargs["messages"][1]
-        assert "reasoning" not in wire_assistant
-        assert "reasoning_details" not in wire_assistant
-        assert wire_assistant["content"] == "I found the first clue."
-        assert wire_assistant["reasoning_content"] == "provider-facing reasoning"
-        assert wire_assistant is not history[1]
-        assert history[1]["reasoning"] == "trajectory-only reasoning"
-        assert history[1]["reasoning_content"] == "provider-facing reasoning"
-        assert history[1]["reasoning_details"] is reasoning_details
-
-    def test_replay_endpoints_keep_reasoning_details(self, monkeypatch):
-        """OpenRouter-compatible endpoints consume signed reasoning replay."""
-        for provider, base_url in (
-            ("openrouter", "https://openrouter.ai/api/v1"),
-            ("nous", "https://inference-api.nousresearch.com/v1"),
-        ):
-            agent = _make_agent(monkeypatch, provider, base_url=base_url)
-            reasoning_details = [
-                {
-                    "type": "reasoning",
-                    "text": "opaque",
-                    "signature": "router-signature",
-                }
-            ]
-            history = [
-                {"role": "user", "content": "hi"},
-                {
-                    "role": "assistant",
-                    "content": "ok",
-                    "reasoning": "trajectory-only reasoning",
-                    "reasoning_details": reasoning_details,
-                },
-            ]
-
-            kwargs = agent._build_api_kwargs(history)
-
-            wire_assistant = kwargs["messages"][1]
-            assert "reasoning" not in wire_assistant, base_url
-            assert wire_assistant["reasoning_details"] is reasoning_details, base_url
-            assert history[1]["reasoning"] == "trajectory-only reasoning", base_url
-            assert history[1]["reasoning_details"] is reasoning_details, base_url
-
     def test_codex_preserves_fields_for_replay(self, monkeypatch):
         """Codex mode should preserve fields for Responses API replay."""
         agent = _make_agent(monkeypatch, "openrouter")
@@ -201,3 +128,4 @@ class TestStrictApiValidation:
 
         # Should sanitize for Fireworks (chat_completions mode)
         assert agent._should_sanitize_tool_calls() is True
+

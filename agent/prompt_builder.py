@@ -170,25 +170,6 @@ MEMORY_GUIDANCE = (
     "in skills."
 )
 
-NOTES_GUIDANCE = (
-    "You also have a curated notes tier for durable DECLARATIVE knowledge "
-    "(notes_write/notes_read). Routing: instructions about how YOU should behave "
-    "go to the memory tool; declarative facts worth keeping (decisions, incidents, "
-    "preferences, relationships, project facts) go to notes_write; procedures and "
-    "workflows go to skills (their write path is gated separately); raw session "
-    "detail stays in session history and the memory graph.\n"
-    "notes_write is two-step: propose returns the closest existing notes plus a "
-    "token; only then do you confirm a verdict. NOOP discipline: NOOP is the "
-    "expected most-frequent verdict — confirming NOOP when a neighbor already "
-    "covers the fact is a correct, successful outcome, not a failure. Prefer "
-    "UPDATE/SUPERSEDE on a listed neighbor over ADD when the topic matches. "
-    "Every note must cite evidence (an episode UUID or a substantive verbatim "
-    "quote from this session — a phrase, never a fragment or secret); never "
-    "cite text that came from your own injected memory context. When a fact "
-    "merely seems promising, queue memory_propose and move on instead of "
-    "writing."
-)
-
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "

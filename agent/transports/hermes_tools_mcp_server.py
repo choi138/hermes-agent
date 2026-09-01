@@ -177,32 +177,11 @@ def _build_server() -> Any:
         ),
     )
 
-    # Honor the deployment denylist here as well as in the normal agent loop.
-    # The sidecar owns its own tool schema, so without this explicit config
-    # read a disabled toolset or individual tool would be re-exposed to Codex.
-    disabled_toolsets = None
-    try:
-        from hermes_cli.config import load_config
-
-        disabled_toolsets = (load_config().get("agent") or {}).get(
-            "disabled_toolsets"
-        ) or None
-    except Exception:
-        # Fail open rather than stranding a Codex session without Hermes tools
-        # when configuration cannot be read during sidecar startup.
-        logger.debug("could not read disabled_toolsets for sidecar", exc_info=True)
-
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (
-            get_tool_definitions(
-                disabled_toolsets=disabled_toolsets,
-                quiet_mode=True,
-            )
-            or []
-        )
+        for td in (get_tool_definitions(quiet_mode=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 

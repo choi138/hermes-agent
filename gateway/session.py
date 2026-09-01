@@ -22,8 +22,6 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
-_RUNTIME_UNSET = object()
-
 
 def _now() -> datetime:
     """Return the current local time."""
@@ -854,19 +852,6 @@ class SessionEntry:
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
 
-    # Durable record of the at-most-one in-flight gateway turn (ADR
-    # durable-turns).  Written when a chat turn is dispatched, cleared when it
-    # finalizes; a record that survives into the next boot (stale ``boot_id``
-    # or status "interrupted") identifies a turn to resume IN PLACE — same
-    # turn_id, same transcript, no synthetic follow-up user turn.  Keys:
-    #   turn_id       str  — matches the agent-side ``_current_turn_id``
-    #   status        str  — "running" | "interrupted" | "resuming"
-    #   boot_id       str  — gateway process instance that dispatched it
-    #   started_at    str  — ISO timestamp of original dispatch
-    #   interrupted_at str — ISO timestamp, set on drain-timeout interrupt
-    #   resume_count  int  — same-turn resume attempts so far (poison cap)
-    active_turn: Optional[Dict[str, Any]] = None
-
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
@@ -875,13 +860,6 @@ class SessionEntry:
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
-
-    # Durable session-scoped runtime overrides. Only stable identifiers are
-    # persisted; credentials, endpoints, and API modes are re-resolved after
-    # a gateway restart and are never written to the routing index.
-    runtime_model: Optional[str] = None
-    runtime_provider: Optional[str] = None
-    runtime_reasoning_effort: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -915,12 +893,7 @@ class SessionEntry:
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
             "prev_session_id": self.prev_session_id,
-            "runtime_model": self.runtime_model,
-            "runtime_provider": self.runtime_provider,
-            "runtime_reasoning_effort": self.runtime_reasoning_effort,
         }
-        if self.active_turn:
-            result["active_turn"] = dict(self.active_turn)
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
@@ -998,14 +971,6 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
-            runtime_model=data.get("runtime_model"),
-            runtime_provider=data.get("runtime_provider"),
-            runtime_reasoning_effort=data.get("runtime_reasoning_effort"),
-            active_turn=(
-                dict(data["active_turn"])
-                if isinstance(data.get("active_turn"), dict)
-                else None
-            ),
         )
 
 
@@ -2762,15 +2727,9 @@ class SessionStore:
             if entry is None:
                 return
             cleaned = sanitize_model_override(override)
-            has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
-            if entry.model_override == cleaned and not (
-                cleaned is not None and has_runtime_route
-            ):
+            if entry.model_override == cleaned:
                 return
             entry.model_override = cleaned
-            if cleaned is not None:
-                entry.runtime_model = None
-                entry.runtime_provider = None
             self._save()
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
@@ -2781,73 +2740,6 @@ class SessionStore:
             if entry is None:
                 return None
             return dict(entry.model_override) if entry.model_override else None
-
-    def get_entry(self, session_key: str) -> Optional[SessionEntry]:
-        """Return a loaded SessionEntry by key without creating a session."""
-        with self._lock:
-            self._ensure_loaded_locked()
-            return self._entries.get(session_key)
-
-    def update_runtime_override(
-        self,
-        session_key: str,
-        *,
-        model: Any = _RUNTIME_UNSET,
-        provider: Any = _RUNTIME_UNSET,
-        reasoning_effort: Any = _RUNTIME_UNSET,
-    ) -> bool:
-        """Persist secret-free session-scoped runtime override metadata.
-
-        The private sentinel means leave a field unchanged; None or an empty
-        value clears it. Resolved credentials and endpoint details are never
-        accepted or stored by this seam.
-        """
-        if not session_key:
-            return False
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if entry is None:
-                return False
-            if model is not _RUNTIME_UNSET or provider is not _RUNTIME_UNSET:
-                entry.model_override = None
-            if model is not _RUNTIME_UNSET:
-                entry.runtime_model = str(model).strip() if model else None
-            if provider is not _RUNTIME_UNSET:
-                entry.runtime_provider = str(provider).strip() if provider else None
-            if reasoning_effort is not _RUNTIME_UNSET:
-                entry.runtime_reasoning_effort = (
-                    str(reasoning_effort).strip().lower()
-                    if reasoning_effort
-                    else None
-                )
-            entry.updated_at = _now()
-            self._save()
-            return True
-
-    def clear_runtime_overrides(
-        self,
-        session_key: str,
-        *,
-        model: bool = True,
-        reasoning: bool = True,
-    ) -> bool:
-        """Clear durable runtime overrides at a conversation boundary."""
-        if not session_key:
-            return False
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if entry is None:
-                return False
-            if model:
-                entry.runtime_model = None
-                entry.runtime_provider = None
-            if reasoning:
-                entry.runtime_reasoning_effort = None
-            entry.updated_at = _now()
-            self._save()
-            return True
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
@@ -2910,94 +2802,6 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
-            self._save()
-            return True
-
-    def begin_active_turn(
-        self,
-        session_key: str,
-        turn_id: str,
-        boot_id: str,
-        resume_count: int = 0,
-    ) -> bool:
-        """Record the dispatch of a gateway chat turn (ADR durable-turns).
-
-        The record survives the process: if it is still present (and not
-        cleared by ``finish_active_turn``) on the next boot, the turn was
-        killed mid-flight and is a candidate for same-turn resume.
-
-        Returns True if the session existed and the record was written.
-        """
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if entry is None:
-                return False
-            entry.active_turn = {
-                "turn_id": turn_id,
-                "status": "resuming" if resume_count > 0 else "running",
-                "boot_id": boot_id,
-                "started_at": _now().isoformat(),
-                "resume_count": resume_count,
-            }
-            self._save()
-            return True
-
-    def mark_active_turn_interrupted(self, session_key: str, reason: str) -> bool:
-        """Flag the in-flight turn as gateway-interrupted (drain timeout).
-
-        Distinguishes gateway-initiated interrupts (restart/shutdown — the
-        turn should resume next boot) from user-initiated ones (/stop, steer
-        — the record is simply cleared by the post-turn path).
-        """
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if entry is None or not entry.active_turn:
-                return False
-            entry.active_turn["status"] = "interrupted"
-            entry.active_turn["interrupted_reason"] = reason
-            entry.active_turn["interrupted_at"] = _now().isoformat()
-            self._save()
-            return True
-
-    def finish_active_turn(
-        self,
-        session_key: str,
-        turn_id: Optional[str] = None,
-        *,
-        force: bool = False,
-        turn_interrupted: bool = False,
-    ) -> bool:
-        """Clear the in-flight turn record after the turn ends.
-
-        ``turn_interrupted`` is the agent result's ``interrupted`` flag.  A
-        turn that ended *because the gateway interrupted it for a restart*
-        (record status "interrupted") must KEEP its record so the next boot
-        resumes it — the post-turn path still runs during the drain grace
-        window.  Every other ending (normal completion, user interrupt,
-        error) clears the record.  ``force=True`` clears unconditionally
-        (abandonment); ``turn_id`` guards against clearing a newer turn's
-        record from a stale run.
-
-        Returns True if the record was cleared.
-        """
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if entry is None or not entry.active_turn:
-                return False
-            record = entry.active_turn
-            if turn_id and record.get("turn_id") != turn_id:
-                return False
-            if (
-                not force
-                and turn_interrupted
-                and record.get("status") == "interrupted"
-            ):
-                # Gateway-initiated interrupt: keep the record for boot resume.
-                return False
-            entry.active_turn = None
             self._save()
             return True
 
@@ -3593,26 +3397,6 @@ class SessionStore:
         except Exception as e:
             logger.debug("Failed to rewrite transcript in DB: %s", e)
             return False
-
-    def deactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
-        """Reversibly hide explicit transcript rows in the canonical DB."""
-        if not self._db or not message_ids:
-            return 0
-        try:
-            return self._db.deactivate_messages(session_id, message_ids)
-        except Exception as e:
-            logger.debug("Failed to deactivate transcript messages: %s", e)
-            return 0
-
-    def reactivate_messages(self, session_id: str, message_ids: List[int]) -> int:
-        """Reverse :meth:`deactivate_messages` for explicit transcript rows."""
-        if not self._db or not message_ids:
-            return 0
-        try:
-            return self._db.reactivate_messages(session_id, message_ids)
-        except Exception as e:
-            logger.debug("Failed to reactivate transcript messages: %s", e)
-            return 0
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript.

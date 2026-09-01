@@ -9,110 +9,11 @@ from model_tools import (
     TrustedToolResult,
     handle_function_call,
     get_all_tool_names,
-    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
-
-
-# =========================================================================
-# disabled_toolsets accepts individual tool names
-# =========================================================================
-
-class TestDisabledToolsetsAcceptsToolNames:
-    @staticmethod
-    def _names(disabled=None):
-        return {
-            tool["function"]["name"]
-            for tool in get_tool_definitions(
-                enabled_toolsets=["terminal", "skills"],
-                disabled_toolsets=disabled,
-                quiet_mode=True,
-            )
-        }
-
-    def test_single_tool_name_is_removed(self):
-        baseline = self._names()
-        assert "process" in baseline, "precondition: process is registered"
-
-        filtered = self._names(["process"])
-
-        assert baseline - filtered == {"process"}
-
-    def test_multiple_tool_names_are_removed(self):
-        disabled = {"process", "skill_manage"}
-        baseline = self._names()
-        assert disabled <= baseline, "precondition: tools are registered"
-
-        filtered = self._names(sorted(disabled))
-
-        assert baseline - filtered == disabled
-
-    def test_unknown_name_is_a_graceful_noop(self):
-        baseline = self._names()
-
-        filtered = self._names(["definitely_not_a_real_tool_or_toolset"])
-
-        assert filtered == baseline
-
-    def test_unknown_name_warning_mentions_tools(self, capsys):
-        get_tool_definitions(
-            enabled_toolsets=[],
-            disabled_toolsets=["definitely_not_a_real_tool_or_toolset"],
-            quiet_mode=False,
-        )
-
-        assert "Unknown toolset or tool" in capsys.readouterr().out
-
-    def test_toolset_name_takes_precedence_over_tool_name(self):
-        # `terminal` names both a toolset and one of its tools. The toolset
-        # match must win and remove its sibling `process` as well.
-        filtered = self._names(["terminal"])
-
-        assert "terminal" not in filtered
-        assert "process" not in filtered
-
-    def test_individual_deny_is_final_after_worker_tool_augmentation(
-        self, monkeypatch
-    ):
-        import model_tools
-
-        selected = []
-
-        def capture_selected(tool_names, quiet=False):
-            selected.append(set(tool_names))
-            return []
-
-        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-        with patch.object(
-            model_tools.registry,
-            "get_definitions",
-            side_effect=capture_selected,
-        ):
-            model_tools._compute_tool_definitions(
-                enabled_toolsets=[],
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
-            )
-            model_tools._compute_tool_definitions(
-                enabled_toolsets=[],
-                disabled_toolsets=["kanban_complete"],
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
-            )
-            model_tools._compute_tool_definitions(
-                enabled_toolsets=[],
-                disabled_toolsets=["kanban_worker"],
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
-            )
-
-        assert "kanban_complete" in selected[0]
-        assert "kanban_complete" not in selected[1]
-        # Preserve the current worker invariant for whole-toolset denies.
-        assert "kanban_complete" in selected[2]
 
 
 # =========================================================================
@@ -349,8 +250,6 @@ class TestAgentLoopTools:
         assert "memory" in _AGENT_LOOP_TOOLS
         assert "session_search" in _AGENT_LOOP_TOOLS
         assert "delegate_task" in _AGENT_LOOP_TOOLS
-        assert "model_status" in _AGENT_LOOP_TOOLS
-        assert "model_switch" in _AGENT_LOOP_TOOLS
 
     def test_no_regular_tools_in_set(self):
         assert "web_search" not in _AGENT_LOOP_TOOLS

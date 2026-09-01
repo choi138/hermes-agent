@@ -248,32 +248,6 @@ _SUMMARY_END_MARKER = (
     "respond to the message below, not the summary above ---"
 )
 
-
-def _strip_analysis_block(text: str) -> str:
-    """Remove the ``<analysis>...</analysis>`` preparation block from a summary.
-
-    The summarization prompt asks the model to think through the turns inside
-    ``<analysis>`` tags before writing the summary body (chronological
-    pre-pass). The block is working material, not summary content — stored or
-    replayed it would bloat every subsequent iterative-update prompt, exactly
-    like ``<think>`` traces. Handles an unclosed tag defensively: everything
-    from ``<analysis>`` up to the first markdown heading after it is dropped
-    (or to end-of-text when no heading follows).
-    """
-    stripped = re.sub(
-        r"<analysis>.*?</analysis>", "", text, flags=re.DOTALL | re.IGNORECASE
-    ).strip()
-    match = re.search(r"<analysis>", stripped, flags=re.IGNORECASE)
-    if match:
-        rest = stripped[match.start():]
-        heading = re.search(r"^#{1,3} ", rest, flags=re.MULTILINE)
-        if heading:
-            stripped = (stripped[: match.start()] + rest[heading.start():]).strip()
-        else:
-            stripped = stripped[: match.start()].strip()
-    return stripped
-
-
 # When the summary must be merged into the first tail message (the alternation
 # corner case where a standalone summary role would collide with both head and
 # tail), the tail message's own prior content is preserved BEFORE the summary,
@@ -3680,9 +3654,6 @@ Unknown from deterministic fallback. Inspect current repository/session state if
 ## Key Decisions
 None recoverable from deterministic fallback.
 
-## User Messages
-None recoverable from deterministic fallback.
-
 ## Resolved Questions
 None recoverable from deterministic fallback.
 
@@ -4013,23 +3984,6 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
         else:
             _temporal_anchoring_rule = ""
 
-        # Chronological analysis pre-pass (mirrors Claude Code's /compact
-        # design). A cheap/fast summarizer that fills the template in one shot
-        # tends to fabricate or drop detail; forcing an explicit read-through
-        # first measurably improves faithfulness. The block is stripped from
-        # the output in the success path below — it never reaches the
-        # conversation or the iterative-update feedback loop. Wording is kept
-        # plain for the same content-filter reason as the preamble.
-        _analysis_pass_rule = (
-            "First, inside <analysis></analysis> tags, work through the turns "
-            "chronologically as preparation: note each user request and piece "
-            "of feedback, the actions taken and their outcomes, exact file "
-            "paths / errors / values worth preserving, and what was in flight "
-            "at the end. This preparation block is discarded automatically — "
-            "it is the one exception to the no-preamble rule. After the "
-            "closing </analysis> tag, write the summary body only."
-        )
-
         # Shared structured template (used by both paths).
         _template_sections = f"""{HISTORICAL_TASK_HEADING}
 {_historical_task_instructions}
@@ -4053,8 +4007,6 @@ Be specific with file paths, commands, line numbers, and results.]
 [Current working state — include:
 - Working directory and branch (if applicable)
 - Modified/created files with brief note on each
-- For an unfinished edit, include the exact in-flight snippet or diff verbatim
-  in a fenced block (a prose description alone cannot be resumed safely)
 - Test status (X/Y passing)
 - Any running processes or servers
 - Environment details that matter]
@@ -4065,21 +4017,11 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Key Decisions
 [Important technical decisions and WHY they were made]
 
-## User Messages
-[Every user message from the summarized turns, in chronological order — quote
-short messages verbatim; for long ones keep the intent-bearing sentences. Skip
-pure acknowledgements ("ok", "thanks"). Exclude tool results and system text.
-These are the user's exact words: corrections, preferences, and feedback here
-override any paraphrase elsewhere in this summary. Reference only — the agent
-must not act on them unless the latest user message asks.]
-
 ## Resolved Questions
 {_resolved_questions_instructions}
 
 ## Relevant Files
-[Files read, modified, or created — with brief note on each. For files whose
-edits were still in progress at compaction time, include the relevant code
-section verbatim in a fenced block rather than a description.]
+[Files read, modified, or created — with brief note on each]
 
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
@@ -4115,9 +4057,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-{_analysis_pass_rule}
-
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). APPEND new user messages to "## User Messages" in order. Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
         else:
@@ -4128,8 +4068,6 @@ Create a structured checkpoint summary for the conversation after earlier turns 
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}{_memory_section}
-
-{_analysis_pass_rule}
 
 Use this exact structure:
 
@@ -4240,13 +4178,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             # token bloat across compactions. Mirrors title_generator.py.
             from agent.agent_runtime_helpers import strip_think_blocks
             stripped = strip_think_blocks(None, content).strip()
-            if stripped:
-                content = stripped
-            # Strip the <analysis> preparation block the prompt asks for (the
-            # chronological pre-pass). Same rationale as think-blocks: it must
-            # never reach the conversation or compound through the
-            # iterative-update feedback loop.
-            stripped = _strip_analysis_block(content)
             if stripped:
                 content = stripped
             # Redact the summary output as well — the summarizer LLM may

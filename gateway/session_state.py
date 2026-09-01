@@ -93,11 +93,6 @@ class ConversationState:
 
     # /model per-session override (model/provider/api_key/base_url/api_mode).
     model_override: Optional[Dict[str, Any]] = None
-    # Purpose route last applied by the enforce-mode model router.  Kept
-    # separately from model_override because accepted models can belong to
-    # multiple routes; the selected route cannot be reconstructed from model
-    # membership after an agent-cache rebuild.
-    active_route_name: str = ""
     # /model --once restore snapshot.
     one_turn_restore: Optional[Dict[str, Any]] = None
     # /reasoning per-session override.
@@ -112,9 +107,6 @@ class ConversationState:
     sidecar_notes: List[str] = field(default_factory=list)
     # Pinned session-context bytes: (change_key, text).
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
-    # One-shot recall quarantine armed by a refusal clean-fork.  Consumed when
-    # the next agent turn is bound.
-    refusal_recall_quarantine: bool = False
     # Last voice-channel context delivered (None = never delivered).
     vc_last: Optional[str] = None
 
@@ -126,7 +118,6 @@ class ConversationState:
         automatically.
         """
         self.model_override = None
-        self.active_route_name = ""
         self.one_turn_restore = None
         self.reasoning_override = None
         self.service_tier_override = _UNSET_TIER
@@ -134,7 +125,6 @@ class ConversationState:
         self.queued_events = []
         self.sidecar_notes = []
         self.ephemeral_pin = None
-        self.refusal_recall_quarantine = False
         self.vc_last = None
 
 

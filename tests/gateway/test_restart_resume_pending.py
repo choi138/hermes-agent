@@ -784,8 +784,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will pause and resume "
-        "automatically after the restart."
+        "⚠️ Gateway restarting — Your current task will be interrupted. "
+        "Send any message after restart and I'll try to resume where you left off."
     ]
 
 
@@ -1076,4 +1076,5 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
+
 

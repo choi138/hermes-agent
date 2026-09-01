@@ -553,11 +553,6 @@ from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
-try:
-    from agent import turn_trace as _turn_trace_mod
-except Exception:  # pragma: no cover - tracing import must not break gateway startup
-    _turn_trace_mod = None
-
 if TYPE_CHECKING:
     from agent.display import ToolPreview
 
@@ -5580,22 +5575,6 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
-    def _finish_inline_turn_trace(self, event: MessageEvent) -> None:
-        """Finish a trace for dispatch paths that bypass the background task."""
-        try:
-            if _turn_trace_mod is None:
-                return
-            _trace = _turn_trace_mod.safe_get_bound(event)
-            if _trace is None:
-                _trace = _turn_trace_mod.safe_get_bound(
-                    getattr(event, "source", None)
-                )
-            _turn_trace_mod.safe_finish(_trace, status="ok")
-            if _trace is not None:
-                _turn_trace_mod.safe_bind(getattr(event, "source", None), None)
-        except Exception:
-            pass
-
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -5670,8 +5649,6 @@ class BasePlatformAdapter(ABC):
                 else:
                     self._release_session_guard(session_key, guard=command_guard)
             raise
-        finally:
-            self._finish_inline_turn_trace(event)
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
@@ -5781,8 +5758,6 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
-                finally:
-                    self._finish_inline_turn_trace(event)
                 return
 
             # Clarify reply bypass: if the agent is blocked on a
@@ -5839,8 +5814,6 @@ class BasePlatformAdapter(ABC):
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
-                    finally:
-                        self._finish_inline_turn_trace(event)
                     return
 
             if self._busy_session_handler is not None:
@@ -5971,38 +5944,12 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
-
-        def _resolve_turn_trace():
-            try:
-                if _turn_trace_mod is None:
-                    return None
-                _trace = _turn_trace_mod.safe_get_bound(event)
-                if _trace is None:
-                    _trace = _turn_trace_mod.safe_get_bound(
-                        getattr(event, "source", None)
-                    )
-                return _trace
-            except Exception:
-                return None
-
-        def _finish_turn_trace(status: str) -> None:
-            try:
-                _trace = _resolve_turn_trace()
-                _turn_trace_mod.safe_finish(_trace, status=status)
-                if _trace is not None and _turn_trace_mod is not None:
-                    _turn_trace_mod.safe_bind(
-                        getattr(event, "source", None), None
-                    )
-            except Exception:
-                pass
-
-        _turn_trace = None
+        
         try:
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            _turn_trace = _resolve_turn_trace()
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6035,7 +5982,6 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
-            _delivery_start = time.time() if _turn_trace is not None else 0.0
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -6485,18 +6431,6 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            if _turn_trace is not None:
-                if response:
-                    _turn_trace_mod.safe_add_span(
-                        _turn_trace,
-                        "transport.delivery",
-                        _delivery_start,
-                        time.time(),
-                        delivered=delivery_succeeded,
-                    )
-                _turn_trace_mod.safe_finish(_turn_trace, status="ok")
-                _turn_trace_mod.safe_bind(getattr(event, "source", None), None)
-
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag (#60671).
@@ -6564,7 +6498,6 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
-            _finish_turn_trace("cancelled")
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6572,7 +6505,6 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
-            _finish_turn_trace("error")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6595,7 +6527,6 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
-            _finish_turn_trace("error")
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

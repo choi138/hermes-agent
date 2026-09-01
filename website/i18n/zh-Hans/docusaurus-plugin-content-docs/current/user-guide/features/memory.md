@@ -14,8 +14,8 @@ Hermes Agent 拥有有界、经过整理的记忆，可跨会话持久保存。�
 
 | 文件 | 用途 | 字符上限 |
 |------|------|----------|
-| **MEMORY.md** | Agent 的个人笔记——环境事实、约定、已学内容 | 2,750 字符（约 1,000 tokens） |
-| **USER.md** | 用户档案——你的偏好、沟通风格、期望 | 2,750 字符（约 1,000 tokens） |
+| **MEMORY.md** | Agent 的个人笔记——环境事实、约定、已学内容 | 2,200 字符（约 800 tokens） |
+| **USER.md** | 用户档案——你的偏好、沟通风格、期望 | 1,375 字符（约 500 tokens） |
 
 两个文件均存储于 `~/.hermes/memories/`，在会话开始时以冻结快照的形式注入系统 prompt（提示词）。Agent 通过 `memory` 工具管理自身记忆——可添加、替换或删除条目。
 
@@ -29,7 +29,7 @@ Hermes Agent 拥有有界、经过整理的记忆，可跨会话持久保存。�
 
 ```
 ══════════════════════════════════════════════
-MEMORY (your personal notes) [54% — 1,474/2,750 chars]
+MEMORY (your personal notes) [67% — 1,474/2,200 chars]
 ══════════════════════════════════════════════
 User's project is a Rust web service at ~/code/myapi using Axum + SQLx
 §
@@ -118,8 +118,8 @@ Agent 会自动保存——无需你主动要求。当它学到以下内容时�
 
 | 存储 | 上限 | 典型条目数 |
 |------|------|-----------|
-| memory | 2,750 字符 | 8-15 条 |
-| user | 2,750 字符 | 5-10 条 |
+| memory | 2,200 字符 | 8-15 条 |
+| user | 1,375 字符 | 5-10 条 |
 
 ### 记忆已满时的处理
 
@@ -128,9 +128,9 @@ Agent 会自动保存——无需你主动要求。当它学到以下内容时�
 ```json
 {
   "success": false,
-  "error": "Memory at 2,650/2,750 chars. Adding this entry (250 chars) would exceed the limit. Replace or remove existing entries first.",
+  "error": "Memory at 2,100/2,200 chars. Adding this entry (250 chars) would exceed the limit. Replace or remove existing entries first.",
   "current_entries": ["..."],
-  "usage": "2,650/2,750"
+  "usage": "2,100/2,200"
 }
 ```
 
@@ -207,8 +207,8 @@ hermes sessions list    # 浏览过去的会话
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2750   # ~1,000 tokens
-  user_char_limit: 2750     # ~1,000 tokens
+  memory_char_limit: 2200   # ~800 tokens
+  user_char_limit: 1375     # ~500 tokens
 ```
 
 ## 外部记忆提供商

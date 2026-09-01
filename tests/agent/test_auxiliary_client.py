@@ -2487,76 +2487,11 @@ class TestAuxiliaryTaskExtraBody:
     def test_anthropic_aux_extra_body_passthrough(self):
         """Bug B (#37217): vendor fields in extra_body reach the Anthropic SDK."""
         api_kwargs = self._run_anthropic_adapter(
-            call_extra_body={
-                "thinking": {"type": "disabled"},
-                "metadata": {"user_id": "u1"},
-                "reasoning": {"enabled": False},
-                "_private": "not-on-wire",
-            },
+            call_extra_body={"thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"}},
         )
         assert api_kwargs["extra_body"] == {
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
-
-    def test_anthropic_aux_translates_json_schema_response_format(self):
-        schema = {
-            "type": "object",
-            "properties": {"title": {"type": "string"}},
-            "required": ["title"],
-        }
-        api_kwargs = self._run_anthropic_adapter(
-            call_extra_body={
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "thread_title",
-                        "schema": schema,
-                        "strict": False,
-                    },
-                },
-                "metadata": {"user_id": "autotitle"},
-            },
-            bak_result={
-                "model": "claude-sonnet-4-6",
-                "messages": [],
-                "max_tokens": 64,
-                "output_config": {"effort": "high"},
-            },
-        )
-
-        assert api_kwargs["output_config"] == {
-            "effort": "high",
-            "format": {"type": "json_schema", "schema": schema},
-        }
-        assert api_kwargs["extra_body"] == {
-            "metadata": {"user_id": "autotitle"}
-        }
-        assert "response_format" not in api_kwargs
-        assert "response_format" not in api_kwargs["extra_body"]
-
-    def test_anthropic_aux_translates_json_object_response_format(self):
-        api_kwargs = self._run_anthropic_adapter(
-            call_extra_body={"response_format": {"type": "json_object"}},
-        )
-
-        assert api_kwargs["output_config"]["format"] == {
-            "type": "json_schema",
-            "schema": {"type": "object"},
-        }
-        assert "response_format" not in api_kwargs
-        assert "extra_body" not in api_kwargs
-
-    def test_anthropic_aux_does_not_translate_unrelated_response_format(self):
-        api_kwargs = self._run_anthropic_adapter(
-            call_extra_body={
-                "response_format": {"type": "text"},
-                "vendor_option": True,
-            },
-        )
-
-        assert "output_config" not in api_kwargs
-        assert api_kwargs["extra_body"] == {"vendor_option": True}
-        assert "response_format" not in api_kwargs["extra_body"]
 
 
 

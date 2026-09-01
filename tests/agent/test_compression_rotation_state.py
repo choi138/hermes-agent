@@ -421,14 +421,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
             )
 
         assert returned is messages
-        # The stale "rate limited" cooldown cleared by the other agent must be
-        # gone. Post-#61 (hygiene-noprogress-cooldown) the unchanged-transcript
-        # compress legitimately records a FRESH no_progress cooldown, so the
-        # assertion pins provenance rather than absence.
-        refreshed = compressor.get_active_compression_failure_cooldown()
-        if refreshed is not None:
-            assert "no_progress" in str(refreshed.get("error", ""))
-            assert "rate limited" not in str(refreshed.get("error", ""))
+        assert compressor.get_active_compression_failure_cooldown() is None
         compress.assert_called_once()
         assert db.get_compression_lock_holder(session_id) is None
 

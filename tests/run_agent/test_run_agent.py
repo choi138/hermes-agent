@@ -2338,9 +2338,6 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("todo", {"todos": []}),
         ("session_search", {"query": "needle"}),
         ("memory", {"action": "view", "target": "memory"}),
-        ("notes_write", {"step": "propose", "content": "gist", "kind": "fact"}),
-        ("notes_read", {"action": "list"}),
-        ("memory_propose", {"content": "worth curating"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("read_preview", {}),
@@ -2374,10 +2371,6 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.memory_tool.memory_tool",
             lambda **kwargs: '{"ok":true}',
-        )
-        monkeypatch.setattr(
-            "tools.notes_tool.dispatch_notes_tool_for_agent",
-            lambda *args, **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",
@@ -2961,9 +2954,7 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with(
-            reason=FailoverReason.content_policy_blocked
-        )
+        mock_try_activate_fallback.assert_called_once_with()
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False

@@ -92,9 +92,9 @@ See [Persistent Memory](/user-guide/features/memory#how-memory-appears-in-the-sy
 
 **Symptom:** Hermes doesn't recall a detail from a session last week, even though you discussed it at length.
 
-**Check:** Memory capacity and contents. The system prompt memory header shows usage (e.g., `[54% — 1,474/2,750 chars]`), and `hermes journey list` shows every saved memory entry and skill.
+**Check:** Memory capacity and contents. The system prompt memory header shows usage (e.g., `[67% — 1,474/2,200 chars]`), and `hermes journey list` shows every saved memory entry and skill.
 
-**What it means:** Persistent memory is intentionally bounded — 2,750 chars (~1,000 tokens) for MEMORY.md and 2,750 chars (~1,000 tokens) for USER.md. It holds curated key facts, not conversation transcripts. Things worth saving are preferences, environment facts, conventions, and corrections; raw discussion detail is not stored there by design.
+**What it means:** Persistent memory is intentionally bounded — 2,200 chars (~800 tokens) for MEMORY.md and 1,375 chars (~500 tokens) for USER.md. It holds curated key facts, not conversation transcripts. Things worth saving are preferences, environment facts, conventions, and corrections; raw discussion detail is not stored there by design.
 
 For "did we discuss X last week?" recall, the agent has a separate mechanism: `session_search` queries all past sessions (stored in SQLite with full-text search) and can find things discussed weeks ago even when they're not in active memory. Just ask — "search our past sessions for the deploy discussion."
 

@@ -130,11 +130,8 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
 
     call_order: list[str] = []
 
-    kill_kwargs = []
-
-    def _fake_kill_all(task_id=None, **kwargs):
+    def _fake_kill_all(task_id=None):
         call_order.append("kill_all")
-        kill_kwargs.append(kwargs)
         return 2
 
     cleanup_budgets: list[float | None] = []
@@ -187,10 +184,6 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     assert len(cleanup_budgets) == 1
     assert cleanup_budgets[0] is not None
     assert 0 <= cleanup_budgets[0] <= 10.0
-    # Durable tool subprocesses must be excluded from every kill_all() call
-    # made during shutdown (#62 durable-bg-processes).
-    assert kill_kwargs
-    assert all(call == {"exclude_durable": True} for call in kill_kwargs)
 
 
 @pytest.mark.asyncio
@@ -202,7 +195,7 @@ async def test_gateway_stop_passes_positive_environment_cleanup_budget(monkeypat
     import tools.process_registry as _pr
     import tools.terminal_tool as _tt
 
-    monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None, **kwargs: 0)
+    monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
     monkeypatch.setattr(
         _tt,
         "cleanup_all_environments",
@@ -226,44 +219,6 @@ async def test_gateway_stop_passes_positive_environment_cleanup_budget(monkeypat
     assert len(cleanup_budgets) == 1
     assert cleanup_budgets[0] is not None
     assert 0 < cleanup_budgets[0] <= 10.0
-
-
-@pytest.mark.asyncio
-async def test_gateway_shutdown_logs_and_preserves_durable_processes(monkeypatch, caplog):
-    runner, adapter = make_restart_runner()
-    adapter.disconnect = AsyncMock()
-    kill_calls = []
-
-    import cron.scheduler as sched
-    import tools.process_registry as _pr
-    import tools.terminal_tool as _tt
-    import tools.browser_tool as _bt
-
-    monkeypatch.setattr(_pr.process_registry, "count_durable_running", lambda: 1)
-
-    def _fake_kill_all(task_id=None, **kwargs):
-        kill_calls.append(kwargs)
-        return 0
-
-    mark_interrupted = MagicMock()
-    monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
-    monkeypatch.setattr(sched, "mark_running_jobs_interrupted", mark_interrupted)
-    monkeypatch.setattr(_tt, "cleanup_all_environments", lambda **_kwargs: None)
-    monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
-
-    with patch("gateway.status.remove_pid_file"), \
-         patch("gateway.status.write_runtime_status"), \
-         caplog.at_level("INFO", logger="gateway.run"):
-        await runner.stop()
-
-    assert kill_calls
-    assert all(call == {"exclude_durable": True} for call in kill_calls)
-    assert "skipped 1 durable tool subprocess(es)" in caplog.text
-    # Durable processes survive, but any in-flight cron job's agent thread
-    # still dies with this gateway process — the interrupted marking must
-    # therefore run unconditionally (#60432). See
-    # test_cron_active_work_drain.py::test_cron_job_marked_interrupted_even_when_only_durable_survive
-    assert mark_interrupted.call_count >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -359,4 +314,5 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
+
 

@@ -737,7 +737,6 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 if base_url:
                     result = {
                         "name": entry.get("name", ep_name),
-                        "provider_label": ep_name,
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
@@ -1115,20 +1114,8 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
-    named_provider_label = str(custom_provider.get("provider_label") or "").strip()
-    runtime_provider_label = (
-        named_provider_label
-        if named_provider_label and named_provider_label.lower() != "custom"
-        else "custom"
-    )
-
-    # Check if a credential pool exists for this custom endpoint.
-    pool_result = _try_resolve_from_custom_pool(
-        base_url,
-        runtime_provider_label,
-        custom_provider.get("api_mode"),
-        provider_name=custom_provider.get("name"),
-    )
+    # Check if a credential pool exists for this custom endpoint
+    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -1167,7 +1154,7 @@ def _resolve_named_custom_runtime(
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
     result = {
-        "provider": runtime_provider_label,
+        "provider": "custom",
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",

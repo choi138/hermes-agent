@@ -25,7 +25,6 @@ import tempfile
 import threading
 import time
 import traceback
-import unicodedata
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
@@ -155,6 +154,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import (
     MessageDeduplicator,
     ThreadParticipationTracker,
+    convert_table_to_bullets,
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
@@ -273,146 +273,6 @@ async def _wait_for_ready_or_bot_exit(
             ready_task.cancel()
             with suppress(asyncio.CancelledError):
                 await ready_task
-
-
-# ---------------------------------------------------------------------------
-# Markdown table → Discord-friendly fenced ASCII tables
-# ---------------------------------------------------------------------------
-# Discord does not render GitHub-flavored markdown pipe tables. Leaving them as
-# raw pipes makes dense tables hard to scan, especially in narrow mobile views.
-# Reformat detected tables as monospace box-drawing tables inside code fences.
-# BasePlatformAdapter.truncate_message() preserves code-block boundaries when
-# a converted table exceeds Discord's 2000-character message limit.
-
-# Matches a GFM table delimiter row: optional outer pipes, cells containing only
-# dashes (with optional leading/trailing colons for alignment) separated by '|'.
-# Requires at least one internal '|' so lone '---' horizontal rules are ignored.
-_TABLE_SEPARATOR_RE = re.compile(
-    r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$'
-)
-
-
-def _is_markdown_table_row(line: str) -> bool:
-    """Return True if *line* could plausibly be a markdown table data row."""
-    stripped = line.strip()
-    return bool(stripped) and '|' in stripped
-
-
-def _split_markdown_table_row(line: str) -> list[str]:
-    """Split a simple GFM pipe-table row into stripped cell values."""
-    stripped = line.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
-    return [cell.strip() for cell in stripped.split("|")]
-
-
-def _display_width(text: str) -> int:
-    """Return monospace display width, treating CJK full/wide chars as width 2."""
-    width = 0
-    for ch in text:
-        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
-    return width
-
-
-def _pad_display_width(text: str, target_width: int) -> str:
-    """Pad *text* with spaces up to *target_width* display columns."""
-    padding = target_width - _display_width(text)
-    return text + (" " * padding if padding > 0 else "")
-
-
-def _render_markdown_table_for_discord(table_block: list[str]) -> str:
-    """Render a detected GFM pipe table as a fenced box-drawing table."""
-    if len(table_block) < 2:
-        return "\n".join(table_block)
-
-    headers = _split_markdown_table_row(table_block[0])
-    if len(headers) < 2:
-        return "\n".join(table_block)
-
-    num_cols = len(headers)
-    rows: list[list[str]] = []
-    for row_line in table_block[2:]:
-        row = _split_markdown_table_row(row_line)
-        if len(row) < num_cols:
-            row.extend([""] * (num_cols - len(row)))
-        elif len(row) > num_cols:
-            row = row[:num_cols]
-        rows.append(row)
-
-    col_widths = [max(3, _display_width(header)) for header in headers]
-    for row in rows:
-        for index, cell in enumerate(row):
-            col_widths[index] = max(col_widths[index], _display_width(cell))
-
-    def border(left: str, middle: str, right: str) -> str:
-        return left + middle.join("─" * (width + 2) for width in col_widths) + right
-
-    def data_row(cells: list[str]) -> str:
-        padded = [
-            " " + _pad_display_width(cell, col_widths[index]) + " "
-            for index, cell in enumerate(cells)
-        ]
-        return "│" + "│".join(padded) + "│"
-
-    rendered = [
-        border("┌", "┬", "┐"),
-        data_row(headers),
-        border("├", "┼", "┤"),
-    ]
-    rendered.extend(data_row(row) for row in rows)
-    rendered.append(border("└", "┴", "┘"))
-
-    return "```\n" + "\n".join(rendered) + "\n```"
-
-
-def _wrap_markdown_tables_for_discord(text: str) -> str:
-    """Rewrite GFM-style pipe tables into Discord-friendly codeblock tables.
-
-    Tables are detected by a header row containing '|' immediately followed by
-    a delimiter row matching :data:`_TABLE_SEPARATOR_RE`. Existing fenced code
-    blocks are left untouched so preformatted examples stay stable.
-    """
-    if '|' not in text or '-' not in text:
-        return text
-
-    lines = text.split('\n')
-    out: list[str] = []
-    in_fence = False
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.lstrip()
-
-        if stripped.startswith('```'):
-            in_fence = not in_fence
-            out.append(line)
-            i += 1
-            continue
-        if in_fence:
-            out.append(line)
-            i += 1
-            continue
-
-        if (
-            '|' in line
-            and i + 1 < len(lines)
-            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
-        ):
-            table_block = [line, lines[i + 1]]
-            j = i + 2
-            while j < len(lines) and _is_markdown_table_row(lines[j]):
-                table_block.append(lines[j])
-                j += 1
-            out.append(_render_markdown_table_for_discord(table_block))
-            i = j
-            continue
-
-        out.append(line)
-        i += 1
-
-    return "\n".join(out)
 
 
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
@@ -5538,13 +5398,12 @@ class DiscordAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Format message for Discord.
 
-        Discord uses its own markdown variant, but it does not render
-        GitHub-flavored pipe tables. Convert those to fenced ASCII tables so
-        they stay readable in Discord clients.
+        Converts GFM markdown tables to bullet-list groups since Discord
+        does not render pipe tables natively.
         """
         if not content:
             return content
-        return _wrap_markdown_tables_for_discord(content)
+        return convert_table_to_bullets(content)
 
     async def _run_simple_slash(
         self,
@@ -7020,26 +6879,18 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
-        channels: set[str]
         if isinstance(raw, list):
-            channels = {str(part).strip() for part in raw if str(part).strip()}
-        else:
-            # Coerce non-list scalars (str/int/float) to str before splitting.
-            # YAML parses a bare numeric value such as
-            # `free_response_channels: 1491973769726791812` as int, which was
-            # previously falling through the isinstance(str) branch and silently
-            # returning an empty set.  str() here accepts whatever scalar the
-            # YAML loader hands us without changing existing string/CSV
-            # semantics.
-            value = str(raw).strip() if raw is not None else ""
-            channels = {part.strip() for part in value.split(",") if part.strip()}
-        # The home channel is the user's own conversation surface, so it never
-        # requires a mention.  Auto-threading is restored separately in
-        # _handle_message so this free-response entry does not suppress it.
-        home = getattr(self.config, "home_channel", None)
-        if home and getattr(home, "chat_id", None):
-            channels.add(str(home.chat_id))
-        return channels
+            return {str(part).strip() for part in raw if str(part).strip()}
+        # Coerce non-list scalars (str/int/float) to str before splitting.
+        # YAML parses a bare numeric value such as
+        # `free_response_channels: 1491973769726791812` as int, which was
+        # previously falling through the isinstance(str) branch and silently
+        # returning an empty set.  str() here accepts whatever scalar the YAML
+        # loader hands us without changing existing string/CSV semantics.
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
@@ -8448,10 +8299,6 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         is_voice_linked_channel = False
-        is_free_channel = False
-        is_home_channel = False
-        channel_ids: set[str] = set()
-        home = getattr(self.config, "home_channel", None)
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
@@ -8508,8 +8355,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 or bool(channel_keys & free_channels)
                 or is_voice_linked_channel
             )
-            home_channel_id = str(getattr(home, "chat_id", "") or "")
-            is_home_channel = bool(home_channel_id and home_channel_id in channel_ids)
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in)
@@ -8555,12 +8400,8 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or (
-                is_free_channel and not is_home_channel
-            )
+            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
-            if is_home_channel and getattr(home, "auto_thread", None) is not None:
-                auto_thread = bool(home.auto_thread)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)

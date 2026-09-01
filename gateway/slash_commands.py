@@ -1955,10 +1955,6 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
-                        # A manual model choice supersedes model-router intent.
-                        # Do not reconstruct a route later from ambiguous model
-                        # membership.
-                        _self._set_active_model_route(_session_key, "")
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2270,7 +2266,6 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
-            self._set_active_model_route(session_key, "")
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}

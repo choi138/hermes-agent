@@ -193,10 +193,6 @@ class TurnRetryState:
     # ── Transport / rate-limit recovery ──────────────────────────────────
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
-    # Consecutive transport failures that die in under two seconds. A refused
-    # or reset connection streak indicates an unavailable endpoint rather
-    # than congestion where retry backoff could help.
-    fast_transport_failures: int = 0
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider

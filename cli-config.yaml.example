@@ -157,77 +157,6 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
-# Model Routing (ADR-003) — purpose-based route catalog
-# =============================================================================
-# Dormant unless routes are declared. Each route maps a purpose to a concrete
-# runtime plus an ordered, health-checked fallback chain. Route provider names
-# must exist under providers: above (or be a built-in provider id).
-#
-# NOTE: this root-level model_routes: catalog is unrelated to the API server's
-# per-client alias map under platforms.api_server.extra.model_routes (below) —
-# that one maps inbound API model aliases to concrete models for API clients.
-#
-# model_routes:
-#   routes:
-#     dev:
-#       description: "Backend/system/debug/PR source-code work"
-#       provider: claude-lb            # must exist under providers: (or built-in)
-#       model: claude-fable-5
-#       reasoning_effort: xhigh        # minimal|low|medium|high|xhigh|max|none; omit to leave unset
-#       accepted:                      # model ids already "in this tier" (no-op suppression)
-#         - claude-fable-5             # use dash forms: claude-opus-4-8 matches a live
-#         - gpt-5.6-sol                # claude-opus-4.8, not the other way around
-#       fallbacks:                     # ordered failover chain, passively health-checked
-#         - provider: codex-nekos
-#           model: gpt-5.6-sol
-#           reasoning_effort: xhigh    # fallback effort is NOT inherited from the route
-#         - provider: glm-vooy
-#           model: grok-4.5
-#       repromote_after_turns: 3       # trusted no-op turns on a non-primary accepted member
-#                                      # before returning to the healthy primary; 0 disables,
-#                                      # omit to inherit router.repromote_after_turns
-#     chat:
-#       description: "Conversation, quick Q&A"
-#       provider: glm-vooy
-#       model: grok-4.5
-#   health:                            # fail-open provider health tracking and recovery probes
-#     enabled: true
-#     cache_path: ""                   # "" = <hermes home>/state/model_route_health.json
-#     ok_ttl_seconds: 300              # healthy results cached this long
-#     fail_ttl_seconds: 120            # failures retried sooner
-#     probe_timeout_seconds: 2.5
-#   static_rules:                      # matched before the LLM classifier; first match wins
-#     - name: pr-review-shorthand      # optional; appears as `rule` in the decision log
-#       route: dev
-#       when:                          # every condition must hold (AND)
-#         text_matches_any:            # regex list, any may match
-#           - 'codex-lb\s+#?\d+'
-#       reason: "PR shorthand always routes to dev"
-#     - route: chat
-#       when:                          # source conditions use {eq|in|not_in}
-#         is_owner: { eq: false }
-#         chat_type: { in: [dm] }
-#       reason: "non-owner DMs stay on the chat tier"
-#   router:                            # dynamic pre-dispatch router (gateway/model_router.py)
-#     mode: off                        # off | shadow (log-only soak) | enforce;
-#                                      # env HERMES_MODEL_ROUTER_MODE wins when set
-#     provider: gemini                 # classifier provider
-#     model: gemini-3-flash-preview    # classifier model (bench winner; keep unless re-benched)
-#     timeout_ms: 8000                 # classifier transport timeout
-#     classify_timeout_s: 2            # enforce-mode wall-clock budget; timeout uses
-#                                      # the narrow regex fallback (never hysteresis)
-#     recent_turns: 5                  # dialogue turns shown to the classifier
-#     normal_downgrade_streak: 3       # consecutive trusted NORMALs before chat downgrade
-#     repromote_after_turns: 3         # trusted no-op turns on a non-primary accepted member
-#                                      # before re-promotion to the route primary; 0 disables
-#     chat_route: chat                 # NORMAL downgrade target; "" disables downgrades
-#     label_routes:                    # classifier label -> route; missing/"" = never switches
-#       SYSTEM_DEV: dev
-#       FRONTEND_DEV: dev
-#       DOCUMENT_WORK: ""
-#     decision_log: ""                 # "" = <hermes home>/logs/model_router_decisions.jsonl
-
-# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.
@@ -760,8 +689,8 @@ memory:
   user_profile_enabled: true
   
   # Character limits (~2.75 chars per token, model-independent)
-  memory_char_limit: 2750   # ~1,000 tokens
-  user_char_limit: 2750     # ~1,000 tokens
+  memory_char_limit: 2200   # ~800 tokens
+  user_char_limit: 1375     # ~500 tokens
 
   # Periodic memory nudge: remind the agent to consider saving memories
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
@@ -1175,18 +1104,6 @@ platform_toolsets:
 #
 # CLI override: hermes chat --toolsets terminal,web,file
 
-# agent.disabled_toolsets subtracts names from the resolved tool surface,
-# regardless of which platform or toolset enabled them. Entries may be:
-#   - a toolset name     (for example, "browser") to remove the whole bundle
-#   - a registered tool  (for example, "text_to_speech") to remove one tool
-# Toolset names take precedence when a name is both a toolset and a tool (for
-# example, "memory"). Disabling unused tools trims the model-visible schema
-# without unregistering them; remove an entry from the list to re-enable it.
-# agent:
-#   disabled_toolsets:
-#     - text_to_speech      # Drop voice output if unused
-#     - browser             # Drop the entire browser suite
-
 # =============================================================================
 # MCP (Model Context Protocol) Servers
 # =============================================================================
@@ -1401,12 +1318,6 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
-  # default_route: ""                         # model_routes route used when delegate_task names no route.
-  #                                           # Empty/absent keeps delegation.model/provider behavior above.
-  #                                           # When valid routes exist, delegate_task exposes a config-derived
-  #                                           # route enum at the top level and per task (per-task wins).
-  #                                           # The route's health-checked runtime and reasoning_effort apply;
-  #                                           # unknown or fully unhealthy routes error without silent fallback.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

@@ -885,17 +885,6 @@ def run_codex_app_server_turn(
             )
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
-        # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW) —
-        # mirrors the turn_finalizer hook so the codex app-server path feeds
-        # the same mechanical salience accumulator. Fail-open.
-        try:
-            from agent.ingest_curator import observe_turn_completed
-            observe_turn_completed(agent, messages)
-        except Exception:
-            logger.debug(
-                "ingest-curator turn observation failed (fail-open)",
-                exc_info=True,
-            )
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND

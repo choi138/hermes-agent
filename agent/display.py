@@ -566,65 +566,6 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     return preview
 
 
-def format_todo_result_for_progress(
-    result: str, *, max_items: int = 12, max_content_len: int = 88
-) -> str | None:
-    """Render a todo tool JSON result as a compact gateway progress block."""
-    data = safe_json_loads(result, default={})
-    if not isinstance(data, dict) or not isinstance(data.get("todos"), list):
-        return None
-    todos = data["todos"]
-    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
-
-    def _count(key: str, default: int = 0) -> int:
-        try:
-            return int(summary.get(key, default) or 0)
-        except (TypeError, ValueError):
-            return default
-
-    def _code_text(text: str) -> str:
-        text = _oneline(text).replace("```", "`\u200b``")
-        if max_content_len > 3 and len(text) > max_content_len:
-            return text[: max_content_len - 3] + "..."
-        return text[:max_content_len] if max_content_len > 0 else text
-
-    counts = {
-        "total": _count("total", len(todos)),
-        "doing": _count("in_progress"),
-        "todo": _count("pending"),
-        "done": _count("completed"),
-        "cancelled": _count("cancelled"),
-    }
-    parts = [f"{counts['total']} total"]
-    parts.extend(
-        f"{count} {label}"
-        for label, count in counts.items()
-        if label != "total" and count
-    )
-    header = f"📋 tasks: {' · '.join(parts)}"
-    markers = {
-        "in_progress": ("▸", "doing"),
-        "pending": ("○", "todo"),
-        "completed": ("✓", "done"),
-        "cancelled": ("✕", "cancelled"),
-    }
-    valid_items = [item for item in todos if isinstance(item, dict)]
-    lines = []
-    for item in valid_items[:max_items]:
-        status = str(item.get("status") or "pending").strip().lower()
-        marker, label = markers.get(status, ("?", status or "unknown"))
-        content = _code_text(str(item.get("content") or "(no description)"))
-        lines.append(f"{marker} {label:<9} {content}")
-    remaining = len(valid_items) - len(lines)
-    if remaining > 0:
-        lines.append(f"… +{remaining} more")
-    return (
-        header
-        if not lines
-        else f"{header}\n```text\n" + "\n".join(lines) + "\n```"
-    )
-
-
 def prepare_tool_preview(
     tool_name: str,
     args: dict | None,

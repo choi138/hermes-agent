@@ -28,7 +28,6 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
-import hashlib
 import inspect
 import json
 import logging
@@ -41,14 +40,12 @@ import sys
 import signal
 import threading
 import time
-import traceback
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Iterable, Optional, Any, List, Tuple, Union, cast
 
-from agent import turn_trace
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
@@ -89,8 +86,6 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
-_MODEL_ROUTER_SHADOW_MAX_INFLIGHT = 4
-_MODEL_ROUTER_INIT_LOCK = threading.Lock()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -1064,34 +1059,6 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
-def _gateway_turn_resume_enabled() -> bool:
-    """Return whether interrupted gateway turns resume in place."""
-    raw = (os.environ.get("HERMES_GATEWAY_TURN_RESUME") or "").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
-
-
-_TURN_RESUME_MAX_DEFAULT = 2
-
-
-def _turn_resume_max() -> int:
-    """Return the poison-turn retry cap for same-turn resumes."""
-    value = int(_float_env("HERMES_TURN_RESUME_MAX", _TURN_RESUME_MAX_DEFAULT))
-    return value if value >= 0 else _TURN_RESUME_MAX_DEFAULT
-
-
-def _orphaned_active_turn(entry: Any, boot_id: str) -> Optional[Dict[str, Any]]:
-    """Return an interrupted or stale-process active-turn record."""
-    record = getattr(entry, "active_turn", None)
-    if not isinstance(record, dict):
-        return None
-    status = record.get("status")
-    if status == "interrupted":
-        return record
-    if status in ("running", "resuming") and record.get("boot_id") != boot_id:
-        return record
-    return None
-
-
 def _stamp_hygiene_compression_provenance(
     agent: Any,
     desc: str,
@@ -1966,18 +1933,6 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     agent_cfg = cfg.get("agent", {})
     if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
-    if isinstance(agent_cfg, dict) and "process_wait_cap" in agent_cfg:
-        os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
-    if isinstance(agent_cfg, dict) and "fast_conn_fail_limit" in agent_cfg:
-        os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(
-            agent_cfg["fast_conn_fail_limit"]
-        )
-    if isinstance(agent_cfg, dict) and "gateway_turn_resume" in agent_cfg:
-        os.environ["HERMES_GATEWAY_TURN_RESUME"] = str(
-            agent_cfg["gateway_turn_resume"]
-        )
-    if isinstance(agent_cfg, dict) and "turn_resume_max" in agent_cfg:
-        os.environ["HERMES_TURN_RESUME_MAX"] = str(agent_cfg["turn_resume_max"])
     # config-authoritative knobs for the session-search index (config.yaml
     # sessions.* wins over stale env; env stays the cross-process carrier).
     sessions_cfg = cfg.get("sessions", {})
@@ -1986,33 +1941,6 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_CJK_FTS"] = str(sessions_cfg["cjk_fts"])
         if "search_slow_ms" in sessions_cfg:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
-
-
-def _gateway_max_workers(default: int = 12) -> int:
-    """Return the size of the shared gateway agent-turn thread pool.
-
-    Every gateway turn occupies one worker for its full lifetime, including
-    blocking process waits and long-running background work.  Resolve the
-    setting from ``gateway.max_workers`` first, then the environment carrier,
-    and keep at least two workers available.
-    """
-    value = None
-    try:
-        config = _load_gateway_config()
-        gateway_config = config.get("gateway") if isinstance(config, dict) else None
-        if isinstance(gateway_config, dict) and gateway_config.get("max_workers") is not None:
-            value = gateway_config["max_workers"]
-    except Exception:
-        pass
-
-    if value is None:
-        value = os.environ.get("HERMES_GATEWAY_MAX_WORKERS")
-
-    try:
-        workers = int(value) if value is not None else default
-    except (TypeError, ValueError):
-        workers = default
-    return max(2, workers)
 
 
 def _current_max_iterations() -> int:
@@ -2318,14 +2246,6 @@ if _config_path.exists():
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
-                )
-            if "process_wait_cap" in _agent_cfg:
-                os.environ["HERMES_PROCESS_WAIT_CAP"] = str(
-                    _agent_cfg["process_wait_cap"]
-                )
-            if "fast_conn_fail_limit" in _agent_cfg:
-                os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(
-                    _agent_cfg["fast_conn_fail_limit"]
                 )
             if "gateway_startup_restore_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
@@ -2635,8 +2555,7 @@ _AGENT_PENDING_SENTINEL = object()
 # ``ConversationState.clear()`` — adding a field to ConversationState means
 # every boundary picks it up automatically.  This tuple is retained for:
 #   (a) plain-dict conversation-scoped stores not yet folded into
-#       SessionState (currently ``_pending_model_notes`` and
-#       ``_model_router_state``), which
+#       SessionState (currently ``_pending_model_notes``), which
 #       _clear_conversation_scope still pops per-key; and
 #   (b) the public test contract (tests import and iterate this tuple).
 # History: boundaries used to each carry a hand-copied pop-list that drifted
@@ -2657,12 +2576,8 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
-    # One-shot desired-route intent from pre_gateway_dispatch runtime routers;
-    # stale route intent must not survive a conversation reset.
-    "_pending_runtime_route_states",
     "_session_service_tier_overrides",
     "_pending_model_notes",
-    "_model_router_state",
     "_last_resolved_model",
     "_queued_events",
     # Stall-watchdog "already notified" latch (#72016). Cleared on /new so a
@@ -2754,24 +2669,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _resolve_runtime_agent_kwargs_for_provider(
-    provider: str,
-    *,
-    target_model: Optional[str] = None,
-) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
     try:
-        if target_model is None:
-            runtime = resolve_runtime_provider(requested=provider)
-        else:
-            runtime = resolve_runtime_provider(
-                requested=provider,
-                target_model=target_model,
-            )
+        runtime = resolve_runtime_provider(requested=provider)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -3388,23 +3293,6 @@ def _load_gateway_config() -> dict:
     except Exception:
         pass
     return raw
-
-
-def _model_router_mode(config: Optional[dict] = None) -> str:
-    """Return effective router mode without importing the router module.
-
-    ``HERMES_MODEL_ROUTER_MODE`` is an emergency bridge and wins when set.
-    Unknown non-empty overrides fail safe to ``off``.
-    """
-    override = os.environ.get("HERMES_MODEL_ROUTER_MODE", "").strip().lower()
-    if override:
-        return override if override in {"shadow", "enforce"} else "off"
-    cfg = config if isinstance(config, dict) else _load_gateway_config()
-    section = cfg.get("model_routes") if isinstance(cfg, dict) else None
-    router = section.get("router") if isinstance(section, dict) else None
-    raw_mode = router.get("mode") if isinstance(router, dict) else None
-    mode = str(raw_mode or "").strip().lower() if isinstance(raw_mode, str) else "off"
-    return mode if mode in {"shadow", "enforce"} else "off"
 
 
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
@@ -4173,35 +4061,6 @@ class TurnRunner:
         except Exception:
             pass
 
-        # A completed todo call carries the authoritative task list, so the
-        # bubble can show per-item statuses instead of the count-only start
-        # line ("📋 Updating tasks planning N task(s)").  Semantic progress
-        # owns its own fixed-vocabulary snapshot and is left untouched.
-        if (
-            event_type == "tool.completed"
-            and tool_name == "todo"
-            and not kwargs.get("is_error")
-            and not ctx.semantic_progress_enabled
-        ):
-            try:
-                from agent.display import (
-                    format_todo_result_for_progress,
-                    get_tool_verb,
-                )
-
-                todo_progress = format_todo_result_for_progress(
-                    kwargs.get("result") or ""
-                )
-                if todo_progress:
-                    todo_verb = get_tool_verb("todo")
-                    todo_prefix = f"📋 {todo_verb}" if todo_verb else "📋 todo"
-                    ctx.progress_queue.put(
-                        ("__replace_last_matching__", todo_prefix, todo_progress)
-                    )
-            except Exception as todo_err:
-                logger.debug("todo progress formatting failed: %s", todo_err)
-            return
-
         if ctx.semantic_progress_enabled:
             # Discord's default all/new surface is a fixed-vocabulary
             # snapshot. Raw names, args, previews, and results never reach
@@ -4611,31 +4470,6 @@ class TurnRunner:
                     if progress_lines:
                         progress_lines[-1] = f"{base_msg} (×{count + 1})"
                     msg = progress_lines[-1] if progress_lines else base_msg
-                elif (
-                    isinstance(raw, tuple)
-                    and len(raw) == 3
-                    and raw[0] == "__replace_last_matching__"
-                ):
-                    # In-place refinement of an earlier line (todo statuses
-                    # replacing the count-only "planning N task(s)" line) so
-                    # the detail lands where the tool call was reported
-                    # instead of duplicating it at the bottom.
-                    _, prefix, replacement = raw
-                    msg = str(replacement)
-                    replace_idx = next(
-                        (
-                            idx
-                            for idx in range(len(progress_lines) - 1, -1, -1)
-                            if str(progress_lines[idx]).startswith(str(prefix))
-                        ),
-                        None,
-                    )
-                    if replace_idx is None:
-                        progress_lines.append(msg)
-                    else:
-                        progress_lines[replace_idx] = msg
-                    ctx.last_progress_msg[0] = msg
-                    ctx.repeat_count[0] = 0
                 elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                     # Content bubble just landed on the platform — close off
                     # the current tool-progress bubble so the next tool
@@ -4653,7 +4487,7 @@ class TurnRunner:
                     ctx.repeat_count[0] = 0
                     continue
                 else:
-                    msg = str(raw)
+                    msg = raw
                     progress_lines.append(msg)
 
                 if await _roll_progress_overflow_if_needed():
@@ -4670,11 +4504,11 @@ class TurnRunner:
                 _now = time.monotonic()
                 _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
                 if _remaining > 0:
-                    # Wait out the throttle interval and then deliver, rather
-                    # than looping back to batch: when this is the final
-                    # queued event nothing else arrives to trigger the edit
-                    # and the accumulated lines would never be flushed.
+                    # Wait out the throttle interval, then loop back to
+                    # drain any additional queued messages before sending
+                    # a single batched edit.
                     await asyncio.sleep(_remaining)
+                    continue
 
                 if ctx.progress_closed.is_set() or not ctx._run_still_current():
                     return
@@ -4778,25 +4612,6 @@ class TurnRunner:
                             if progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                 await _roll_progress_overflow_if_needed()
-                        elif (
-                            isinstance(raw, tuple)
-                            and len(raw) == 3
-                            and raw[0] == "__replace_last_matching__"
-                        ):
-                            _, prefix, replacement = raw
-                            replace_idx = next(
-                                (
-                                    idx
-                                    for idx in range(len(progress_lines) - 1, -1, -1)
-                                    if str(progress_lines[idx]).startswith(str(prefix))
-                                ),
-                                None,
-                            )
-                            if replace_idx is None:
-                                progress_lines.append(str(replacement))
-                            else:
-                                progress_lines[replace_idx] = str(replacement)
-                            await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                             # Content-bubble marker during drain: close off
                             # the current progress bubble and start a fresh
@@ -4815,7 +4630,7 @@ class TurnRunner:
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
                         else:
-                            progress_lines.append(str(raw))
+                            progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
                     except Exception:
                         break
@@ -4930,13 +4745,6 @@ class TurnRunner:
 
     def run_sync(self):
         ctx = self._ctx
-        # Always replace the worker thread's current trace, including with
-        # None. Thread-pool workers are reused across sessions; retaining an
-        # unfinished prior trace could misattribute a later untraced turn.
-        turn_trace.safe_adopt(ctx.turn_trace_obj)
-        _trace_setup_started = (
-            time.time() if ctx.turn_trace_obj is not None else 0.0
-        )
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
         # (prepending model-switch / resume-recovery notes) would otherwise
@@ -5008,34 +4816,6 @@ class TurnRunner:
             model=model,
         )
         self._runner._reasoning_config = reasoning_config
-        if ctx.event is not None:
-            _shadow_runtime = {
-                "model": str(model or ""),
-                "provider": str(runtime_kwargs.get("provider") or ""),
-                "api_mode": str(runtime_kwargs.get("api_mode") or ""),
-            }
-            if isinstance(reasoning_config, dict):
-                if reasoning_config.get("enabled") is False:
-                    _shadow_runtime["reasoning_effort"] = "none"
-                elif reasoning_config.get("effort"):
-                    _shadow_runtime["reasoning_effort"] = str(
-                        reasoning_config["effort"]
-                    )
-            try:
-                self._runner._schedule_model_router_shadow(
-                    event=ctx.event,
-                    session_key=ctx.session_key or "",
-                    runtime=_shadow_runtime,
-                    user_config=ctx.user_config,
-                )
-            except Exception as exc:
-                # Scheduling is best-effort. Never include exception text or a
-                # traceback: classifier transports can carry credentials.
-                logger.warning(
-                    "model router shadow scheduling failed open for session=%s (%s)",
-                    ctx.session_key or "?",
-                    type(exc).__name__,
-                )
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
         )
@@ -5583,72 +5363,16 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
-        if hasattr(agent, "_runtime_reasoning_source"):
-            try:
-                delattr(agent, "_runtime_reasoning_source")
-            except AttributeError:
-                pass
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
-        # Route identity is session intent, not model membership.  Rebind it
-        # after both fresh construction and cache reuse so outage fallback can
-        # prefer the correct route even when accepted models overlap.
-        self._runner._bind_active_model_route(agent, ctx.session_key)
-        # Consume the route state exactly once. It is rendered onto the current
-        # user-message sidecar below; assigning unconditionally ensures a reused
-        # cached agent cannot replay the preceding turn's directive.
-        agent._runtime_route_state = (
-            self._runner._consume_pending_runtime_route_state(ctx.session_key)
-        )
-        agent._refusal_recall_quarantine_pending = (
-            self._runner._consume_refusal_recall_quarantine(ctx.session_key)
-        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
         # intro, voice-channel change).  Assigned unconditionally so a
         # reused cached agent never replays a stale note.
-        turn_sidecar_parts = self._runner._consume_pending_turn_sidecar_notes(
-            ctx.session_key
+        agent._gateway_turn_context_notes = "\n\n".join(
+            self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         )
-        if agent._runtime_route_state:
-            try:
-                from agent.system_prompt import format_routing_directive
-
-                directive_line = format_routing_directive(agent._runtime_route_state)
-                if directive_line:
-                    turn_sidecar_parts.append(directive_line)
-            except Exception:
-                logger.debug("routing directive render failed", exc_info=True)
-        agent._gateway_turn_context_notes = "\n\n".join(turn_sidecar_parts)
-
-        def _runtime_update_callback(
-            *, scope: str, model_override=None, reasoning_config=None
-        ) -> None:
-            if scope != "session" or not ctx.session_key:
-                return
-            state = self._runner._session_state(ctx.session_key)
-            if model_override:
-                state.conversation.model_override = {
-                    "model": model_override.get("model", ""),
-                    "provider": model_override.get("provider", ""),
-                    "api_key": model_override.get("api_key", ""),
-                    "base_url": model_override.get("base_url", ""),
-                    "api_mode": model_override.get("api_mode", ""),
-                }
-            if reasoning_config is not None:
-                state.conversation.reasoning_override = dict(reasoning_config)
-            if model_override or reasoning_config is not None:
-                self._runner._persist_session_runtime_override(
-                    ctx.session_key,
-                    model=(model_override or {}).get("model"),
-                    provider=(model_override or {}).get("provider"),
-                    reasoning_config=reasoning_config,
-                    include_model=bool(model_override),
-                    include_reasoning=reasoning_config is not None,
-                )
-
-        agent.runtime_update_callback = _runtime_update_callback
 
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
@@ -5829,14 +5553,6 @@ class TurnRunner:
         agent.thinking_progress = ctx._thinking_enabled
         # Store agent reference for interrupt support
         ctx.agent_holder[0] = agent
-        if ctx.turn_trace_obj is not None:
-            turn_trace.safe_add_span(
-                ctx.turn_trace_obj,
-                "gateway.agent_setup",
-                _trace_setup_started,
-                time.time(),
-                rebuild=not reused_cached_agent,
-            )
         # Publish turn ownership for explicit /stop, /new, disconnect, and
         # shutdown interrupts. Older session processes are outside this
         # baseline and remain alive.
@@ -6009,37 +5725,11 @@ class TurnRunner:
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
 
-        # A restart-generated event can re-enter the interrupted transcript in
-        # place. Legacy resume markers without a durable record are trusted
-        # only when the persisted tail itself still looks interrupted.
-        _turn_resume_marker = ctx.turn_resume_marker
-        _is_turn_resume = bool(
-            isinstance(_turn_resume_marker, dict)
-            and agent_history
-            and _gateway_turn_resume_enabled()
-        )
-        if _is_turn_resume and not _turn_resume_marker.get("record_backed"):
-            from agent.turn_resume import is_interrupt_closer_message as _is_closer
-
-            _rt_tail = agent_history[-1]
-            _is_turn_resume = bool(
-                isinstance(_rt_tail, dict)
-                and (
-                    _rt_tail.get("role") == "tool"
-                    or (
-                        _rt_tail.get("role") == "assistant"
-                        and _rt_tail.get("tool_calls")
-                    )
-                    or _is_closer(_rt_tail)
-                )
-            )
-
         # Prepend pending model switch note so the model knows about the switch
         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
-        if not _is_turn_resume:
-            _msn = _pending_notes.pop(ctx.session_key, None) if ctx.session_key else None
-            if _msn:
-                ctx.message = _msn + "\n\n" + ctx.message
+        _msn = _pending_notes.pop(ctx.session_key, None) if ctx.session_key else None
+        if _msn:
+            ctx.message = _msn + "\n\n" + ctx.message
 
         # Auto-continue: if the loaded history ends with a tool result,
         # the previous agent turn was interrupted mid-work (gateway
@@ -6106,9 +5796,7 @@ class TurnRunner:
             and _interruption_is_fresh
         )
 
-        if _is_turn_resume:
-            pass
-        elif _is_resume_pending:
+        if _is_resume_pending:
             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             _persist_user_message_override = ctx.message
             # The empty-message case is the auto-resume startup turn
@@ -6142,12 +5830,7 @@ class TurnRunner:
         # clear. Nothing was written to the transcript out-of-band, so
         # message alternation stays intact.
         _pending_notes = getattr(self._runner, "_pending_skills_reload_notes", None)
-        if (
-            not _is_turn_resume
-            and _pending_notes
-            and ctx.session_key
-            and ctx.session_key in _pending_notes
-        ):
+        if _pending_notes and ctx.session_key and ctx.session_key in _pending_notes:
             _srn = _pending_notes.pop(ctx.session_key, None)
             if _srn:
                 ctx.message = _srn + "\n\n" + ctx.message
@@ -6162,8 +5845,7 @@ class TurnRunner:
         # legitimately empty user turns (e.g. an image with no caption,
         # wrapped as native content below) are untouched.
         if (
-            not _is_turn_resume
-            and isinstance(ctx.message, str)
+            isinstance(ctx.message, str)
             and not ctx.message.strip()
             and _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
@@ -6184,8 +5866,6 @@ class TurnRunner:
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
-            if ctx.turn_trace_obj is not None:
-                turn_trace.safe_bind(agent, ctx.turn_trace_obj)
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
@@ -6225,43 +5905,14 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
-            if _is_turn_resume:
-                _conversation_kwargs["resume_turn"] = True
-                _conversation_kwargs["turn_id"] = _turn_resume_marker.get("turn_id")
-                _api_run_message = ""
-            else:
-                if _persist_user_message_override is not None:
-                    _conversation_kwargs["persist_user_message"] = _persist_user_message_override
-                elif observed_group_context:
-                    _conversation_kwargs["persist_user_message"] = ctx.message
-                if ctx.moa_config is not None:
-                    _conversation_kwargs["moa_config"] = ctx.moa_config
-                if _persist_user_timestamp_override is not None:
-                    _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-
-                # Record the turn immediately before dispatch so a crash at
-                # any later point leaves an orphan that the next boot can
-                # identify and resume with the same agent-side turn id.
-                if ctx.session_key and _gateway_turn_resume_enabled():
-                    import uuid as _uuid_mod
-
-                    _gateway_turn_id = (
-                        f"{ctx.session_id}:{ctx.session_id}:"
-                        f"{_uuid_mod.uuid4().hex[:8]}"
-                    )
-                    try:
-                        if self._runner.session_store.begin_active_turn(
-                            ctx.session_key,
-                            _gateway_turn_id,
-                            self._runner._boot_id,
-                        ):
-                            _conversation_kwargs["turn_id"] = _gateway_turn_id
-                    except Exception:
-                        logger.debug(
-                            "begin_active_turn failed for %s",
-                            ctx.session_key,
-                            exc_info=True,
-                        )
+            if _persist_user_message_override is not None:
+                _conversation_kwargs["persist_user_message"] = _persist_user_message_override
+            elif observed_group_context:
+                _conversation_kwargs["persist_user_message"] = ctx.message
+            if ctx.moa_config is not None:
+                _conversation_kwargs["moa_config"] = ctx.moa_config
+            if _persist_user_timestamp_override is not None:
+                _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -6274,9 +5925,6 @@ class TurnRunner:
             except Exception:
                 pass
             reset_current_session_key(_approval_session_token)
-            if ctx.turn_trace_obj is not None:
-                turn_trace.safe_bind(agent, None)
-            turn_trace.safe_adopt(None)
         ctx.result_holder[0] = result
 
         # Signal the stream consumer that the agent is done
@@ -6822,23 +6470,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
-        self._model_router_state: Dict[str, dict] = {}
-        self._model_router_state_lock = threading.Lock()
-        self._model_router_shadow_slots = threading.BoundedSemaphore(
-            _MODEL_ROUTER_SHADOW_MAX_INFLIGHT
-        )
-        self._model_router_shadow_inflight: set[str] = set()
-        self._model_route_catalog_cache: OrderedDict[str, Any] = OrderedDict()
-        self._model_route_catalog_cache_lock = threading.Lock()
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
-        # Process identity recorded with durable turns. A different value on
-        # the next boot proves an in-flight record was orphaned.
-        import uuid as _uuid_mod
-        self._boot_id: str = _uuid_mod.uuid4().hex
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -7798,949 +7434,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
-    def _ensure_model_router_runtime_state(self):
-        """Return lazily initialized guards for bare-test and live runners."""
-        if all(
-            getattr(self, name, None) is not None
-            for name in (
-                "_model_router_state_lock",
-                "_model_router_state",
-                "_model_router_shadow_slots",
-                "_model_router_shadow_inflight",
-            )
-        ):
-            return (
-                self._model_router_state_lock,
-                self._model_router_state,
-                self._model_router_shadow_slots,
-                self._model_router_shadow_inflight,
-            )
-
-        with _MODEL_ROUTER_INIT_LOCK:
-            if getattr(self, "_model_router_state_lock", None) is None:
-                self._model_router_state_lock = threading.Lock()
-            if getattr(self, "_model_router_state", None) is None:
-                self._model_router_state = {}
-            if getattr(self, "_model_router_shadow_slots", None) is None:
-                self._model_router_shadow_slots = threading.BoundedSemaphore(
-                    _MODEL_ROUTER_SHADOW_MAX_INFLIGHT
-                )
-            if getattr(self, "_model_router_shadow_inflight", None) is None:
-                self._model_router_shadow_inflight = set()
-        return (
-            self._model_router_state_lock,
-            self._model_router_state,
-            self._model_router_shadow_slots,
-            self._model_router_shadow_inflight,
-        )
-
-    @staticmethod
-    def _model_route_catalog_fingerprint(cfg: dict) -> str:
-        """Hash only config roots that affect route parsing and validation."""
-        relevant = {
-            "model_routes": cfg.get("model_routes"),
-            "providers": cfg.get("providers"),
-            "custom_providers": cfg.get("custom_providers"),
-            "router_mode_env": os.environ.get(
-                "HERMES_MODEL_ROUTER_MODE", ""
-            ).strip().lower(),
-        }
-        try:
-            serialized = json.dumps(
-                relevant,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-        except (TypeError, ValueError):
-            # Malformed hand-written YAML can contain mixed-type mapping keys,
-            # which JSON cannot sort. Validation still needs to see that input.
-            serialized = repr(relevant)
-        payload = serialized.encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
-
-    def _model_route_catalog(self, cfg: dict):
-        """Return the parsed route catalog until relevant config changes."""
-        from hermes_cli.model_routes import load_routes
-
-        fingerprint = self._model_route_catalog_fingerprint(cfg)
-        lock = getattr(self, "_model_route_catalog_cache_lock", None)
-        cache = getattr(self, "_model_route_catalog_cache", None)
-        if lock is None or cache is None:
-            with _MODEL_ROUTER_INIT_LOCK:
-                if getattr(self, "_model_route_catalog_cache_lock", None) is None:
-                    self._model_route_catalog_cache_lock = threading.Lock()
-                if getattr(self, "_model_route_catalog_cache", None) is None:
-                    self._model_route_catalog_cache = OrderedDict()
-            lock = self._model_route_catalog_cache_lock
-            cache = self._model_route_catalog_cache
-
-        with lock:
-            catalog = cache.get(fingerprint)
-            if catalog is not None:
-                cache.move_to_end(fingerprint)
-                return catalog
-            catalog = load_routes(cfg)
-            cache[fingerprint] = catalog
-            cache.move_to_end(fingerprint)
-            while len(cache) > 16:
-                cache.popitem(last=False)
-            return catalog
-
-    def _begin_model_router_state(self, session_key: str, *, invalidate: bool):
-        """Create an isolated state transaction for one routing decision."""
-        lock, shared, _slots, _inflight = self._ensure_model_router_runtime_state()
-        key = str(session_key or "unknown")
-        with lock:
-            current = shared.get(key)
-            if not isinstance(current, dict):
-                current = {"normal_streak": 0}
-                shared[key] = current
-            elif invalidate:
-                # Enforce supersedes any older detached shadow transaction.
-                current = dict(current)
-                shared[key] = current
-            local = {key: dict(current)}
-        return key, shared, current, local
-
-    def _commit_model_router_state(
-        self,
-        key: str,
-        shared: dict,
-        identity: dict,
-        local: dict,
-    ) -> bool:
-        """Commit only if no boundary or newer decision replaced this entry."""
-        lock, current_shared, _slots, _inflight = (
-            self._ensure_model_router_runtime_state()
-        )
-        with lock:
-            if current_shared is not shared or shared.get(key) is not identity:
-                return False
-            entry = local.get(key)
-            if not isinstance(entry, dict):
-                return False
-            shared[key] = entry
-            return True
-
-    def _schedule_model_router_shadow(
-        self,
-        *,
-        event: MessageEvent,
-        session_key: str,
-        runtime: dict,
-        user_config: Optional[dict] = None,
-    ) -> bool:
-        """Start bounded fire-and-forget shadow evaluation.
-
-        Only one task per session and at most four tasks per gateway may be in
-        flight. Saturation drops shadow observations instead of queueing work
-        behind the user-facing turn.
-        """
-        cfg = user_config if isinstance(user_config, dict) else {}
-        if _model_router_mode(cfg) != "shadow":
-            return False
-
-        lock, shared, slots, inflight = self._ensure_model_router_runtime_state()
-        if not slots.acquire(blocking=False):
-            logger.debug("model router: shadow capacity full; observation skipped")
-            return False
-
-        key = str(session_key or "unknown")
-        with lock:
-            if key in inflight:
-                slots.release()
-                logger.debug(
-                    "model router: shadow observation already running for %s",
-                    key,
-                )
-                return False
-            inflight.add(key)
-            identity = shared.get(key)
-            if not isinstance(identity, dict):
-                identity = {"normal_streak": 0}
-                shared[key] = identity
-            local_state = {key: dict(identity)}
-
-        def evaluate() -> None:
-            try:
-                decision = self._evaluate_model_router_shadow(
-                    event=event,
-                    session_key=session_key,
-                    runtime=runtime,
-                    user_config=cfg,
-                    state_override=local_state,
-                )
-                if decision is not None and _model_router_mode(cfg) == "shadow":
-                    self._commit_model_router_state(
-                        key, shared, identity, local_state
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "model router shadow evaluation failed open for session=%s (%s)",
-                    session_key or "?",
-                    type(exc).__name__,
-                )
-            finally:
-                with lock:
-                    inflight.discard(key)
-                slots.release()
-
-        try:
-            worker_context = copy_context()
-            threading.Thread(
-                target=worker_context.run,
-                args=(evaluate,),
-                daemon=True,
-                name=f"model-router-shadow-{key[:24]}",
-            ).start()
-        except Exception as exc:
-            with lock:
-                inflight.discard(key)
-            slots.release()
-            logger.warning(
-                "model router shadow worker failed to start (%s)",
-                type(exc).__name__,
-            )
-            return False
-        return True
-
-    def _model_router_runtime_snapshot(
-        self,
-        source: SessionSource,
-        session_key: str,
-        *,
-        user_config: Optional[dict] = None,
-    ) -> dict:
-        """Return the current non-secret runtime axes for route evaluation."""
-        try:
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
-                source=source,
-                session_key=session_key,
-                user_config=user_config,
-            )
-        except Exception:
-            logger.debug("model router: runtime snapshot failed", exc_info=True)
-            return {}
-        snapshot: dict = {}
-        if model:
-            snapshot["model"] = model
-        for name in ("provider", "base_url"):
-            value = (runtime_kwargs or {}).get(name)
-            if value:
-                snapshot[name] = value
-        try:
-            reasoning = self._resolve_session_reasoning_config(
-                source=source,
-                session_key=session_key,
-                model=str(model or ""),
-            )
-        except Exception:
-            logger.debug("model router: reasoning snapshot failed", exc_info=True)
-            reasoning = None
-        if isinstance(reasoning, dict):
-            if reasoning.get("enabled") is False:
-                snapshot["reasoning_effort"] = "none"
-            elif reasoning.get("effort"):
-                snapshot["reasoning_effort"] = str(reasoning["effort"])
-        return snapshot
-
-    def _set_active_model_route(self, session_key: str, route_name: str) -> None:
-        """Persist applied route intent for agent rebuilds in this conversation."""
-        if not session_key:
-            return
-        self._session_state(session_key).conversation.active_route_name = str(
-            route_name or ""
-        ).strip()
-
-    def _bind_active_model_route(self, agent: Any, session_key: str) -> None:
-        """Copy conversation route intent onto a newly built or cached agent."""
-        state = self._peek_session_state(session_key) if session_key else None
-        route_name = state.conversation.active_route_name if state else ""
-        agent._active_route_name = str(route_name or "").strip()
-
-    @staticmethod
-    def _selected_model_route(decision: Any, router: Any) -> str:
-        """Recover the selected route for no-op decisions without model scans."""
-        directive = getattr(decision, "directive", None)
-        if isinstance(directive, dict):
-            return str(directive.get("route") or "").strip()
-        if getattr(decision, "rule", None):
-            return str(getattr(decision, "label", "") or "").strip()
-        outcome = str(getattr(decision, "outcome", "") or "")
-        label = str(getattr(decision, "label", "") or "")
-        record = getattr(decision, "record", None) or {}
-        if record.get("refusal_applied"):
-            refusal = getattr(router, "refusal", None)
-            if label in {"SYSTEM_DEV", "FRONTEND_DEV"}:
-                return str(getattr(refusal, "dev_route", "") or "").strip()
-            if label == "DOCUMENT_WORK":
-                return str(
-                    getattr(refusal, "document_route", "")
-                    or getattr(refusal, "chat_route", "")
-                    or ""
-                ).strip()
-            return str(getattr(refusal, "chat_route", "") or "").strip()
-        if label == "NORMAL" and (
-            outcome in {"noop_already_chat", "repromote_held"}
-            or outcome.startswith("noop_satisfied_repromote_")
-        ):
-            return str(getattr(router, "chat_route", "") or "").strip()
-        label_routes = dict(getattr(router, "label_routes", None) or {})
-        return str(label_routes.get(label) or "").strip()
-
-    async def _classify_model_router_with_budget(
-        self,
-        *,
-        model_router: Any,
-        event: MessageEvent,
-        session_key: str,
-        runtime: dict,
-        cfg: dict,
-        catalog: Any,
-        mode: str,
-        state: dict,
-    ):
-        """Classify within the enforce deadline, then apply state once.
-
-        The overdue worker performs classification only. Its eventual result is
-        discarded, so it cannot mutate hysteresis or apply a late directive.
-        """
-        context = await asyncio.to_thread(
-            model_router.build_context,
-            event=event,
-            session_store=self.session_store,
-            runtime=runtime,
-            recent_turn_limit=int(
-                getattr(catalog.router, "recent_turns", 5) or 5
-            ),
-            loaded_skills=[],
-            session_key_override=session_key,
-        )
-        provider, model, transport_timeout, budget = (
-            model_router._classifier_request_settings(catalog.router)
-        )
-        classify_task = asyncio.create_task(
-            asyncio.to_thread(
-                model_router.classify_dev_detailed,
-                context,
-                provider=provider,
-                model=model,
-                timeout=min(transport_timeout, budget),
-            )
-        )
-        try:
-            done, _pending = await asyncio.wait(
-                {classify_task}, timeout=budget
-            )
-        except asyncio.CancelledError:
-            classify_task.cancel()
-            classify_task.add_done_callback(consume_detached_task_result)
-            raise
-
-        if classify_task in done:
-            detail = await classify_task
-        else:
-            classify_task.cancel()
-            classify_task.add_done_callback(consume_detached_task_result)
-            detail = model_router._fallback_classification(
-                context, "classifier_timeout"
-            )
-            logger.warning(
-                "model router: classifier exceeded %.3fs; using fallback",
-                budget,
-            )
-
-        return await asyncio.to_thread(
-            model_router.classifier_decision_from_detail,
-            context=context,
-            detail=detail,
-            session_store=self.session_store,
-            runtime=runtime,
-            cfg=cfg,
-            catalog=catalog,
-            router=catalog.router,
-            mode=mode,
-            state=state,
-            provider=provider,
-            model=model,
-        )
-
-    async def _model_router_stage(
-        self,
-        event: MessageEvent,
-        source: SessionSource,
-        session_key: str,
-        *,
-        mode: str,
-        user_config: Optional[dict] = None,
-    ):
-        """Evaluate routing and apply directives only when mode is enforce.
-
-        Shadow is scheduled fire-and-forget by the off-loop turn builder. This
-        pre-dispatch rail exists for live enforce decisions so a successful
-        route selection can rebuild the agent before the current turn starts
-        and carry the exact route intent with it.
-        """
-        from gateway import model_router
-
-        mode = str(mode or "").strip().lower()
-        if mode not in {"shadow", "enforce"}:
-            return None
-        raw_text = str(getattr(event, "text", None) or "")
-        text = raw_text.strip()
-        if not text:
-            return None
-
-        cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
-        catalog = self._model_route_catalog(cfg)
-        if str(getattr(catalog.router, "mode", "") or "").lower() != mode:
-            return None
-        matched = model_router.match_static_rule(
-            list(catalog.static_rules or []),
-            text=raw_text,
-            source_context=model_router._source_dict(event),
-        )
-        if matched is None and text.startswith("/"):
-            return None
-
-        state_key, shared_state, state_identity, local_state = (
-            self._begin_model_router_state(
-                session_key,
-                invalidate=mode == "enforce",
-            )
-        )
-
-        runtime = self._model_router_runtime_snapshot(
-            source,
-            session_key,
-            user_config=cfg,
-        )
-        if matched is not None:
-            rule, rule_name = matched
-            decision = await asyncio.to_thread(
-                model_router.static_rule_decision,
-                rule=rule,
-                rule_name=rule_name,
-                text=raw_text,
-                session_key=session_key,
-                runtime=runtime,
-                cfg=cfg,
-                catalog=catalog,
-                router=catalog.router,
-                mode=mode,
-                state=local_state,
-            )
-        else:
-            decision = await self._classify_model_router_with_budget(
-                model_router=model_router,
-                event=event,
-                session_key=session_key,
-                runtime=runtime,
-                cfg=cfg,
-                catalog=catalog,
-                mode=mode,
-                state=local_state,
-            )
-
-        state_committed = self._commit_model_router_state(
-            state_key,
-            shared_state,
-            state_identity,
-            local_state,
-        )
-        directive = decision.directive
-        if mode == "enforce":
-            decision.record["applied"] = False
-        if (
-            mode == "enforce"
-            and state_committed
-            and directive
-            and decision.outcome in {
-                "switch",
-                "downgrade_to_chat",
-                "repromote_to_primary",
-                "refusal_switch",
-            }
-        ):
-            reasoning_effort = str(directive.get("reasoning_effort") or "")
-            try:
-                applied, reasoning_applied = await self._apply_model_router_directive(
-                    session_key,
-                    directive,
-                    cfg,
-                    source=source,
-                )
-            except Exception:
-                logger.warning(
-                    "model router: applying directive %s failed",
-                    directive,
-                    exc_info=True,
-                )
-                applied, reasoning_applied = False, False
-            decision.record["applied"] = bool(applied)
-            if reasoning_effort:
-                decision.record["reasoning_applied"] = bool(reasoning_applied)
-            if applied:
-                logger.info(
-                    "model router: %s session=%s -> route=%s model=%s (%s)",
-                    decision.outcome,
-                    session_key,
-                    directive.get("route"),
-                    directive.get("model"),
-                    decision.label,
-                )
-                if (
-                    decision.outcome == "refusal_switch"
-                    and not decision.record.get("forced_refusal_route")
-                    and bool(
-                        getattr(
-                            getattr(catalog.router, "refusal", None),
-                            "notify",
-                            True,
-                        )
-                    )
-                ):
-                    try:
-                        masked = int(decision.record.get("masked") or 0)
-                        notice = (
-                            f"⚠️ 거절 감지 → {directive.get('route')}"
-                            f"({directive.get('model')}) 라우팅 (masked={masked})"
-                        )
-                        await self._deliver_platform_notice(source, notice)
-                    except Exception:
-                        logger.debug(
-                            "model router: refusal-risk notice send failed",
-                            exc_info=True,
-                        )
-        elif mode == "enforce" and state_committed and (
-            decision.outcome in {
-                "noop_satisfied",
-                "noop_already_chat",
-                "repromote_held",
-            }
-            or decision.outcome.startswith("noop_satisfied_repromote_")
-        ):
-            # A no-op still selected a concrete route; retain that explicit
-            # intent rather than reconstructing it later from model membership.
-            selected_route = self._selected_model_route(decision, catalog.router)
-            if selected_route:
-                self._set_active_model_route(session_key, selected_route)
-
-        await asyncio.to_thread(
-            model_router.log_decision,
-            decision.record,
-            decision_log=catalog.router.decision_log,
-        )
-        return decision
-
-    async def _handle_gateway_hard_refusal(
-        self,
-        session_key: str,
-        session_id: str,
-        source: SessionSource,
-        agent_result: dict,
-    ) -> int:
-        """Mask this hard-refused turn and stage one permissive next-turn hop."""
-        if not str(agent_result.get("error") or "").startswith(
-            "content_policy_blocked"
-        ):
-            return 0
-
-        from hermes_cli.model_routes import load_routes as _load_model_routes
-
-        try:
-            cfg = _load_gateway_config()
-            catalog = _load_model_routes(cfg)
-            refusal = catalog.router.refusal
-            if not bool(getattr(refusal, "enabled", False)):
-                return 0
-        except Exception:
-            logger.warning(
-                "model router: hard-refusal config load failed session=%s",
-                session_key,
-                exc_info=True,
-            )
-            return 0
-
-        return await self._stage_gateway_refusal_recovery(
-            session_key,
-            session_id,
-            source,
-            cfg=cfg,
-            catalog=catalog,
-            refusal=refusal,
-            kind="hard",
-        )
-
-    def _reset_gateway_refusal_recovery(self, session_key: str) -> None:
-        """Clear the consecutive-refusal guard after one clean agent turn."""
-        state = getattr(self, "_model_router_state", None)
-        if state is None:
-            state = {}
-            self._model_router_state = state
-        entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
-        entry["refusal_recovery_count"] = 0
-        entry["refusal_recovery_exhausted"] = False
-
-    async def _handle_gateway_soft_refusal(
-        self,
-        session_key: str,
-        session_id: str,
-        source: SessionSource,
-        agent_result: dict,
-        event_text: str,
-    ) -> int:
-        """Probe a completed assistant response and stage permissive recovery."""
-        error = str(agent_result.get("error") or "")
-        if error.startswith("content_policy_blocked"):
-            # The hard-refusal path owns this turn, including the guard count.
-            return 0
-        if (
-            agent_result.get("interrupted")
-            or agent_result.get("failed")
-            or agent_result.get("partial")
-            or error
-        ):
-            return 0
-
-        response_text = str(agent_result.get("final_response") or "").strip()
-        if not response_text:
-            return 0
-
-        from gateway import model_router as _model_router
-        from hermes_cli.model_routes import load_routes as _load_model_routes
-
-        try:
-            cfg = _load_gateway_config()
-            catalog = _load_model_routes(cfg)
-            refusal = catalog.router.refusal
-        except Exception:
-            logger.warning(
-                "model router: soft-refusal config load failed session=%s",
-                session_key,
-                exc_info=True,
-            )
-            return 0
-
-        if not (
-            bool(getattr(refusal, "enabled", False))
-            and bool(getattr(refusal, "mask_on_refusal", True))
-            and bool(getattr(refusal, "soft_detect", True))
-        ):
-            self._reset_gateway_refusal_recovery(session_key)
-            return 0
-        if len(response_text) < 40:
-            self._reset_gateway_refusal_recovery(session_key)
-            return 0
-
-        detail = await asyncio.to_thread(
-            _model_router.classify_prior_refusal,
-            response_text,
-            str(event_text or ""),
-            cfg,
-            catalog,
-        )
-        try:
-            confidence = float(detail.get("prior_refusal_confidence"))
-        except (TypeError, ValueError):
-            confidence = None
-        threshold = float(getattr(refusal, "min_confidence", 0.85))
-        if (
-            detail.get("prior_refusal") is not True
-            or confidence is None
-            or confidence < threshold
-        ):
-            self._reset_gateway_refusal_recovery(session_key)
-            return 0
-
-        return await self._stage_gateway_refusal_recovery(
-            session_key,
-            session_id,
-            source,
-            cfg=cfg,
-            catalog=catalog,
-            refusal=refusal,
-            kind="soft",
-        )
-
-    async def _stage_gateway_refusal_recovery(
-        self,
-        session_key: str,
-        session_id: str,
-        source: SessionSource,
-        *,
-        cfg: dict,
-        catalog: object,
-        refusal: object,
-        kind: str,
-    ) -> int:
-        """Mask one refused turn and stage a guarded permissive-route hop."""
-        from gateway import model_router as _model_router
-
-        state = getattr(self, "_model_router_state", None)
-        if state is None:
-            state = {}
-            self._model_router_state = state
-        entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
-        max_hops = max(1, int(getattr(refusal, "max_recovery_hops", 2) or 2))
-        recovery_count = int(entry.get("refusal_recovery_count") or 0)
-        if recovery_count >= max_hops:
-            if not bool(entry.get("refusal_recovery_exhausted")):
-                entry["refusal_recovery_exhausted"] = True
-                try:
-                    await self._deliver_platform_notice(
-                        source,
-                        "⚠️ 거절이 반복 — 라우팅으로 해결되는 케이스가 아님. 자동 전환을 멈춤",
-                    )
-                except Exception:
-                    logger.debug(
-                        "model router: refusal exhaustion notice send failed",
-                        exc_info=True,
-                    )
-            return 0
-
-        entry["refusal_recovery_count"] = recovery_count + 1
-        entry["refusal_recovery_exhausted"] = False
-        masked = 0
-        if bool(getattr(refusal, "mask_on_refusal", True)):
-            try:
-                db = getattr(self.session_store, "_db", None)
-                rows = (
-                    await asyncio.to_thread(db.get_messages, session_id)
-                    if db is not None
-                    else []
-                )
-                latest_user_id = next(
-                    (
-                        int(message["id"])
-                        for message in reversed(rows)
-                        if message.get("role") == "user"
-                    ),
-                    None,
-                )
-                assistant_ids = [
-                    int(message["id"])
-                    for message in rows
-                    if latest_user_id is not None
-                    and int(message.get("id") or 0) > latest_user_id
-                    and message.get("role") == "assistant"
-                    and str(message.get("content") or "").strip()
-                ]
-                masked = await self.async_session_store.deactivate_messages(
-                    session_id, assistant_ids,
-                )
-            except Exception:
-                logger.warning(
-                    "model router: %s-refusal masking failed session=%s",
-                    kind, session_key,
-                    exc_info=True,
-                )
-
-        entry["force_refusal_route"] = True
-        entry["force_refusal_reason"] = "prior_turn_refused"
-
-        if bool(getattr(refusal, "notify", True)):
-            try:
-                label = str(entry.get("last_label") or "NORMAL")
-                route_name = _model_router.refusal_route_for_label(refusal, label)
-                directive = await asyncio.to_thread(
-                    _model_router._resolve_route_directive,
-                    route_name,
-                    cfg,
-                    catalog,
-                )
-                route = str(
-                    (directive or {}).get("route") or route_name or "PERMISSIVE"
-                )
-                model = str((directive or {}).get("model") or "staged")
-                detected = "거절 감지" if kind == "hard" else "응답 거절 감지"
-                await self._deliver_platform_notice(
-                    source,
-                    f"⚠️ {detected} → 메시지 가림({masked}) · 다음 턴 {route}({model})",
-                )
-            except Exception:
-                logger.debug(
-                    "model router: %s-refusal notice send failed", kind, exc_info=True,
-                )
-        return masked
-
-    async def _apply_model_router_directive(
-        self,
-        session_key: str,
-        directive: dict,
-        cfg: dict,
-        *,
-        source: Optional[SessionSource] = None,
-    ) -> tuple[bool, bool]:
-        """Apply a resolved route before dispatch and retain its exact intent."""
-        from hermes_cli.model_switch import switch_model
-
-        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-        if not isinstance(model_cfg, dict):
-            model_cfg = {}
-        current_model = model_cfg.get("default", "")
-        current_provider = model_cfg.get("provider", "openrouter")
-        current_base_url = model_cfg.get("base_url", "")
-        current_api_key = ""
-        user_providers = cfg.get("providers") if isinstance(cfg, dict) else None
-        try:
-            from hermes_cli.config import get_compatible_custom_providers
-
-            custom_providers = get_compatible_custom_providers(cfg)
-        except Exception:
-            custom_providers = (
-                cfg.get("custom_providers") if isinstance(cfg, dict) else None
-            )
-        state = self._peek_session_state(session_key)
-        override = state.conversation.model_override if state else None
-        if override:
-            current_model = override.get("model", current_model)
-            current_provider = override.get("provider", current_provider)
-            current_base_url = override.get("base_url", current_base_url)
-            current_api_key = override.get("api_key", current_api_key)
-
-        result = await asyncio.to_thread(
-            switch_model,
-            raw_input=str(directive.get("model") or ""),
-            current_provider=current_provider,
-            current_model=current_model,
-            current_base_url=current_base_url,
-            current_api_key=current_api_key,
-            is_global=False,
-            explicit_provider=str(directive.get("provider") or "") or None,
-            user_providers=user_providers,
-            custom_providers=custom_providers,
-        )
-        if not result.success:
-            logger.warning(
-                "model router: switch to %s@%s failed: %s",
-                directive.get("model"),
-                directive.get("provider"),
-                result.error_message,
-            )
-            return False, False
-
-        session_db = getattr(self, "_session_db", None)
-        async_store = getattr(self, "async_session_store", None)
-        if session_db is not None and source is not None and async_store is not None:
-            try:
-                session_entry = await async_store.get_or_create_session(source)
-                await session_db.update_session_model(
-                    session_entry.session_id,
-                    result.new_model,
-                )
-            except Exception:
-                logger.debug(
-                    "model router: persist model switch to session DB failed",
-                    exc_info=True,
-                )
-
-        route_name = str(directive.get("route") or "").strip()
-        route_reason = str(directive.get("reason") or "").strip()
-        if not hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes = {}
-        self._pending_model_notes[session_key] = (
-            f"[Note: model was just switched from {current_model} to "
-            f"{result.new_model} by the model router (route '{route_name}'"
-            + (
-                f": {route_reason}"
-                if route_reason and route_reason != route_name
-                else ""
-            )
-            + "). Adjust your self-identification accordingly.]"
-        )
-
-        self._session_state(session_key).conversation.model_override = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "api_key": result.api_key,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
-        }
-        # Record route intent only after the runtime switch commits.  This is
-        # the source of truth consumed by route-aware outage fallback; never
-        # infer it later from ambiguous accepted-model membership.
-        self._set_active_model_route(session_key, route_name)
-        if async_store is not None:
-            try:
-                await async_store.set_model_override(
-                    session_key,
-                    self._session_state(session_key).conversation.model_override,
-                )
-            except Exception:
-                logger.debug(
-                    "model router: persist session override failed",
-                    exc_info=True,
-                )
-
-        reasoning_applied = False
-        effort = str(directive.get("reasoning_effort") or "")
-        if effort:
-            from hermes_constants import parse_reasoning_effort
-
-            parsed = parse_reasoning_effort(effort)
-            if parsed is not None:
-                self._set_session_reasoning_override(session_key, parsed)
-                reasoning_applied = True
-
-        self._evict_cached_agent(session_key)
-        return True, reasoning_applied
-
-    def _evaluate_model_router_shadow(
-        self,
-        *,
-        event: MessageEvent,
-        session_key: str,
-        runtime: dict,
-        user_config: Optional[dict] = None,
-        state_override: Optional[dict] = None,
-    ):
-        """Evaluate and audit M3 routing without mutating live routing state.
-
-        A bounded daemon worker calls this after ``TurnRunner.run_sync`` has
-        resolved the canonical runtime. It intentionally recognizes only
-        ``mode: shadow``; enforce decisions use the pre-dispatch
-        ``_model_router_stage`` so an applied switch is visible before agent
-        construction.
-        Route health resolution is read-only: shadow evaluation may append its
-        decision log, but cannot run a recovery probe or rewrite shared health.
-        """
-        cfg = user_config if isinstance(user_config, dict) else {}
-        mode = _model_router_mode(cfg)
-        if mode != "shadow":
-            return None
-
-        from gateway import model_router
-
-        catalog = self._model_route_catalog(cfg)
-        if catalog.router.mode != "shadow":
-            return None
-        if isinstance(state_override, dict):
-            state = state_override
-        else:
-            _lock, state, _slots, _inflight = (
-                self._ensure_model_router_runtime_state()
-            )
-        decision = model_router.evaluate_event(
-            event=event,
-            session_store=self.session_store,
-            runtime=runtime,
-            cfg=cfg,
-            catalog=catalog,
-            router=catalog.router,
-            mode="shadow",
-            state=state,
-            session_key_override=session_key,
-        )
-        if decision is not None:
-            model_router.log_decision(
-                decision.record,
-                decision_log=catalog.router.decision_log,
-            )
-        return decision
-
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -8762,10 +7455,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
-        override = (
-            self._get_session_model_override(resolved_session_key)
+        if resolved_session_key:
+            self._rehydrate_session_model_override(resolved_session_key)
+        _override_state = (
+            self._peek_session_state(resolved_session_key)
             if resolved_session_key
             else None
+        )
+        override = (
+            _override_state.conversation.model_override if _override_state else None
         )
         if override:
             override_model = override.get("model", model)
@@ -8777,20 +7475,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
-            if override.get("_runtime_bundle_complete") is True:
-                if override_runtime["max_tokens"] is None:
-                    override_runtime.pop("max_tokens")
-                override_runtime["command"] = override.get("command")
-                override_runtime["args"] = list(override.get("args") or [])
-                logger.debug(
-                    "Persisted runtime bundle (fast): session=%s config_model=%s "
-                    "-> override_model=%s provider=%s",
-                    resolved_session_key or "",
-                    model,
-                    override_model,
-                    override_runtime.get("provider"),
-                )
-                return override_model, override_runtime
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
@@ -10224,9 +8908,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve reasoning effort for a session, honoring session overrides.
 
         Priority: session-scoped ``/reasoning --session`` override >
-        persisted ``SessionEntry.runtime_reasoning_effort`` (rehydrated
-        after a gateway restart) > per-model override
-        (``agent.reasoning_overrides``) > global
+        per-model override (``agent.reasoning_overrides``) > global
         ``agent.reasoning_effort``. ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
         per-model overrides track what the session actually runs — when
@@ -10243,17 +8925,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
-            entry = self._get_session_entry(resolved_session_key)
-            persisted_effort = getattr(entry, "runtime_reasoning_effort", None)
-            if persisted_effort:
-                from hermes_constants import parse_reasoning_effort
-
-                persisted = parse_reasoning_effort(persisted_effort)
-                if persisted is not None:
-                    self._session_state(
-                        resolved_session_key
-                    ).conversation.reasoning_override = dict(persisted)
-                    return persisted
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -11369,19 +10040,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
-        if self._restart_requested:
-            # Honest wording: with durable turns the interrupted turn resumes
-            # by itself after the restart; only legacy mode still needs the
-            # user to send a message.
-            hint = (
-                "Your current task will pause and resume automatically "
-                "after the restart."
-                if _gateway_turn_resume_enabled()
-                else "Your current task will be interrupted. Send any message "
-                "after restart and I'll try to resume where you left off."
-            )
-        else:
-            hint = "Your current task will be interrupted."
+        hint = (
+            "Your current task will be interrupted. "
+            "Send any message after restart and I'll try to resume where you left off."
+            if self._restart_requested
+            else "Your current task will be interrupted."
+        )
         msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
@@ -12604,65 +11268,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "clear_resume_pending failed for %s", session_key,
                         exc_info=True,
                     )
-                # Durable turns (ADR durable-turns): an obligation row means
-                # the turn FINISHED generating — only delivery was owed, and
-                # the ledger now owns it (delivered, or retried on later
-                # boots via the claimed row).  Retire any orphaned
-                # active_turn record so _schedule_resume_pending_sessions
-                # cannot same-turn resume the session and deliver the same
-                # composed final a second time.
-                try:
-                    await self.async_session_store.finish_active_turn(
-                        session_key, force=True
-                    )
-                except Exception:
-                    logger.debug(
-                        "finish_active_turn (obligation redelivered) failed "
-                        "for %s", session_key,
-                        exc_info=True,
-                    )
         return redelivered
 
-    def _notify_turn_abandoned(
-        self,
-        adapter: Any,
-        source: Any,
-        attempts: int,
-    ) -> None:
-        """Best-effort honest notice when a poison turn hits the resume cap."""
-        try:
-            metadata = None
-            thread_id = getattr(source, "thread_id", None)
-            if thread_id:
-                metadata = {"thread_id": thread_id}
-            msg = (
-                "⚠️ I couldn't automatically resume the interrupted task "
-                f"(gave up after {attempts} attempt(s)). The conversation "
-                "history is preserved — tell me to continue if you still "
-                "want it finished."
-            )
-            coro = (
-                adapter.send(str(source.chat_id), msg, metadata=metadata)
-                if metadata
-                else adapter.send(str(source.chat_id), msg)
-            )
-            task = asyncio.ensure_future(coro)
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        except Exception:
-            logger.debug("Failed to send turn-abandoned notice", exc_info=True)
-
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Resume restart-interrupted turns after startup (ADR durable-turns).
+        """Auto-continue fresh restart-interrupted sessions after startup.
 
-        Default mode is SAME-TURN resume: an orphaned ``active_turn`` record
-        (or, for legacy sessions, a bare ``resume_pending`` flag) identifies a
-        turn that never finalized; the dispatched event carries a
-        ``_hermes_turn_resume`` marker so ``_handle_message_with_agent``
-        re-enters the conversation loop on the persisted transcript — the
-        SAME turn continues, no synthetic follow-up user turn, no recovery
-        system note.  With ``HERMES_GATEWAY_TURN_RESUME=0`` the legacy
-        behavior (empty user turn + reason-aware note) is preserved.
+        ``resume_pending`` already preserves the transcript AND the existing
+        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
+        injects a reason-aware recovery system note on the next turn.  This
+        method closes the UX gap by synthesizing that next turn once
+        adapters are back online — the event text is empty so the existing
+        injection path owns the wording and we never double up.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
@@ -12678,26 +11294,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scheduled at startup is never resumed a second time.
         """
         window = _auto_continue_freshness_window()
-        _turn_resume_on = _gateway_turn_resume_enabled()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if not entry.suspended
+                    if entry.resume_pending
+                    and not entry.suspended
                     and entry.origin is not None
+                    and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
-                    and (
-                        (
-                            entry.resume_pending
-                            and entry.resume_reason in self._AUTO_RESUME_REASONS
-                        )
-                        or (
-                            _turn_resume_on
-                            and _orphaned_active_turn(entry, self._boot_id)
-                            is not None
-                        )
-                    )
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -12726,40 +11332,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            _turn_record = (
-                _orphaned_active_turn(entry, self._boot_id)
-                if _turn_resume_on
-                else None
-            )
-
-            # Freshness: prefer the turn record's own interruption clock;
-            # fall back to the legacy resume-marker/session clock.
-            _fresh_signal: Any = None
-            if _turn_record is not None:
-                _fresh_signal = _turn_record.get("interrupted_at") or _turn_record.get(
-                    "started_at"
-                )
-            if _fresh_signal is not None:
-                if not _is_fresh_gateway_interruption(
-                    _fresh_signal, window_secs=window
-                ):
-                    # Stale in-flight turn: abandon the record so it cannot
-                    # revive an unrelated task days later (#16802 scars).
-                    try:
-                        self.session_store.finish_active_turn(
-                            entry.session_key, force=True
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to abandon stale turn record for %s",
-                            entry.session_key,
-                            exc_info=True,
-                        )
-                    continue
-            else:
-                marker = entry.last_resume_marked_at or entry.updated_at
-                if marker is not None and (now - marker).total_seconds() > window:
-                    continue
+            marker = entry.last_resume_marked_at or entry.updated_at
+            if marker is not None and (now - marker).total_seconds() > window:
+                continue
 
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
@@ -12797,81 +11372,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            # Poison-turn cap (same-turn resume only): a turn that keeps
-            # getting interrupted — or keeps killing the gateway — must not
-            # resume-loop forever.  Abandon its record, clear the legacy
-            # marker, and tell the thread honestly instead of silently
-            # replaying it a third time.
-            _resume_marker: Optional[Dict[str, Any]] = None
-            if _turn_resume_on:
-                _max_resumes = _turn_resume_max()
-                _prior_resumes = 0
-                if _turn_record is not None:
-                    try:
-                        _prior_resumes = int(_turn_record.get("resume_count") or 0)
-                    except (TypeError, ValueError):
-                        _prior_resumes = 0
-                if _prior_resumes >= _max_resumes:
-                    try:
-                        self.session_store.finish_active_turn(
-                            entry.session_key, force=True
-                        )
-                        self.session_store.clear_resume_pending(entry.session_key)
-                    except Exception:
-                        logger.debug(
-                            "Failed to abandon poison turn for %s",
-                            entry.session_key,
-                            exc_info=True,
-                        )
-                    logger.warning(
-                        "Abandoning interrupted turn for %s after %d resume "
-                        "attempt(s) (cap %d)",
-                        entry.session_key, _prior_resumes, _max_resumes,
-                    )
-                    self._notify_turn_abandoned(
-                        adapter, source, _prior_resumes,
-                    )
-                    continue
-
-                _resume_turn_id = None
-                if _turn_record is not None:
-                    _resume_turn_id = _turn_record.get("turn_id")
-                if not _resume_turn_id:
-                    # Legacy resume_pending session (no durable record, e.g.
-                    # first boot after this patch deploys, or unclean-boot
-                    # 120s-window marking): same-turn resume still works from
-                    # the transcript alone — mint the turn id now.
-                    import uuid as _uuid_mod
-                    _resume_turn_id = (
-                        f"{entry.session_id}:{entry.session_id}:"
-                        f"{_uuid_mod.uuid4().hex[:8]}"
-                    )
-                try:
-                    self.session_store.begin_active_turn(
-                        entry.session_key,
-                        _resume_turn_id,
-                        self._boot_id,
-                        resume_count=_prior_resumes + 1,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to update turn record for resume of %s",
-                        entry.session_key,
-                        exc_info=True,
-                    )
-                _resume_marker = {
-                    "turn_id": _resume_turn_id,
-                    "resume_count": _prior_resumes + 1,
-                    # Distinguishes a durable-record resume (turn provably
-                    # in flight when the process died) from a legacy
-                    # resume_pending-only candidate (e.g. unclean-boot 120s
-                    # marking, which also catches sessions that were NOT
-                    # mid-turn).  The dispatch path only trusts a clean
-                    # assistant-text tail as a deliverable composed final
-                    # when the record vouches for an in-flight turn.
-                    "record_backed": _turn_record is not None,
-                }
-
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -12891,11 +11391,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
             )
-            if _resume_marker is not None:
-                try:
-                    setattr(event, "_hermes_turn_resume", _resume_marker)
-                except Exception:
-                    pass
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -14318,19 +12813,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # adapter.handle_message would spawn a background task and we'd
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
-        try:
-            response_text = await self._handle_message(synthetic_event)
-        finally:
-            _handoff_trace = turn_trace.safe_get_bound(synthetic_event)
-            if _handoff_trace is None:
-                _handoff_trace = turn_trace.safe_get_bound(
-                    getattr(synthetic_event, "source", None)
-                )
-            turn_trace.safe_finish(_handoff_trace, status="ok")
-            if _handoff_trace is not None:
-                turn_trace.safe_bind(
-                    getattr(synthetic_event, "source", None), None
-                )
+        response_text = await self._handle_message(synthetic_event)
         if not response_text:
             # Streaming may have already delivered the response inline.
             # Either way, agent ran without raising — count as success.
@@ -15714,38 +14197,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 """
                 try:
                     from tools.process_registry import process_registry
-                    _skipped_durable = process_registry.count_durable_running()
-                    _killed = process_registry.kill_all(exclude_durable=True)
+                    _killed = process_registry.kill_all()
                     if _killed:
                         logger.info(
                             "Shutdown (%s): killed %d tool subprocess(es)",
                             phase, _killed,
                         )
-                    if _skipped_durable:
-                        logger.info(
-                            "Shutdown (%s): skipped %d durable tool subprocess(es)",
-                            phase, _skipped_durable,
-                        )
                 except Exception as _e:
                     logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
                 try:
-                    # Any cron job still dispatched at this instant is dying
-                    # with this process regardless of what kill_all() did: the
-                    # job's AGENT is a thread inside this gateway process
-                    # (cron/scheduler.py ThreadPoolExecutor), so even when its
-                    # tool subprocess survived as a durable systemd scope, the
-                    # run itself is interrupted. Mark it so the scheduler can
-                    # never report that run as success (#60432). Gating this
-                    # on _killed>0 would regress #60432 for cron jobs whose
-                    # only live subprocess was durable, or that held no
-                    # registered subprocess at the kill instant at all.
+                    # Any cron job still dispatched at this instant just had
+                    # its tool subprocess killed above (kill_all() has no
+                    # per-job-ID targeting — it's a global sweep). Its agent
+                    # thread is still alive in this process and may go on to
+                    # produce a plausible-looking final response from the
+                    # now-truncated tool output; mark the run interrupted so
+                    # the scheduler can never report that as success (#60432).
                     # No-op when no cron job is in flight.
                     from cron.scheduler import mark_running_jobs_interrupted
                     _interrupted = mark_running_jobs_interrupted(
-                        f"Gateway shutdown ({phase}) interrupted the run "
-                        "before it finished (the job's agent dies with the "
-                        "gateway process; non-durable tool subprocesses were "
-                        "killed)."
+                        f"Gateway shutdown ({phase}) killed the job's tool "
+                        "subprocess before the run finished."
                     )
                     if _interrupted:
                         logger.warning(
@@ -15963,20 +14435,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
-                            _sk, _e,
-                        )
-                    # Flag the in-flight durable turn record as
-                    # gateway-interrupted (ADR durable-turns).  This both
-                    # marks it for same-turn resume on the next boot and
-                    # tells the post-turn path (which may still run inside
-                    # the 5s grace window below) to KEEP the record.
-                    try:
-                        await self.async_session_store.mark_active_turn_interrupted(
-                            _sk, _resume_reason
-                        )
-                    except Exception as _e:
-                        logger.debug(
-                            "mark_active_turn_interrupted failed for %s: %s",
                             _sk, _e,
                         )
                 self._interrupt_running_agents(
@@ -17524,14 +15982,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "prepend", "text":  ...}     -> prepend text to event.text, continue
-        #                                              (dropped when the event is a slash command)
-        #   {"action": "runtime_override", ...}      -> update runtime after auth
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
-        _runtime_override_directives: list[dict] = []
-        _hook_prepends: list[str] = []
         if not is_internal:
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -17560,14 +16013,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.chat_id or "unknown",
                     )
                     return None
-                if _action == "runtime_override":
-                    _runtime_override_directives.append(_result)
-                    continue
-                if _action == "prepend":
-                    _prepend_text = _result.get("text")
-                    if isinstance(_prepend_text, str) and _prepend_text.strip():
-                        _hook_prepends.append(_prepend_text.strip())
-                    continue
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
@@ -17576,26 +16021,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
-
-            if _hook_prepends and event.is_command():
-                # Slash commands must reach the dispatcher unmodified:
-                # is_command()/get_command() key off text.startswith("/"),
-                # so a prepended advisory would demote /model, /status,
-                # etc. into plain chat that falls through to the agent.
-                # Command handlers can't consume hook context anyway.
-                logger.debug(
-                    "pre_gateway_dispatch prepend dropped for slash command %r",
-                    (event.text or "").split(maxsplit=1)[0],
-                )
-                _hook_prepends = []
-            if _hook_prepends:
-                _combined = "\n\n".join(_hook_prepends)
-                _original = event.text or ""
-                event = dataclasses.replace(
-                    event,
-                    text=f"{_combined}\n\n{_original}" if _original else _combined,
-                )
-                source = event.source
 
         if is_internal:
             pass
@@ -17666,13 +16091,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-
-        # Runtime directives are trusted only after the normal authorization
-        # path succeeds. Apply them before command interception or agent setup
-        # so the first model call observes the selected session runtime.
-        if _runtime_override_directives:
-            for _directive in _runtime_override_directives:
-                self._apply_gateway_runtime_override(_directive, source)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -19636,33 +18054,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
-        _trace = turn_trace.safe_begin(
-            key=_quick_key,
-            started_at=_msg_start_time,
-            platform=_platform_name,
-        )
-        if _trace is not None:
-            turn_trace.safe_bind(event, _trace)
-            turn_trace.safe_bind(source, _trace)
-            try:
-                _debounce_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
-                if _debounce_ts:
-                    turn_trace.safe_mark(
-                        "transport.inbound_debounce",
-                        trace=_trace,
-                        at=float(_debounce_ts),
-                    )
-                    turn_trace.safe_tag(
-                        _trace,
-                        debounce_ms=round(
-                            (_msg_start_time - float(_debounce_ts)) * 1000.0,
-                            1,
-                        ),
-                    )
-            except Exception:
-                pass
-        _t_span = time.time() if _trace is not None else 0.0
-
         # Discord's first progress acknowledgment is gateway-owned and must not
         # wait for session I/O, prompt construction, the model, or a first tool
         # call. Internal completion injections stay silent here; their parent
@@ -19775,11 +18166,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
-        if _trace is not None:
-            turn_trace.safe_add_span(
-                _trace, "gateway.session_resolve", _t_span, time.time()
-            )
-            turn_trace.safe_tag(_trace, session_key=session_key)
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -19800,40 +18186,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
             session_entry.was_auto_reset = False
-
-        # Apply enforce-mode routing only after the canonical session key and
-        # any auto-reset boundary are final, but before this turn builds or
-        # reuses an agent.  That makes recorded route intent follow the same
-        # session identity as the agent itself (including topic/inbox aliases)
-        # and lets the freshly selected override feed this turn's runtime.
-        # Shadow evaluation remains observational in TurnRunner.run_sync.
-        if not getattr(event, "internal", False):
-            try:
-                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-                    with _profile_runtime_scope(
-                        self._resolve_profile_home_for_source(source)
-                    ):
-                        router_cfg = _load_gateway_config()
-                        if _model_router_mode(router_cfg) == "enforce":
-                            await self._model_router_stage(
-                                event,
-                                source,
-                                session_key,
-                                mode="enforce",
-                                user_config=router_cfg,
-                            )
-                else:
-                    router_cfg = _load_gateway_config()
-                    if _model_router_mode(router_cfg) == "enforce":
-                        await self._model_router_stage(
-                            event,
-                            source,
-                            session_key,
-                            mode="enforce",
-                            user_config=router_cfg,
-                        )
-            except Exception:
-                logger.warning("model router enforce stage failed open", exc_info=True)
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -20044,13 +18396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state.lease_generation = run_generation
 
         # Load conversation history from transcript
-        _t_span = time.time() if _trace is not None else 0.0
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        if _trace is not None:
-            turn_trace.safe_add_span(
-                _trace, "gateway.transcript_load", _t_span, time.time()
-            )
-            _t_span = time.time()
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -20297,20 +18643,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _needs_compress = False
 
                 if _needs_compress:
-                    _hyg_trigger = (
-                        f"hard_message_limit ({_HARD_MSG_LIMIT})"
-                        if _approx_tokens < _compress_token_threshold
-                        and _msg_count >= _HARD_MSG_LIMIT
-                        else "token_threshold"
-                    )
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                        "(threshold: %s%% of %s = %s tokens; trigger=%s)",
+                        "(threshold: %s%% of %s = %s tokens)",
                         _msg_count, f"{_approx_tokens:,}", _token_source,
                         int(_hyg_threshold_pct * 100),
                         f"{_hyg_context_length:,}",
                         f"{_compress_token_threshold:,}",
-                        _hyg_trigger,
                     )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -20356,36 +18695,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc_info=True,
                                     )
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
-                                _hyg_sid = session_entry.session_id
-
-                                def _hyg_build_agent():
-                                    # AIAgent.__init__ binds session state —
-                                    # raw SessionDB reads under the writer
-                                    # lock. It must NEVER run on the event
-                                    # loop: a writer-lock convoy here freezes
-                                    # every platform heartbeat (2026-07-28
-                                    # outage: 160s Discord stall dumped this
-                                    # exact stack). Build in the executor,
-                                    # same thread pool as the compression.
-                                    agent = AIAgent(
-                                        **_hyg_runtime,
-                                        model=_hyg_model,
-                                        max_iterations=4,
-                                        quiet_mode=True,
-                                        skip_context_files=True,
-                                        skip_memory=True,
-                                        enabled_toolsets=["memory"],
-                                        session_id=_hyg_sid,
-                                        session_db=_hyg_session_db,
-                                    )
-                                    _seed_hygiene_system_prompt(
-                                        agent,
-                                        _hyg_session_row,
-                                    )
-                                    # If compression must rebuild instead of retaining
-                                    # the cached prompt, make the persisted result
-                                    # deliberately stale for every real gateway surface.
-                                    agent.platform = _GATEWAY_HYGIENE_PLATFORM
+                                _hyg_agent = AIAgent(
+                                    **_hyg_runtime,
+                                    model=_hyg_model,
+                                    max_iterations=4,
+                                    quiet_mode=True,
+                                    skip_context_files=True,
+                                    skip_memory=True,
+                                    enabled_toolsets=["memory"],
+                                    session_id=session_entry.session_id,
+                                    session_db=_hyg_session_db,
+                                )
+                                _seed_hygiene_system_prompt(
+                                    _hyg_agent,
+                                    _hyg_session_row,
+                                )
+                                # If compression must rebuild instead of retaining
+                                # the cached prompt, make the persisted result
+                                # deliberately stale for every real gateway surface.
+                                _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
+                                _hyg_cleanup_deferred = False
+                                try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
                                     # Prefer in-place compaction here: it archives
@@ -20395,35 +18725,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # bindings.  If no SessionDB is available,
                                     # compress_context leaves this flag false and
                                     # the guard below preserves the transcript.
-                                    agent.compression_in_place = True
+                                    _hyg_agent.compression_in_place = True
                                     _bind_hyg_state = getattr(
-                                        getattr(agent, "context_compressor", None),
+                                        getattr(_hyg_agent, "context_compressor", None),
                                         "bind_session_state",
                                         None,
                                     )
                                     if callable(_bind_hyg_state):
-                                        _bind_hyg_state(_hyg_session_db, _hyg_sid)
+                                        _bind_hyg_state(
+                                            _hyg_session_db,
+                                            session_entry.session_id,
+                                        )
                                     # It must never finalize on close() — close()
                                     # would end the live gateway session row.
-                                    agent._end_session_on_close = False
-                                    agent._print_fn = lambda *a, **kw: None
-                                    return agent
+                                    _hyg_agent._end_session_on_close = False
+                                    _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                loop = asyncio.get_running_loop()
-                                _hyg_agent = await loop.run_in_executor(
-                                    None, _hyg_build_agent
-                                )
-                                _hyg_cleanup_deferred = False
-                                _hyg_commit_fence = CompressionCommitFence()
-                                _hyg_future = loop.run_in_executor(
-                                    None,
-                                    lambda: _hyg_agent._compress_context(
-                                        _hyg_msgs, "",
-                                        approx_tokens=_approx_tokens,
-                                        commit_fence=_hyg_commit_fence,
-                                    ),
-                                )
-                                try:
+                                    loop = asyncio.get_running_loop()
+                                    _hyg_commit_fence = CompressionCommitFence()
+                                    _hyg_future = loop.run_in_executor(
+                                        None,
+                                        lambda: _hyg_agent._compress_context(
+                                            _hyg_msgs, "",
+                                            approx_tokens=_approx_tokens,
+                                            commit_fence=_hyg_commit_fence,
+                                        ),
+                                    )
                                     try:
                                         # Progress-aware wait: the timeout is an
                                         # INACTIVITY budget, not a total one. The
@@ -20680,50 +19007,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # the pre-compression ones.
                                         _new_count = _msg_count
                                         _new_tokens = _approx_tokens
-                                        _comp = getattr(
-                                            _hyg_agent, "context_compressor", None
+                                        logger.warning(
+                                            "Gateway hygiene compression for session %s "
+                                            "did not rotate or compact in place "
+                                            "(no session_db on the hygiene agent) — "
+                                            "preserving the original transcript instead "
+                                            "of overwriting it with the summary (#21301).",
+                                            session_entry.session_id,
                                         )
-                                        if getattr(
-                                            _hyg_agent,
-                                            "_last_compression_no_progress",
-                                            False,
-                                        ):
-                                            logger.info(
-                                                "Gateway hygiene compression for session %s "
-                                                "made no progress: the protected tail exceeds "
-                                                "the compressible budget. Preserving the "
-                                                "original transcript; the compression-failure "
-                                                "cooldown was recorded.",
-                                                session_entry.session_id,
-                                            )
-                                        elif _comp is not None and getattr(
-                                            _comp, "_last_compress_aborted", False
-                                        ):
-                                            logger.warning(
-                                                "Gateway hygiene compression for session %s "
-                                                "aborted during summary generation — preserving "
-                                                "the original transcript.",
-                                                session_entry.session_id,
-                                            )
-                                        elif getattr(
-                                            _hyg_agent, "_session_db", None
-                                        ) is None:
-                                            logger.warning(
-                                                "Gateway hygiene compression for session %s "
-                                                "did not rotate or compact in place "
-                                                "(no session_db on the hygiene agent) — "
-                                                "preserving the original transcript instead "
-                                                "of overwriting it with the summary (#21301).",
-                                                session_entry.session_id,
-                                            )
-                                        else:
-                                            logger.warning(
-                                                "Gateway hygiene compression for session %s "
-                                                "did not rotate or compact in place despite a "
-                                                "bound session_db — preserving the original "
-                                                "transcript.",
-                                                session_entry.session_id,
-                                            )
 
                                     logger.info(
                                         "Session hygiene: compressed %s → %s msgs, "
@@ -20856,11 +19147,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
                         )
-
-        if _trace is not None:
-            turn_trace.safe_add_span(
-                _trace, "gateway.hygiene", _t_span, time.time()
-            )
 
         # First-message onboarding -- only on the very first interaction ever.
         # Delivered on the current user message (sidecar), NOT the ephemeral
@@ -21107,13 +19393,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     persist_user_message=persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     message_type=event.message_type,
-                    turn_trace_obj=_trace,
                     semantic_progress_message_id=_semantic_progress_message_id,
                     semantic_progress_text=_semantic_progress_text,
                     mention_inbox_execution_id=_mention_execution_id,
                     mention_inbox_execution_observer=_mention_execution_observer,
-                    routing_event=event,
-                    turn_resume_marker=getattr(event, "_hermes_turn_resume", None),
                 )
             except BaseException:
                 if _mention_execution_observer is not None:
@@ -21126,7 +19409,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "mention-inbox execution failure receipt failed"
                         )
                 raise
-            _t_persist = time.time() if _trace is not None else 0.0
             if _mention_execution_observer is not None:
                 try:
                     await _mention_execution_observer.run_completed(
@@ -21245,26 +19527,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug(
                         "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
-
-            # Durable turn record: the turn ended, retire its record — UNLESS
-            # it ended because the gateway interrupted it for a restart
-            # (record status "interrupted"), in which case the record is the
-            # next boot's resume signal and finish_active_turn keeps it.
-            if session_key:
-                try:
-                    await self.async_session_store.finish_active_turn(
-                        session_key,
-                        agent_result.get("turn_id") if isinstance(agent_result, dict) else None,
-                        turn_interrupted=bool(
-                            isinstance(agent_result, dict)
-                            and agent_result.get("interrupted")
-                        ),
-                    )
-                except Exception as _e:
-                    logger.debug(
-                        "finish_active_turn failed for %s: %s",
                         session_key, _e,
                     )
 
@@ -21690,25 +19952,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
                         )
-
-            # Hard provider refusals are known only after the agent turn ends.
-            # Mask rows after this turn's user anchor only after all agent- or
-            # gateway-owned persistence has settled, then stage a one-shot
-            # permissive route for the next classifiable message.
-            _hard_refusal_masked = await self._handle_gateway_hard_refusal(
-                session_key,
-                session_entry.session_id,
-                source,
-                agent_result,
-            )
-            if _hard_refusal_masked == 0:
-                await self._handle_gateway_soft_refusal(
-                    session_key,
-                    session_entry.session_id,
-                    source,
-                    agent_result,
-                    message_text,
-                )
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
@@ -21739,11 +19982,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._refresh_agent_cache_message_count(
                 session_key, session_entry.session_id
             )
-
-            if _trace is not None:
-                turn_trace.safe_add_span(
-                    _trace, "gateway.persist", _t_persist, time.time()
-                )
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -21829,7 +20067,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
-            turn_trace.safe_tag(_trace, gateway_error=type(e).__name__)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current
@@ -25220,7 +23457,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             executor = getattr(self, "_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
                 executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=_gateway_max_workers(),
+                    max_workers=10,
                     thread_name_prefix="hermes-gateway",
                 )
                 self._executor = executor
@@ -26593,33 +24830,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-    @staticmethod
-    def _reasoning_effort_from_config(
-        reasoning_config: Optional[dict],
-    ) -> Optional[str]:
-        if reasoning_config is None:
-            return None
-        if reasoning_config.get("enabled") is False:
-            return "none"
-        effort = str(reasoning_config.get("effort") or "").strip().lower()
-        return effort or "medium"
-
-    def _get_session_entry(self, session_key: Optional[str]):
-        if not session_key:
-            return None
-        store = getattr(self, "session_store", None)
-        getter = getattr(store, "get_entry", None)
-        if not callable(getter):
-            return None
-        try:
-            return getter(session_key)
-        except Exception:
-            logger.debug(
-                "Failed to load SessionEntry for runtime override",
-                exc_info=True,
-            )
-            return None
-
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Lazily restore a persisted /model override after a gateway restart.
 
@@ -26649,54 +24859,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug(
                 "Failed to read persisted session model override", exc_info=True
             )
-            persisted = None
-        if not persisted or not isinstance(persisted, dict):
-            entry = self._get_session_entry(session_key)
-            runtime_model = getattr(entry, "runtime_model", None) if entry else None
-            runtime_provider = (
-                getattr(entry, "runtime_provider", None) if entry else None
-            )
-            if not isinstance(runtime_model, str) or not runtime_model.strip():
-                return
-            if not isinstance(runtime_provider, str) or not runtime_provider.strip():
-                return
-            runtime_model = runtime_model.strip()
-            runtime_provider = runtime_provider.strip()
-            try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(
-                    runtime_provider,
-                    target_model=runtime_model,
-                )
-            except Exception:
-                logger.warning(
-                    "Persisted runtime override for session=%s could not be "
-                    "resolved; using defaults",
-                    session_key,
-                    exc_info=True,
-                )
-                return
-            resolved_provider = runtime.get("provider")
-            if not isinstance(resolved_provider, str) or not resolved_provider.strip():
-                return
-            override = {
-                "model": runtime_model,
-                "provider": resolved_provider.strip(),
-                "api_key": runtime.get("api_key"),
-                "base_url": runtime.get("base_url"),
-                "api_mode": runtime.get("api_mode"),
-                "command": runtime.get("command"),
-                "args": list(runtime.get("args") or []),
-                "credential_pool": runtime.get("credential_pool"),
-                "_runtime_bundle_complete": True,
-            }
-            self._session_state(session_key).conversation.model_override = override
-            logger.info(
-                "Rehydrated persisted runtime override for session=%s: "
-                "model=%s provider=%s",
-                session_key,
-                runtime_model,
-                resolved_provider,
-            )
+            return
+        if not persisted:
             return
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
@@ -26727,294 +24891,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
         )
-
-    def _get_session_model_override(
-        self, session_key: Optional[str]
-    ) -> Optional[Dict[str, Any]]:
-        if not session_key:
-            return None
-        state = self._peek_session_state(session_key)
-        override = state.conversation.model_override if state else None
-        if override:
-            return dict(override)
-        self._rehydrate_session_model_override(session_key)
-        state = self._peek_session_state(session_key)
-        override = state.conversation.model_override if state else None
-        if override:
-            return dict(override)
-        return None
-
-    def _persist_session_runtime_override(
-        self,
-        session_key: str,
-        *,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-        reasoning_config: Optional[dict] = None,
-        include_model: bool = False,
-        include_reasoning: bool = False,
-    ) -> None:
-        store = getattr(self, "session_store", None)
-        updater = getattr(store, "update_runtime_override", None)
-        if not session_key or not callable(updater):
-            return
-        kwargs: Dict[str, Any] = {}
-        if include_model:
-            kwargs.update(model=model, provider=provider)
-        if include_reasoning:
-            kwargs["reasoning_effort"] = self._reasoning_effort_from_config(
-                reasoning_config
-            )
-        if not kwargs:
-            return
-        try:
-            updater(session_key, **kwargs)
-        except Exception:
-            logger.debug("Failed to persist session runtime override", exc_info=True)
-
-    def _clear_persisted_session_runtime_overrides(
-        self,
-        session_key: str,
-        *,
-        model: bool = True,
-        reasoning: bool = True,
-    ) -> None:
-        store = getattr(self, "session_store", None)
-        clearer = getattr(store, "clear_runtime_overrides", None)
-        if not session_key or not callable(clearer):
-            return
-        try:
-            clearer(session_key, model=model, reasoning=reasoning)
-        except Exception:
-            logger.debug("Failed to clear session runtime override", exc_info=True)
-
-    def _build_pending_runtime_route_state(
-        self,
-        directive: dict,
-        *,
-        target_model: str = "",
-        target_provider: str = "",
-        target_reasoning_effort: str = "",
-        reason: str = "",
-    ) -> dict:
-        label = (
-            directive.get("label")
-            or directive.get("route_label")
-            or directive.get("policy_label")
-            or directive.get("policy")
-            or "RUNTIME_OVERRIDE"
-        )
-        return {
-            "label": str(label),
-            "target_provider": str(
-                target_provider or directive.get("provider") or ""
-            ).strip(),
-            "target_model": str(
-                target_model
-                or directive.get("model")
-                or directive.get("raw_input")
-                or ""
-            ).strip(),
-            "target_reasoning_effort": str(
-                target_reasoning_effort or directive.get("reasoning_effort") or ""
-            )
-            .strip()
-            .lower(),
-            "source": str(
-                directive.get("source") or "pre_gateway_dispatch"
-            ).strip(),
-            "strictness": str(
-                directive.get("strictness") or "auto_reconsiderable"
-            ).strip(),
-            "confidence": directive.get("confidence", "unknown"),
-            "reason": str(
-                reason or directive.get("reason") or "pre-dispatch routing"
-            ).strip(),
-        }
-
-    def _set_pending_runtime_route_state(
-        self, session_key: str, route_state: dict
-    ) -> None:
-        if not session_key or not isinstance(route_state, dict):
-            return
-        states = getattr(self, "_pending_runtime_route_states", None)
-        if not isinstance(states, dict):
-            states = {}
-            self._pending_runtime_route_states = states
-        states[session_key] = route_state
-
-    def _consume_pending_runtime_route_state(
-        self, session_key: str
-    ) -> Optional[dict]:
-        states = getattr(self, "_pending_runtime_route_states", None)
-        if not session_key or not isinstance(states, dict):
-            return None
-        state = states.pop(session_key, None)
-        return state if isinstance(state, dict) else None
-
-    def _apply_gateway_runtime_override(
-        self, directive: dict, source: SessionSource
-    ) -> bool:
-        if not isinstance(directive, dict) or source is None:
-            return False
-        model_input = str(
-            directive.get("model") or directive.get("raw_input") or ""
-        ).strip()
-        explicit_provider = str(
-            directive.get("provider") or directive.get("explicit_provider") or ""
-        ).strip()
-        reasoning_effort = str(
-            directive.get("reasoning_effort") or ""
-        ).strip().lower()
-        if not model_input and not explicit_provider and not reasoning_effort:
-            return False
-        try:
-            session_key = self._session_key_for_source(source)
-        except Exception:
-            session_key = ""
-        if not session_key:
-            return False
-
-        changed = False
-        # Effective-delta guard: evict the cached agent (a full system-prompt
-        # and provider prompt-cache rebuild) only when the override actually
-        # moves a model runtime axis. A router that re-selects the already-active
-        # route every triggering message must not bust the cache each time.
-        # Reasoning-only overrides never require eviction: reasoning is excluded
-        # from the agent-cache signature and re-applied per turn in run_sync.
-        evict_needed = False
-        if model_input or explicit_provider:
-            try:
-                from hermes_cli.config import get_compatible_custom_providers
-                from hermes_cli.model_switch import switch_model as _switch_model
-
-                cfg = _load_gateway_config()
-                model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-                current_model = model_cfg.get("default", "")
-                current_provider = model_cfg.get("provider", "openrouter")
-                current_base_url = model_cfg.get("base_url", "")
-                current_api_key = ""
-                user_provs = cfg.get("providers") if isinstance(cfg, dict) else None
-                try:
-                    custom_provs = get_compatible_custom_providers(cfg)
-                except Exception:
-                    custom_provs = (
-                        cfg.get("custom_providers") if isinstance(cfg, dict) else None
-                    )
-                override = self._get_session_model_override(session_key) or {}
-                current_model = override.get("model", current_model)
-                current_provider = override.get("provider", current_provider)
-                current_base_url = override.get("base_url", current_base_url)
-                current_api_key = override.get("api_key", current_api_key)
-                result = _switch_model(
-                    raw_input=model_input,
-                    current_provider=current_provider,
-                    current_model=current_model,
-                    current_base_url=current_base_url,
-                    current_api_key=current_api_key,
-                    is_global=False,
-                    explicit_provider=explicit_provider or None,
-                    user_providers=user_provs,
-                    custom_providers=custom_provs,
-                )
-                if not getattr(result, "success", False):
-                    logger.warning(
-                        "pre_gateway_dispatch runtime_override failed for %s: %s",
-                        session_key,
-                        getattr(result, "error_message", "model switch failed"),
-                    )
-                    return changed
-                result_model = getattr(result, "new_model", "")
-                result_provider = getattr(result, "target_provider", "")
-                result_base_url = getattr(result, "base_url", "") or ""
-                result_api_mode = getattr(result, "api_mode", "") or ""
-                previous_api_mode = override.get("api_mode")
-                model_axes_changed = (
-                    str(result_model or "") != str(current_model or "")
-                    or str(result_provider or "") != str(current_provider or "")
-                    or str(result_base_url or "") != str(current_base_url or "")
-                    or (
-                        previous_api_mode is not None
-                        and str(result_api_mode) != str(previous_api_mode or "")
-                    )
-                )
-                self._session_state(
-                    session_key
-                ).conversation.model_override = {
-                    "model": result_model,
-                    "provider": result_provider,
-                    "api_key": getattr(result, "api_key", "") or "",
-                    "base_url": result_base_url,
-                    "api_mode": result_api_mode,
-                }
-                self._persist_session_runtime_override(
-                    session_key,
-                    model=result_model,
-                    provider=result_provider,
-                    include_model=True,
-                )
-                reason = str(
-                    directive.get("reason") or "pre-dispatch routing"
-                ).strip()
-                self._set_pending_runtime_route_state(
-                    session_key,
-                    self._build_pending_runtime_route_state(
-                        directive,
-                        target_model=result_model,
-                        target_provider=result_provider,
-                        target_reasoning_effort=reasoning_effort,
-                        reason=reason,
-                    ),
-                )
-                if model_axes_changed:
-                    pending = getattr(self, "_pending_model_notes", None)
-                    if pending is None:
-                        self._pending_model_notes = {}
-                        pending = self._pending_model_notes
-                    pending[session_key] = (
-                        "[Note: runtime route selected before this turn: "
-                        f"{current_model or 'default'} -> {result_model} via "
-                        f"{getattr(result, 'provider_label', '') or result_provider} "
-                        f"({reason}). Adjust your self-identification accordingly.]"
-                    )
-                    evict_needed = True
-                changed = True
-            except Exception as exc:
-                logger.warning(
-                    "pre_gateway_dispatch runtime_override raised for %s: %s",
-                    session_key,
-                    exc,
-                )
-        if reasoning_effort:
-            try:
-                from hermes_constants import parse_reasoning_effort
-
-                parsed = parse_reasoning_effort(reasoning_effort)
-                if parsed is None:
-                    logger.warning(
-                        "Ignoring unknown reasoning_effort=%r", reasoning_effort
-                    )
-                else:
-                    self._set_session_reasoning_override(session_key, parsed)
-                    if not (model_input or explicit_provider):
-                        self._set_pending_runtime_route_state(
-                            session_key,
-                            self._build_pending_runtime_route_state(
-                                directive,
-                                target_reasoning_effort=reasoning_effort,
-                            ),
-                        )
-                    self._persist_session_runtime_override(
-                        session_key,
-                        reasoning_config=parsed,
-                        include_reasoning=True,
-                    )
-                    changed = True
-            except Exception as exc:
-                logger.warning("Reasoning runtime override failed: %s", exc)
-        if changed and evict_needed:
-            self._evict_cached_agent(session_key)
-        return changed
 
     def _apply_session_model_override(
         self, session_key: str, model: str, runtime_kwargs: dict
@@ -27053,9 +24929,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {
             "had_override": override is not None,
             "override": dict(override) if override is not None else None,
-            "active_route_name": (
-                _snap_state.conversation.active_route_name if _snap_state else ""
-            ),
         }
 
     def _restore_session_model_override(self, session_key: str, snapshot: dict) -> None:
@@ -27070,10 +24943,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _rst_state = self._peek_session_state(session_key)
             if _rst_state is not None:
                 _rst_state.conversation.model_override = None
-        self._set_active_model_route(
-            session_key,
-            str(snapshot.get("active_route_name") or ""),
-        )
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
@@ -27261,12 +25130,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for attr in _CONVERSATION_SCOPED_STATE:
             store = getattr(self, attr, None)
             if isinstance(store, dict):
-                if attr == "_model_router_state":
-                    lock = getattr(self, "_model_router_state_lock", None)
-                    if lock is not None:
-                        with lock:
-                            store.pop(session_key, None)
-                        continue
                 store.pop(session_key, None)
         self._clear_session_boundary_security_state(session_key)
         logger.debug(
@@ -27517,103 +25380,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-    async def _llm_activity_recap(self, agent, session_key: str) -> Optional[str]:
-        """Generate a cached one-line recap for a long-running agent turn."""
-        try:
-            context = agent.get_activity_recap_context()
-        except Exception:
-            return None
-
-        cache = getattr(self, "_activity_recap_cache", None)
-        if cache is None:
-            cache = {}
-            self._activity_recap_cache = cache
-        context_key = hash(
-            (
-                context.get("goal"),
-                tuple(context.get("recent_tools") or ()),
-                context.get("current_tool") or context.get("last_activity_desc"),
-                tuple(context.get("voice_samples") or ()),
-                bool(context.get("persona_snippet")),
-            )
-        )
-        cached = cache.get(session_key)
-        if cached and cached[0] == context_key:
-            return cached[1]
-
-        def _generate() -> str:
-            from agent.auxiliary_client import call_llm
-
-            tools_text = "; ".join(context.get("recent_tools") or []) or "(none yet)"
-            current = (
-                context.get("current_tool")
-                or context.get("last_activity_desc")
-                or "thinking"
-            )
-            samples = context.get("voice_samples") or []
-            voice_block = ""
-            if samples:
-                joined = "\n".join(f"- {sample}" for sample in samples)
-                voice_block = (
-                    "Your recent messages in this conversation (this is YOUR "
-                    f"voice — match its language, tone, and persona exactly):\n{joined}\n"
-                )
-            elif context.get("persona_snippet"):
-                voice_block = (
-                    "Your persona and conversation-style definition (write in "
-                    f"this voice):\n{context['persona_snippet']}\n"
-                )
-            result_block = ""
-            if context.get("last_tool_result"):
-                result_block = (
-                    "Last tool result (truncated): "
-                    f"{context['last_tool_result']}\n"
-                )
-            prompt = (
-                "You are the AI agent in the middle of a long-running turn. "
-                "Write YOUR OWN one-line status update to the user: what you "
-                "are doing right now and what you are waiting on. ONE line, "
-                "max 100 chars, present tense, no prefix/quotes.\n"
-                + voice_block
-                + f"Goal of this turn: {context.get('goal') or '(unknown)'}\n"
-                + f"Your recent tool calls (oldest first): {tools_text}\n"
-                + result_block
-                + f"Currently: {current} "
-                + f"({int(context.get('seconds_since_activity') or 0)}s since last activity, "
-                + f"iteration {context.get('iteration')}/{context.get('max_iterations')})"
-            )
-            response = call_llm(
-                task="activity_recap",
-                main_runtime={
-                    "model": getattr(agent, "model", None),
-                    "provider": getattr(agent, "provider", None),
-                    "base_url": getattr(agent, "base_url", None),
-                    "api_key": getattr(agent, "api_key", None),
-                    "api_mode": getattr(agent, "api_mode", None),
-                },
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=80,
-                timeout=8,
-            )
-            message = response.choices[0].message
-            content = (
-                message.get("content")
-                if isinstance(message, dict)
-                else getattr(message, "content", "")
-            )
-            lines = str(content or "").strip().splitlines()
-            return lines[0][:140].strip() if lines else ""
-
-        try:
-            text = await asyncio.wait_for(asyncio.to_thread(_generate), timeout=10)
-        except Exception as exc:
-            logger.debug("activity recap generation failed: %s", exc)
-            return None
-        if not text:
-            return None
-        cache[session_key] = (context_key, text)
-        return text
-
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -27799,17 +25565,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         staged = state.conversation.sidecar_notes
         state.conversation.sidecar_notes = []
         return list(staged) if isinstance(staged, list) else []
-
-    def _consume_refusal_recall_quarantine(self, session_key: str) -> bool:
-        """Consume the one-turn recall quarantine armed by a clean-fork."""
-        if not session_key:
-            return False
-        state = self._peek_session_state(session_key)
-        if state is None:
-            return False
-        active = bool(state.conversation.refusal_recall_quarantine)
-        state.conversation.refusal_recall_quarantine = False
-        return active
 
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """Return a ``[Voice channel now: ...]`` note when VC state changed.
@@ -28708,9 +26463,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_text: Optional[str] = None,
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
-        routing_event: Optional[MessageEvent] = None,
-        turn_resume_marker: Optional[Dict[str, Any]] = None,
-        turn_trace_obj: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28734,9 +26486,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 semantic_progress_text=semantic_progress_text,
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
-                routing_event=routing_event,
-                turn_resume_marker=turn_resume_marker,
-                turn_trace_obj=turn_trace_obj,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28753,9 +26502,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 semantic_progress_text=semantic_progress_text,
                 mention_inbox_execution_id=mention_inbox_execution_id,
                 mention_inbox_execution_observer=mention_inbox_execution_observer,
-                routing_event=routing_event,
-                turn_resume_marker=turn_resume_marker,
-                turn_trace_obj=turn_trace_obj,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28882,9 +26628,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         semantic_progress_text: Optional[str] = None,
         mention_inbox_execution_id: Optional[str] = None,
         mention_inbox_execution_observer: Any = None,
-        routing_event: Optional[MessageEvent] = None,
-        turn_resume_marker: Optional[Dict[str, Any]] = None,
-        turn_trace_obj: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28903,15 +26646,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if mention_inbox_execution_id is not None:
                 raise RuntimeError(
                     "approved mention-inbox execution requires local tool receipts"
-                )
-            if turn_trace_obj is not None:
-                turn_trace.safe_add_span(
-                    turn_trace_obj,
-                    "gateway.ingest",
-                    turn_trace.safe_started_at(turn_trace_obj),
-                    time.time(),
-                    platform=source.platform.value if source.platform else "",
-                    session_key=session_key,
                 )
             return await self._run_agent_via_proxy(
                 message=message,
@@ -28995,9 +26729,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default: bool = False,
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
-            allow_recap: bool = False,
         ) -> str:
-            """Return the normalized visibility mode for a gateway surface."""
+            """Return off|raw|generic for a gateway visibility surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
@@ -29012,8 +26745,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
-            if isinstance(value, str) and value.strip().lower() == "recap":
-                return "recap" if allow_recap else "raw"
             return "raw" if bool(value) else "off"
 
         # Disable tool progress for webhooks - they don't support message editing,
@@ -29158,7 +26889,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _LONG_TOOL_THRESHOLD_S = 30.0
 
         turn_ctx = TurnContext(
-            event=routing_event,
             source=source,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
@@ -29207,8 +26937,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
-            turn_resume_marker=turn_resume_marker,
-            turn_trace_obj=turn_trace_obj,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -29618,7 +27346,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "long_running_notifications",
             default=True,
             allow_generic=True,
-            allow_recap=True,
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
@@ -29670,19 +27397,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                _recap_line = None
-                if _long_running_mode == "recap" and agent_holder[0] is not None:
-                    _recap_line = await self._llm_activity_recap(
-                        agent_holder[0], session_key
-                    )
                 # User-facing heartbeats never copy implementation details
                 # from get_activity_summary(). Discord re-renders the same
                 # structured semantic snapshot; other platforms get localized
                 # elapsed-time copy without tool or iteration names.
-                if _recap_line:
-                    _heartbeat_text = f"⏳ {_elapsed_mins} min — {_recap_line}"
-                    _active_heartbeat_id = _heartbeat_msg_id
-                elif _long_running_mode == "generic" and _long_running_phrase_catalog:
+                if _long_running_mode == "generic" and _long_running_phrase_catalog:
                     try:
                         from gateway.status_phrases import choose_status_phrase
 
@@ -29726,23 +27445,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _active_heartbeat_id = _heartbeat_msg_id
                 try:
                     _notify_res = None
-                    # Recaps must remain visible at the bottom of a busy
-                    # thread. When deletion is supported, replace the prior
-                    # bubble instead of editing it in its old position.
-                    if (
-                        _heartbeat_msg_id
-                        and _long_running_mode == "recap"
-                        and type(_notify_adapter).delete_message
-                        is not BasePlatformAdapter.delete_message
-                    ):
-                        try:
-                            await _notify_adapter.delete_message(
-                                source.chat_id, _heartbeat_msg_id
-                            )
-                        except Exception:
-                            pass
-                        _heartbeat_msg_id = None
-                        _active_heartbeat_id = None
                     if _active_heartbeat_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
@@ -29762,10 +27464,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
                         ):
-                            if (
-                                semantic_progress_enabled
-                                and _long_running_mode != "recap"
-                            ):
+                            if semantic_progress_enabled:
                                 semantic_progress_message_id_ref[0] = str(
                                     _notify_res.message_id
                                 )
@@ -29896,15 +27595,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
                 ).start()
-            if turn_trace_obj is not None:
-                turn_trace.safe_add_span(
-                    turn_trace_obj,
-                    "gateway.ingest",
-                    turn_trace.safe_started_at(turn_trace_obj),
-                    time.time(),
-                    platform=source.platform.value if source.platform else "",
-                    session_key=session_key,
-                )
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
@@ -30555,8 +28245,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
-                    routing_event=pending_event,
-                    turn_trace_obj=turn_trace_obj,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -30821,90 +28509,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
         return response
-
-
-def _run_loop_stall_watchdog(
-    stop_event: threading.Event,
-    loop: asyncio.AbstractEventLoop,
-    *,
-    ping_interval: float = 2.0,
-    stall_threshold: float = 5.0,
-) -> None:
-    """Detect and loudly report event-loop stalls.
-
-    Pings the loop via ``call_soon_threadsafe`` and measures how long the
-    callback takes to run. 2026-07-28: the loop blocked for 160s on the
-    SessionDB writer lock and the only signal was discord.py's heartbeat
-    warning — invisible when Discord isn't connected. This watchdog is
-    transport-independent: on a stall it logs ERROR with the MainThread
-    stack (the exact frame holding the loop) and a cgroup PSI snapshot so
-    host CPU/memory starvation is distinguishable from an in-process
-    block. Alarms escalate (5s, then doubling) and recovery logs the
-    total stall duration.
-    """
-    # The loop normally runs on MainThread; record the actual ident from
-    # inside a pong so the dump targets the right thread even when the
-    # loop was started elsewhere (tests, embedders).
-    loop_ident = [threading.main_thread().ident]
-
-    def _loop_stack() -> str:
-        try:
-            frame = sys._current_frames().get(loop_ident[0])
-            if frame is None:
-                return "<loop thread frame unavailable>"
-            return "".join(traceback.format_stack(frame))
-        except Exception as exc:  # pragma: no cover - diagnostics only
-            return f"<stack capture failed: {exc}>"
-
-    def _psi_snapshot() -> str:
-        try:
-            cg = ""
-            with open("/proc/self/cgroup", encoding="utf-8") as fh:
-                for line in fh:
-                    if line.startswith("0::"):
-                        cg = line.strip().split("::", 1)[1]
-                        break
-            parts = []
-            for kind in ("cpu", "memory"):
-                try:
-                    with open(f"/sys/fs/cgroup{cg}/{kind}.pressure", encoding="utf-8") as fh:
-                        parts.append(f"{kind} {fh.readline().strip()}")
-                except OSError:
-                    continue
-            return "; ".join(parts) or "<unavailable>"
-        except Exception:  # pragma: no cover - diagnostics only
-            return "<unavailable>"
-
-    while not stop_event.wait(ping_interval):
-        pong = threading.Event()
-        t0 = time.monotonic()
-
-        def _pong(_evt=pong):
-            loop_ident[0] = threading.get_ident()
-            _evt.set()
-
-        try:
-            loop.call_soon_threadsafe(_pong)
-        except RuntimeError:
-            return  # loop closed — shutdown race
-        next_alarm = stall_threshold
-        alarmed = False
-        while not pong.wait(0.25):
-            if stop_event.is_set():
-                return
-            lag = time.monotonic() - t0
-            if lag >= next_alarm:
-                alarmed = True
-                logger.error(
-                    "event loop blocked for %.1fs — loop thread stack:\n%s\nPSI: %s",
-                    lag, _loop_stack(), _psi_snapshot(),
-                )
-                next_alarm = max(next_alarm * 2, lag + stall_threshold)
-        if alarmed:
-            logger.warning(
-                "event loop recovered after %.1fs stall",
-                time.monotonic() - t0,
-            )
 
 
 def _run_planned_stop_watcher(
@@ -31684,18 +29288,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     _planned_stop_watcher_thread.start()
 
-    # Loop-stall watchdog: platform-independent successor to relying on
-    # discord.py's "heartbeat blocked" warnings for loop-freeze detection
-    # (2026-07-28 outage). ERROR + MainThread stack + PSI on stalls ≥5s.
-    _loop_stall_watchdog_stop = threading.Event()
-    _loop_stall_watchdog_thread = threading.Thread(
-        target=_run_loop_stall_watchdog,
-        args=(_loop_stall_watchdog_stop, loop),
-        daemon=True,
-        name="loop-stall-watchdog",
-    )
-    _loop_stall_watchdog_thread.start()
-
     # Claim the PID file BEFORE bringing up any platform adapters.
     # This closes the --replace race window: two concurrent `gateway run
     # --replace` invocations both pass the termination-wait above, but
@@ -31930,8 +29522,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
-    _loop_stall_watchdog_stop.set()
-    _loop_stall_watchdog_thread.join(timeout=2)
 
     # Close MCP server connections
     try:

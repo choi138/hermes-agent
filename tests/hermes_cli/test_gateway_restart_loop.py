@@ -823,61 +823,6 @@ class TestLifecycleGuardModule:
         )
         assert result is True
 
-    def test_remote_fallback_does_not_resurrect_local_binary(self, tmp_path):
-        """The terminal tool's ``read_remote_script`` callback
-        (``_read_script_in_env``) re-reads paths the local bounded reader
-        already *skipped*: a binary makes ``_read_referenced_script`` return
-        ``(None, False)``, which then hands the same path to the callback, and
-        the callback's local-read branch decodes the raw bytes (NUL survives —
-        U+0000 is valid UTF-8). Invoking any binary by path inside a gateway
-        session (GNU time, the system python3, a venv python symlink) therefore
-        fed machine code back into the recursion.
-
-        Distinct from ``test_binary_from_remote_callback_never_false_positives``
-        (synthetic callback, nonexistent path): here the file EXISTS locally and
-        was deliberately skipped, so this pins the skip on the resurrection path
-        the original binary-sniff fix did not cover. A compiled tool's .rodata
-        can legitimately hold lifecycle-looking strings — the hermes launcher
-        binary does — so scanning the decoded bytes would both false-positive
-        block it and tokenize NUL-bearing junk paths into the walk.
-        """
-        from pathlib import Path
-
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        # Fake ELF: NUL bytes, a lifecycle-looking .rodata string, and a line
-        # whose first token is a slash-bearing junk "executable" with an
-        # embedded NUL — machine code tokenizes into shapes like this, and the
-        # walk treats a segment's leading /-token as a referenced script path.
-        binary = tmp_path / "fake-time"
-        binary.write_bytes(
-            b"\x7fELF\x00\x00\n/usr/li\x00b/junk.so --flag\n"
-            b"hermes gateway restart\x00\x00junk\n"
-        )
-        reads: list[str] = []
-
-        def _terminal_tool_like_fallback(script_path: str):
-            # Mimics tools/terminal_tool.py::_read_script_in_env — reads the
-            # local file raw and decodes with errors="replace".
-            reads.append(script_path)
-            path = Path(script_path)
-            if path.is_file():
-                return path.read_bytes().decode("utf-8", errors="replace")
-            return None
-
-        result = contains_gateway_lifecycle_command_or_referenced_script(
-            f'{binary} -f "elapsed=%es" bash benign.sh',
-            cwd=str(tmp_path),
-            read_remote_script=_terminal_tool_like_fallback,
-        )
-        # The callback IS consulted for the locally-skipped binary (that is the
-        # exposure), and its content must be discarded as binary rather than
-        # scanned — otherwise the .rodata fragment above blocks the command.
-        assert str(binary) in reads
-        assert result is False
-
     def test_guard_is_total_against_adversarial_inputs(self, monkeypatch):
         """The public guard is a total function: no input may raise. Covers
         the residual class beyond the four named sites — including

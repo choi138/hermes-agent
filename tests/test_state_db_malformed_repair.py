@@ -301,7 +301,7 @@ def test_fts_write_corruption_repaired_in_place(tmp_path):
 
 def _corrupt_btree_index(db_path: Path, index_name: str) -> None:
     """Make a real B-tree index stale so integrity_check reports
-    missing rows or a wrong entry count for ``index_name``.
+    'wrong # of entries in index <name>'.
 
     writable_schema hack: temporarily rewrite the index definition in
     sqlite_master to a partial index (``WHERE 0``), REINDEX so its b-tree is
@@ -344,7 +344,7 @@ def test_repair_rebuilds_stale_btree_indexes(tmp_path):
     """repair_state_db_schema repairs a REAL stale B-tree index via REINDEX.
 
     End-to-end, no mocks: a genuinely stale index (empty b-tree under a full
-    index definition — the #63386 missing/wrong-entry-count class) is
+    index definition — the #63386 'wrong # of entries in index' class) is
     detected by the real _db_opens_cleanly, repaired by Strategy 0.5
     (REINDEX), and the DB verifies clean afterwards with real integrity
     checks.
@@ -357,14 +357,7 @@ def test_repair_rebuilds_stale_btree_indexes(tmp_path):
     # The real detector must see the real corruption...
     reason = hermes_state._db_opens_cleanly(db_path)
     assert reason is not None
-    # SQLite phrases stale-index corruption differently across versions
-    # ("row N missing from index" vs "wrong # of entries in index"); accept
-    # either so the test pins the detection, not the build's wording.
-    assert "idx_messages_session" in reason
-    assert (
-        "wrong # of entries in index" in reason
-        or "missing from index" in reason
-    )
+    assert "wrong # of entries in index idx_messages_session" in reason
 
     # ...and the real repair ladder must fix it via REINDEX.
     report = repair_state_db_schema(db_path)

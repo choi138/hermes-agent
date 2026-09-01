@@ -1,4 +1,4 @@
-"""Discord format_message: tables converted to fenced ASCII codeblock tables."""
+"""Discord format_message: tables converted to bullet groups."""
 
 import types
 import sys
@@ -24,7 +24,7 @@ def _make_discord_adapter():
 
 class TestDiscordFormatMessage:
 
-    def test_table_converted_to_fenced_ascii_table(self):
+    def test_table_converted_to_bullets(self):
         adapter = _make_discord_adapter()
         text = (
             "Results:\n\n"
@@ -35,10 +35,10 @@ class TestDiscordFormatMessage:
             "\nDone."
         )
         out = adapter.format_message(text)
-        assert "```\n┌" in out
-        assert "│ Name  │ Score │" in out
-        assert "│ Alice │ 95    │" in out
-        assert "│ Bob   │ 80    │" in out
+        assert "**Alice**" in out
+        assert "• Score: 95" in out
+        assert "**Bob**" in out
+        assert "• Score: 80" in out
         assert out.startswith("Results:")
         assert out.rstrip().endswith("Done.")
         assert "|---" not in out

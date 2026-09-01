@@ -83,7 +83,6 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
         action="add",
         target="memory",
         content="User prefers concise answers.",
-        reason="Durable user preference that should persist across sessions.",
         store=agent._memory_store,
     )
     result = json.loads(raw)
