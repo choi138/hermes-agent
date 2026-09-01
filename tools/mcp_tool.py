@@ -92,7 +92,9 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import math
@@ -102,11 +104,12 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -1722,7 +1725,7 @@ class MCPServerTask:
     __slots__ = (
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
-        "_tools", "_error", "_config",
+        "_tools", "_error", "_config", "_profile_home",
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
@@ -1749,6 +1752,7 @@ class MCPServerTask:
         self._tools: list = []
         self._error: Optional[Exception] = None
         self._config: dict = {}
+        self._profile_home = ""
         self._sampling: Optional[SamplingHandler] = None
         self._elicitation: Optional[ElicitationHandler] = None
         self._registered_tool_names: list[str] = []
@@ -2422,6 +2426,7 @@ class MCPServerTask:
         ssl_verify: bool = True,
         client_cert=None,
         timeout: float = 5.0,
+        follow_redirects: bool = True,
     ) -> None:
         """Probe *url* for an MCP-shaped response before the SDK connects.
 
@@ -2458,7 +2463,7 @@ class MCPServerTask:
 
         client_kwargs: dict = {
             "verify": ssl_verify,
-            "follow_redirects": True,
+            "follow_redirects": follow_redirects,
             "timeout": _httpx.Timeout(timeout),
         }
         if client_cert is not None:
@@ -2555,6 +2560,7 @@ class MCPServerTask:
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
+        follow_redirects = bool(config.get("follow_redirects", True))
         client_cert = _resolve_client_cert(self.name, config)
 
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
@@ -2611,22 +2617,25 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
-            if client_cert is not None or ssl_verify is not True:
-                # SSE transport doesn't expose verify/cert as kwargs, so route
-                # them through an httpx_client_factory that wraps the SDK's
-                # defaults (follow_redirects=True) and adds our TLS settings.
-                # The SDK calls the factory with (headers, auth, timeout); we
-                # forward all of those and layer verify/cert on top.
+            if (
+                client_cert is not None
+                or ssl_verify is not True
+                or not follow_redirects
+            ):
+                # SSE transport doesn't expose verify/cert/redirect policy as
+                # kwargs, so route them through an httpx client factory while
+                # preserving the SDK's headers, timeout, and auth values.
                 import httpx as _httpx_mod
 
                 _cert_for_factory = client_cert
                 _verify_for_factory = ssl_verify
+                _follow_redirects_for_factory = follow_redirects
 
                 def _mcp_http_client_factory(
                     headers=None, timeout=None, auth=None,
                 ):
                     kwargs: dict = {
-                        "follow_redirects": True,
+                        "follow_redirects": _follow_redirects_for_factory,
                         "verify": _verify_for_factory,
                     }
                     if timeout is not None:
@@ -2687,7 +2696,7 @@ class MCPServerTask:
                         response.next_request.headers.pop("Authorization", None)
 
             client_kwargs: dict = {
-                "follow_redirects": True,
+                "follow_redirects": follow_redirects,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
@@ -2726,7 +2735,15 @@ class MCPServerTask:
                             )
             return reason
         else:
-            # Deprecated API (mcp < 1.24.0): manages httpx client internally.
+            # Deprecated API (mcp < 1.24.0) manages its httpx client
+            # internally and offers no redirect-policy hook. A capability that
+            # explicitly forbids endpoint replacement must fail closed rather
+            # than silently restoring the SDK's redirect-following default.
+            if not follow_redirects:
+                raise RuntimeError(
+                    f"MCP server '{self.name}' requires redirects disabled, but "
+                    "the installed MCP SDK cannot enforce that policy"
+                )
             _http_kwargs: dict = {
                 "headers": headers,
                 "timeout": float(connect_timeout),
@@ -2812,6 +2829,12 @@ class MCPServerTask:
         connection drops unexpectedly (unless shutdown was requested).
         """
         self._config = config
+        try:
+            from hermes_constants import get_hermes_home
+
+            self._profile_home = str(get_hermes_home().resolve())
+        except Exception:
+            self._profile_home = ""
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
@@ -2877,6 +2900,7 @@ class MCPServerTask:
                         headers=_probe_headers,
                         ssl_verify=config.get("ssl_verify", True),
                         client_cert=_resolve_client_cert(self.name, config),
+                        follow_redirects=bool(config.get("follow_redirects", True)),
                     )
                 except NonMcpEndpointError as exc:
                     logger.warning("%s", exc)
@@ -3917,6 +3941,402 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
             if future.done():
                 return future.result()
             continue
+
+
+@dataclass(frozen=True)
+class BoundReadOnlyMCPTool:
+    """Capability bound to one live MCP server instance and profile.
+
+    It bypasses the generic MCP handler because that path may reconnect,
+    retry, or run OAuth recovery after its per-call timeout. Recall needs one
+    cancellable call whose complete lifetime fits the caller's deadline.
+    """
+
+    server_name: str
+    tool_name: str
+    allowed_tools: frozenset[str]
+    allowed_argument_keys: frozenset[str]
+    profile_home: str
+    config_digest: str
+    max_timeout: float
+    max_response_chars: int
+    raw_tool_names: tuple[str, ...]
+    registered_tool_names: tuple[str, ...]
+    _server: Any
+    _session: Any
+    _rpc_lock: Any
+
+    def _validate_live_binding(self) -> Any:
+        from hermes_constants import get_hermes_home
+
+        if _normalize_profile_home(get_hermes_home()) != self.profile_home:
+            raise RuntimeError("Read-only MCP capability profile context mismatch")
+        servers = _load_mcp_config()
+        if not isinstance(servers, dict):
+            raise RuntimeError("Read-only MCP capability configuration missing")
+        _reject_mcp_server_name_collision(servers, self.server_name)
+        config = servers.get(self.server_name)
+        if not _read_only_binding_config_is_safe(
+            config,
+            tool_name=self.tool_name,
+            allowed_tools=self.allowed_tools,
+            max_timeout=self.max_timeout,
+        ):
+            raise RuntimeError("Read-only MCP capability configuration mismatch")
+        if _mcp_config_digest(config) != self.config_digest:
+            raise RuntimeError("Read-only MCP capability configuration changed")
+
+        with _lock:
+            server = _servers.get(self.server_name)
+            if server is not self._server:
+                raise RuntimeError("Read-only MCP capability live server instance changed")
+            if server._rpc_lock is not self._rpc_lock:
+                raise RuntimeError("Read-only MCP capability RPC lock changed")
+            raw_tool_names, registered_tool_names = _validate_bound_server_instance(
+                server,
+                server_name=self.server_name,
+                tool_name=self.tool_name,
+                allowed_tools=self.allowed_tools,
+                profile_home=self.profile_home,
+                config_digest=self.config_digest,
+                max_timeout=self.max_timeout,
+            )
+            if (
+                raw_tool_names != self.raw_tool_names
+                or registered_tool_names != self.registered_tool_names
+            ):
+                raise RuntimeError("Read-only MCP capability tool provenance changed")
+            session = server.session
+            if session is not self._session:
+                raise RuntimeError("Read-only MCP capability bound session changed")
+        if session is None:
+            raise RuntimeError("Read-only MCP capability server is disconnected")
+        return session
+
+    def call(self, args: Dict[str, Any], *, deadline: float) -> Dict[str, Any]:
+        if not isinstance(args, dict) or not set(args) <= self.allowed_argument_keys:
+            raise RuntimeError("Read-only MCP capability arguments are not allowed")
+        try:
+            encoded_args = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Read-only MCP capability arguments are invalid") from exc
+        if len(encoded_args) > 8192:
+            raise RuntimeError("Read-only MCP capability arguments exceed the limit")
+        if isinstance(deadline, bool):
+            raise RuntimeError("Read-only MCP capability deadline is invalid")
+        try:
+            deadline_value = float(deadline)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Read-only MCP capability deadline is invalid") from exc
+        if not math.isfinite(deadline_value):
+            raise RuntimeError("Read-only MCP capability deadline is invalid")
+
+        self._validate_live_binding()
+        remaining = min(self.max_timeout, deadline_value - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("Read-only MCP capability deadline expired")
+
+        async def _call_exact_session() -> Dict[str, Any]:
+            call_timeout = min(
+                self.max_timeout, deadline_value - time.monotonic()
+            )
+            if call_timeout <= 0:
+                raise TimeoutError("Read-only MCP capability deadline expired")
+            async with asyncio.timeout(call_timeout):
+                async with self._rpc_lock:
+                    session = self._validate_live_binding()
+                    if time.monotonic() >= deadline_value:
+                        raise TimeoutError("Read-only MCP capability deadline expired")
+                    result = await session.call_tool(self.tool_name, arguments=args)
+            return _serialize_read_only_result(result, self.max_response_chars)
+
+        return _run_on_mcp_loop(_call_exact_session(), timeout=remaining)
+
+
+def _normalize_profile_home(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return os.path.realpath(os.path.expanduser(raw))
+
+
+def _mcp_config_digest(config: Any) -> str:
+    if not isinstance(config, dict):
+        return ""
+    try:
+        encoded = json.dumps(
+            config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+_READ_ONLY_BINDING_CONFIG_KEYS = frozenset({
+    "elicitation",
+    "enabled",
+    "follow_redirects",
+    "sampling",
+    "timeout",
+    "tools",
+    "transport",
+    "url",
+})
+_READ_ONLY_BINDING_TOOL_CONFIG_KEYS = frozenset({
+    "exclude",
+    "include",
+    "prompts",
+    "resources",
+})
+
+
+def _read_only_binding_config_is_safe(
+    config: Any,
+    *,
+    tool_name: str,
+    allowed_tools: frozenset[str],
+    max_timeout: float,
+) -> bool:
+    if (
+        not isinstance(config, dict)
+        or set(config) - _READ_ONLY_BINDING_CONFIG_KEYS
+        or config.get("enabled") is not True
+        or config.get("follow_redirects") is not False
+    ):
+        return False
+    transport = str(config.get("transport") or "streamable_http").strip().lower()
+    if transport not in {"http", "streamable-http", "streamable_http"}:
+        return False
+    try:
+        raw_url = str(config.get("url") or "")
+        if (
+            not raw_url
+            or raw_url != raw_url.strip()
+            or any(
+                char == "\\" or char.isspace() or ord(char) < 32 or ord(char) == 127
+                for char in raw_url
+            )
+        ):
+            return False
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or not parsed.hostname
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or "%" in parsed.netloc
+            or ";" in unquote(parsed.path)
+        ):
+            return False
+        _ = parsed.port
+        if parsed.hostname.lower() != "localhost" and not ipaddress.ip_address(
+            parsed.hostname
+        ).is_loopback:
+            return False
+    except (TypeError, ValueError):
+        return False
+    for capability_name in ("sampling", "elicitation"):
+        if config.get(capability_name) != {"enabled": False}:
+            return False
+    tools = config.get("tools")
+    if (
+        not isinstance(tools, dict)
+        or set(tools) - _READ_ONLY_BINDING_TOOL_CONFIG_KEYS
+        or not {"include", "resources", "prompts"} <= set(tools)
+    ):
+        return False
+    if tools.get("resources") is not False or tools.get("prompts") is not False:
+        return False
+    if tools.get("exclude") not in (None, []):
+        return False
+    include = tools.get("include")
+    if not isinstance(include, list) or not include:
+        return False
+    included = [str(name).strip() for name in include]
+    if any(not name for name in included) or len(included) != len(set(included)):
+        return False
+    included_set = set(included)
+    if tool_name not in included_set or included_set != allowed_tools:
+        return False
+    raw_timeout = config.get("timeout")
+    if isinstance(raw_timeout, bool):
+        return False
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(timeout) and 0 < timeout <= max_timeout
+
+
+def _reject_mcp_server_name_collision(servers: Dict[str, Any], server_name: str) -> None:
+    canonical = sanitize_mcp_name_component(server_name)
+    if any(
+        name != server_name and sanitize_mcp_name_component(name) == canonical
+        for name in servers
+    ):
+        raise RuntimeError("Read-only MCP capability server-name collision")
+
+
+def _validate_bound_server_instance(
+    server: Any,
+    *,
+    server_name: str,
+    tool_name: str,
+    allowed_tools: frozenset[str],
+    profile_home: str,
+    config_digest: str,
+    max_timeout: float,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if getattr(server, "name", None) != server_name:
+        raise RuntimeError("Read-only MCP capability server provenance mismatch")
+    if _normalize_profile_home(getattr(server, "_profile_home", "")) != profile_home:
+        raise RuntimeError("Read-only MCP capability server profile mismatch")
+    if _mcp_config_digest(getattr(server, "_config", None)) != config_digest:
+        raise RuntimeError("Read-only MCP capability server configuration mismatch")
+    raw_timeout = getattr(server, "tool_timeout", None)
+    if isinstance(raw_timeout, bool):
+        raise RuntimeError("Read-only MCP capability server timeout mismatch")
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Read-only MCP capability server timeout mismatch") from exc
+    if not math.isfinite(timeout) or not 0 < timeout <= max_timeout:
+        raise RuntimeError("Read-only MCP capability server timeout mismatch")
+    if getattr(server, "_sampling", None) is not None or getattr(
+        server, "_elicitation", None
+    ) is not None:
+        raise RuntimeError("Read-only MCP capability interactive handler mismatch")
+    tools = getattr(server, "_tools", None)
+    if not isinstance(tools, list):
+        raise RuntimeError("Read-only MCP capability tool provenance mismatch")
+    tool_names = [getattr(tool, "name", None) for tool in tools]
+    if (
+        any(not isinstance(name, str) or not name for name in tool_names)
+        or len(tool_names) != len(set(tool_names))
+        or tool_names.count(tool_name) != 1
+    ):
+        raise RuntimeError("Read-only MCP capability tool provenance mismatch")
+    registered_names = getattr(server, "_registered_tool_names", None)
+    if not isinstance(registered_names, list) or any(
+        not isinstance(name, str) or not name for name in registered_names
+    ):
+        raise RuntimeError("Read-only MCP capability tool provenance mismatch")
+    expected_registered_names = {
+        mcp_prefixed_tool_name(server_name, name) for name in allowed_tools
+    }
+    if (
+        len(registered_names) != len(set(registered_names))
+        or set(registered_names) != expected_registered_names
+    ):
+        raise RuntimeError("Read-only MCP capability tool provenance mismatch")
+    if getattr(server, "session", None) is None:
+        raise RuntimeError("Read-only MCP capability server is disconnected")
+    return tuple(sorted(tool_names)), tuple(sorted(registered_names))
+
+
+def _serialize_read_only_result(result: Any, max_response_chars: int) -> Dict[str, Any]:
+    if getattr(result, "isError", False):
+        raise RuntimeError("Read-only MCP tool returned an error")
+    payload: Dict[str, Any] = {}
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        payload["structuredContent"] = structured
+    content = getattr(result, "content", None)
+    if isinstance(content, list):
+        text_parts = []
+        text_chars = 0
+        for block in content[:64]:
+            text = getattr(block, "text", None)
+            if not isinstance(text, str):
+                continue
+            text_chars += len(text)
+            if text_chars > max_response_chars:
+                raise RuntimeError("Read-only MCP response exceeds the limit")
+            text_parts.append(text)
+        if text_parts:
+            payload["result"] = "\n".join(text_parts)
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Read-only MCP response is malformed") from exc
+    if len(encoded) > max_response_chars:
+        raise RuntimeError("Read-only MCP response exceeds the limit")
+    return payload
+
+
+def bind_read_only_mcp_tool(
+    *,
+    server_name: str,
+    tool_name: str,
+    allowed_tools: frozenset[str],
+    allowed_argument_keys: frozenset[str],
+    profile_home: str,
+    max_timeout: float,
+    max_response_chars: int,
+) -> BoundReadOnlyMCPTool:
+    """Bind one read-only call to the exact current server, config, and profile."""
+    if tool_name not in allowed_tools or not allowed_argument_keys:
+        raise RuntimeError("Read-only MCP capability declaration is invalid")
+    normalized_home = _normalize_profile_home(profile_home)
+    from hermes_constants import get_hermes_home
+
+    if _normalize_profile_home(get_hermes_home()) != normalized_home:
+        raise RuntimeError("Read-only MCP capability profile context mismatch")
+    servers = _load_mcp_config()
+    if not isinstance(servers, dict):
+        raise RuntimeError("Read-only MCP capability configuration missing")
+    _reject_mcp_server_name_collision(servers, server_name)
+    config = servers.get(server_name)
+    if not _read_only_binding_config_is_safe(
+        config,
+        tool_name=tool_name,
+        allowed_tools=allowed_tools,
+        max_timeout=max_timeout,
+    ):
+        raise RuntimeError("Read-only MCP capability configuration mismatch")
+    digest = _mcp_config_digest(config)
+    if not digest:
+        raise RuntimeError("Read-only MCP capability configuration is invalid")
+    bound_timeout = min(float(max_timeout), float(config["timeout"]))
+    with _lock:
+        server = _servers.get(server_name)
+        if server is None:
+            raise RuntimeError("Read-only MCP capability live server is unavailable")
+        raw_tool_names, registered_tool_names = _validate_bound_server_instance(
+            server,
+            server_name=server_name,
+            tool_name=tool_name,
+            allowed_tools=allowed_tools,
+            profile_home=normalized_home,
+            config_digest=digest,
+            max_timeout=bound_timeout,
+        )
+        session = server.session
+        if session is None:
+            raise RuntimeError("Read-only MCP capability server is disconnected")
+        rpc_lock = server._rpc_lock
+    return BoundReadOnlyMCPTool(
+        server_name=server_name,
+        tool_name=tool_name,
+        allowed_tools=frozenset(allowed_tools),
+        allowed_argument_keys=frozenset(allowed_argument_keys),
+        profile_home=normalized_home,
+        config_digest=digest,
+        max_timeout=bound_timeout,
+        max_response_chars=int(max_response_chars),
+        raw_tool_names=raw_tool_names,
+        registered_tool_names=registered_tool_names,
+        _server=server,
+        _session=session,
+        _rpc_lock=rpc_lock,
+    )
 
 
 def _interrupted_call_result() -> str:

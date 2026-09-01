@@ -1,0 +1,4 @@
+name: graphiti_canonical
+version: 0.1.0
+description: "Read-only selective recall from a local Graphiti canonical MCP server."
+requires_env: []

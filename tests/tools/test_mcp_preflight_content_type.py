@@ -340,6 +340,37 @@ def test_run_skips_preflight_when_skip_preflight_set(monkeypatch):
     )
 
 
+def test_run_forwards_redirect_policy_to_preflight(monkeypatch):
+    import tools.mcp_tool as _mcp
+
+    preflight_kwargs: list[dict] = []
+
+    async def _inner():
+        async def _fake_preflight(self, _url, **kwargs):
+            preflight_kwargs.append(kwargs)
+
+        async def _fake_run_http(self, _config):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda _n, _u: None)
+        monkeypatch.setattr(_mcp.MCPServerTask, "_preflight_content_type", _fake_preflight)
+        monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _fake_run_http)
+
+        task = _mcp.MCPServerTask("redirect-policy-test")
+        with pytest.raises(asyncio.CancelledError):
+            await task.run(
+                {
+                    "url": "http://127.0.0.1:8201/mcp",
+                    "follow_redirects": False,
+                }
+            )
+
+    asyncio.run(_inner())
+
+    assert len(preflight_kwargs) == 1
+    assert preflight_kwargs[0]["follow_redirects"] is False
+
+
 def test_ssl_verify_and_cert_forwarded(monkeypatch):
     captured: dict = {}
 
@@ -369,6 +400,38 @@ def test_ssl_verify_and_cert_forwarded(monkeypatch):
     assert captured.get("verify") is False
     assert captured.get("cert") == "/path/to/cert.pem"
     assert captured.get("follow_redirects") is True
+
+
+def test_preflight_can_disable_redirects(monkeypatch):
+    captured: dict = {}
+
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, headers=None):
+            return httpx.Response(302, headers={"location": "https://other.invalid/mcp"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    task = _make_task()
+
+    asyncio.run(
+        task._preflight_content_type(
+            "http://127.0.0.1:8201/mcp",
+            follow_redirects=False,
+            timeout=3.0,
+        )
+    )
+
+    assert captured.get("follow_redirects") is False
 
 
 # ---------------------------------------------------------------------------

@@ -278,7 +278,13 @@ class TestHTTPClientCert:
         asyncio.run(_drive())
         assert captured.get("cert") == (str(cert), str(key))
 
-    def test_no_cert_means_no_cert_kwarg(self):
+    @pytest.mark.parametrize(
+        ("configured_follow_redirects", "expected_follow_redirects"),
+        [(None, True), (False, False)],
+    )
+    def test_no_cert_means_no_cert_kwarg(
+        self, configured_follow_redirects, expected_follow_redirects
+    ):
         """When client_cert is unset, ``cert`` is not passed to ``httpx.AsyncClient``
         (matches SDK defaults)."""
         from tools.mcp_tool import MCPServerTask
@@ -320,6 +326,9 @@ class TestHTTPClientCert:
             self._shutdown_event.set()
 
         async def _drive():
+            config = {"url": "https://example.com/mcp"}
+            if configured_follow_redirects is not None:
+                config["follow_redirects"] = configured_follow_redirects
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
                  patch("tools.mcp_tool._MCP_NEW_HTTP", True), \
                  patch("httpx.AsyncClient", DummyAsyncClient), \
@@ -327,10 +336,11 @@ class TestHTTPClientCert:
                        return_value=DummyTransportCtx()), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
                  patch.object(MCPServerTask, "_discover_tools", _discover_tools):
-                await server._run_http({"url": "https://example.com/mcp"})
+                await server._run_http(config)
 
         asyncio.run(_drive())
         assert "cert" not in captured
+        assert captured["follow_redirects"] is expected_follow_redirects
 
     def test_missing_cert_file_surfaces_clear_error(self, tmp_path):
         """A missing cert file fails fast with a server-scoped error message."""
