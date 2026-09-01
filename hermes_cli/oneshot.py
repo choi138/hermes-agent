@@ -402,6 +402,19 @@ def _cleanup_oneshot_resources(agent: object = None, session_db: object = None) 
         pass
 
     if agent is not None:
+        # Linger (bounded) for background processes this turn spawned with
+        # notify_on_complete=true BEFORE agent.close(): close() calls
+        # process_registry.kill_all(task_id) and the dying parent owns the
+        # children's stdout pipes, so exiting now destroys in-flight
+        # deliveries — including Bot Mode handoff replies dispatched from
+        # a short-lived recipient (#90879).
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.wait_for_pending_completions(None)
+        except Exception:
+            logging.debug("oneshot background completion wait failed", exc_info=True)
+
         try:
             shutdown_memory = getattr(agent, "shutdown_memory_provider", None)
             if callable(shutdown_memory):

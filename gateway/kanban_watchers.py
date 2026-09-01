@@ -13,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 import unicodedata
+from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -362,6 +364,27 @@ def _kanban_event_profile(kb, conn, event, task) -> Optional[str]:
         else None
     )
 
+_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
+    r"[A-Za-z]:\\[^\s,;]+)"
+)
+
+
+def _safe_review_reason(value: Any, limit: int = 160) -> str:
+    """Return a mobile-friendly review reason safe for external delivery."""
+    from agent.redact import redact_sensitive_text
+
+    reason = redact_sensitive_text(
+        "" if value is None else str(value),
+        force=True,
+        redact_url_credentials=True,
+    )
+    reason = _LOCAL_PATH_RE.sub("[local path]", reason)
+    reason = " ".join(reason.split())
+    if len(reason) > limit:
+        reason = reason[: limit - 1].rstrip() + "…"
+    return reason
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -409,6 +432,27 @@ def _kanban_dispatch_allowed() -> bool:
     except ImportError:
         return True
     return not check_paused("kanban", logger)
+
+
+def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
+    """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
+
+    ``asyncio.to_thread`` copies the calling task's context onto the worker
+    thread. Supervised Kanban ticks are process-owned writers; if that copy
+    still carries a ``delegate_task`` child marker, ``write_txn``
+    false-trips. Since watchers spawn from a fresh ``Context``
+    (``_spawn_supervised``), this offload-boundary scrub is defense in
+    depth: it covers non-supervised spawn paths and any task context frozen
+    before spawn isolation shipped. An empty Context keeps the DB guard
+    intact for real children without exempting dispatcher writes.
+    """
+    return Context().run(func, *args)
+
+
+async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) -> Any:
+    """Offload blocking process-service work (dispatcher + notifier writers)
+    without inheriting request-local ContextVars."""
+    return await asyncio.to_thread(_run_in_fresh_context, func, *args)
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -750,7 +794,6 @@ class GatewayKanbanWatchersMixin:
         when the task is ``archived``. A ``done`` task can be reopened for
         review or continuation, so its subscription and origin-session
         ownership survive completion; cursor advancement prevents replay.
-
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
         WAL lock. Failures in one tick don't stop subsequent ticks.
@@ -792,6 +835,7 @@ class GatewayKanbanWatchersMixin:
             "unblocked",
             "block_loop_detected",
             "review_requested",
+            "changes_requested",
         )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
@@ -1141,7 +1185,7 @@ class GatewayKanbanWatchersMixin:
                     except ValueError:
                         # Unknown platform string; skip and advance cursor so
                         # we don't replay forever.
-                        await asyncio.to_thread(
+                        await _to_thread_process_service(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         continue
@@ -1163,7 +1207,7 @@ class GatewayKanbanWatchersMixin:
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                             platform_str, sub["task_id"],
                         )
-                        await asyncio.to_thread(
+                        await _to_thread_process_service(
                             self._kanban_rewind,
                             sub,
                             d["cursor"],
@@ -1189,6 +1233,7 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
                         heartbeat_note = ""
@@ -1291,11 +1336,36 @@ class GatewayKanbanWatchersMixin:
                             # first-class review lane. Wake the origin thread.
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                summary = str(ev.payload["summary"])
+                                handoff = f"\n{summary[:200]}"
+                                # Carry the worker's handoff into the wake turn
+                                # like ``completed`` does: a reviewer woken with
+                                # a bare "ready for review" has to re-read the
+                                # board to learn what was implemented.
+                                lines = summary.strip().splitlines()
+                                wake_handoff = (
+                                    lines[0][:200] if lines else summary[:200]
+                                )
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
                             )
+                        elif kind == "changes_requested":
+                            payload = ev.payload or {}
+                            reason = _safe_review_reason(payload.get("reason"))
+                            reviewer = _safe_review_reason(payload.get("reviewer"), 48)
+                            implementer = _safe_review_reason(payload.get("implementer"), 48)
+                            reason_text = reason or "reviewer feedback requires changes"
+                            provenance = ""
+                            if reviewer:
+                                provenance += f" — reviewer @{reviewer}"
+                            if implementer:
+                                provenance += f" → implementer @{implementer}"
+                            msg = (
+                                f"🛑 {board_tag}Kanban {sub['task_id']} review requested "
+                                f"changes/BLOCK: {reason_text}{provenance}"
+                            )
+                            wake_review_detail = reason_text
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -1498,10 +1568,10 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
-                                await asyncio.to_thread(
+                                await _to_thread_process_service(
                                     self._kanban_rewind,
                                     sub,
                                     d["cursor"],
@@ -1530,7 +1600,19 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        # Kinds that hand a decision back to the origin, so the
+                        # origin has to take a turn. ``review_requested`` (the
+                        # implementation is done and waits for a reviewer),
+                        # ``changes_requested`` (a reviewer BLOCKed and work
+                        # returns to the implementer) and ``block_loop_detected``
+                        # (routed to triage) belong here for the same reason
+                        # ``blocked`` does. ``status`` / ``archived`` /
+                        # ``unblocked`` stay out: bookkeeping.
+                        _WAKE_KINDS = (
+                            "completed", "gave_up", "crashed", "timed_out",
+                            "blocked", "review_requested", "changes_requested",
+                            "block_loop_detected",
+                        )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -1567,6 +1649,9 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
+                            if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
+                            if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -1585,6 +1670,11 @@ class GatewayKanbanWatchersMixin:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.handoff",
                                     summary=wake_handoff,
+                                )
+                            if wake_review_detail:
+                                _synth += "\n" + t(
+                                    "gateway.kanban.wake.review_detail",
+                                    reason=wake_review_detail,
                                 )
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
@@ -1621,13 +1711,13 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
                                     # tick retries the self-post — the event
                                     # is NOT lost.
-                                    await asyncio.to_thread(
+                                    await _to_thread_process_service(
                                         self._kanban_rewind,
                                         sub,
                                         d["cursor"],
@@ -1721,13 +1811,13 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
                                     # tick retries the wake — the event is
                                     # NOT lost.
-                                    await asyncio.to_thread(
+                                    await _to_thread_process_service(
                                         self._kanban_rewind,
                                         sub,
                                         d["cursor"],
@@ -1741,7 +1831,7 @@ class GatewayKanbanWatchersMixin:
                         # push subs): advance cursor. The cursor is the dedup
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
-                        await asyncio.to_thread(
+                        await _to_thread_process_service(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         if not _is_push_adapter:
@@ -1776,7 +1866,7 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
                         if task_terminal:
-                            await asyncio.to_thread(
+                            await _to_thread_process_service(
                                 self._kanban_unsub, sub, board_slug,
                             )
             except Exception as exc:
@@ -2895,7 +2985,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
-                pids = await asyncio.to_thread(_kb.reap_worker_zombies)
+                pids = await _to_thread_process_service(_kb.reap_worker_zombies)
                 if pids:
                     logger.info(
                         "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
@@ -2918,8 +3008,8 @@ class GatewayKanbanWatchersMixin:
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
-                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
-                    results = await asyncio.to_thread(_tick_once)
+                        await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
+                    results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
@@ -2938,7 +3028,7 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await asyncio.to_thread(_ready_nonempty)
+                    ready_pending = await _to_thread_process_service(_ready_nonempty)
                     if ready_pending and not any_spawned:
                         bad_ticks += 1
                     else:
