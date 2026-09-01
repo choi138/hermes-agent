@@ -20,7 +20,6 @@ import pytest
 from hermes_cli.kanban_runtime import (
     KANBAN_EXECUTION_BACKEND_ENV,
     KANBAN_LOCAL_EXECUTION_BACKEND,
-    KanbanExecutionContractError,
 )
 
 
@@ -113,6 +112,12 @@ def test_spawn_drops_an_inherited_remote_terminal_location(kb, monkeypatch, tmp_
 
 
 def test_spawn_fails_closed_when_the_workspace_is_not_local(kb, monkeypatch, tmp_path):
-    """A workspace that cannot be pinned must stop the worker, not run it anyway."""
-    with pytest.raises(KanbanExecutionContractError):
+    """A workspace that cannot be pinned must stop the worker, not run it anyway.
+
+    Matched on the base class and message rather than on
+    ``KanbanExecutionContractError`` itself: other suites reload
+    ``hermes_cli.kanban_runtime``, so a class captured at import time is not
+    always the class the reloaded module raises.
+    """
+    with pytest.raises(RuntimeError, match="workspace/backend mismatch"):
         _spawn(kb, monkeypatch, "relative/workspace")
