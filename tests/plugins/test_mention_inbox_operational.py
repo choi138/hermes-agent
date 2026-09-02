@@ -277,6 +277,24 @@ def test_outbox_first_send_same_revision_retry_and_changed_revision(tmp_path: Pa
     assert store.pending_delivery_count() == 1
 
 
+def test_live_lease_blocks_only_its_own_destination(tmp_path: Path) -> None:
+    other = "discord:1531851208858275861"
+    store = MentionInboxStore(
+        tmp_path / "inbox.db",
+        clock=lambda: NOW,
+        delivery_destinations=(DESTINATION, other),
+    )
+    store.upsert(_event(), source_revision="2026-07-29T08:00:00Z")
+
+    held = store.claim_delivery(DESTINATION, lease_seconds=60)
+    assert held is not None
+
+    # The held lease must not leak across destinations: the outbox row for
+    # *other* is still claimable while DESTINATION is in flight.
+    assert store.claim_delivery(DESTINATION, lease_seconds=60) is None
+    assert store.claim_delivery(other, lease_seconds=60) is not None
+
+
 def test_concurrent_claim_and_restart_use_single_durable_delivery(tmp_path: Path) -> None:
     db = tmp_path / "inbox.db"
     store = MentionInboxStore(db, clock=lambda: NOW)

@@ -544,6 +544,10 @@ class MentionInboxStore:
                 )
             """)
             connection.execute("""
+                CREATE INDEX IF NOT EXISTS ix_delivery_outbox_destination_status
+                ON delivery_outbox(destination, status, delivery_id)
+            """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS mention_event_lineage (
                     dedupe_key TEXT PRIMARY KEY,
                     latest_revision INTEGER NOT NULL,
@@ -3472,13 +3476,16 @@ class MentionInboxStore:
                   AND NOT EXISTS (
                       SELECT 1
                       FROM delivery_outbox active
-                      WHERE active.destination = o.destination
+                      WHERE active.destination = ?
                         AND active.status = 'sending'
                         AND julianday(active.lease_until) > julianday(?)
                   )
                 ORDER BY o.delivery_id LIMIT 1
                 """,
-                (destination, now, now),
+                # Binding the destination again instead of correlating on
+                # o.destination keeps the subquery scalar: SQLite evaluates it
+                # once instead of rescanning the outbox for every candidate row.
+                (destination, now, destination, now),
             ).fetchone()
             if row is None:
                 connection.commit()
