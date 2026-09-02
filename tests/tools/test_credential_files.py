@@ -154,6 +154,28 @@ class TestIterSkillsFiles:
         with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
             assert iter_skills_files() == []
 
+    def test_excludes_cache_and_backup_artifacts(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        skills_dir = hermes_home / "skills"
+        (skills_dir / "cat" / "myskill").mkdir(parents=True)
+        (skills_dir / "cat" / "myskill" / "SKILL.md").write_text("# skill")
+        (skills_dir / ".hub" / "index-cache").mkdir(parents=True)
+        (skills_dir / ".hub" / "index-cache" / "hermes-index.json").write_text("{}")
+        (skills_dir / ".hub" / "taps.json").write_text("{}")
+        (skills_dir / ".curator_backups" / "2026-08-31").mkdir(parents=True)
+        (skills_dir / ".curator_backups" / "2026-08-31" / "skills.tar.gz").write_text("x")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            files = iter_skills_files()
+
+        paths = {f["container_path"] for f in files}
+        assert "/root/.hermes/skills/cat/myskill/SKILL.md" in paths
+        # .hub config is still needed remotely; only its cache is dropped.
+        assert "/root/.hermes/skills/.hub/taps.json" in paths
+        assert not any("index-cache" in p for p in paths)
+        assert not any(".curator_backups" in p for p in paths)
+
+
 class TestPathTraversalSecurity:
     """Path traversal and absolute path rejection.
 

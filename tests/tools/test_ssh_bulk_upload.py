@@ -13,6 +13,22 @@ from tools.environments.file_sync import quoted_mkdir_command, unique_parent_dir
 from tools.environments.ssh import SSHEnvironment
 
 
+class TestBulkUploadTimeout:
+    def test_small_payload_uses_floor(self):
+        assert ssh_env._bulk_upload_timeout(0) == float(
+            ssh_env._BULK_UPLOAD_TIMEOUT_SECONDS
+        )
+        assert ssh_env._bulk_upload_timeout(1024) == float(
+            ssh_env._BULK_UPLOAD_TIMEOUT_SECONDS
+        )
+
+    def test_large_payload_scales_above_floor(self):
+        payload = 512 * 1024 * 1024
+        expected = payload / ssh_env._BULK_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC
+        assert ssh_env._bulk_upload_timeout(payload) == expected
+        assert expected > ssh_env._BULK_UPLOAD_TIMEOUT_SECONDS
+
+
 def _mock_proc(*, returncode=0, poll_return=0, communicate_return=(b"", b""),
                stderr_read=b""):
     """Create a MagicMock mimicking subprocess.Popen for tar/ssh pipes."""

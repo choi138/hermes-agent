@@ -344,6 +344,24 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
+# Cache and backup artifacts live under the skills tree but must never be
+# synced: they are large, host-local, and regenerable.  Uploading them pushed
+# the payload past the bulk-upload timeout, and a failed sync rolls its state
+# back, so every later cycle retransmitted the whole tree and never converged.
+_SKILLS_SYNC_EXCLUDED_PREFIXES: tuple[tuple[str, ...], ...] = (
+    (".hub", "index-cache"),
+    (".curator_backups",),
+)
+
+
+def _is_excluded_skills_path(rel: Path) -> bool:
+    parts = rel.parts
+    return any(
+        parts[: len(prefix)] == prefix
+        for prefix in _SKILLS_SYNC_EXCLUDED_PREFIXES
+    )
+
+
 def iter_skills_files(
     container_base: str = "/root/.hermes",
 ) -> List[Dict[str, str]]:
@@ -364,6 +382,8 @@ def iter_skills_files(
             if item.is_symlink() or not item.is_file():
                 continue
             rel = item.relative_to(skills_dir)
+            if _is_excluded_skills_path(rel):
+                continue
             result.append({
                 "host_path": str(item),
                 "container_path": f"{container_root}/{rel}",

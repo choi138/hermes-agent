@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 _BULK_UPLOAD_TIMEOUT_SECONDS = 120
 _BULK_DOWNLOAD_TIMEOUT_SECONDS = 120
+# A flat ceiling livelocks large payloads: the upload cannot finish, the
+# failure rolls sync state back without advancing the rate-limit clock, and the
+# next cycle retransmits everything.  Scale the deadline with the bytes queued.
+_BULK_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC = 512 * 1024
 _LOCAL_TAR_EXIT_TIMEOUT_SECONDS = 10
 _SHUTDOWN_CONTROL_EXIT_RESERVE_SECONDS = 1.0
 _MAX_PROCESS_STDERR_BYTES = 16 * 1024
@@ -52,6 +56,12 @@ _REMOTE_KILL_TIMEOUT_SECONDS = 8
 _SYNC_STATE_CACHE_VERSION = 1
 _SYNC_STATE_PROCESS_NONCE = secrets.token_hex(16)
 _monotonic = time.monotonic
+
+
+def _bulk_upload_timeout(payload_bytes: int) -> float:
+    """Return the upload deadline for *payload_bytes*, never below the floor."""
+    scaled = payload_bytes / _BULK_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC
+    return max(float(_BULK_UPLOAD_TIMEOUT_SECONDS), scaled)
 
 
 # A persistent SSH environment is normally shared by all foreground and
@@ -1041,7 +1051,12 @@ class SSHEnvironment(BaseEnvironment):
         # OSErrors (e.g. disk full, bad path) are re-raised as normal.
         with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging:
             archive_members: list[str] = []
+            payload_bytes = 0
             for host_path, remote_path, rel_remote in validated_files:
+                try:
+                    payload_bytes += os.path.getsize(host_path)
+                except OSError:
+                    pass
                 staged = _staging_path(staging, rel_remote, remote_path, base)
                 os.makedirs(os.path.dirname(staged), exist_ok=True)
                 try:
@@ -1102,12 +1117,13 @@ class SSHEnvironment(BaseEnvironment):
             ssh_stderr_drain = _BoundedPipeDrain(ssh_proc.stderr)
             drains_started = False
             timed_out = False
+            upload_timeout = _bulk_upload_timeout(payload_bytes)
 
             try:
                 tar_stderr_drain.start()
                 ssh_stderr_drain.start()
                 drains_started = True
-                ssh_proc.wait(timeout=_BULK_UPLOAD_TIMEOUT_SECONDS)
+                ssh_proc.wait(timeout=upload_timeout)
                 tar_proc.wait(timeout=_LOCAL_TAR_EXIT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 timed_out = True
@@ -1122,8 +1138,10 @@ class SSHEnvironment(BaseEnvironment):
                 ssh_stderr_raw, ssh_stderr_total = ssh_stderr_drain.finish()
 
             if timed_out:
+                mib = payload_bytes / (1024 * 1024)
                 raise EnvironmentConnectionError(
-                    "SSH bulk upload timed out",
+                    f"SSH bulk upload timed out after {upload_timeout:.0f}s "
+                    f"({len(archive_members)} file(s), {mib:.1f} MiB)",
                     retry_hint=(
                         f"Bulk file sync to {self.host} timed out — check the "
                         "connection and retry."
