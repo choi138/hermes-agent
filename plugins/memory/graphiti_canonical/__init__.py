@@ -64,7 +64,7 @@ _MAX_QUERY_CHARS = 4_000
 _MIN_RECALL_CHARS = 2
 _NOTES_RECALL_MAX = 2
 _NOTES_GIST_CHARS = 280
-_NOTES_MIN_MATCH_SCORE = 2
+_NOTES_MIN_MATCH_SCORE = 1
 _STRONG_OVERLAP_MIN = 2
 _PREFETCH_TIMEOUT_SECONDS = 15.0
 # unrestricted recall (user directive 2026-08-07): single-user Discord bot.
@@ -2217,6 +2217,19 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                 ).strip():
                     # Keep the bumped set identical to the rendered set:
                     # _format_notes_block would drop a bodyless note anyway.
+                    continue
+                # Content anchor: neighbor_search also matches frontmatter
+                # metadata words (status/origin/kind), so require at least one
+                # query term inside the body or topic key before injecting.
+                content_haystack = " ".join(
+                    [
+                        topic_key.casefold(),
+                        str(
+                            note.get("body") or note.get("body_preview") or ""
+                        ).casefold(),
+                    ]
+                )
+                if not any(term in content_haystack for term in terms):
                     continue
                 recalled.append(note)
                 if len(recalled) >= _NOTES_RECALL_MAX:
