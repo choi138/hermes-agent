@@ -2314,6 +2314,11 @@ class DiscordAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        # These loops live outside BasePlatformAdapter._background_tasks.
+        # Stop them before the client can be closed or replaced so an old
+        # conversation cannot resume heartbeats through a reconnected client.
+        for chat_id in list(getattr(self, "_typing_tasks", {})):
+            await self.stop_typing(chat_id)
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -5768,7 +5773,7 @@ class DiscordAdapter(BasePlatformAdapter):
         default), and continues — it does NOT die on a single rate-limit
         hit.  Only CancelledError (from stop_typing) stops the loop.
         """
-        if not self._client:
+        if not self._client or self._disconnecting:
             return
         # Don't start a duplicate loop
         if chat_id in self._typing_tasks:
@@ -5805,7 +5810,12 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                # A stop/restart can interleave while this cancelled task is
+                # unwinding.  Do not erase the replacement owner's task or it
+                # will keep POSTing typing heartbeats with no registry handle
+                # left for the replacement's stop_typing() call to cancel.
+                if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                    self._typing_tasks.pop(chat_id, None)
 
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
