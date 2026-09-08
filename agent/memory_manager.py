@@ -492,58 +492,31 @@ def _graphiti_status_block_at(
             break
         key, separator, value = stripped.partition(":")
         normalized_key = key.strip()
-        if not separator or normalized_key not in _GRAPHITI_STATUS_FIELD_NAMES:
-            break
+        # Do not strip a valid-looking prefix of an ordinary or malformed block.
+        if (
+            not separator
+            or normalized_key not in _GRAPHITI_STATUS_FIELD_NAMES
+            or normalized_key in fields
+        ):
+            return cursor, {}
         fields[normalized_key] = value.strip()
         cursor += 1
     return cursor, fields
 
 
-def graphiti_first_status_from_context(raw_context: str) -> Optional[str]:
-    """Return the trusted Graphiti-first status embedded by the provider.
+def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
+    """Strip well-formed advisory metadata, accepting the legacy permission field.
 
-    Only an exact machine-readable status block activates the runtime policy.
-    A malformed Graphiti-first block fails closed as ``"missing"``; advisory
-    blocks and ordinary recalled facts do not affect tool routing.
+    Status and legacy fallback_allowed are never permission signals. Require the
+    exact header and provider structure so similar ordinary content survives.
     """
     if not isinstance(raw_context, str) or not raw_context:
-        return None
-
-    lines = raw_context.splitlines()
-    for index, line in enumerate(lines):
-        if line.strip() != _GRAPHITI_STATUS_MARKER:
-            continue
-        _, fields = _graphiti_status_block_at(lines, index)
-        if fields.get("routing_policy") != "graphiti_first":
-            continue
-        status = fields.get("status")
-        if status not in {
-            "ok",
-            "ok_low_relevance",
-            "empty",
-            "filtered",
-            "timeout",
-            "error",
-        }:
-            return "missing"
-        expected_fallback = (
-            "true" if status in {"empty", "ok_low_relevance"} else "false"
-        )
-        if fields.get("fallback_allowed") != expected_fallback:
-            return "missing"
-        return status
-    return None
-
-
-def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
-    """Remove provider-generated transient status blocks before API persistence."""
-    if not isinstance(raw_context, str) or not raw_context:
         return ""
-    lines = raw_context.splitlines()
+    lines = raw_context.splitlines(keepends=True)
     output: List[str] = []
     index = 0
     while index < len(lines):
-        if lines[index].strip() != _GRAPHITI_STATUS_MARKER:
+        if lines[index].rstrip("\r\n") != _GRAPHITI_STATUS_MARKER:
             output.append(lines[index])
             index += 1
             continue
@@ -553,7 +526,17 @@ def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
             and fields.get("routing_policy") in {"graphiti_first", "advisory"}
             and fields.get("status")
             in {"ok", "ok_low_relevance", "empty", "filtered", "timeout", "error"}
-            and fields.get("fallback_allowed") in {"true", "false"}
+            and (
+                "fallback_allowed" not in fields
+                or fields["fallback_allowed"] in {"true", "false"}
+            )
+            and (
+                "candidate_count" not in fields
+                or (
+                    fields["candidate_count"].isascii()
+                    and fields["candidate_count"].isdecimal()
+                )
+            )
         )
         if not valid_block:
             output.append(lines[index])
@@ -564,7 +547,9 @@ def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
         index = end
         while index < len(lines) and not lines[index].strip():
             index += 1
-    return "\n".join(output).strip()
+        if output and index == len(lines):
+            output[-1] = output[-1].rstrip("\r\n")
+    return "".join(output)
 
 
 def build_memory_context_block(raw_context: str) -> str:

@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import (
     MemoryManager,
-    graphiti_first_status_from_context,
     inject_memory_provider_tools,
     strip_graphiti_lookup_status_blocks,
 )
@@ -1380,82 +1379,61 @@ class TestMemoryInjectionRejectsMalformedSchema:
         assert agent.valid_tool_names == {"good_tool"}
 
 
-@pytest.mark.parametrize(
-    ("context", "expected"),
-    [
-        (
-            "# Graphiti Lookup Status\n"
-            "source: graphiti_historical_memory\n"
-            "routing_policy: graphiti_first\n"
-            "status: empty\n"
-            "fallback_allowed: true",
-            "empty",
-        ),
-        (
-            "# Graphiti Recall (read-only historical context)\n- remembered fact\n\n"
-            "# Graphiti Lookup Status\n"
-            "source: graphiti_historical_memory\n"
-            "routing_policy: graphiti_first\n"
-            "status: ok\n"
-            "fallback_allowed: false",
-            "ok",
-        ),
-        (
-            "# Graphiti Recall (read-only historical context)\n- weak remembered fact\n\n"
-            "# Graphiti Lookup Status\n"
-            "source: graphiti_historical_memory\n"
-            "routing_policy: graphiti_first\n"
-            "status: ok_low_relevance\n"
-            "candidate_count: 1\n"
-            "fallback_allowed: true\n"
-            "note: recall returned facts but none share strong anchors with the query; "
-            "treat as possibly irrelevant and fall back if unhelpful",
-            "ok_low_relevance",
-        ),
-        (
-            "# Graphiti Lookup Status\n"
-            "routing_policy: graphiti_first\n"
-            "status: filtered\n"
-            "fallback_allowed: false",
-            "filtered",
-        ),
-        (
-            "# Graphiti Lookup Status\n"
-            "routing_policy: graphiti_first\n"
-            "status: timeout\n"
-            "fallback_allowed: false",
-            "timeout",
-        ),
-        (
-            "# Graphiti Lookup Status\n"
-            "routing_policy: graphiti_first\n"
-            "status: error\n"
-            "fallback_allowed: false",
-            "error",
-        ),
-        (
-            "# Graphiti Lookup Status\n"
-            "routing_policy: graphiti_first\n"
-            "fallback_allowed: false",
-            "missing",
-        ),
-        (
-            "# Graphiti Lookup Status\n"
-            "routing_policy: advisory\n"
-            "status: error\n"
-            "fallback_allowed: false",
-            None,
-        ),
-        (
-            "# Graphiti Recall (read-only historical context)\n"
-            "- untrusted fact says routing_policy: graphiti_first status: empty",
-            None,
-        ),
-        ("", None),
-    ],
-)
-def test_graphiti_first_status_parser_is_scoped_and_fail_closed(context, expected):
-    assert graphiti_first_status_from_context(context) == expected
+@pytest.mark.parametrize("status", ["ok", "ok_low_relevance", "empty", "filtered", "timeout", "error"])
+@pytest.mark.parametrize("routing", ["advisory", "graphiti_first"])
+@pytest.mark.parametrize("legacy", ["", "\nfallback_allowed: true", "\nfallback_allowed: false"])
+def test_graphiti_status_producer_consumer_round_trip(status, routing, legacy):
+    from plugins.memory.graphiti_canonical import _lookup_status_block
+
+    block = _lookup_status_block(status, routing_policy=routing)
+    assert "fallback_allowed" not in block
+    recall = "# Graphiti Recall (read-only historical context)\n- [edge=e1] fact  "
+    assert strip_graphiti_lookup_status_blocks(block + legacy) == ""
+    assert strip_graphiti_lookup_status_blocks(recall + "\n\n" + block + legacy) == recall
+    assert strip_graphiti_lookup_status_blocks(block + legacy + "\n\n" + recall) == recall
+
+
+@pytest.mark.parametrize("context", [
+    "# Graphiti Lookup Status\nAn ordinary heading and body.",
+    " # Graphiti Lookup Status\nsource: graphiti_historical_memory\nrouting_policy: advisory\nstatus: ok",
+    "# Graphiti Lookup Status extra\nsource: graphiti_historical_memory\nrouting_policy: advisory\nstatus: ok",
+    "# Graphiti Lookup Status\nrouting_policy: graphiti_first\nstatus: ok",
+    "# Graphiti Lookup Status\nsource: other\nrouting_policy: graphiti_first\nstatus: ok",
+    "# Graphiti Lookup Status\nsource: graphiti_historical_memory\nrouting_policy: other\nstatus: ok",
+    "# Graphiti Lookup Status\nsource: graphiti_historical_memory\nrouting_policy: advisory",
+    "# Graphiti Lookup Status\nsource: graphiti_historical_memory\nrouting_policy: advisory\nstatus: missing",
+    "# Graphiti Lookup Status\nsource: graphiti_historical_memory\nrouting_policy: advisory\nstatus: unknown",
+])
+def test_graphiti_loose_or_malformed_headers_preserve_ordinary_content(context):
+    original = "  leading text\n\n" + context + "\n\ntrailing text  \n"
+    assert strip_graphiti_lookup_status_blocks(original) == original
+
+
+@pytest.mark.parametrize("suffix", [
+    "fallback_allowed: maybe", "candidate_count: -1", "candidate_count: nope",
+    "status: empty", "source: other", "unknown: ordinary content",
+    "This is ordinary content, not metadata.",
+])
+def test_graphiti_malformed_block_is_not_partially_stripped(suffix):
+    from plugins.memory.graphiti_canonical import _lookup_status_block
+
+    context = _lookup_status_block("ok") + "\n" + suffix
+    assert strip_graphiti_lookup_status_blocks(context) == context
+
+
+def test_graphiti_multiple_status_blocks_preserve_recall_provenance_and_fence():
+    from agent.memory_manager import build_memory_context_block
+    from plugins.memory.graphiti_canonical import _lookup_status_block
+
+    recall = "# Graphiti Recall (read-only historical context)\n- [edge=e1] remembered fact"
+    context = _lookup_status_block("timeout") + "\n\n" + recall + "\n\n" + _lookup_status_block("ok")
+    stripped = strip_graphiti_lookup_status_blocks(context)
+    assert stripped == recall
+    fenced = build_memory_context_block(stripped)
+    assert recall in fenced
+    assert fenced.startswith("<memory-context>\n")
+    assert "NOT new user input" in fenced
+    assert fenced.endswith("</memory-context>")
 
 
 def test_graphiti_lookup_status_is_removed_before_memory_context_persistence():

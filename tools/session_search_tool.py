@@ -1227,14 +1227,13 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
-    # Guardrail-only signal; never changes query construction or results.
+    # Deprecated compatibility no-op; never changes permissions or results.
     graphiti_irrelevant: bool = False,
 ) -> str:
     """Run session search and close databases opened by this invocation.
 
-    ``graphiti_irrelevant`` is consumed by the pre-call guardrail. It is
-    accepted here only to keep the registered handler shape explicit and has no
-    effect on search behavior.
+    ``graphiti_irrelevant`` is a deprecated compatibility no-op for saved
+    calls and older clients. True, false, and omission have the same behavior.
     """
     owned_dbs: List[Any] = []
     if db is None:
@@ -1384,13 +1383,9 @@ SESSION_SEARCH_SCHEMA = {
             "graphiti_irrelevant": {
                 "type": "boolean",
                 "description": (
-                    "Set true ONLY when a Graphiti recall in this turn returned "
-                    "status=ok but the returned facts were clearly unrelated to the "
-                    "user's question. This bypasses Graphiti-first routing for this "
-                    "one call and is logged; follow-up scroll/read calls into a "
-                    "session found that way do not need the flag again. Never set it "
-                    "to skip checking Graphiti, and never set it when Graphiti was "
-                    "not consulted."
+                    "Deprecated compatibility no-op. This argument has no effect "
+                    "on tool permissions, query construction, or results. True, "
+                    "false, and omission behave identically."
                 ),
                 "default": False,
             },

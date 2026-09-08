@@ -84,8 +84,8 @@ class TestSchema:
         assert "role_filter" in params
         assert params["graphiti_irrelevant"]["type"] == "boolean"
         assert params["graphiti_irrelevant"]["default"] is False
-        assert "status=ok" in params["graphiti_irrelevant"]["description"]
-        assert "one call" in params["graphiti_irrelevant"]["description"]
+        assert "Deprecated compatibility no-op" in params["graphiti_irrelevant"]["description"]
+        assert "no effect" in params["graphiti_irrelevant"]["description"]
         # Mode is inferred from which args are set — no explicit mode param
         assert "mode" not in params
 
@@ -110,6 +110,27 @@ class TestSchema:
         # ``detail``, so assert the prefix rather than the whole list.
         assert parameters[:len(historical_prefix)] == historical_prefix
         assert parameters[len(historical_prefix)] == "detail"
+
+
+@pytest.mark.parametrize("shape", ["discovery", "scroll", "read", "browse"])
+def test_graphiti_irrelevant_is_a_compatibility_noop(db, shape):
+    from tools.registry import registry
+
+    _seed_modpack_sessions(db)
+    args = {
+        "discovery": {"query": "modpack"},
+        "scroll": {"session_id": "s_newest", "around_message_id": 1},
+        "read": {"session_id": "s_newest"},
+        "browse": {},
+    }[shape]
+    expected = session_search(db=db, **args)
+    for flag in (False, True):
+        assert session_search(db=db, graphiti_irrelevant=flag, **args) == expected
+
+    # Saved calls use this same registered handler.
+    handler = registry.get_entry("session_search").handler
+    for flag in ({}, {"graphiti_irrelevant": False}, {"graphiti_irrelevant": True}):
+        assert handler({**args, **flag}, db=db) == expected
 
 
 class TestFormatTimestamp:
@@ -1393,4 +1414,3 @@ class TestNewResetLineageBrowse:
         result = json.loads(session_search(db=db, current_session_id="s_other"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_legacy_child" in sids
-
