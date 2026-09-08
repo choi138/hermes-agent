@@ -3851,11 +3851,11 @@ class GatewaySlashCommandsMixin:
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
                 return t("gateway.reasoning.set_global", effort=value)
-            self._set_session_reasoning_override(session_key, parsed)
+            self._set_session_reasoning_override(session_key, parsed, selection="pinned")
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
 
-        self._set_session_reasoning_override(session_key, parsed)
+        self._set_session_reasoning_override(session_key, parsed, selection="pinned")
         self._evict_cached_agent(session_key)
         return t("gateway.reasoning.set_session", effort=value)
 

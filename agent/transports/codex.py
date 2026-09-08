@@ -633,14 +633,13 @@ class ResponsesApiTransport(ProviderTransport):
                 params.get("provider"), model, params.get("base_url")
             )
             if _declared is not None:
+                _supported = _declared
                 if not _declared:
                     reasoning_enabled = False
-                else:
-                    _supported = _declared
             if _supported is None:
                 # OpenAI/Codex Responses backend — per-model vocabulary
-                # (live-verified: "max" is gpt-5.6-only, "minimal" always
-                # rejected). #68365 premise confirmed.
+                # (including the exact Astra family; unknown families keep
+                # the legacy ceiling).
                 _supported = codex_supported_efforts(model)
         reasoning_effort = clamp_effort(reasoning_effort, _supported)
 
@@ -922,7 +921,11 @@ class ResponsesApiTransport(ProviderTransport):
             else:
                 extra_body.pop("prompt_cache_key", None)
 
-        return kwargs
+        from agent.reasoning_pin import validate_pinned_request
+
+        return validate_pinned_request(kwargs, reasoning_config,
+            api_mode=self.api_mode, provider=params.get("provider"),
+            base_url=params.get("base_url"))
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Codex Responses API response to NormalizedResponse."""

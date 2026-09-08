@@ -892,6 +892,7 @@ class SessionEntry:
     runtime_model: Optional[str] = None
     runtime_provider: Optional[str] = None
     runtime_reasoning_effort: Optional[str] = None
+    runtime_reasoning_selection: str = "auto"
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -934,6 +935,7 @@ class SessionEntry:
             "runtime_model": self.runtime_model,
             "runtime_provider": self.runtime_provider,
             "runtime_reasoning_effort": self.runtime_reasoning_effort,
+            "runtime_reasoning_selection": self.runtime_reasoning_selection,
         }
         if self.active_turn:
             result["active_turn"] = dict(self.active_turn)
@@ -1033,6 +1035,7 @@ class SessionEntry:
             runtime_model=data.get("runtime_model"),
             runtime_provider=data.get("runtime_provider"),
             runtime_reasoning_effort=data.get("runtime_reasoning_effort"),
+            runtime_reasoning_selection=("pinned" if data.get("runtime_reasoning_selection") == "pinned" else "auto"),
             active_turn=(
                 dict(data["active_turn"])
                 if isinstance(data.get("active_turn"), dict)
@@ -3456,20 +3459,31 @@ class SessionStore:
         model: Any = _RUNTIME_UNSET,
         provider: Any = _RUNTIME_UNSET,
         reasoning_effort: Any = _RUNTIME_UNSET,
+        reasoning_selection: Any = _RUNTIME_UNSET,
+        rollback_on_failure: bool = False,
     ) -> bool:
         """Persist secret-free session-scoped runtime override metadata.
 
         The private sentinel means leave a field unchanged; None or an empty
         value clears it. Resolved credentials and endpoint details are never
         accepted or stored by this seam.
+        Explicit user selections request rollback_on_failure so failed writes
+        cannot leave an override cached for a later unrelated save to persist.
         """
         if not session_key:
             return False
+        if reasoning_selection is not _RUNTIME_UNSET and reasoning_selection not in ("auto", "pinned"):
+            raise ValueError("Invalid reasoning selection policy")
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
+            previous = {
+                name: getattr(entry, name)
+                for name in ("model_override", "runtime_model", "runtime_provider",
+                             "runtime_reasoning_effort", "runtime_reasoning_selection", "updated_at")
+            } if rollback_on_failure else {}
             if model is not _RUNTIME_UNSET or provider is not _RUNTIME_UNSET:
                 entry.model_override = None
             if model is not _RUNTIME_UNSET:
@@ -3482,8 +3496,15 @@ class SessionStore:
                     if reasoning_effort
                     else None
                 )
+            if reasoning_selection is not _RUNTIME_UNSET:
+                entry.runtime_reasoning_selection = reasoning_selection
             entry.updated_at = _now()
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                for name, value in previous.items():
+                    setattr(entry, name, value)
+                raise
             return True
 
     def clear_runtime_overrides(
@@ -3506,6 +3527,7 @@ class SessionStore:
                 entry.runtime_provider = None
             if reasoning:
                 entry.runtime_reasoning_effort = None
+                entry.runtime_reasoning_selection = "auto"
             entry.updated_at = _now()
             self._save()
             return True

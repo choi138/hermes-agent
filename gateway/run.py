@@ -7083,33 +7083,7 @@ class TurnRunner:
                 logger.debug("routing directive render failed", exc_info=True)
         agent._gateway_turn_context_notes = "\n\n".join(turn_sidecar_parts)
 
-        def _runtime_update_callback(
-            *, scope: str, model_override=None, reasoning_config=None
-        ) -> None:
-            if scope != "session" or not ctx.session_key:
-                return
-            state = self._runner._session_state(ctx.session_key)
-            if model_override:
-                state.conversation.model_override = {
-                    "model": model_override.get("model", ""),
-                    "provider": model_override.get("provider", ""),
-                    "api_key": model_override.get("api_key", ""),
-                    "base_url": model_override.get("base_url", ""),
-                    "api_mode": model_override.get("api_mode", ""),
-                }
-            if reasoning_config is not None:
-                state.conversation.reasoning_override = dict(reasoning_config)
-            if model_override or reasoning_config is not None:
-                self._runner._persist_session_runtime_override(
-                    ctx.session_key,
-                    model=(model_override or {}).get("model"),
-                    provider=(model_override or {}).get("provider"),
-                    reasoning_config=reasoning_config,
-                    include_model=bool(model_override),
-                    include_reasoning=reasoning_config is not None,
-                )
-
-        agent.runtime_update_callback = _runtime_update_callback
+        self._runner._bind_runtime_update_callback(agent, ctx.session_key)
 
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
@@ -9829,6 +9803,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("model router: reasoning snapshot failed", exc_info=True)
             reasoning = None
         if isinstance(reasoning, dict):
+            if reasoning.get("selection") == "pinned":
+                snapshot["reasoning_selection"] = "pinned"
             if reasoning.get("enabled") is False:
                 snapshot["reasoning_effort"] = "none"
             elif reasoning.get("effort"):
@@ -10372,6 +10348,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
     ) -> tuple[bool, bool]:
         """Apply a resolved route before dispatch and retain its exact intent."""
+        from agent.reasoning_effort import reasoning_is_pinned
+
+        if reasoning_is_pinned(self._resolve_session_reasoning_config(session_key=session_key)):
+            return False, False
         from hermes_cli.model_switch import switch_model
 
         model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
@@ -12229,6 +12209,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 persisted = parse_reasoning_effort(persisted_effort)
                 if persisted is not None:
+                    if getattr(entry, "runtime_reasoning_selection", "auto") == "pinned":
+                        persisted["selection"] = "pinned"
                     self._session_state(
                         resolved_session_key
                     ).conversation.reasoning_override = dict(persisted)
@@ -12239,16 +12221,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         session_key: str,
         reasoning_config: Optional[dict],
+        *, selection: Optional[str] = None,
     ) -> None:
         """Set or clear the session-scoped reasoning override."""
         if not session_key:
             return
+        if selection not in (None, "auto", "pinned"):
+            raise ValueError("Invalid reasoning selection policy")
+        if reasoning_config is not None and selection == "pinned":
+            reasoning_config = {**reasoning_config, "selection": "pinned"}
         # Per-session field write — the old lazy ``self._session_reasoning_overrides
         # = {}`` init replaced the WHOLE dict, racing concurrent sessions'
         # overrides; a SessionState field reset cannot cross sessions.
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+        if selection is not None or reasoning_config is None:
+            self._persist_session_runtime_override(session_key, reasoning_config=reasoning_config,
+                                                   include_reasoning=True)
 
     def _resolve_session_service_tier(
         self,
@@ -32336,6 +32326,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return dict(override)
         return None
 
+    def _bind_runtime_update_callback(self, agent, session_key: str) -> None:
+        """Bind live tool updates to the same durable session runtime store."""
+        def _runtime_update_callback(
+            *, scope: str, model_override=None, reasoning_config=None,
+            require_persistence: bool = False,
+        ) -> Optional[bool]:
+            if scope != "session" or not session_key:
+                if require_persistence:
+                    raise RuntimeError("Session persistence unavailable")
+                return
+            persistence_kwargs = dict(
+                model=(model_override or {}).get("model"),
+                provider=(model_override or {}).get("provider"),
+                reasoning_config=reasoning_config,
+                include_model=bool(model_override),
+                include_reasoning=reasoning_config is not None,
+            )
+            if require_persistence:
+                # Commit before changing gateway caches. Failed explicit user
+                # selections must not reappear on a rebuild from memory.
+                self._persist_session_runtime_override(
+                    session_key, **persistence_kwargs, require_persistence=True,
+                )
+            state = self._session_state(session_key)
+            if model_override:
+                state.conversation.model_override = {
+                    "model": model_override.get("model", ""),
+                    "provider": model_override.get("provider", ""),
+                    "api_key": model_override.get("api_key", ""),
+                    "base_url": model_override.get("base_url", ""),
+                    "api_mode": model_override.get("api_mode", ""),
+                }
+            if reasoning_config is not None:
+                state.conversation.reasoning_override = dict(reasoning_config) or None
+            if require_persistence:
+                return True
+            if model_override or reasoning_config is not None:
+                self._persist_session_runtime_override(
+                    session_key, **persistence_kwargs,
+                )
+
+        agent.runtime_update_callback = _runtime_update_callback
+
     def _persist_session_runtime_override(
         self,
         session_key: str,
@@ -32345,10 +32378,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reasoning_config: Optional[dict] = None,
         include_model: bool = False,
         include_reasoning: bool = False,
+        require_persistence: bool = False,
     ) -> None:
         store = getattr(self, "session_store", None)
         updater = getattr(store, "update_runtime_override", None)
         if not session_key or not callable(updater):
+            if require_persistence:
+                raise RuntimeError("Session persistence unavailable")
             return
         kwargs: Dict[str, Any] = {}
         if include_model:
@@ -32356,12 +32392,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if include_reasoning:
             kwargs["reasoning_effort"] = self._reasoning_effort_from_config(
                 reasoning_config
-            )
+            ) if reasoning_config else None
+            kwargs["reasoning_selection"] = (reasoning_config or {}).get("selection", "auto")
         if not kwargs:
+            if require_persistence:
+                raise RuntimeError("No session runtime update to persist")
             return
+        if require_persistence:
+            kwargs["rollback_on_failure"] = True
         try:
-            updater(session_key, **kwargs)
+            updated = updater(session_key, **kwargs)
+            if require_persistence and updated is not True:
+                raise RuntimeError("Session runtime update was not persisted")
         except Exception:
+            if require_persistence:
+                raise
             logger.debug("Failed to persist session runtime override", exc_info=True)
 
     def _clear_persisted_session_runtime_overrides(
@@ -32486,6 +32531,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             session_key = ""
         if not session_key:
+            return False
+
+        from agent.reasoning_effort import reasoning_is_pinned
+
+        if reasoning_is_pinned(self._resolve_session_reasoning_config(session_key=session_key)):
             return False
 
         changed = False

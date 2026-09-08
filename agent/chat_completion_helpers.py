@@ -1140,6 +1140,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent.reasoning_pin import validate_agent_request
+
+    validate_agent_request(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -2072,6 +2075,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+    """Validate after all transport and provider extras have been assembled."""
+    from agent.reasoning_pin import validate_agent_request
+
+    kwargs = _build_api_kwargs_unvalidated(agent, api_messages, tools_for_api)
+    return validate_agent_request(agent, kwargs)
+
+
+def _build_api_kwargs_unvalidated(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
@@ -3654,10 +3665,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # config load failure must not kill the swap.
         try:
             from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
+            from agent.reasoning_effort import reasoning_for_model
 
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
+            agent.reasoning_config = reasoning_for_model(
+                getattr(agent, "reasoning_config", None), load_config() or {}, agent.model
             )
             logger.info(
                 "Fallback %s: reasoning_config resolved: %s",
@@ -3845,9 +3856,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
 
+        def validated_callback(final_request):
+            from agent.reasoning_pin import validate_agent_request
+            validate_agent_request(agent, final_request)
+            return callback(final_request)
+
         return relay_llm.execute_current(
             request,
-            callback,
+            validated_callback,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
             metadata={
@@ -4973,6 +4989,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             last_chunk_time["t"] = time.time()
             _wire["token"] = begin_wire_attempt(agent, "chat_completions")
             agent._touch_activity("waiting for provider response (streaming)")
+            from agent.reasoning_pin import validate_agent_request
+            validate_agent_request(agent, stream_kwargs)
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -5572,6 +5590,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
             _wire["token"] = begin_wire_attempt(agent, "anthropic_messages")
+            from agent.reasoning_pin import validate_agent_request
+            validate_agent_request(agent, final_kwargs)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

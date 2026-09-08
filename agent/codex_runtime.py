@@ -726,6 +726,14 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
+    from agent.reasoning_pin import validate_pinned_request
+
+    # This delegated protocol has no verifiable exact-effort contract. Refuse
+    # before touching either a cached session or the lazy spawn path.
+    validate_pinned_request(
+        {}, getattr(agent, "reasoning_config", None), api_mode="codex_app_server"
+    )
+
     # Defense in depth for compression.checkpoint_required: agent init
     # already refuses this combination, but api_mode is a plain attribute a
     # future code path could mutate on a live agent. Fail closed before the
@@ -1662,6 +1670,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from openai import APIConnectionError as _APIConnectionError
 
     from agent import relay_llm
+    from agent.reasoning_pin import validate_pinned_request
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
@@ -1707,11 +1716,26 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
+            # Relay can rewrite the builder's validated request. Check before
+            # the bulk bypass too: it normalizes non-dict extra_body values,
+            # which must not erase a malformed or conflicting explicit pin.
+            validate_pinned_request(
+                stream_kwargs, getattr(agent, "reasoning_config", None),
+                api_mode="codex_responses", provider=getattr(agent, "provider", None),
+                base_url=getattr(agent, "base_url", None),
+            )
             # Inside the factory AND inside the attempt loop, so each internal
             # reconnect gets its own TTFT denominator. Bare body — the helper
             # swallows everything and returns None.
             _wire["token"] = _begin_codex_wire_attempt(agent)
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
+            # Validate the final effective SDK merge on EVERY physical call,
+            # including reconnects, after all consumer-side transformations.
+            validate_pinned_request(
+                stream_kwargs, getattr(agent, "reasoning_config", None),
+                api_mode="codex_responses", provider=getattr(agent, "provider", None),
+                base_url=getattr(agent, "base_url", None),
+            )
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:

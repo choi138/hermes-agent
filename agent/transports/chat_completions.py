@@ -830,7 +830,10 @@ class ChatCompletionsTransport(ProviderTransport):
             cache_scope_id=params.get("cache_scope_id"),
         )
 
-        return api_kwargs
+        from agent.reasoning_pin import validate_pinned_request
+        return validate_pinned_request(api_kwargs, params.get("reasoning_config"),
+            api_mode=self.api_mode, provider=params.get("provider"),
+            base_url=params.get("base_url"), provider_profile=params.get("provider_profile"))
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
         """Build API kwargs using a ProviderProfile — single path, no legacy flags.
@@ -993,7 +996,10 @@ class ChatCompletionsTransport(ProviderTransport):
             cache_scope_id=params.get("cache_scope_id"),
         )
 
-        return api_kwargs
+        from agent.reasoning_pin import validate_pinned_request
+        return validate_pinned_request(api_kwargs, params.get("reasoning_config"),
+            api_mode=self.api_mode, provider=params.get("provider"),
+            base_url=params.get("base_url"), provider_profile=params.get("provider_profile"))
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize OpenAI ChatCompletion to NormalizedResponse.
