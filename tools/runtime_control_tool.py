@@ -5,8 +5,9 @@ need live AIAgent state.  Handlers here are defensive stubs only.
 
 Route-only contract (ADR-003 Phase 3c): the LLM-facing switch surface is a
 declared ``model_routes`` route (purpose category) plus a free-text reason.
-Provider ids, model ids, and reasoning effort are deliberately NOT model
-inputs — the benchmark-informed choice of model and effort lives in the
+Provider and model ids are deliberately NOT model inputs. Routine effort
+selection lives in the catalog; explicit user pin/release is a separate
+operation, never inferred from the reason text. The choice of model lives in the
 route catalog (config SoT), and exposing raw ids only invites stale-model
 bias (a model that predates the catalog asking for last year's flagship).
 With no declared routes the switch tool goes dormant (``check_fn`` returns
@@ -51,13 +52,32 @@ _MODEL_SWITCH_SCHEMA = {
         "Switch the current agent runtime by selecting a declared route "
         "(purpose category). The route picks the provider, model, and "
         "reasoning effort from the config-declared catalog with "
-        "health-checked fallbacks — these are not model inputs. "
+        "health-checked fallbacks. Bare route selection stays automatic. "
+        "ONLY when the user explicitly asks to pin or release reasoning, use "
+        "pin_reasoning/release_reasoning with user_requested=true; never use "
+        "these operations for your own task difficulty or routing decisions. "
+        "Pinning changes effort only, not model. Do not combine it with route. "
+        "Release removes the session effort override and resumes automatic policy. "
         "All switches are session-scoped and persist until /new. "
         "Global config changes are intentionally unsupported."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["route", "pin_reasoning", "release_reasoning"],
+                "description": "Defaults to route. Pin/release require explicit user intent.",
+            },
+            "user_requested": {
+                "type": "boolean",
+                "description": "Must be true for pin/release, confirming an explicit user request; omit for routine routing.",
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+                "description": "Required only for pin_reasoning. Exact requested effort; unsupported transports fail explicitly.",
+            },
             "route": {
                 "type": "string",
                 "description": (
@@ -69,7 +89,7 @@ _MODEL_SWITCH_SCHEMA = {
                 "description": "Short explanation for why the route switch is needed.",
             },
         },
-        "required": ["route"],
+        "required": [],
         "additionalProperties": False,
     },
 }

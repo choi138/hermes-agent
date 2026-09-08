@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from hermes_constants import parse_reasoning_effort
+from agent.reasoning_effort import reasoning_is_pinned
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,40 @@ def _sanitize_base_url(raw_url: Any) -> str:
 def _reasoning_state(agent: Any) -> Dict[str, Any]:
     cfg = getattr(agent, "reasoning_config", None)
     source = getattr(agent, "_runtime_reasoning_source", None) or "agent"
+    if reasoning_is_pinned(cfg):
+        effort = "none" if cfg.get("enabled") is False else cfg.get("effort")
+        availability = "unavailable"
+        # Inspect the same merged body/capability boundary as the transport.
+        # Do not build on the live agent: that consumes turn token overrides.
+        if callable(getattr(agent, "_build_api_kwargs", None)):
+            try:
+                copy.copy(agent)._build_api_kwargs([], [])
+                availability = "locally_supported"
+            except (ValueError, TypeError):
+                pass
+        elif getattr(agent, "api_mode", None) == "codex_responses":
+            from agent.transports.codex import ResponsesApiTransport
+            try:
+                ResponsesApiTransport().build_kwargs(
+                    model=getattr(agent, "model", ""), messages=[], tools=[],
+                    provider=getattr(agent, "provider", None),
+                    base_url=getattr(agent, "base_url", None), reasoning_config=cfg,
+                    request_overrides=getattr(agent, "request_overrides", None))
+                availability = "locally_supported"
+            except (ValueError, TypeError):
+                pass
+        elif getattr(agent, "api_mode", None) == "anthropic_messages":
+            from agent.transports.anthropic import AnthropicTransport
+            try:
+                AnthropicTransport().build_kwargs(model=getattr(agent, "model", ""),
+                    messages=[], tools=[], reasoning_config=cfg)
+                availability = "locally_supported"
+            except (ValueError, TypeError):
+                pass
+        return {"enabled": cfg.get("enabled", True), "effort": effort,
+                "source": source if source.startswith("user:") else "user:session", "selection": "pinned", "scope": "session",
+                "requested_effort": effort, "internal_effort": effort,
+                "wire_effort": None, "availability": availability}
     if isinstance(cfg, dict):
         if cfg.get("enabled") is False:
             return {"enabled": False, "effort": "none", "source": source}
@@ -602,16 +637,21 @@ def _notify_runtime_update(
     scope: str,
     model_override: Optional[Dict[str, Any]],
     reasoning_config: Optional[Dict[str, Any]],
+    require_persistence: bool = False,
 ) -> Optional[str]:
     callback = getattr(agent, "runtime_update_callback", None)
     if not callable(callback):
-        return None
+        return "Session persistence unavailable." if require_persistence else None
     try:
-        callback(
+        kwargs = {"require_persistence": True} if require_persistence else {}
+        persisted = callback(
             scope=scope,
             model_override=model_override,
             reasoning_config=copy.deepcopy(reasoning_config),
+            **kwargs,
         )
+        if require_persistence and persisted is not True:
+            return "Session persistence was not acknowledged."
         return None
     except Exception as exc:  # pragma: no cover - defensive surface callback guard
         logger.warning("runtime_update_callback failed: %s", exc)
@@ -622,7 +662,7 @@ def _notify_runtime_update(
 # so a schema/executor drift (the Phase 3b `route` omission shipped because
 # two executors each hand-listed the kwargs) cannot recur; a parity test
 # pins these tuples against the registered tool schema.
-_MODEL_SWITCH_FORWARD_KEYS = ("route", "reason")
+_MODEL_SWITCH_FORWARD_KEYS = ("route", "reason", "operation", "user_requested", "reasoning_effort")
 _MODEL_SWITCH_REJECTED_KEYS = ("model", "provider", "reasoning_effort")
 
 
@@ -638,6 +678,13 @@ def dispatch_model_switch(agent: Any, function_args: Any) -> str:
     """
     if not isinstance(function_args, dict):
         function_args = {}
+    operation = function_args.get("operation", "route")
+    if operation in ("pin_reasoning", "release_reasoning"):
+        return _user_reasoning_selection(agent, function_args)
+    if operation != "route":
+        return json.dumps({"success": False, "error": "Unknown model_switch operation."})
+    if "user_requested" in function_args:
+        return json.dumps({"success": False, "error": "user_requested is only valid for explicit pin/release, not route selection."})
     rejected = [
         key
         for key in _MODEL_SWITCH_REJECTED_KEYS
@@ -671,10 +718,66 @@ def dispatch_model_switch(agent: Any, function_args: Any) -> str:
         agent,
         **{
             key: function_args[key]
-            for key in _MODEL_SWITCH_FORWARD_KEYS
+            for key in ("route", "reason")
             if key in function_args
         },
     )
+
+
+def _user_reasoning_selection(agent: Any, args: dict) -> str:
+    """Execute interpreted user intent, independently of routine route selection.
+
+    user_requested is an explicit intent assertion, not authentication. Never
+    derive it by parsing free-text reasons or by observing the current route.
+    Empty reasoning_config in the existing callback means clear the override.
+    """
+    operation = args["operation"]
+    allowed = {"operation", "user_requested", "reason"}
+    if operation == "pin_reasoning":
+        allowed.add("reasoning_effort")
+    if set(args) - allowed or args.get("user_requested") is not True:
+        return json.dumps({"success": False, "error": "Pin/release requires user_requested=true and cannot be combined with route/model/provider or other arguments."})
+    if operation == "pin_reasoning":
+        effort = args.get("reasoning_effort")
+        parsed = parse_reasoning_effort(effort) if isinstance(effort, str) else None
+        if parsed is None:
+            return json.dumps({"success": False, "error": "pin_reasoning requires a valid reasoning_effort."})
+        selected = {**parsed, "selection": "pinned"}
+        persisted = selected
+    else:
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+
+        config = load_config()
+        selected = resolve_reasoning_config(config, getattr(agent, "model", ""))
+        persisted = {}  # clear, rather than storing the old max as automatic
+    snapshot_updates = []
+    for name in ("_primary_runtime", "_runtime_turn_restore_snapshot"):
+        snapshot = getattr(agent, name, None)
+        if isinstance(snapshot, dict):
+            # Automatic policy belongs to the snapshot's model, not whichever
+            # fallback happens to be active when the user releases the pin.
+            reasoning = (resolve_reasoning_config(config, snapshot.get("model", ""))
+                         if operation == "release_reasoning" else selected)
+            snapshot_updates.append((snapshot, copy.deepcopy(reasoning)))
+    # Explicit intent requires a durable acknowledgement before live/saved
+    # runtime changes. Generic route callbacks retain their best-effort contract.
+    error = _notify_runtime_update(agent, scope="session", model_override=None,
+                                   reasoning_config=persisted, require_persistence=True)
+    if error:
+        return json.dumps({
+            "success": False, "scope": "session", "changed": [],
+            "runtime": get_runtime_state(agent),
+            "error": "Session persistence failed; live reasoning was not changed. Please retry.",
+        }, ensure_ascii=False)
+    agent.reasoning_config = copy.deepcopy(selected)
+    agent._runtime_reasoning_source = "user:model_switch"
+    for snapshot, reasoning in snapshot_updates:
+        snapshot["reasoning_config"] = reasoning
+    state = get_runtime_state(agent)
+    _emit_runtime_state_event(agent, event="switch", state=state)
+    result = {"success": True, "scope": "session", "changed": ["reasoning"], "runtime": state}
+    return json.dumps(result, ensure_ascii=False)
 
 
 def model_switch(
@@ -708,6 +811,8 @@ def model_switch(
     requested_provider = str(provider or "").strip()
     requested_reasoning = str(reasoning_effort or "").strip().lower()
     requested_route = str(route or "").strip()
+    if (requested_route or requested_reasoning) and reasoning_is_pinned(getattr(agent, "reasoning_config", None)):
+        return json.dumps({"success": False, "error": "User reasoning pin holds this session. Use /reasoning reset to resume automatic routes."})
     if (
         not requested_model
         and not requested_provider

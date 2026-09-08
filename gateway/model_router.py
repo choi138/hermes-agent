@@ -1064,6 +1064,16 @@ class RoutingDecision:
     record: dict  # decision-log record (ts stamped by log_decision)
 
 
+def _user_pin_decision(runtime, session_key, mode, label, rule=None):
+    if not isinstance(runtime, dict) or runtime.get("reasoning_selection") != "pinned":
+        return None
+    return RoutingDecision(None, "user_pinned", label, rule, {
+        "policy": "user_pin", "session_key": session_key, "mode": mode,
+        "outcome": "user_pinned", "label": label, "source": "user",
+        "applied": False, "runtime_model": runtime.get("model", ""),
+    })
+
+
 def _runtime_already_satisfies(
     runtime: dict[str, Any] | None,
     route_name: str,
@@ -1254,6 +1264,9 @@ def static_rule_decision(
     it until a rule actually matched. Re-promotion state is shared with the
     classifier path for the same session.
     """
+    pinned = _user_pin_decision(runtime, session_key, mode, "STATIC", rule_name)
+    if pinned is not None:
+        return pinned
     route_name = str(rule.get("route") or "")
     entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
     directive: Optional[dict] = None
@@ -1470,6 +1483,9 @@ def classifier_decision_from_detail(
     a late classification before any shared routing state is mutated.
     """
     dev_label = detail["label"]
+    pinned = _user_pin_decision(runtime, context.session_key, mode, dev_label)
+    if pinned is not None:
+        return pinned
     state_key = context.session_key or context.session_id or "unknown"
     entry = state.setdefault(state_key, {"normal_streak": 0})
     # A deterministic hard refusal from the prior turn is a one-shot signal.

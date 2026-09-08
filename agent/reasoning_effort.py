@@ -71,10 +71,15 @@ CODEX_GPT56_EFFORTS: tuple[str, ...] = (
 CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
     "none", "low", "medium", "high", "xhigh",
 )
+CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+_ASTRA_MODEL_RE = re.compile(r"gpt-6-astra(?:-\d{4}-\d{2}-\d{2})?")
 
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
+    slug = (model or "").lower().split("/")[-1]
+    if _ASTRA_MODEL_RE.fullmatch(slug):
+        return CODEX_ASTRA_EFFORTS
     if "gpt-5.6" in (model or "").lower():
         return CODEX_GPT56_EFFORTS
     return CODEX_LEGACY_EFFORTS
@@ -228,3 +233,21 @@ def requested_effort(reasoning_config: Optional[dict]) -> Optional[str]:
         return None
     effort = str(reasoning_config.get("effort") or "").strip().lower()
     return effort or None
+
+
+def reasoning_is_pinned(config: Optional[dict]) -> bool:
+    """Only explicit user selection is a pin; route defaults remain automatic."""
+    return isinstance(config, dict) and config.get("selection") == "pinned"
+
+
+def reasoning_for_model(current: Optional[dict], config: dict, model: str) -> Optional[dict]:
+    """Model changes must preserve a session pin over per-model/global defaults.
+
+    Keep the requested level even on an unsupported destination. The transport
+    must reject it explicitly rather than quietly sending a weaker request.
+    """
+    if reasoning_is_pinned(current):
+        return dict(current)
+    from hermes_constants import resolve_reasoning_config
+
+    return resolve_reasoning_config(config, model)

@@ -1942,9 +1942,10 @@ def restore_primary_runtime(agent) -> bool:
         # ── Restore reasoning_config if it was saved ──
         # switch_model saves reasoning_config in _primary_runtime. If the
         # snapshot predates that (older sessions), keep the current value.
+        # A saved None is an explicit return to provider defaults after release.
         saved_reasoning = rt.get("reasoning_config")
-        if saved_reasoning is not None:
-            agent.reasoning_config = dict(saved_reasoning)
+        if "reasoning_config" in rt:
+            agent.reasoning_config = dict(saved_reasoning) if saved_reasoning is not None else None
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
@@ -3444,11 +3445,13 @@ def switch_model(
     # resolved through the shared chokepoint (per-model > global; YAML
     # boolean False = disabled).
     try:
-        from hermes_constants import resolve_reasoning_config
+        from agent.reasoning_effort import reasoning_for_model
         from hermes_cli.config import load_config as _sm_load_config
 
         _reasoning_cfg = _sm_load_config() or {}
-        agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
+        agent.reasoning_config = reasoning_for_model(
+            getattr(agent, "reasoning_config", None), _reasoning_cfg, agent.model
+        )
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s",
             agent.model, agent.reasoning_config,

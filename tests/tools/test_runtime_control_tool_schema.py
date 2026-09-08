@@ -18,15 +18,11 @@ from tools.runtime_control_tool import (
 # ---------------------------------------------------------------------------
 
 
-def test_model_switch_static_schema_is_route_only():
-    """The LLM-facing switch surface is route + reason, nothing else.
-
-    Raw model/provider ids and reasoning effort are catalog (config SoT)
-    decisions — exposing them invites stale-model bias.
-    """
+def test_model_switch_schema_keeps_routes_and_explicit_user_pin_operations():
+    """Model selection stays route-only; user effort pin/release is separate."""
     props = _MODEL_SWITCH_SCHEMA["parameters"]["properties"]
-    assert set(props) == {"route", "reason"}
-    assert _MODEL_SWITCH_SCHEMA["parameters"]["required"] == ["route"]
+    assert set(props) == {"route", "reason", "operation", "reasoning_effort", "user_requested"}
+    assert _MODEL_SWITCH_SCHEMA["parameters"]["required"] == []
     assert _MODEL_SWITCH_SCHEMA["parameters"]["additionalProperties"] is False
 
 
@@ -53,12 +49,12 @@ def test_model_switch_route_enum_injected(monkeypatch):
     overrides = _build_model_switch_schema_overrides()
 
     props = overrides["parameters"]["properties"]
-    assert set(props) == {"route", "reason"}
+    assert set(props) == {"route", "reason", "operation", "reasoning_effort", "user_requested"}
     assert props["route"]["enum"] == ["dev", "chat"]
     # Each route's purpose line is carried in the description.
     assert "dev: Deep coding and debugging" in props["route"]["description"]
     assert "chat: Casual conversation" in props["route"]["description"]
-    assert overrides["parameters"]["required"] == ["route"]
+    assert overrides["parameters"]["required"] == []
     assert overrides["parameters"]["additionalProperties"] is False
     # The static schema is never mutated by building overrides.
     assert _MODEL_SWITCH_SCHEMA == static_snapshot
@@ -76,7 +72,7 @@ def test_model_switch_route_schema_flows_through_registry_definitions(monkeypatc
     schema = definitions[0]["function"]
     props = schema["parameters"]["properties"]
     assert props["route"]["enum"] == ["dev"]
-    assert set(props) == {"route", "reason"}
+    assert set(props) == {"route", "reason", "operation", "reasoning_effort", "user_requested"}
 
     invalidate_check_fn_cache()
 
@@ -99,7 +95,9 @@ def test_dispatch_forwarding_matches_schema():
     # The legacy free-form knobs must stay actively rejected (teaching error),
     # not silently dropped — and must never leak back into the schema.
     assert set(_MODEL_SWITCH_REJECTED_KEYS) == {"model", "provider", "reasoning_effort"}
-    assert props.isdisjoint(_MODEL_SWITCH_REJECTED_KEYS)
+    assert props.intersection(_MODEL_SWITCH_REJECTED_KEYS) == {"reasoning_effort"}
+    # Effort stays rejected on ordinary route calls; only explicit user pin
+    # operations may carry it. Model/provider ids remain unexposed.
 
 
 def test_model_status_schema_is_static():

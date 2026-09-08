@@ -62,7 +62,7 @@ class AnthropicTransport(ProviderTransport):
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
 
-        return build_anthropic_kwargs(
+        kwargs = build_anthropic_kwargs(
             model=model,
             messages=messages,
             tools=tools,
@@ -76,6 +76,10 @@ class AnthropicTransport(ProviderTransport):
             fast_mode=params.get("fast_mode", False),
             drop_context_1m_beta=params.get("drop_context_1m_beta", False),
         )
+
+        from agent.reasoning_pin import validate_pinned_request
+        return validate_pinned_request(kwargs, params.get("reasoning_config"),
+            api_mode=self.api_mode, provider=params.get("provider"), base_url=params.get("base_url"))
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Anthropic response to NormalizedResponse.

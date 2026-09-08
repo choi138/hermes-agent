@@ -115,6 +115,7 @@ class TestReasoningCommand:
         assert runner._session_reasoning_overrides[session_key] == {
             "enabled": True,
             "effort": effort,
+            "selection": "pinned",
         }
 
 
@@ -217,4 +218,3 @@ class TestLoadShowReasoningCoercion:
             tmp_path, monkeypatch,
             'display:\n  show_reasoning: true\n',
         ) is True
-
