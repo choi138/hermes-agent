@@ -81,10 +81,10 @@ RECONNECTED_MARKER = (
 )
 
 # Runtime replay is deliberately fail-closed. Only errors whose send contract
-# proves they are transient reconnect failures belong here; permanent rejects
+# permits another recovery attempt belong here; permanent rejects
 # (blocked bot, bad auth, missing chat) must not be retried merely because an
 # adapter reconnected.
-_RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
+_RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded", "lifecycle_deferred"})
 
 
 def _db_path():
@@ -239,12 +239,24 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
     adapter_profile: Optional[str] = None,
+    preserve_existing: bool = False,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     stored_profile = str(adapter_profile).strip() if adapter_profile else "default"
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        if preserve_existing:
+            existing = conn.execute(
+                "SELECT session_key,platform,chat_id,thread_id,content,adapter_profile "
+                "FROM delivery_obligations WHERE obligation_id=?", (obligation_id,),
+            ).fetchone()
+            expected = (session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+                        content, stored_profile)
+            if existing is not None:
+                if tuple(existing) != expected:
+                    raise ValueError("Delivery obligation payload conflict")
+                return
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
@@ -268,6 +280,27 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def defer_lifecycle_claim(obligation_id: str, *, attempts: int) -> bool:
+    """Keep a deferred startup/runtime claim eligible for reconnect recovery.
+
+    Preserve the bounded attempt budget and never overwrite a concurrent
+    completion, abandoned row, newer claim, or another process's ownership.
+    Lifecycle send intent/readback still decides whether sending is safe.
+    """
+    pid, started = _owner_stamp()
+    if started is None:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', updated_at=?, last_error='lifecycle_deferred'
+               WHERE obligation_id=? AND state IN ('pending', 'attempting', 'failed')
+                 AND owner_pid IS ? AND owner_started_at IS ? AND attempts=?""",
+            (time.time(), obligation_id, pid, started, attempts),
+        )
+    return bool(cursor.rowcount)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:

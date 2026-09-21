@@ -5760,6 +5760,66 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
+    async def send_lifecycle_result(self, *, chat_id: str, content: str, attachment=None):
+        """One exact message; ambiguous sends are reconciled by the lifecycle ledger.
+
+        Generic send() formats/splits text and send_document() can send a
+        fallback notice after an ambiguous failure. Neither behavior preserves
+        this caller's immutable content and single-send contract.
+        """
+        if not self._client or not self._client.user:
+            raise RuntimeError("Discord is not connected")
+        if not content or len(content) > self.MAX_MESSAGE_LENGTH:
+            raise ValueError("Lifecycle result must fit one Discord message")
+        channel = self._client.get_channel(int(chat_id)) or await self._client.fetch_channel(int(chat_id))
+        if self._is_forum_parent(channel):
+            raise ValueError("Lifecycle result requires the original channel or thread")
+        upload = None
+        try:
+            if attachment is not None:
+                import io
+                if not isinstance(attachment['data'], bytes) or len(attachment['data']) > 8 * 1024 * 1024:
+                    raise ValueError("Lifecycle attachment exceeds supported size")
+                upload = discord.File(io.BytesIO(attachment['data']), filename=attachment['name'])
+            msg = await channel.send(content=content, files=[upload] if upload else [],
+                                     allowed_mentions=discord.AllowedMentions.none())
+            return SendResult(success=True, message_id=str(msg.id))
+        finally:
+            if upload is not None:
+                upload.close()
+
+    async def find_lifecycle_result(self, channel_id: str, content: str):
+        """Read-only reconciliation after a lifecycle send lost its ACK."""
+        if not self._client or not self._client.user:
+            raise RuntimeError("Discord is not connected")
+        channel = self._client.get_channel(int(channel_id)) or await self._client.fetch_channel(int(channel_id))
+        async for message in channel.history(limit=100):
+            if message.author.id == self._client.user.id and message.content == content:
+                return str(message.id)
+        return None
+
+    async def read_lifecycle_result(self, channel_id: str, message_id: str):
+        """Read back the exact bot message and downloaded attachment bytes."""
+        import hashlib
+        if not self._client or not self._client.user:
+            raise RuntimeError("Discord is not connected")
+        channel = self._client.get_channel(int(channel_id)) or await self._client.fetch_channel(int(channel_id))
+        message = await channel.fetch_message(int(message_id))
+        if message.author.id != self._client.user.id:
+            raise ValueError("Result message belongs to a different author")
+        attachments = []
+        for item in message.attachments:
+            if item.size > 8 * 1024 * 1024:
+                raise ValueError("Lifecycle attachment exceeds supported size")
+            data = await item.read()
+            if len(data) != item.size:
+                raise ValueError("Discord attachment size does not match downloaded bytes")
+            attachments.append({"name": item.filename, "bytes": len(data),
+                                "sha256": hashlib.sha256(data).hexdigest()})
+        return {"message_id": str(message.id), "channel_id": str(message.channel.id),
+                "content_digest": hashlib.sha256(message.content.encode()).hexdigest(),
+                "attachments": attachments}
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing indicator for a channel.
 

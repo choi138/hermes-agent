@@ -15048,6 +15048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
+                defer_lifecycle_claim,
                 mark_delivered,
                 mark_failed,
                 release_runtime_claim,
@@ -15100,6 +15101,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
 
+            # A claimed obligation means generation already finished. Retire
+            # the orphaned turn before transport so lifecycle/error branches
+            # cannot leave it eligible for same-turn replay on a later boot.
+            session_key = row.get("session_key") or ""
+            if session_key:
+                try:
+                    await self.async_session_store.finish_active_turn(
+                        session_key, force=True
+                    )
+                except Exception:
+                    logger.debug(
+                        "finish_active_turn (obligation redelivered) failed "
+                        "for %s", session_key,
+                        exc_info=True,
+                    )
+
+            # Opt-in lifecycle results retain their original content and
+            # attachment receipts. Generic replay must not turn an ACK into
+            # acceptance or resend an ambiguous completed job.
+            try:
+                from agent.task_lifecycle.handoff import lifecycle_obligation, deliver_result
+                if await asyncio.to_thread(lifecycle_obligation, row["obligation_id"]):
+                    confirmed = await deliver_result(
+                        row["obligation_id"], adapter,
+                        adapter_profile=row.get("profile") or "default",
+                    )
+                    redelivered += int(confirmed)
+                    continue
+            except Exception:
+                logger.warning(
+                    "obligation %s: lifecycle reconciliation deferred",
+                    row["obligation_id"], exc_info=True,
+                )
+                try:
+                    await asyncio.to_thread(
+                        defer_lifecycle_claim, row["obligation_id"],
+                        attempts=row["attempts"],
+                    )
+                except Exception:
+                    logger.debug("lifecycle claim deferral failed", exc_info=True)
+                # Never fall through to generic send after uncertain routing
+                # or a busy finalizer; continue recovering unrelated rows.
+                continue
+
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],
@@ -15131,28 +15176,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
 
-            # Resume flags were already cleared at claim time
-            # (_clear_resume_pending_for_claimed_obligations) — clearing again
-            # here would double-count against the sweep's session-store
-            # contract. What remains fork-specific is retiring the orphaned
-            # active_turn record: an obligation row means the turn FINISHED
-            # generating — only delivery was owed, and the ledger now owns it
-            # (delivered, or retried on later boots via the claimed row).
-            # Without this, _schedule_resume_pending_sessions could same-turn
-            # resume the session and deliver the same composed final twice
-            # (ADR durable-turns).
-            session_key = row.get("session_key") or ""
-            if session_key:
-                try:
-                    await self.async_session_store.finish_active_turn(
-                        session_key, force=True
-                    )
-                except Exception:
-                    logger.debug(
-                        "finish_active_turn (obligation redelivered) failed "
-                        "for %s", session_key,
-                        exc_info=True,
-                    )
         return redelivered
 
     async def _redeliver_pending_obligations(self) -> int:

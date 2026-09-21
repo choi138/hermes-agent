@@ -635,6 +635,10 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
+    if spec.event in {"pre_tool_call", "post_tool_call"}:
+        # Admission must filter unmatched tools before a running/timed-out
+        # policy callback can block them. Retain the inner gate for direct use.
+        _callback._hermes_tool_matcher = spec.matches_tool
     return _callback
 
 
