@@ -17,6 +17,7 @@ import tools.mcp_tool as mcp_tool
 _ALLOWED_TOOLS = (
     "get_entity_edge",
     "get_status",
+    "search_episodes",
     "search_memory_facts",
     "search_nodes",
 )
@@ -183,7 +184,7 @@ def test_aiagent_loads_filtered_search_wrapper_but_keeps_raw_mcp_tools_hidden(
         assert [
             schema["name"]
             for schema in agent._memory_manager.get_all_tool_schemas()
-        ] == ["search_memory_facts"]
+        ] == ["search_memory_facts", "search_episodes"]
         assert any(
             tool.get("function", {}).get("name") == "search_memory_facts"
             for tool in agent.tools
@@ -218,6 +219,7 @@ def test_aiagent_loads_filtered_search_wrapper_but_keeps_raw_mcp_tools_hidden(
                     "query": "continue the previous P1 project",
                     "max_facts": 24,
                     "group_ids": ["mnemos"],
+                    "temporal_mode": "current",
                 },
             ),
             (
@@ -226,6 +228,7 @@ def test_aiagent_loads_filtered_search_wrapper_but_keeps_raw_mcp_tools_hidden(
                     "query": "continue the previous P1 project",
                     "max_facts": 24,
                     "group_ids": ["mnemos"],
+                    "temporal_mode": "current",
                 },
             ),
         ]
