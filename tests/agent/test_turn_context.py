@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import threading
 import types
+import json
+import copy
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -529,7 +531,7 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     assert not _title_turn(platform).called
 
 
-def test_prefetch_graphiti_first_status_arms_runtime_fallback_guard():
+def test_prefetch_graphiti_first_status_never_calls_permission_setter():
     agent = _FakeAgent()
     agent._memory_manager = types.SimpleNamespace(
         on_turn_start=lambda *_args: None,
@@ -544,7 +546,7 @@ def test_prefetch_graphiti_first_status_arms_runtime_fallback_guard():
 
     ctx = _build(agent, user_message="Instagram에서 마지막 연락 상대를 찾아줘")
 
-    assert agent._tool_guardrails.graphiti_statuses == ["filtered"]
+    assert agent._tool_guardrails.graphiti_statuses == []
     assert ctx.ext_prefetch_cache == ""
     assert "api_content" not in ctx.messages[-1]
 
@@ -567,7 +569,157 @@ def test_prefetch_keeps_recall_but_never_persists_graphiti_status_block():
 
     ctx = _build(agent, user_message="전에 하던 작업을 이어줘")
 
-    assert agent._tool_guardrails.graphiti_statuses == ["ok"]
+    assert agent._tool_guardrails.graphiti_statuses == []
     assert ctx.ext_prefetch_cache == recall
     assert recall in ctx.messages[-1]["api_content"]
     assert "Graphiti Lookup Status" not in ctx.messages[-1]["api_content"]
+
+
+@pytest.mark.parametrize("status", ["ok", "ok_low_relevance", "empty", "filtered", "timeout", "error"])
+@pytest.mark.parametrize("legacy", ["", "\nfallback_allowed: false", "\nfallback_allowed: true"])
+def test_automatic_graphiti_status_is_advisory_and_taint_only_tracks_recall(status, legacy):
+    from agent.tool_guardrails import ToolCallGuardrailController
+    from plugins.memory.graphiti_canonical import _lookup_status_block
+
+    agent = _FakeAgent()
+    agent._tool_guardrails = ToolCallGuardrailController()
+    recall = (
+        "# Graphiti Recall (read-only historical context)\n- [edge=e1] remembered fact"
+        if status in {"ok", "ok_low_relevance"} else ""
+    )
+    block = _lookup_status_block(status, routing_policy="graphiti_first") + legacy
+    agent._memory_manager = types.SimpleNamespace(
+        on_turn_start=lambda *_args: None,
+        prefetch_all=lambda _query: (recall + "\n\n" if recall else "") + block,
+    )
+    with patch("agent.memory_taint.record_injected_text") as record:
+        ctx = _build(agent, user_message="Find the earlier project decision")
+    assert ctx.ext_prefetch_cache == recall
+    record.assert_called_once_with(agent.session_id, recall, source="prefetch")
+    assert agent._tool_guardrails.before_call("web_search", {"query": "verify"}).action == "allow"
+    assert agent._tool_guardrails.before_call("session_search", {"query": "history"}).action == "allow"
+    if recall:
+        api_content = ctx.messages[-1]["api_content"]
+        assert recall in api_content
+        assert "<memory-context>" in api_content
+        assert "NOT new user input" in api_content
+        assert "Graphiti Lookup Status" not in api_content
+    else:
+        assert "api_content" not in ctx.messages[-1]
+
+
+@pytest.fixture
+def legacy_graphiti_session(tmp_path):
+    old_prompt = (
+        "SYSTEM\nThe runtime guard denies a fallback source only after status=ok. "
+        "When a status=ok recall is clearly unrelated to the question, call "
+        "session_search once with graphiti_irrelevant=true."
+    )
+    history = [
+        {"role": "user", "content": "Find my earlier project decision"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "memory-1", "type": "function", "function": {
+                "name": "search_memory_facts", "arguments": '{"query":"project decision"}',
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "memory-1", "name": "search_memory_facts",
+         "content": '{"status":"ok","fallback_allowed":false,"recall":"historical fact"}'},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "session-1", "type": "function", "function": {
+                "name": "session_search",
+                "arguments": '{"query":"project decision","graphiti_irrelevant":true}',
+            },
+        }]},
+    ]
+    # Persist/reload the old wire schema, including the pending flagged call.
+    path = tmp_path / "legacy-session.json"
+    path.write_text(json.dumps({"system_prompt": old_prompt, "messages": history}))
+    return json.loads(path.read_text())
+
+
+def test_old_graphiti_session_resumes_without_rewriting_cached_prompt(
+    legacy_graphiti_session, tmp_path
+):
+    from agent.tool_guardrails import ToolCallGuardrailController
+    from tools.registry import registry
+    from tools.session_search_tool import session_search
+
+    agent = _FakeAgent()
+    agent._cached_system_prompt = legacy_graphiti_session["system_prompt"]
+    agent._tool_guardrails = ToolCallGuardrailController()
+    history = legacy_graphiti_session["messages"]
+    original = copy.deepcopy(history)
+    restore = MagicMock()
+    ctx = _build(
+        agent, conversation_history=history, resume_turn=True,
+        restore_or_build_system_prompt=restore,
+    )
+    restore.assert_not_called()
+    assert agent._cached_system_prompt == legacy_graphiti_session["system_prompt"]
+    assert ctx.active_system_prompt == legacy_graphiti_session["system_prompt"]
+    assert history == original
+    assert ctx.messages == original
+
+    agent._tool_guardrails.after_call(
+        "search_memory_facts", {"query": "project decision"}, history[2]["content"]
+    )
+    call = history[-1]["tool_calls"][0]["function"]
+    args = json.loads(call["arguments"])
+    assert agent._tool_guardrails.before_call(call["name"], args).action == "allow"
+    with SessionDB(tmp_path / "compat.db") as db:
+        assert registry.get_entry(call["name"]).handler(args, db=db) == session_search(
+            query=args["query"], db=db
+        )
+    assert agent._tool_guardrails.before_call("web_search", {"query": "verify"}).action == "allow"
+
+
+def test_new_session_uses_advisory_provider_prompt_and_then_keeps_cache():
+    from agent.memory_manager import MemoryManager
+    from plugins.memory.graphiti_canonical import GraphitiCanonicalMemoryProvider
+
+    manager = MemoryManager()
+    manager.add_provider(GraphitiCanonicalMemoryProvider())
+    agent = _FakeAgent()
+    agent._cached_system_prompt = None
+
+    def restore(agent, *_args):
+        agent._cached_system_prompt = manager.build_system_prompt()
+
+    ctx = _build(agent, restore_or_build_system_prompt=restore)
+    assert "advisory and do not change tool permissions" in ctx.active_system_prompt
+    cached = ctx.active_system_prompt
+    restore_again = MagicMock()
+    ctx2 = _build(
+        agent, conversation_history=ctx.messages,
+        restore_or_build_system_prompt=restore_again,
+    )
+    restore_again.assert_not_called()
+    assert ctx2.active_system_prompt == cached
+
+
+def test_real_graphiti_prefetch_reaches_turn_context_without_permission_side_effect(
+    monkeypatch, tmp_path
+):
+    from agent.memory_manager import MemoryManager
+    from agent.tool_guardrails import ToolCallGuardrailController
+    from plugins.memory import graphiti_canonical
+
+    monkeypatch.setattr(graphiti_canonical, "_RECALL_LOG_PATH", tmp_path / "recall.jsonl")
+    monkeypatch.setattr(graphiti_canonical, "_dispatch_tool", lambda *_a, **_k: {"facts": [{
+        "uuid": "turn-edge", "name": "PREFERS",
+        "fact": "Alice prefers Graphiti project history in Korean.",
+    }]})
+    provider = graphiti_canonical.GraphitiCanonicalMemoryProvider()
+    provider.initialize("sess-1", hermes_home=str(tmp_path), user_name="Alice")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    agent = _FakeAgent()
+    agent._memory_manager = manager
+    agent._tool_guardrails = ToolCallGuardrailController()
+    with patch("agent.memory_taint.record_injected_text") as record:
+        ctx = _build(agent, user_message="Graphiti project history")
+    assert "edge=turn-edge" in ctx.ext_prefetch_cache
+    assert "Graphiti Lookup Status" not in ctx.ext_prefetch_cache
+    record.assert_called_once_with("sess-1", ctx.ext_prefetch_cache, source="prefetch")
+    assert ctx.ext_prefetch_cache in ctx.messages[-1]["api_content"]
+    assert agent._tool_guardrails.before_call("web_search", {"query": "verify"}).action == "allow"

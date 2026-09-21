@@ -1636,17 +1636,8 @@ def build_turn_context(
             decision="hit" if ext_prefetch_cache else "empty",
         )
     if ext_prefetch_cache:
-        from agent.memory_manager import (
-            graphiti_first_status_from_context,
-            strip_graphiti_lookup_status_blocks,
-        )
+        from agent.memory_manager import strip_graphiti_lookup_status_blocks
 
-        _graphiti_status = graphiti_first_status_from_context(ext_prefetch_cache)
-        _set_graphiti_status = getattr(
-            agent._tool_guardrails, "set_graphiti_routing_status", None
-        )
-        if _graphiti_status is not None and callable(_set_graphiti_status):
-            _set_graphiti_status(_graphiti_status)
         ext_prefetch_cache = strip_graphiti_lookup_status_blocks(ext_prefetch_cache)
 
         # ADR-004 §① origin-taint (Phase 2): the prefetch text injected into

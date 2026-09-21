@@ -2197,18 +2197,11 @@ DEFAULT_CONFIG = {
         # Only ONE external provider is allowed at a time.
         "provider": "",
         "graphiti": {
-            # Narrow, auditable escape hatch when a successful Graphiti recall
-            # returned facts clearly unrelated to the user's question. The
-            # runtime still requires Graphiti first and permits only one flagged
-            # session_search call per turn. False preserves the strict default.
+            # Deprecated compatibility settings. Graphiti lookup statuses are
+            # advisory; these values no longer affect tool permissions.
             "allow_irrelevant_fallback": False,
-            # How many explicitly flagged (graphiti_irrelevant=true)
-            # session_search calls the hatch permits per turn. Only consulted
-            # when allow_irrelevant_fallback is true. 0 means unlimited, which
-            # effectively disables Graphiti-first routing for session_search
-            # and is not recommended. Follow-up scroll/read calls into a
-            # session already reached through the hatch are free and never
-            # charged against this budget.
+            # Retained for older configurations. No Graphiti-specific escape
+            # hatch or per-turn fallback budget is enforced.
             "irrelevant_fallback_max_per_turn": 1,
         },
     },

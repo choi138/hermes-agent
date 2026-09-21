@@ -89,7 +89,9 @@ def test_graphiti_canonical_provider_exposes_only_bounded_read_only_search():
     assert "status=filtered" in description
     assert "status=timeout" in description
     assert "status=error" in description
-    assert "do not fall back only when status=ok" in description
+    assert "all statuses are advisory" in description
+    assert "including after status=ok" in description
+    assert "correct, complete, relevant, or current" in description
 
 
 def test_memory_manager_registers_graphiti_model_search_tool():
@@ -102,6 +104,56 @@ def test_memory_manager_registers_graphiti_model_search_tool():
     assert [schema["name"] for schema in manager.get_all_tool_schemas()] == [
         "search_memory_facts"
     ]
+
+
+@pytest.mark.parametrize("status", ["ok", "empty", "filtered", "timeout", "error"])
+def test_real_provider_manager_guardrail_contract_is_advisory(monkeypatch, tmp_path, status):
+    from agent.memory_manager import strip_graphiti_lookup_status_blocks
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    def dispatch(*_args, **_kwargs):
+        if status == "timeout":
+            raise TimeoutError("synthetic timeout")
+        if status == "error":
+            raise RuntimeError("synthetic failure")
+        if status == "empty":
+            return {"facts": []}
+        return {"facts": [{
+            "uuid": "contract-edge", "name": "PREFERS",
+            "fact": (
+                "Alice prefers Graphiti project history in Korean."
+                if status == "ok" else "Alice has secret synthetic-value."
+            ),
+        }]}
+
+    monkeypatch.setattr(graphiti_module, "_dispatch_tool", dispatch)
+    provider = GraphitiCanonicalMemoryProvider()
+    provider.initialize("contract-session", hermes_home=str(tmp_path), user_name="Alice")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    query = "Graphiti project history"
+    args = {"query": query}
+    result = manager.handle_tool_call("search_memory_facts", args)
+    decoded = json.loads(result)
+    assert decoded["status"] == status
+    assert decoded["source"] == "graphiti_historical_memory"
+    assert "fallback_allowed" not in decoded
+    controller = ToolCallGuardrailController()
+    controller.after_call("search_memory_facts", args, result)
+    assert controller.before_call("web_search", {"query": "verify source"}).action == "allow"
+    assert controller.before_call("session_search", args).action == "allow"
+
+    automatic = manager.prefetch_all(query)
+    assert f"status: {status}" in automatic
+    assert "fallback_allowed" not in automatic
+    recall = strip_graphiti_lookup_status_blocks(automatic)
+    assert recall == decoded.get("recall", "")
+    if status == "ok":
+        assert "edge=contract-edge" in recall
+        assert recall in build_memory_context_block(recall)
+    elif status in {"timeout", "error"}:
+        assert decoded["error"]
+        assert "status: empty" not in automatic
 
 
 def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
@@ -149,7 +201,6 @@ def test_model_search_tool_uses_exact_read_only_capability_and_filters_output(
         "reached_fetch_limit": False,
         "has_more": True,
         "total_unknown": False,
-        "fallback_allowed": False,
         "recall": (
             "# Graphiti Recall (read-only historical context)\n"
             "Current user instructions and built-in USER/MEMORY override conflicts.\n"
@@ -233,25 +284,21 @@ def test_model_search_tool_distinguishes_empty_results_from_failures(
         "reached_fetch_limit": False,
         "has_more": False,
         "total_unknown": False,
-        "fallback_allowed": True,
         "recall": "",
     }
     assert reported_error == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert reported_string_error == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert failed == {
         "status": "timeout",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search timed out",
     }
     assert "synthetic" not in json.dumps(reported_error)
@@ -296,7 +343,6 @@ def test_model_search_tool_reports_filtered_candidates_and_allows_fallback(
         "reached_fetch_limit": False,
         "has_more": True,
         "total_unknown": False,
-        "fallback_allowed": True,
         "recall": "",
     }
 
@@ -333,11 +379,11 @@ def test_prefetch_allows_fallback_for_any_non_ok_graphiti_result(
     assert "source: graphiti_historical_memory" in empty
     assert "routing_policy: graphiti_first" in empty
     assert "status: empty" in empty
-    assert "fallback_allowed: true" in empty
+    assert "fallback_allowed" not in empty
     assert "candidate_count: 0" in empty
     assert "status: filtered" in filtered
     assert "routing_policy: graphiti_first" in filtered
-    assert "fallback_allowed: true" in filtered
+    assert "fallback_allowed" not in filtered
     assert "candidate_count: 1" in filtered
 
 
@@ -367,7 +413,7 @@ def test_unrestricted_prefetch_keeps_ok_when_a_kept_fact_has_strong_overlap(
     assert fact in result
     assert "\nstatus: ok\n" in result
     assert "status: ok_low_relevance" not in result
-    assert "fallback_allowed: false" in result
+    assert "fallback_allowed" not in result
 
 
 def test_prefetch_exposes_kept_weak_facts_and_allows_fallback(
@@ -394,7 +440,7 @@ def test_prefetch_exposes_kept_weak_facts_and_allows_fallback(
 
     assert fact in result
     assert "status: ok_low_relevance" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
     assert (
         "note: recall returned facts but none share strong anchors with the query; "
         "treat as possibly irrelevant and fall back if unhelpful"
@@ -409,7 +455,7 @@ def test_low_relevance_lookup_status_is_not_downgraded_to_error():
     )
 
     assert "status: ok_low_relevance" in block
-    assert "fallback_allowed: true" in block
+    assert "fallback_allowed" not in block
     assert "status: error" not in block
     assert "note: recall returned facts" in block
 
@@ -439,7 +485,7 @@ def test_unrestricted_prefetch_marks_weak_overlap_low_relevance(
 
     assert fact in result
     assert "status: ok_low_relevance" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
 
 
 def test_prefetch_reports_application_error_and_allows_fallback(
@@ -459,7 +505,7 @@ def test_prefetch_reports_application_error_and_allows_fallback(
 
     assert "status: error" in result
     assert "routing_policy: graphiti_first" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
     assert "synthetic" not in result
 
 
@@ -481,7 +527,7 @@ def test_prefetch_timeout_allows_fallback(monkeypatch, tmp_path):
 
     assert "status: timeout" in result
     assert "routing_policy: graphiti_first" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
 
 
 def test_model_search_tool_marks_fetch_limit_as_unknown_total(monkeypatch, tmp_path):
@@ -516,7 +562,7 @@ def test_model_search_tool_marks_fetch_limit_as_unknown_total(monkeypatch, tmp_p
     assert result["reached_fetch_limit"] is False
     assert result["has_more"] is False
     assert result["total_unknown"] is False
-    assert result["fallback_allowed"] is False
+    assert "fallback_allowed" not in result
 
 
 def test_model_search_tool_treats_structured_application_error_as_failure(
@@ -549,7 +595,6 @@ def test_model_search_tool_treats_structured_application_error_as_failure(
     assert result == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert "synthetic" not in json.dumps(result)
@@ -577,7 +622,6 @@ def test_model_search_tool_treats_malformed_payload_as_failure(monkeypatch, tmp_
     assert result == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert "synthetic" not in json.dumps(result)
@@ -625,13 +669,11 @@ def test_model_search_tool_bounds_post_dispatch_processing(monkeypatch, tmp_path
     assert result == {
         "status": "timeout",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search timed out",
     }
     assert overlapping_result == {
         "status": "error",
         "source": "graphiti_historical_memory",
-        "fallback_allowed": True,
         "error": "Graphiti search failed",
     }
     assert len(dispatch_calls) == 1
@@ -1136,7 +1178,7 @@ def test_prefetch_enforces_one_end_to_end_deadline(monkeypatch, tmp_path):
     result = provider.prefetch("이전 P1 Graphiti 작업 기억해")
 
     assert "status: timeout" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
     assert len(calls) == 1
     assert started < calls[0][0] <= started + 0.02
     assert calls[0][1] == str(tmp_path)
@@ -1162,7 +1204,7 @@ def test_prefetch_deadline_bounds_synchronous_safety_checks(monkeypatch, tmp_pat
     elapsed = time.monotonic() - started
 
     assert "status: timeout" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
     assert elapsed < 0.08
     assert finished.wait(0.3)
 
@@ -1186,11 +1228,11 @@ def test_prefetch_timeout_keeps_only_one_lingering_worker(monkeypatch, tmp_path)
     try:
         timed_out = provider.prefetch("이전 P1 Graphiti 작업 기억해")
         assert "status: timeout" in timed_out
-        assert "fallback_allowed: true" in timed_out
+        assert "fallback_allowed" not in timed_out
         assert started.wait(0.1)
         overlapping = provider.prefetch("이전 P1 Graphiti 작업 기억해")
         assert "status: error" in overlapping
-        assert "fallback_allowed: true" in overlapping
+        assert "fallback_allowed" not in overlapping
         assert calls == [1]
     finally:
         release.set()
@@ -1242,7 +1284,7 @@ def test_continuity_request_recalls_fact_through_read_only_search(
     assert "edge-1" in result
     assert "status: ok_low_relevance" in result
     assert "routing_policy: graphiti_first" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
 
 
 def test_recall_parses_structured_mcp_content(monkeypatch, tmp_path):
@@ -2047,7 +2089,7 @@ def test_recall_reports_timeout_and_allows_fallback(monkeypatch, tmp_path):
 
     result = provider.prefetch("이전 프로젝트 작업 계속")
     assert "status: timeout" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
 
 
 def test_recall_uses_daemon_worker_around_bounded_mcp_handler(monkeypatch, tmp_path):
@@ -2069,7 +2111,7 @@ def test_recall_uses_daemon_worker_around_bounded_mcp_handler(monkeypatch, tmp_p
 
     result = provider.prefetch("이전 프로젝트 작업 계속")
     assert "status: error" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
     assert len(created) == 1
     assert created[0]["daemon"] is True
     assert created[0]["name"] == "graphiti-canonical-prefetch"
@@ -2165,7 +2207,7 @@ def test_unrelated_temporal_question_reports_confirmed_empty(monkeypatch, tmp_pa
 
     assert "status: empty" in result
     assert "routing_policy: advisory" in result
-    assert "fallback_allowed: true" in result
+    assert "fallback_allowed" not in result
     assert [call[1]["query"] for call in calls] == ["지난밤 서울 날씨는 어땠어?"]
 
 
@@ -2900,17 +2942,19 @@ def test_provider_prompt_declares_recall_non_authoritative_and_read_only():
     assert "live state" in block
     assert "before browser" in block
     assert "before session history" in block
-    assert "denies a fallback source only after status=ok" in block
+    assert "advisory and do not change tool permissions" in block
+    assert "does not prove correctness, completeness, relevance, or currentness" in block
+    assert "including after status=ok" in block
     assert "status=empty or status=filtered" in block
     assert "status=timeout or status=error" in block
     assert "use session_search" in block
-    assert "runtime guard" in block
+    assert "denies a fallback" not in block
     assert "explicitly directs a live" in block
     assert "graphiti records" in block
     assert "returned_count" in block
     assert "not the total" in block
-    assert "graphiti_irrelevant=true" in block
-    assert "genuine irrelevance" in block
+    assert "graphiti_irrelevant" not in block
+    assert "escape hatch" not in block
 
 
 def test_memory_context_fence_treats_recall_as_informational():
@@ -3471,7 +3515,7 @@ def test_model_search_tool_maps_supported_empty_mcp_envelopes_to_empty(
     )
 
     assert result["status"] == "empty"
-    assert result["fallback_allowed"] is True
+    assert "fallback_allowed" not in result
     assert result["candidate_count"] == 0
 
 
@@ -3542,7 +3586,7 @@ def test_prefetch_and_model_search_share_one_inflight_gate(monkeypatch, tmp_path
         prefetch_thread.join(timeout=1)
 
     assert result["status"] == "error"
-    assert result["fallback_allowed"] is True
+    assert "fallback_allowed" not in result
     assert calls == [1]
 
 
@@ -3575,13 +3619,13 @@ def test_mixed_language_empty_search_retries_once_with_graphiti_anchor(
         provider.handle_tool_call("search_memory_facts", {"query": query})
     )
     assert direct["status"] == "ok"
-    assert direct["fallback_allowed"] is False
+    assert "fallback_allowed" not in direct
     assert calls == [query, "Instagram"]
 
     calls.clear()
     prefetched = provider.prefetch(query)
     assert "status: ok_low_relevance" in prefetched
-    assert "fallback_allowed: true" in prefetched
+    assert "fallback_allowed" not in prefetched
     assert calls == [query, "Instagram"]
 
 
