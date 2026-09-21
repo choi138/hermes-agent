@@ -10,7 +10,7 @@ def inspect_adoption(root, executable):
     root, executable = Path(root), Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise LifecycleError('An installed agentsx executable is required')
-    result = subprocess.run([str(executable), 'check', str(root)], capture_output=True, text=True, timeout=30)
+    result = subprocess.run([str(executable), 'check', str(root)], capture_output=True, text=True, encoding='utf-8', timeout=30)
     if result.returncode != 0:
         raise LifecycleError('agentsx adoption check failed; install/sync explicitly before executing')
     paths = [root/'AGENTS.md', root/'.agents/.engine-lock.json', root/'.agents/verify.sh']
