@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -170,6 +171,40 @@ def test_timeout_reaps_owned_child_and_sigterm_cancels_cli(inputs, tmp_path):
     pid = int(Path(result["artifact_dir"], "events.jsonl").read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+@pytest.mark.macos_only
+def test_repeated_cleanup_of_reaped_leaders_and_stubborn_children(inputs, tmp_path):
+    import psutil
+
+    # The previously observed Darwin EPERM appeared after repeated reaping.
+    # Exercise fresh real CLI processes, without bypassing the test kill guard.
+    for attempt in range(48):
+        result = run_stub(inputs, tmp_path, ECHO)
+        assert (result['status'], result['exit_code']) == ('cli_completed', 0), attempt
+    child = '''import json, os, signal, time, psutil
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print(json.dumps({'pid':os.getpid(),'started_at':psutil.Process().create_time()}), flush=True)
+time.sleep(30)
+'''
+    for attempt in range(4):
+        # The leader exits immediately; its child retains the pipes and ignores
+        # TERM. Group cleanup must still kill that child after timeout.
+        body = f'import os, subprocess, sys\nsubprocess.Popen([sys.executable, "-c", {child!r}])\nos._exit(0)\n'
+        result = run_stub(inputs, tmp_path, body, timeout=2)
+        assert (result['status'], result['exit_code']) == ('timed_out', 124), attempt
+        identity = json.loads(Path(result['artifact_dir'], 'events.jsonl').read_text())
+        def running():
+            try:
+                process = psutil.Process(identity['pid'])
+                return (process.create_time() == identity['started_at']
+                        and process.status() != psutil.STATUS_ZOMBIE)
+            except psutil.NoSuchProcess:
+                return False
+        deadline = time.monotonic() + 3
+        while running() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert not running(), identity
 
 
 def test_artifact_close_failure_cannot_report_success(inputs, tmp_path):

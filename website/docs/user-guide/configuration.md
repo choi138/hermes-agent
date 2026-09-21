@@ -919,7 +919,7 @@ The value is the **first rung** of an escalating ladder, not a fixed interval: c
 
 `context_timeout_seconds` (default `120`) is the same **inactivity budget** for in-agent `compress_context` — the conversation loop, preflight compaction, and manual `/compress` — so a hung summary model cannot stall a session indefinitely. Streamed summary tokens extend the wait; only a silent worker is cut off. On timeout Hermes retries the summary once against the first entry of `auxiliary.compression.fallback_chain` (using that entry's own `timeout` when it declares one) — a stalled route never raises, so the auxiliary client's own fallback handling cannot see it. Only if that attempt also fails, or no fallback chain is configured, does Hermes skip compaction, keep the existing messages, and warn the user. Set to `0` to disable. Gateway session hygiene keeps its own `hygiene_timeout_seconds` path and is not double-wrapped.
 
-`context_total_ceiling_seconds` (default `600`) bounds the in-agent **pre-commit** wait (summary / stream phase) even while tokens are still moving. It is clamped to at least `context_timeout_seconds`. The exact guarantee: **the summary phase is bounded by this ceiling; the commit phase is logged and surfaced if it exceeds it.** Once the worker has entered the compression commit fence and SessionDB mutation is in flight, the commit is never abandoned mid-flight — that would risk transcript divergence — but the wait is no longer silent: if the commit runs past the ceiling, Hermes logs the overrun (WARNING, escalating to ERROR on repeat), sends a one-shot warning through the user-visible warning channel, and keeps waiting in bounded increments until the commit completes.
+`context_total_ceiling_seconds` (default `600`) bounds the combined in-agent **pre-commit** wait (primary summary, retries, and fallback attempts) even while tokens are still moving. It is clamped to at least `context_timeout_seconds` when the primary attempt starts. Retries and fallback attempts share that absolute deadline; a fallback entry’s own timeout cannot extend it, and no fallback starts once it is exhausted. Cancelled workers receive a short, bounded teardown grace after the deadline. The exact guarantee: **the summary phase is bounded by this ceiling; the commit phase is logged and surfaced if it exceeds it.** Once the worker has entered the compression commit fence and SessionDB mutation is in flight, the commit is never abandoned mid-flight — that would risk transcript divergence — but the wait is no longer silent: if the commit runs past the ceiling, Hermes logs the overrun (WARNING, escalating to ERROR on repeat), sends a one-shot warning through the user-visible warning channel, and keeps waiting in bounded increments until the commit completes.
 
 `protect_first_n` controls how many **non-system** head messages are pinned across every compaction. Default `3` — the opening user/assistant exchange survives every summarizer pass so the original goal stays visible. On long-running rolling-compaction sessions where the opening turn is no longer relevant, set `protect_first_n: 0` to pin nothing but the system prompt + summary + tail. The system prompt itself is always preserved regardless of this setting.
 
@@ -2651,6 +2651,22 @@ Hermes uses two different context scopes:
 - **AGENTS.md** is hierarchical: if subdirectories also have AGENTS.md, all are combined.
 - Hermes automatically seeds a default `SOUL.md` if one does not already exist.
 - All loaded context files are capped at `context_file_max_chars` characters (default 20,000) with smart truncation.
+
+Project files are read in the owning session's terminal backend. An unavailable
+remote workspace does not fall back to the controller's project instructions.
+SOUL.md remains local to the owning Hermes profile. Backend metadata and project
+discovery each have an eight-second total budget, including connection setup and
+cleanup. Configure that budget in `config.yaml`:
+
+```yaml
+timeouts:
+  prompt:
+    backend: 8  # seconds per discovery operation; non-positive values use 8
+```
+
+Environment metadata is cached by target, profile, session, and working directory.
+An existing conversation keeps its saved system prompt; these lookups run when
+the prompt is built or rebuilt, including after context compression.
 
 See also:
 - [Personality & SOUL.md](/user-guide/features/personality)

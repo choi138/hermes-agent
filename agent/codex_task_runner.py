@@ -7,6 +7,7 @@ records CLI completion only; acceptance testing remains the caller's job.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import os
@@ -66,6 +67,7 @@ class TaskRequest:
     sandbox: str = "read-only"
     timeout: float = 600
     model: str = "gpt-6-astra"
+    cli: str = "codex"
 
     def __post_init__(self):
         if os.name != "posix":
@@ -74,6 +76,10 @@ class TaskRequest:
             raise ValueError("A validated worker selection is required")
         if self.sandbox not in ("read-only", "workspace-write"):
             raise ValueError("Unsupported sandbox")
+        if self.cli not in ("codex", "claude"):
+            raise ValueError("Unsupported CLI")
+        if self.cli == "claude" and self.sandbox != "read-only":
+            raise ValueError("Claude currently supports read-only tasks only")
         if (isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float))
                 or not math.isfinite(self.timeout) or not 0 < self.timeout <= 86400):
             raise ValueError("Timeout must be finite and between 0 and 86400 seconds")
@@ -94,6 +100,13 @@ class TaskRequest:
             raise ValueError("Output directory must be caller-owned and not writable by others")
 
     def argv(self):
+        if self.cli == "claude":
+            return ["claude", "--print", "--verbose", "--output-format", "stream-json",
+                    "--no-session-persistence", "--model", self.model,
+                    "--effort", self.selection.metadata()["effort"],
+                    "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+                    "--allowedTools", "Read,Glob,Grep", "--strict-mcp-config",
+                    "--mcp-config", '{"mcpServers":{}}']
         return ["codex", "exec", "--ephemeral", "-m", self.model, "-c",
                 f'model_reasoning_effort="{self.selection.metadata()["effort"]}"',
                 "-s", self.sandbox, "-C", str(self.workdir), "--json", "-"]
@@ -111,28 +124,47 @@ def _stop_group(process):
     # start_new_session gives this task its own process group, including
     # children that keep pipes open after the leader exits. Never signal the
     # calling terminal's group. Always reap the immediate child.
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
-        process.wait(timeout=2)
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    import psutil
+
+    def signal_owned(sig):
+        # poll()/wait() may already have reaped the leader. A new process
+        # reusing its PID is not ours, even if its group has the same number.
+        expected = getattr(process, "_hermes_started_at", None)
+        try:
+            leader = psutil.Process(process.pid)
+            if expected is not None and leader.create_time() != expected:
+                return
+        except psutil.NoSuchProcess:
+            pass
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # Darwin can report EPERM for the group of an already reaped
+            # sandboxed child. Suppress only when no owned live member remains.
+            for member in psutil.process_iter(["pid", "uids", "status"]):
+                try:
+                    if (member.info["uids"].real == os.getuid()
+                            and member.info["status"] != psutil.STATUS_ZOMBIE
+                            and os.getpgid(member.pid) == process.pid):
+                        raise
+                except (ProcessLookupError, psutil.NoSuchProcess):
+                    continue
+            if process.poll() is None:
+                raise
+
+    signal_owned(signal.SIGTERM)
     try:
         process.wait(timeout=.5)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    signal_owned(signal.SIGKILL)
     process.wait(timeout=2)
 
 
 def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
-             output_limit=MAX_OUTPUT_BYTES, before_spawn=None):
+             output_limit=MAX_OUTPUT_BYTES, before_spawn=None, prompt_bytes=None):
     """Run using real binary pipes; ``popen`` is a Python-only testing seam.
 
     Each stream is bounded. Over-limit and artifact I/O errors are failures,
@@ -153,13 +185,20 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
         if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
             raise ValueError("SPEC must be a regular file")
         prompt = source.read(MAX_SPEC_BYTES + 1)
+    if prompt_bytes is not None:
+        if not isinstance(prompt_bytes, bytes):
+            raise ValueError("Explicit prompt must be bytes")
+        prompt = prompt_bytes
     if not prompt or len(prompt) > MAX_SPEC_BYTES:
         raise ValueError("SPEC must be nonempty and within size limit")
     prompt.decode("utf-8")  # Reject malformed text; no guessing or replacement.
     run_dir = Path(tempfile.mkdtemp(prefix="codex-task-", dir=request.output_dir))
     result = {"status": "launch_failed", "exit_code": 127, "process_returncode": None,
               "selection": request.selection.metadata(), "sandbox": request.sandbox,
-              "model": request.model, "timeout_seconds": request.timeout, "artifact_dir": str(run_dir)}
+              "model": request.model, "cli": request.cli,
+              "timeout_seconds": request.timeout, "artifact_dir": str(run_dir),
+              "input_receipt": {"sha256": hashlib.sha256(prompt).hexdigest(),
+                                "bytes": len(prompt), "written_bytes": 0, "pipe_complete": False}}
     process = None
     started = time.monotonic()
     try:
@@ -179,6 +218,11 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
                 process = popen(request.argv(), cwd=str(request.workdir), stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
                                 start_new_session=True, bufsize=0)
+                import psutil
+                try:
+                    process._hermes_started_at = psutil.Process(process.pid).create_time()
+                except psutil.NoSuchProcess:
+                    pass
                 result.update(status="running", exit_code=1)
                 with selectors.DefaultSelector() as selector:
                     for stream, event, data in ((process.stdin, selectors.EVENT_WRITE, None),
@@ -200,7 +244,11 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
                                 try:
                                     position += os.write(key.fd, prompt[position:position + 4096])
                                 except BrokenPipeError:
-                                    position = len(prompt)
+                                    selector.unregister(key.fileobj)
+                                    key.fileobj.close()
+                                    continue
+                                result["input_receipt"].update(
+                                    written_bytes=position, pipe_complete=position == len(prompt))
                                 if position == len(prompt):
                                     selector.unregister(key.fileobj)
                                     key.fileobj.close()
@@ -234,7 +282,10 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
                       exit_code=127 if process is None else 74)
     finally:
         if process is not None:
-            _stop_group(process)
+            try:
+                _stop_group(process)
+            except (OSError, subprocess.TimeoutExpired):
+                result.update(status="cleanup_failed", exit_code=74)
             result["process_returncode"] = process.returncode
             for stream in (process.stdin, process.stdout, process.stderr):
                 stream.close()

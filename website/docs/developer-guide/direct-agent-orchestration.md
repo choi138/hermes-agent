@@ -1,7 +1,7 @@
 ---
 sidebar_position: 19
 title: "Direct Agent Orchestration"
-description: "Classification and policy contracts, manual Codex delegation, and independent orchestrator and worker effort"
+description: "Execution policy, opt-in Codex/Claude lifecycle, durable receipts, and independent worker effort"
 ---
 
 # Direct Agent Orchestration
@@ -12,7 +12,7 @@ the request; M2 derives a policy decision. These are contracts and pure policy,
 not an active gateway execution pipeline.
 
 A caller may obtain that read from a classifier. This page describes its
-authority boundary and the separate, runnable manual Codex launcher. The
+authority boundary and the separate, runnable Codex/Claude launcher. The
 launcher does not call a classifier or change Hermes' own reasoning effort.
 
 ## Why a strict contract
@@ -272,11 +272,11 @@ Not included in either, and deliberately so:
 - Graphiti lookups or writes
 - Deployment, restarts, or live configuration changes
 
-The manual launcher below supplies a local Codex execution entry point. It does
-not complete the wider **P2-M3** host registry, approval UI, or gateway dispatch.
-**P2-M4** Claude execution and **P2-M5** independent result verification remain
-separate work. No deployment, restart, live configuration, or skill installation
-is applied by this implementation.
+The launcher below supplies local execution and an opt-in durable lifecycle.
+It includes Claude read-only execution, contract-bound verification and SSH
+receipt transfer. The wider **P2-M3** host registry and automatic gateway
+dispatch remain separate activation work. Deployment, live configuration and
+native engine-hook adoption are not performed by these commands.
 
 ## Orchestrator effort and worker effort
 
@@ -368,10 +368,12 @@ CLI option to supply another executable. Python dependency injection is used
 only by the fake-process contract tests.
 
 A caller using a P2 `ExecutionDecision` must still verify actual paths and
-approval. This launcher supports only the local Mac Codex lane. Refuse other
-lanes/hosts and unsupported permissions; do not silently map
-`write_workdir_network` to a broader sandbox. No automatic P2 adapter or host
-registry is installed here.
+approval. Use `--cli claude --model sonnet --sandbox read-only` for Claude.
+Claude uses `Read`, `Glob`, and `Grep`, `dontAsk`, an empty strict MCP config,
+and no session persistence. Claude workspace writes are rejected; this tool
+restriction is not an OS filesystem sandbox. Refuse unsupported permissions;
+do not silently map `write_workdir_network` to a broader sandbox. The launcher
+does not install an automatic P2 adapter or host registry.
 
 ## Results and limits
 
@@ -394,6 +396,189 @@ Dry-run returns `planned` and the exact argv without launching Codex or writing
 artifacts. Real-run content validation still occurs before launch. Tests run the
 actual CLI parser and real subprocess pipes using a fake Codex adapter; these
 are transport contracts, not live Codex/provider acceptance or paid smoke tests.
+
+## Opt-in durable task lifecycle
+
+`scripts/run_codex_task.py lifecycle` keeps execution, acceptance, and delivery
+as separate states in the active profile's `state.db`. A successful process
+exit is `execution_finished`; all required checks must pass for `verified`.
+Only exact original-thread message and attachment readback reaches `delivered`
+and `complete: true`. Cancellation and unknown outcomes never mean success.
+
+The trusted operator prepares a private config outside the worker's approved
+root. The repository must have a Git HEAD. Use absolute, existing paths for
+SPEC, workdir, root and output; the output and `HERMES_HOME` must also be
+outside the worker's writable root. For example, save this as
+`/approved/control/task.json` with mode 0600, replacing the paths:
+
+```json
+{
+  "request": {
+    "spec": "/approved/repo/SPEC.md",
+    "workdir": "/approved/repo",
+    "allowed_root": "/approved/repo",
+    "output_dir": "/approved/artifacts",
+    "selection": {"requested_tier": "light", "policy": "auto"},
+    "sandbox": "read-only",
+    "timeout": 600,
+    "model": "gpt-6-astra",
+    "cli": "codex"
+  },
+  "request_text": "Inspect the project and report the remaining work.",
+  "objective": "Produce a checked inspection result.",
+  "forbidden_actions": ["file edits", "external messages"],
+  "checks": [
+    {"kind": "test", "name": "spec-present", "argv": ["/usr/bin/test", "-f", "SPEC.md"]}
+  ],
+  "artifacts": ["SPEC.md"]
+}
+```
+
+The example check proves file presence only. Replace it with the acceptance
+checks needed for the task before preparing the grant. Artifact paths must be
+unique, relative to the workdir, and free of symlinks and `.git` access.
+
+```sh
+export HERMES_HOME=/approved/control/profile
+python3 scripts/run_codex_task.py lifecycle prepare \
+  --config /approved/control/task.json --request-key inspection-001 --revision 1
+python3 scripts/run_codex_task.py lifecycle submit --grant /path/from/prepare.json
+python3 scripts/run_codex_task.py lifecycle status RUN_UUID
+python3 scripts/run_codex_task.py lifecycle receipt RUN_UUID
+python3 scripts/run_codex_task.py lifecycle verify RUN_UUID
+```
+
+Retain the returned grant and run ID. `prepare` binds the SPEC hash, original
+request, paths, checks, context, and Git HEAD. Reuse that grant for a lost submit
+reply. Identical submissions share one workload through a durable claim; a new
+request revision is a new execution and must never be an automatic retry.
+`receipt` returns the same durable execution view as `status`.
+
+`cancel RUN_UUID` writes a cancellation request for the owning supervisor,
+which stops its own process group. The detached Mac supervisor survives the
+SSH caller disconnecting. Host/boot/PID/start-time evidence prevents signaling
+a reused PID. If the supervisor disappears without a committed result, the
+run remains discoverable as `unknown`; inspect its receipts before deciding
+what to do. A committed exit receipt can repair a missing exit event without
+rerunning the work. A supervisor lost before a result is not auto-replaced.
+
+Required check commands are trusted argv, with an absolute executable; there
+is no shell-string execution. Absolute file arguments are hashed as check
+dependencies and must be outside the worker root. Use relative paths for
+artifact arguments. Keep checker scripts outside worker control. Dependencies
+loaded indirectly by a checker remain the operator's responsibility. Each
+check has a finite timeout of at most 1800 seconds; output logs belong in a
+size-managed private output directory. A review check names `codex`, `claude`,
+or `human`, different from the implementation CLI, and its adapter must emit:
+
+```json
+{"approved": true, "revision": "the actual artifact revision hash"}
+```
+
+The exact hash is provided to the checker as `HERMES_ARTIFACT_REVISION`.
+The review label itself does not authenticate a reviewer; the trusted adapter
+must obtain the actual independent verdict. Check exit 0 alone is insufficient.
+Changing accepted artifact bytes invalidates the acceptance for a new export.
+
+## Authenticated gateway and SSH receipts
+
+Use `agent.task_lifecycle.intake.gateway_envelope` inside an already
+authenticated user turn, passing its real `SessionSource`, session key,
+message revision, deterministic `ExecutionDecision`, configured Mac request,
+required checks, artifact paths, and approved SPEC SHA-256. It uses the existing
+approval context when the decision requires approval. Model text cannot supply
+identity, destination, approval outcomes, host configuration, or check commands.
+Local `prepare` rejects gateway identity and destination fields.
+
+The source gateway sends the original envelope through `SSHExecutor`. On the
+Mac, `import-request` accepts it only as a trusted OS-authenticated CLI operation;
+it is not an HTTP endpoint or model tool. Preserve the original envelope on the
+source for result verification. In the trusted caller, after creating it:
+
+```python
+from agent.task_lifecycle.transport import SSHExecutor
+
+executor = SSHExecutor(
+    host="configured-mac-alias",
+    python="/installed/hermes/.venv/bin/python",
+    script="/installed/hermes/scripts/run_codex_task.py",
+    profile_home="/approved/control/profile",
+    executable_path="/installed/node/bin:/installed/claude/bin:/usr/bin:/bin",
+    login_shell="/bin/zsh",
+)
+submitted = executor.submit(envelope)
+run_id = submitted["run_id"]
+state = executor.call("status", run_id)
+# After execution_finished:
+verified = executor.call("verify", run_id)
+# Only after verified["accepted"] is true:
+queued = executor.receive(
+    run_id, envelope=envelope, content="The requested checks passed.",
+    attachments=["result.json"],  # Must be declared in the original artifacts.
+)
+```
+
+Configure the exact installed binary directories; an asdf shim may fail in a
+fresh repository without a tool version. Optional `/bin/zsh -lic` loads the
+operator's existing credential environment. No credential values are read,
+copied, or forwarded by this transport. Each SSH call currently has a 45-second
+response deadline; run longer verification directly on the executor before
+fetching its receipt. A lost response remains ambiguous and keeps the same key.
+
+`receive` validates the execution and acceptance against the original envelope,
+imports the verified snapshot into the source profile, and queues its existing
+delivery ledger. The source does not need access to Mac filesystem paths.
+Duplicate imports preserve both the immutable result and delivery attempts.
+Duplicate submission/import responses report `complete: true` only when the
+durable phase is already `delivered`, consistent with `status`. A supervisor
+that dies after claiming a job but before execution is checkpointed is reported
+as `unknown`; the claim is retained and the workload is not automatically replayed.
+The gateway's existing recovery dispatcher recognizes these obligations;
+automatic intake and immediate live-turn finalization still require caller
+activation. The caller invokes `deliver_result` with the adapter owning the
+original profile. Queuing or importing alone does not send a message.
+
+For a same-host gateway-origin run, `lifecycle queue-result RUN_UUID
+--content-file /private/final.txt --attachment result.json` queues the same
+handoff. Final text is limited to 1750 characters, plus a visible run reference,
+and at most one attachment of 8 MiB. The queued result refers to the verified
+snapshot captured at queue/export time. Later repository edits do not modify
+that snapshot. Before sending, private attachment bytes are rechecked. The
+dedicated Discord sender sends the exact content and verified attachment bytes
+in one message, without generic Markdown formatting or a fallback notice.
+The Discord adapter then fetches the original-thread message and downloads its
+attachment to compare exact bytes. If a send loses its acknowledgement, recovery
+searches recent own-bot messages for the run reference; no match leaves delivery
+unconfirmed and never triggers an automatic second send. Readback proves
+platform availability, not that a person read the result.
+
+## Memory inputs and rollout limits
+
+The trusted intake can attach `note_bindings`, `correction_ids`, `work_class`
+and an installed `agentsx` path. NotesStore bindings explicitly identify source,
+owner, project and profile because NotesStore does not supply that scope.
+Superseded, demoted and tombstoned notes are excluded. Policy authority requires
+confirmed user provenance and the approved content digest. Recall does not grant
+permission. New correction revisions require fresh delivery and behavioral
+evidence; older PASS records cannot confirm the new revision.
+Behavior checks must match the verified artifact revision. Reverification
+retains previous observations while the latest executed check determines the
+current status; a stale check does not establish compliance.
+
+Input receipts record the exact prompt hash, size, and bytes written to the CLI
+pipe. They prove input delivery, not understanding. The agentsx adapter checks
+the installed policy files and supplies their actual text; it explicitly reports
+`native_hooks_verified: false` until native hook execution is demonstrated.
+
+Roll out only after independent review and an authorized limited pilot. Keep
+the prior source release and a consistent SQLite backup. Stop new lifecycle
+intake before rollback, reconcile owned workers and pending deliveries, then
+restore the previous source release. Retain additive lifecycle tables and
+receipts for inspection. Do not drop shared tables or restore an old database
+over newer unrelated gateway state. The old generic dispatcher does not know
+the lifecycle acknowledgement-loss rule, so pending lifecycle deliveries must
+be held/reconciled before using an older dispatcher. Unit/fixture success does
+not establish production delivery or reduced supervision.
 
 ## Lena session reasoning pin
 
