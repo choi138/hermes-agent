@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,11 @@ def setup(tmp_path):
 
 
 def executor(registry, **kwargs):
+    # These callers exercise a Mac authority, including its pinned directory
+    # identity. Linux rejection is tested separately, not mistaken for a
+    # successful authority/security rejection in the behavioral tests here.
+    if sys.platform != "darwin":
+        pytest.skip("Mac execution authority requires Darwin openat/fchdir/kqueue")
     from agent.task_lifecycle.executor import MacExecutor
     from pathlib import Path
 

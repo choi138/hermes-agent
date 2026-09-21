@@ -21,6 +21,10 @@ ROOT = Path(__file__).resolve().parents[3]
 
 @pytest.fixture
 def case(tmp_path, monkeypatch):
+    # Only tests needing a real Mac grant/bootstrap use this fixture; portable
+    # transport/registry/contract tests remain active on Linux.
+    if sys.platform != "darwin":
+        pytest.skip("Mac grant and subprocess handoff require Darwin openat/fchdir/kqueue")
     home = tmp_path / 'profile'
     home.mkdir(mode=0o700)
     monkeypatch.setenv('HERMES_HOME', str(home))
