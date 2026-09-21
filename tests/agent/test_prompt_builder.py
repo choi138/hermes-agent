@@ -745,7 +745,7 @@ class TestEnvironmentHints:
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         # Force the probe to fail so we exercise the static fallback path
         # deterministically (the live probe would try to spin up docker).
-        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t, **_kw: None)
         _pb._clear_backend_probe_cache()
         result = _pb.build_environment_hints()
         # Host suppression: none of the local-backend lines should appear.
@@ -794,7 +794,7 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
 
         class _FakeEnv:
-            def execute(self, cmd, timeout=None):
+            def execute(self, cmd, cwd=None, timeout=None):
                 return {
                     "returncode": 0,
                     "output": (
@@ -820,8 +820,8 @@ class TestEnvironmentHints:
 
         line = _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
-        assert created.get("probe_only") is True
-        assert created.get("cleaned") is True
+        assert created.get("probe_only", False) is False
+        assert not created.get("cleaned", False)
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
@@ -841,14 +841,16 @@ class TestEnvironmentHints:
 
 
 
-    def test_remote_backend_list_covers_known_sandboxes(self):
-        """Regression guard: if someone adds a remote backend, they must list it here."""
+    def test_remote_backends_suppress_controller_metadata(self, monkeypatch):
+        """Every remote backend suppresses host facts even when its probe fails."""
         import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda *a, **k: None)
         for backend in ("docker", "singularity", "modal", "daytona", "ssh", "vercel_sandbox"):
-            assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
-                f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
-                f"info is suppressed in the system prompt"
-            )
+            monkeypatch.setenv("TERMINAL_ENV", backend)
+            hints = _pb.build_environment_hints()
+            assert f"Terminal backend: {backend}." in hints
+            assert "User home directory:" not in hints
+            assert "Host:" not in hints
 
 
 # =========================================================================

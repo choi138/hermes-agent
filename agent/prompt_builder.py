@@ -1149,37 +1149,10 @@ WSL_ENVIRONMENT_HINT = (
 )
 
 
-# Non-local terminal backends that run commands (and therefore every file
-# tool: read_file, write_file, patch, search_files) inside a separate
-# container / remote host rather than on the machine where Hermes itself
-# runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
-# misleading — the agent should only see the machine it can actually touch.
-_REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
-})
-
-
 # Per-backend fallback descriptions — used when the live probe fails.
 # Only states what we know from the backend choice itself (container type,
 # likely OS family). Does NOT invent cwd, user, or $HOME — the agent is
 # told to probe those directly if it needs them.
-def _plugin_backend_is_remote(backend: str) -> bool:
-    """Whether a plugin-registered terminal backend runs commands remotely.
-
-    Fail-soft: unknown names return False (treated as local, matching the
-    historical behavior for unrecognized TERMINAL_ENV values).
-    """
-    if not backend or backend in _REMOTE_TERMINAL_BACKENDS or backend == "local":
-        return False
-    try:
-        from agent.terminal_env_registry import provider_flag
-
-        return bool(provider_flag(backend, "is_remote", False))
-    except Exception:
-        return False
-
-
 def _plugin_backend_description(backend: str) -> str | None:
     """Prompt fallback description declared by a plugin backend, if any."""
     try:
@@ -1205,11 +1178,12 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 
 
 # Cache the backend probe result per process so we only pay the probe cost
-# on the first prompt build of a session. Keyed by (env_type, cwd_hint) so
-# a mid-process backend switch rebuilds the string. Kept in-module (not on
+# on the first prompt build of a session. Keyed by resolved target, profile,
+# session, cwd, and (for live environments) instance. Kept in-module (not on
 # disk) because the probe captures live backend state that may change
 # across Hermes restarts.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+_BACKEND_PROBE_CACHE: OrderedDict[tuple, str] = OrderedDict()
+_BACKEND_PROBE_CACHE_LOCK = threading.Lock()
 
 
 def _windows_marketing_version() -> str:
@@ -1256,122 +1230,28 @@ _WINDOWS_BASH_SHELL_HINT = (
 )
 
 
-def _probe_remote_backend(env_type: str) -> str | None:
-    """Run a tiny introspection command inside the active terminal backend.
+def _probe_remote_backend(env_type: str, *, task_id=None, backend=None) -> str | None:
+    """Probe the owning backend; only reuse state for the same target/session."""
+    from agent.prompt_backend import read_backend, resolve_prompt_backend
 
-    Returns a pre-formatted multi-line string describing the backend's OS,
-    $HOME, cwd, and user — or None if the probe failed. Result is cached
-    per process. Used only for non-local backends where the agent's tools
-    operate on a different machine than the host Hermes runs on.
-    """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
-    cache_key = (env_type, cwd_hint)
-    cached = _BACKEND_PROBE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached or None
+    backend = backend or resolve_prompt_backend(task_id)
+    cache_key = backend.cache_key()
+    with _BACKEND_PROBE_CACHE_LOCK:
+        cached = _BACKEND_PROBE_CACHE.get(cache_key)
+        if cached is not None:
+            _BACKEND_PROBE_CACHE.move_to_end(cache_key)
+            return cached
 
-    env = None
-    try:
-        # Import locally: tools/ imports are heavy and only relevant when a
-        # non-local backend is actually configured.
-        from tools.terminal_tool import _create_environment, _get_env_config  # type: ignore
-    except Exception as e:
-        logger.debug("Backend probe unavailable (import failed): %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
+    probe_cmd = (
+        "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
+        "\"$(uname -s 2>/dev/null || echo unknown)\" "
+        "\"$(uname -r 2>/dev/null || echo unknown)\" "
+        "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
+    )
+    result = read_backend(backend, lambda execute: execute(probe_cmd))
+    if not result or result.get("returncode") != 0:
         return None
-
-    try:
-        config = _get_env_config()
-        # Build the environment the same way tools/terminal_tool.py does for a
-        # live command: select the backend image, then assemble ssh/container
-        # config from the env-derived dict. (There is no `get_environment`
-        # factory — the real entry point is `_create_environment`.)
-        if env_type == "docker":
-            image = config.get("docker_image", "")
-        elif env_type == "singularity":
-            image = config.get("singularity_image", "")
-        elif env_type == "modal":
-            image = config.get("modal_image", "")
-        elif env_type == "daytona":
-            image = config.get("daytona_image", "")
-        else:
-            image = ""
-
-        ssh_config = None
-        if env_type == "ssh":
-            ssh_config = {
-                "host": config.get("ssh_host", ""),
-                "user": config.get("ssh_user", ""),
-                "port": config.get("ssh_port", 22),
-                "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
-            }
-
-        container_config = None
-        from tools.terminal_tool import _is_container_backend as _is_container
-
-        if _is_container(env_type):
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "modal_mode": config.get("modal_mode", "auto"),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                "docker_forward_env": config.get("docker_forward_env", []),
-                "docker_env": config.get("docker_env", {}),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_extra_args": config.get("docker_extra_args", []),
-                "docker_shm_size": config.get("docker_shm_size", "1g"),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                "docker_shared_container_key": config.get("docker_shared_container_key", ""),
-                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-            }
-
-        env = _create_environment(
-            env_type=env_type,
-            image=image,
-            cwd=config.get("cwd", ""),
-            timeout=config.get("timeout", 180),
-            ssh_config=ssh_config,
-            container_config=container_config,
-            task_id="prompt-backend-probe",
-            host_cwd=config.get("host_cwd"),
-            probe_only=True,
-        )
-        # Single-line POSIX probe — works on any Unixy backend. Wrapped in
-        # `2>/dev/null` so a missing binary doesn't pollute the output.
-        probe_cmd = (
-            "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
-            "\"$(uname -s 2>/dev/null || echo unknown)\" "
-            "\"$(uname -r 2>/dev/null || echo unknown)\" "
-            "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
-        )
-        result = env.execute(probe_cmd, timeout=4)
-        if result.get("returncode") != 0:
-            logger.debug("Backend probe returned non-zero: %r", result)
-            _BACKEND_PROBE_CACHE[cache_key] = ""
-            return None
-        output = (result.get("output") or "").strip()
-        if not output:
-            _BACKEND_PROBE_CACHE[cache_key] = ""
-            return None
-    except Exception as e:
-        logger.debug("Backend probe failed: %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
-        return None
-    finally:
-        # Probe environments are never registered in terminal_tool's active
-        # environment map, so the normal session cleanup cannot see them.
-        # Close explicitly; otherwise BaseEnvironment.__del__ may run much
-        # later during interpreter teardown.  SSH probe_only mode makes this a
-        # connection-only close with no ~/.hermes sync-back.
-        if env is not None:
-            try:
-                env.cleanup()
-            except Exception:
-                logger.debug("Backend probe cleanup failed", exc_info=True)
+    output = (result.get("output") or "").strip()
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}
@@ -1392,20 +1272,24 @@ def _probe_remote_backend(env_type: str) -> str | None:
         pieces.append(f"Working directory: {parsed['cwd']}")
 
     if not pieces:
-        _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
     formatted = "\n".join(f"  {p}" for p in pieces)
-    _BACKEND_PROBE_CACHE[cache_key] = formatted
+    with _BACKEND_PROBE_CACHE_LOCK:
+        # Creating a sandbox may have established its instance identity.
+        _BACKEND_PROBE_CACHE[backend.cache_key()] = formatted
+        while len(_BACKEND_PROBE_CACHE) > 128:
+            _BACKEND_PROBE_CACHE.popitem(last=False)
     return formatted
 
 
 def _clear_backend_probe_cache() -> None:
     """Test helper — drop the backend probe cache so monkeypatched backends take effect."""
-    _BACKEND_PROBE_CACHE.clear()
+    with _BACKEND_PROBE_CACHE_LOCK:
+        _BACKEND_PROBE_CACHE.clear()
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(task_id=None) -> str:
     """Return environment-specific guidance for the system prompt.
 
     Always emits a factual block describing the execution environment:
@@ -1426,8 +1310,11 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
-    is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
+    from agent.prompt_backend import resolve_prompt_backend
+
+    resolved = resolve_prompt_backend(task_id)
+    backend = resolved.kind
+    is_remote_backend = resolved.is_remote
 
     if not is_remote_backend:
         # --- Host info block (local backend: host == where tools run) ---
@@ -1444,7 +1331,7 @@ def build_environment_hints() -> str:
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
+            host_lines.append(f"Current working directory: {resolved.cwd}")
         except OSError:
             pass
 
@@ -1463,7 +1350,7 @@ def build_environment_hints() -> str:
             hints.append(_WINDOWS_BASH_SHELL_HINT)
     else:
         # --- Remote backend block (host info suppressed) ---
-        probe = _probe_remote_backend(backend)
+        probe = _probe_remote_backend(backend, backend=resolved)
         if probe:
             hints.append(
                 f"Terminal backend: {backend}. Your `terminal`, `read_file`, "
@@ -2482,6 +2369,7 @@ def build_context_files_prompt(
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
     home_override: "Path | None" = None,
+    task_id: Optional[str] = None,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -2501,13 +2389,10 @@ def build_context_files_prompt(
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
     """
-    if cwd is None:
-        cwd = os.getcwd()
-        cwd_is_fallback = True
-    else:
-        cwd_is_fallback = False
+    from agent.prompt_backend import BackendPath, read_backend, resolve_prompt_backend
 
-    cwd_path = Path(cwd).resolve()
+    backend = resolve_prompt_backend(task_id, cwd)
+    cwd_is_fallback = cwd is None
     sections = []
 
     # Never let a FALLBACK-picked directory inside the Hermes install/source
@@ -2520,25 +2405,30 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if (
+    if backend.is_remote:
+        project_context = read_backend(
+            backend,
+            lambda execute: _load_project_context(
+                BackendPath.working_directory(execute), context_length,
+            ),
+        ) or ""
+    elif (
         cwd_is_fallback
         and not allow_install_tree_fallback
-        and _is_install_tree(cwd_path)
+        and _is_install_tree(Path(os.getcwd()))
     ):
         logger.warning(
             "skipping project-context discovery: working-directory resolution "
             "fell back to the Hermes install tree (%s) — set terminal.cwd to "
             "your project directory",
-            cwd_path,
+            os.getcwd(),
         )
         project_context = ""
     else:
-        # Priority-based project context: first match wins
+        cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
         project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
+            _load_project_context(cwd_path, context_length)
+            if cwd_path.is_dir() else ""
         )
     if project_context:
         sections.append(project_context)
@@ -2552,3 +2442,13 @@ def build_context_files_prompt(
     if not sections:
         return ""
     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+
+
+def _load_project_context(cwd_path, context_length=None):
+    # Share precedence, traversal, scanning, and truncation across namespaces.
+    return (
+        _load_hermes_md(cwd_path, context_length)
+        or _load_agents_md(cwd_path, context_length)
+        or _load_claude_md(cwd_path, context_length)
+        or _load_cursorrules(cwd_path, context_length)
+    )

@@ -257,8 +257,8 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
             f"PYTHONDONTWRITEBYTECODE=1 PYTHONPATH={q_dir}"
         )
         started = env.execute(
-            f"cd {q_dir} && nohup env {env_prefix} python3 kernel_runner.py "
-            f"> {q_dir}/runner.log 2>&1 & echo PID:$!",
+            f"cd {q_dir} && {{ nohup env {env_prefix} python3 kernel_runner.py "
+            f"> {q_dir}/runner.log 2>&1 & echo PID:$!; }}",
             cwd="/", timeout=20,
         )
         pid = ""

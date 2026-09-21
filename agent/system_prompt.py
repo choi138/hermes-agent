@@ -56,6 +56,7 @@ from agent.prompt_builder import (
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from pathlib import Path
+from contextlib import contextmanager
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,25 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
     re.MULTILINE,
 )
+
+
+@contextmanager
+def _prompt_profile_scope(agent):
+    """Use the owning profile even on a worker that lost its home binding."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    home = _agent_home(agent)
+    token = set_hermes_home_override(home) if home is not None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _agent_context_cwd(agent):
+    with _prompt_profile_scope(agent):
+        return resolve_context_cwd(task_id=agent.session_id or None)
 
 
 def _ra():
@@ -163,7 +183,7 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
 def _plugin_session_info(agent: Any) -> Dict[str, str]:
     """Return immutable-at-render-time metadata exposed to prompt sections."""
     try:
-        cwd = str(resolve_context_cwd() or "")
+        cwd = str(_agent_context_cwd(agent) or "")
     except Exception:
         cwd = ""
     try:
@@ -493,7 +513,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
             _compact_cats = coding_compact_skill_categories(
                 platform=agent.platform,
-                cwd=resolve_context_cwd(),
+                cwd=_agent_context_cwd(agent),
             )
         except Exception:
             _compact_cats = frozenset()
@@ -678,7 +698,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.coding_context import coding_compact_skill_categories
 
             _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+                platform=agent.platform, cwd=_agent_context_cwd(agent)
             )
         except Exception:
             _compact_cats = frozenset()
@@ -719,8 +739,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
-    # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    # Frozen with this conversation's prompt; resolved from its own backend.
+    with _prompt_profile_scope(agent):
+        _env_hints = _r.build_environment_hints(task_id=agent.session_id or None)
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -737,7 +758,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
             coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
                 platform=agent.platform,
-                cwd=resolve_context_cwd(),
+                cwd=_agent_context_cwd(agent),
                 model=agent.model,
                 valid_tool_names=agent.valid_tool_names,
             )
@@ -940,7 +961,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
-        context_cwd = resolve_context_cwd()
+        context_cwd = _agent_context_cwd(agent)
         if getattr(agent, "_context_cwd_is_launch_artifact", False):
             # Desktop session creation pins the backend launch directory so
             # tools have a deterministic cwd even when the user picked no
@@ -948,11 +969,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # see it as the fallback it really is. The install-tree guard can
             # then reject Hermes's bundled contributor AGENTS.md (#97448).
             context_cwd = None
-        context_files_prompt = _r.build_context_files_prompt(
-            cwd=context_cwd, skip_soul=_soul_loaded,
-            context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent))
+        with _prompt_profile_scope(agent):
+            context_files_prompt = _r.build_context_files_prompt(
+                cwd=context_cwd, skip_soul=_soul_loaded,
+                context_length=_ctx_len,
+                allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+                home_override=_agent_home(agent), task_id=agent.session_id or None)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 

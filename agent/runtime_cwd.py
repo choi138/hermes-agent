@@ -13,7 +13,7 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 import logging
 import os
 from contextvars import ContextVar, Token
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -73,28 +73,22 @@ def resolve_agent_cwd() -> Path:
     return Path(os.getcwd())
 
 
-def resolve_context_cwd() -> Path | None:
-    # None means "no configured cwd": build_context_files_prompt then falls back
-    # to the launch dir (os.getcwd()), correct for a local CLI launched inside a
-    # real project. A configured path is validated here (previously it was passed
-    # through unchecked, diverging from resolve_agent_cwd). An explicitly
-    # configured path is otherwise honored verbatim — including the Hermes
-    # source tree itself, which is a legitimate workspace when the user is
-    # developing Hermes (per-surface policy for fallback-picked directories
-    # lives in build_context_files_prompt; see #64590).
-    override = _session_cwd_override()
-    if override:
-        p = Path(override).expanduser()
-        if not p.is_dir():
-            logger.warning("configured working directory does not exist: %s", override)
-        else:
-            return p
-        return None
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if not p.is_dir():
-            logger.warning("TERMINAL_CWD does not exist: %s", raw)
-        else:
-            return p
-    return None
+def resolve_context_cwd(task_id=None) -> Path | PurePosixPath | None:
+    """Keep an explicit workspace even when it cannot be read here.
+
+    Only an unconfigured LOCAL workspace may fall back to the launch dir.
+    Remote names (including ``~``) must be resolved by the terminal backend.
+    Missing explicit paths must not become the ``None`` fallback sentinel.
+    """
+    from agent.prompt_backend import resolve_prompt_backend
+    from tools import terminal_tool as tt
+
+    backend = resolve_prompt_backend(task_id)
+    if backend.is_remote:
+        return PurePosixPath(backend.cwd)
+    raw = (
+        tt.get_session_cwd(backend.task_id)
+        or tt.resolve_task_overrides(backend.task_id).get("cwd") or _session_cwd_override()
+        or tt._terminal_env_values().get("TERMINAL_CWD", "").strip()
+    )
+    return Path(raw).expanduser() if raw else None
