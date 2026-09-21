@@ -2115,6 +2115,7 @@ def _format_facts_with_count(
     kept_facts_out: List[Dict[str, Any]] | None = None,
     log_recall: bool = True,
     allow_association_expansion: bool = False,
+    include_history: bool = False,
 ) -> tuple[str, int, int]:
     lines = [
         "# Graphiti Recall (read-only historical context)",
@@ -2129,7 +2130,9 @@ def _format_facts_with_count(
         for term in (identity_terms or set())
         if (normalized := _normalize_text(term))
     }
-    include_history = _wants_temporal_history(query)
+    # Explicit/automatic date bounds already constrain the adapter search.
+    # Preserve that intent even when the semantic query has no history keyword.
+    include_history = include_history or _wants_temporal_history(query)
     # Gate BEFORE the history reordering: the reserved history slots must not
     # let low-relevance dead facts bypass the relevance gate.
     gated_facts = _score_gate(facts)
@@ -2793,6 +2796,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             context, _, strong_overlap_count = _format_facts_with_count(
                 facts,
                 query=search_query,
+                include_history=window is not None,
                 builtin_memory=self._builtin_memory,
                 identity_terms=self._identity_terms,
             )
@@ -2805,6 +2809,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             ) = _format_facts_with_count(
                 facts,
                 query=search_query,
+                include_history=window is not None,
                 builtin_memory=self._builtin_memory,
                 identity_terms=self._identity_terms,
                 kept_facts_out=kept_anchor_facts,
@@ -2831,6 +2836,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
                 context, _, strong_overlap_count = _format_facts_with_count(
                     [*kept_anchor_facts, *expansion_facts],
                     query=search_query,
+                    include_history=window is not None,
                     builtin_memory=self._builtin_memory,
                     identity_terms=self._identity_terms,
                     allow_association_expansion=True,
@@ -3010,6 +3016,7 @@ class GraphitiCanonicalMemoryProvider(MemoryProvider):
             ) = _format_facts_with_count(
                 facts,
                 query=query,
+                include_history=window is not None,
                 builtin_memory=self._builtin_memory,
                 identity_terms=self._identity_terms,
                 max_facts=max_facts,
