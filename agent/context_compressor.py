@@ -5558,8 +5558,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             if not content.strip():
                 raise RuntimeError(
                     "Context compression LLM returned empty content "
-                    f"(provider={self.provider or 'auto'} "
-                    f"model={self.summary_model or self.model})"
+                    f"(provider={_aux_provider or 'auto'} "
+                    f"model={_aux_model})"
                 )
             # A finish_reason of "length" means the summarizer hit its output
             # token cap mid-generation: the text present is PARTIAL. Persisting
@@ -5575,8 +5575,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "Context compression summary was truncated "
                     f"({_TRUNCATED_SUMMARY_MARKER}): generation hit the output "
                     "token cap and the summary is incomplete "
-                    f"(provider={self.provider or 'auto'} "
-                    f"model={self.summary_model or self.model})"
+                    f"(provider={_aux_provider or 'auto'} "
+                    f"model={_aux_model})"
                 )
             # Strip reasoning blocks the summarizer model may have emitted
             # (<think>...</think> etc. from thinking models like MiniMax,

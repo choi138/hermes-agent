@@ -332,6 +332,18 @@ class AuxiliaryExplicitCancellation(BaseException):
         super().__init__("auxiliary request explicitly cancelled by host")
 
 
+class AuxiliaryResponseError(RuntimeError):
+    """An unusable provider result, with its terminal failure details intact."""
+
+    def __init__(self, message: str, *, status=None, error=None,
+                 incomplete_details=None, model=None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error = error
+        self.incomplete_details = incomplete_details
+        self.model = model
+
+
 def _aux_interrupt_protected() -> bool:
     return bool(getattr(_aux_interrupt_protection, "active", False))
 
@@ -1579,6 +1591,33 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        # Cached SDK clients carry credentials and routing, but a watchdog
+        # cannot abort their shared pool without interrupting other sessions.
+        # Give each Responses request its own transport. with_options retains
+        # SDK headers, auth callbacks, organization and query configuration;
+        # the new HTTP client retains Hermes proxy/TLS policy. Only the owning
+        # request thread releases its FDs, including on failed header reads.
+        if callable(getattr(self._client, "with_options", None)) and isinstance(
+            self._client, _load_openai_cls()
+        ):
+            from openai import DefaultHttpxClient
+
+            http_kwargs = _openai_http_client_kwargs(str(self._client.base_url))
+            http_client = http_kwargs.get("http_client") or DefaultHttpxClient()
+            try:
+                request_client = self._client.with_options(http_client=http_client)
+            except BaseException:
+                http_client.close()
+                raise
+            try:
+                return _CodexCompletionsAdapter(request_client, self._model)._create(
+                    _owns_transport=True, **kwargs
+                )
+            finally:
+                request_client.close()
+        return self._create(**kwargs)
+
+    def _create(self, *, _owns_transport: bool = False, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -1834,10 +1873,6 @@ class _CodexCompletionsAdapter:
         progress_deadline = [_start_monotonic + no_progress_timeout]
         saw_content = threading.Event()
         timed_out = threading.Event()
-        # Set only when the timeout WON the attempt (not when the owner
-        # hard-cancelled first): tells the owning thread's ``finally`` that
-        # the shared client's FDs still need a real close (#29507).
-        timeout_release_pending = threading.Event()
         stream_finished = threading.Event()
         timeout_timer: List[Optional[threading.Timer]] = [None]
         # A protected provider call may outlive its owning compression attempt:
@@ -1850,10 +1885,6 @@ class _CodexCompletionsAdapter:
         )
         attempt_stream_lock = threading.Lock()
         attempt_stream: List[Any] = []
-        # The thread driving this request owns its transport's file
-        # descriptors — see the FD-ownership note in _close_client_on_timeout.
-        owner_tid = threading.get_ident()
-
         def _effective_deadline() -> float:
             with deadline_lock:
                 return min(hard_deadline, progress_deadline[0])
@@ -1883,7 +1914,7 @@ class _CodexCompletionsAdapter:
                 f"({elapsed:.1f}s elapsed)"
             )
 
-        def _close_client_on_timeout() -> None:
+        def _abort_request_on_timeout() -> None:
             begin_timeout_cleanup = getattr(
                 protected_cancel_check, "begin_timeout_cleanup", None
             )
@@ -1897,65 +1928,23 @@ class _CodexCompletionsAdapter:
             # Publish transport timeout only after the attempt-local decision is
             # fixed, so owner polling cannot observe completion in between.
             timed_out.set()
-            if not timeout_won:
-                # The request owner already hard-cancelled this attempt. The
-                # OpenAI client is process-shared, so closing/evicting it here
-                # would disrupt unrelated sessions. Wake only this attempt's
-                # event stream when responses.create() returned one in time;
-                # otherwise rely on the bounded SDK/provider timeout.
-                with attempt_stream_lock:
-                    stream = attempt_stream[0] if attempt_stream else None
-                close_stream = getattr(stream, "close", None)
-                if callable(close_stream):
-                    try:
-                        close_stream()
-                    except Exception:
-                        logger.debug(
-                            "Codex auxiliary: cancelled attempt stream close "
-                            "during timeout failed",
-                            exc_info=True,
-                        )
-                return
-            # FD-ownership contract (#29507 / #67142 / #70773): only the
-            # thread driving the request may RELEASE this client's file
-            # descriptors. This callback has two callers — ``_check_cancelled``
-            # on the owning thread, and the daemon watchdog ``threading.Timer``,
-            # which is a stranger thread. From a stranger thread we may only
-            # ``shutdown()`` the pooled sockets: ``close()`` releases the raw
-            # TLS fd while the owner's OpenSSL BIO still caches that integer,
-            # the kernel recycles it into the next ``open()`` in this process
-            # (a SessionDB / kanban.db handle), and the owner's unwinding TLS
-            # flush writes an application-data record into that database file.
-            # ``shutdown()`` from any thread is FD-safe; ``close()`` is not.
-            # The owning thread performs the real close in the ``finally``
-            # below, which is where the FD release belongs.
-            timeout_release_pending.set()
-            if threading.get_ident() == owner_tid:
-                close = getattr(self._client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
-            else:
+            if _owns_transport:
+                # shutdown wakes blocked TLS reads without releasing the FD on
+                # this watchdog thread (#29507). This pool belongs ONLY to the
+                # current request. Its owner closes it after stream unwinding.
                 try:
                     from agent.agent_runtime_helpers import force_close_tcp_sockets
 
                     shutdown_count = force_close_tcp_sockets(self._client)
                     logger.info(
-                        "Codex auxiliary client aborted (timeout, tcp_force_closed=%d, "
-                        "deferred_close=stranger_thread)",
-                        shutdown_count,
+                        "Codex auxiliary request aborted (%s, request_tcp_shutdown=%d)",
+                        "timeout" if timeout_won else "cancel", shutdown_count,
                     )
                 except Exception:
-                    logger.debug("Codex auxiliary: client abort during timeout failed", exc_info=True)
-                # Socket shutdown wakes a reader blocked on a REAL transport,
-                # but the owner may be blocked inside the SDK's event stream
-                # (or a test double with no sockets). Closing the attempt-
-                # owned stream is the same attempt-scoped wake the hard-cancel
-                # branch above performs from this Timer thread — it releases
-                # the owner without touching the shared client's FDs; the
-                # owner then does the real close in its ``finally``.
+                    logger.debug("Codex auxiliary: request abort failed", exc_info=True)
+            else:
+                # Non-SDK compatibility clients expose only the request stream;
+                # never close or evict their potentially shared client object.
                 with attempt_stream_lock:
                     stream = attempt_stream[0] if attempt_stream else None
                 close_stream = getattr(stream, "close", None)
@@ -1963,26 +1952,12 @@ class _CodexCompletionsAdapter:
                     try:
                         close_stream()
                     except Exception:
-                        logger.debug(
-                            "Codex auxiliary: attempt stream close during "
-                            "stranger-thread timeout failed",
-                            exc_info=True,
-                        )
-            # The cached auxiliary client wraps this same ``self._client``
-            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
-            # this instance).  After we close the httpx transport above, the
-            # cache must drop that entry — otherwise the next auxiliary call
-            # (compression retry, memory flush, etc.) reuses the dead client
-            # and fails fast with a connection error.  See issue #23432.
-            try:
-                _evict_cached_client_instance(self._client)
-            except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+                        logger.debug("Codex auxiliary: request stream abort failed", exc_info=True)
 
         def _check_cancelled() -> None:
             if total_timeout is not None and time.monotonic() >= _effective_deadline():
                 if not timed_out.is_set():
-                    _close_client_on_timeout()
+                    _abort_request_on_timeout()
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
@@ -2007,6 +1982,8 @@ class _CodexCompletionsAdapter:
             # since this timer was scheduled, reschedule instead of killing
             # a live stream. Only kill when the effective deadline (progress
             # window or hard ceiling, whichever is sooner) has truly passed.
+            if stream_finished.is_set() or timed_out.is_set():
+                return
             remaining = _effective_deadline() - time.monotonic()
             if remaining > 0:
                 if timed_out.is_set() or stream_finished.is_set():
@@ -2016,7 +1993,7 @@ class _CodexCompletionsAdapter:
                 timeout_timer[0] = t
                 t.start()
                 return
-            _close_client_on_timeout()
+            _abort_request_on_timeout()
 
         try:
             if total_timeout:
@@ -2113,8 +2090,23 @@ class _CodexCompletionsAdapter:
                 with attempt_stream_lock:
                     attempt_stream.clear()
 
+            _check_cancelled()
             if final is None:
-                raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
+                raise AuxiliaryResponseError(
+                    "Auxiliary Codex: LLM returned invalid response (missing terminal response)",
+                    model=model,
+                )
+            status = _event_field(final, "status")
+            if status in {"failed", "incomplete", "cancelled"}:
+                error = _event_field(final, "error")
+                incomplete = _event_field(final, "incomplete_details")
+                raise AuxiliaryResponseError(
+                    "Auxiliary Codex: LLM returned invalid response "
+                    f"(model={model} status={status} "
+                    f"code={_event_field(error, 'code')} "
+                    f"reason={_event_field(incomplete, 'reason')})",
+                    status=status, error=error, incomplete_details=incomplete, model=model,
+                )
 
             # Extract text and tool calls from the Responses output.
             # Items may be SimpleNamespace (raw-event path) or dicts
@@ -2162,22 +2154,6 @@ class _CodexCompletionsAdapter:
             _t = timeout_timer[0]
             if _t is not None:
                 _t.cancel()
-            # A stranger-thread timeout only shut the sockets down; the FDs
-            # are still open and this — the owning thread, now unwound — is
-            # the one context that may release them (#29507). Gated on
-            # timeout_release_pending, NOT timed_out: in the hard-cancel
-            # branch (timeout_won=False) the shared client must stay usable
-            # for other sessions.
-            if timeout_release_pending.is_set():
-                close = getattr(self._client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        logger.debug(
-                            "Codex auxiliary: owner-thread close after timeout failed",
-                            exc_info=True,
-                        )
 
         content = "".join(text_parts).strip() or None
 
@@ -4660,6 +4636,26 @@ def _is_auth_error(exc: Exception) -> bool:
     return False
 
 
+def _is_harness_rejection_error(exc: Exception) -> bool:
+    """Detect Anthropic client-harness rejection (403 ``harness_not_allowed``).
+
+    Anthropic keys provisioned for a specific client harness (e.g. Claude
+    Code OAuth keys, and relays fronting them such as claude.nekos.me)
+    return HTTP 403 ``permission_error`` with code ``harness_not_allowed``
+    ("This API key does not allow the detected client harness" / "The client
+    harness could not be recognized") for any request whose client the
+    upstream cannot recognize. This is provider-wide and persistent — no
+    request against that provider can succeed regardless of model, so it
+    must trigger provider fallback like a payment/capacity error rather
+    than aborting the auxiliary task.
+    """
+    err_lower = str(exc).lower()
+    if "harness_not_allowed" in err_lower:
+        return True
+    status = getattr(exc, "status_code", None)
+    return status == 403 and "client harness" in err_lower
+
+
 def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
     """Detect provider 400s for an unsupported request parameter.
 
@@ -4871,6 +4867,8 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     need ``choices[0].message`` and should be able to continue through the
     same fallback path as explicit model-incompatibility errors.
     """
+    if isinstance(exc, AuxiliaryResponseError):
+        return True
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
@@ -4894,6 +4892,18 @@ def _evict_cached_clients(provider: str) -> None:
             if client is not None:
                 _close_cached_client(client)
             _client_cache.pop(key, None)
+
+
+def _aux_client_is_closed(client: Any) -> bool:
+    """Inspect SDK transport state through the additive provider wrappers."""
+    real = getattr(client, "_real_client", None)
+    for candidate in (client, real):
+        closed = getattr(candidate, "is_closed", False)
+        if callable(closed):
+            closed = closed()
+        if closed is True:
+            return True
+    return False
 
 
 def _evict_cached_client_instance(target: Any) -> bool:
@@ -8323,6 +8333,9 @@ def _get_cached_client(
         model=model,
     )
     with _client_cache_lock:
+        cached_entry = _client_cache.get(cache_key)
+        if cached_entry is not None and _aux_client_is_closed(cached_entry[0]):
+            del _client_cache[cache_key]
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             if async_mode:
@@ -9312,7 +9325,7 @@ def _validate_llm_response(
     keeps the model (read from the response itself) with an empty route.
     """
     if response is None:
-        raise RuntimeError(
+        raise AuxiliaryResponseError(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
     from agent.aux_accounting import record_aux_usage
@@ -9326,17 +9339,31 @@ def _validate_llm_response(
     except (AttributeError, TypeError, IndexError) as exc:
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
-            _record_relay_auxiliary_response_model(response)
-            _complete_relay_auxiliary_call()
-            return recovered
-        response_type = type(response).__name__
-        response_preview = str(response)[:120]
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: LLM returned invalid response "
-            f"(type={response_type}): {response_preview!r}. "
-            f"Expected object with .choices[0].message — check provider "
-            f"adapter or custom endpoint compatibility."
-        ) from exc
+            response = recovered
+        else:
+            response_type = type(response).__name__
+            response_preview = str(response)[:120]
+            raise AuxiliaryResponseError(
+                f"Auxiliary {task or 'call'}: LLM returned invalid response "
+                f"(type={response_type}): {response_preview!r}. "
+                f"Expected object with .choices[0].message — check provider "
+                f"adapter or custom endpoint compatibility."
+            ) from exc
+    if task == "compression":
+        choice = response.choices[0]
+        response_model = getattr(response, "model", None)
+        if not extract_content_or_reasoning(response, max_reasoning_chars=8000).strip():
+            raise AuxiliaryResponseError(
+                "Auxiliary compression: LLM returned empty content "
+                f"(provider={provider or 'auto'} model={response_model})",
+                model=response_model,
+            )
+        if getattr(choice, "finish_reason", None) == "length":
+            raise AuxiliaryResponseError(
+                "Auxiliary compression: LLM returned invalid response "
+                f"(truncated summary, model={response_model}, finish_reason=length)",
+                status="incomplete", model=response_model,
+            )
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response
@@ -9669,6 +9696,7 @@ def _create_with_progress_once(
             or _is_auth_error(exc)
             or _is_payment_error(exc)
             or _is_rate_limit_error(exc)
+            or _is_harness_rejection_error(exc)
         ):
             raise
         # Anything else may be a streaming-specific rejection (explicit
@@ -10331,6 +10359,19 @@ def _call_llm_impl(
                 )
                 time.sleep(_backoff)
                 try:
+                    # Eviction alone cannot refresh this call's local variable.
+                    # Check on every retry; a healthy client keeps its exact
+                    # resolved route, while a closed transport must be rebuilt.
+                    if _aux_client_is_closed(client):
+                        _evict_cached_client_instance(client)
+                        client, _retry_model = _get_cached_client(
+                            resolved_provider, resolved_model,
+                            base_url=resolved_base_url, api_key=resolved_api_key,
+                            api_mode=resolved_api_mode, main_runtime=main_runtime,
+                            is_vision=(task == "vision"), task=task,
+                        )
+                        if client is None:
+                            raise _last_transient
                     return _validate_llm_response(
                         _relay_sync_completion(
                             client,
@@ -10681,6 +10722,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_harness_rejection_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10705,9 +10747,18 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_harness_rejection_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
-            if _is_auth_error(first_err):
+            if _is_harness_rejection_error(first_err):
+                reason = "harness rejected"
+                # Provider-wide and persistent (key gated to a specific
+                # client harness) — mark unhealthy so subsequent aux calls
+                # skip the doomed RTT, same as payment exhaustion.
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
+                )
+            elif _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
                 reason = "payment error"
@@ -10738,7 +10789,7 @@ def _call_llm_impl(
             # a sibling model can't recover; keep skipping the whole
             # provider so the main-agent-model safety net is still reached.
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                None if reason in ("auth error", "payment error", "harness rejected") else final_model
             )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
@@ -11446,6 +11497,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_harness_rejection_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -11462,9 +11514,18 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_harness_rejection_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
-            if _is_auth_error(first_err):
+            if _is_harness_rejection_error(first_err):
+                reason = "harness rejected"
+                # Provider-wide and persistent (key gated to a specific
+                # client harness) — mark unhealthy so subsequent aux calls
+                # skip the doomed RTT, same as payment exhaustion.
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                )
+            elif _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
                 reason = "payment error"
@@ -11491,7 +11552,7 @@ async def _async_call_llm_impl(
             # a sibling model can't recover; keep skipping the whole
             # provider so the main-agent-model safety net is still reached.
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                None if reason in ("auth error", "payment error", "harness rejected") else final_model
             )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set

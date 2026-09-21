@@ -194,8 +194,8 @@ class TestNoProgressFailFast:
                 t.join(timeout=5.0)
             assert isinstance(owner_result.get("exc"), TimeoutError)
             assert "no-progress timeout" in str(owner_result["exc"])
-            # The OWNER released the FDs on unwind.
-            assert closed_by == [owner_result["tid"]], closed_by
+            # Neither watchdog nor owner may close this shared client.
+            assert not closed_by, closed_by
         finally:
             release.set()
 

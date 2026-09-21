@@ -726,7 +726,11 @@ class CompressionCommitFence:
         seconds = float(seconds)
         if seconds <= 0:
             raise ValueError("total compression ceiling must be positive")
-        self._deadline = time.monotonic() + seconds
+        self.set_total_deadline(time.monotonic() + seconds)
+
+    def set_total_deadline(self, deadline: float) -> None:
+        """Share an absolute deadline across primary and fallback attempts."""
+        self._deadline = float(deadline)
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -1011,7 +1015,10 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
         future.result(timeout=grace)
         return True
     except concurrent.futures.TimeoutError:
-        return False
+        # result() uses the same exception for an unfinished wait and a
+        # completed worker that raised TimeoutError (e.g. its shared deadline
+        # expired before dispatch). Only the former can retain a live lease.
+        return future.done()
     except concurrent.futures.CancelledError:
         # Never started; nothing can be in flight.
         return True
@@ -1296,6 +1303,7 @@ def _retry_compression_on_fallback_chain(
     system_prompt_fallback: Any,
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
+    total_deadline: float,
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
     on_timeout_cause: Optional[Callable[[bool, bool], None]] = None,
     telemetry_agent: Any = None,
@@ -1308,11 +1316,10 @@ def _retry_compression_on_fallback_chain(
     the attempt raised, or it produced no compression either — the caller then
     degrades exactly as it did before.
 
-    The retry is bounded the same way the primary was: silence for one idle
-    window ends it, while a fallback that is streaming keeps its ceiling. The
+    The retry shares the primary's absolute total deadline. The
     entry's own ``timeout`` (when declared) sets that idle window, so a
-    fallback tuned for a slower-but-healthy backend is not held to a deadline
-    the stalled primary defined (#62452 semantics, applied to the stall path).
+    slower fallback can use its own idle tolerance within the remaining total
+    budget (#62452 semantics, bounded by the host's overall deadline).
 
     Known limitation (accepted, #96634 review): the retry re-runs the COMPLETE
     worker, which repeats memory/plugin pre-compression callbacks. Built-in
@@ -1327,8 +1334,10 @@ def _retry_compression_on_fallback_chain(
     if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
         return None
 
+    if time.monotonic() >= total_deadline:
+        return None
     route = resolve_compression_fallback_route()
-    if route is None:
+    if route is None or time.monotonic() >= total_deadline:
         return None
 
     # The aborted fence refuses every future commit, so the retry needs a
@@ -1354,7 +1363,6 @@ def _retry_compression_on_fallback_chain(
         )
         retry_fence = CompressionCommitFence()
     idle = float(route.get("timeout") or idle_timeout_seconds)
-    ceiling = max(float(total_ceiling_seconds), idle)
     logger.warning(
         "Context compression stalled on the configured summary route — "
         "retrying once on %s (%s) before continuing without compression",
@@ -1370,7 +1378,8 @@ def _retry_compression_on_fallback_chain(
                 messages=messages,
                 system_prompt_fallback=system_prompt_fallback,
                 idle_timeout_seconds=idle,
-                total_ceiling_seconds=ceiling,
+                total_ceiling_seconds=total_ceiling_seconds,
+                _total_deadline=total_deadline,
                 on_commit_overrun=on_commit_overrun,
                 on_timeout_cause=on_timeout_cause,
                 fence=retry_fence,
@@ -1416,12 +1425,14 @@ def run_compress_context_with_progress_timeout(
     telemetry_agent: Any = None,
     stall_fallback: bool = True,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
+    _total_deadline: float | None = None,
 ) -> Tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware timeout.
 
     The idle budget is inactivity-based (same idea as gateway session hygiene):
     streamed summary progress via :meth:`CompressionCommitFence.touch_progress`
-    extends the wait. A hard ceiling still bounds a degenerate trickle stream.
+    extends the wait. A single hard ceiling bounds primary work, retries and
+    fallback work, including a degenerate trickle stream.
 
     When cancellation wins before the commit boundary, returns
     ``(messages, system_prompt_fallback)`` immediately and leaves the worker
@@ -1474,10 +1485,19 @@ def run_compress_context_with_progress_timeout(
             return system_prompt_fallback()
         return system_prompt_fallback
 
-    ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
+    # Clamp only the initial configuration. A fallback's larger idle window
+    # must never extend the already-running total budget.
+    ceiling = float(total_ceiling_seconds)
+    if _total_deadline is None:
+        ceiling = max(ceiling, float(idle_timeout_seconds))
+        _total_deadline = time.monotonic() + ceiling
+    wait_started = _total_deadline - ceiling
     idle = float(idle_timeout_seconds)
     fence = fence if fence is not None else CompressionCommitFence()
-    fence.set_total_ceiling_seconds(ceiling)
+    fence.set_total_deadline(_total_deadline)
+    if fence.deadline_exceeded:
+        fence.revoke_commit_admission()
+        return messages, _resolve_fallback_prompt()
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1538,7 +1558,6 @@ def run_compress_context_with_progress_timeout(
         _release_compression_admission()
         raise
     future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
@@ -1732,6 +1751,7 @@ def run_compress_context_with_progress_timeout(
                 system_prompt_fallback=system_prompt_fallback,
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=ceiling,
+                total_deadline=_total_deadline,
                 on_commit_overrun=on_commit_overrun,
                 on_timeout_cause=on_timeout_cause,
                 telemetry_agent=telemetry_agent,
@@ -1739,6 +1759,8 @@ def run_compress_context_with_progress_timeout(
             )
             if recovered is not None:
                 return recovered
+        waited = time.monotonic() - wait_started
+        since_progress = fence.seconds_since_progress()
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)

@@ -66,10 +66,8 @@ def _adapter_with_recording_client(stream):
 
 
 class TestCodexAuxiliaryTimeoutFdOwnership:
-    def test_stalled_stream_timeout_shuts_down_from_timer_and_closes_from_owner(self):
-        """The watchdog Timer fires on a stalled stream: it may only
-        shutdown(); the real close() must land on the owning thread in the
-        adapter's ``finally``."""
+    def test_stalled_stream_timeout_never_touches_shared_pool(self):
+        """Even FD-safe shutdown is forbidden on a shared transport pool."""
 
         def _stalled():
             deadline = time.monotonic() + 30.0
@@ -78,7 +76,6 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
                 yield SimpleNamespace(type="response.in_progress")
 
         adapter, events = _adapter_with_recording_client(_stalled())
-        owner_tid = threading.get_ident()
 
         def _consume(stream, *, model, on_event):
             del model
@@ -99,23 +96,13 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
 
         # Give the daemon Timer thread a beat to finish its callback.
         time.sleep(0.2)
-        actions = [a for a, _ in events]
-        # Stranger thread (Timer) only shut the sockets down.
-        shutdown_tids = {tid for a, tid in events if a == "shutdown"}
-        assert "shutdown" in actions, events
-        assert owner_tid not in shutdown_tids, "shutdown ran on owner thread"
-        # close() from a stranger thread is the corruption vector — banned.
-        stranger_closes = [
-            (a, tid) for a, tid in events
-            if a in {"client.close", "sock.close"} and tid != owner_tid
-        ]
-        assert not stranger_closes, f"stranger-thread FD release: {stranger_closes}"
-        # The owning thread released the FDs on unwind.
-        assert ("client.close", owner_tid) in events, events
+        # No thread may shutdown or close a socket from the SHARED pool.
+        # Real per-request transport ownership is exercised over HTTP in
+        # test_auxiliary_request_recovery.py.
+        assert events == []
 
-    def test_owner_thread_deadline_hit_closes_directly(self):
-        """When the OWNING thread detects the deadline in _check_cancelled,
-        it may close() directly — no shutdown-only detour required."""
+    def test_owner_thread_deadline_hit_never_closes_shared_pool(self):
+        """An owner-side timeout also leaves the shared transport untouched."""
 
         def _one_keepalive_then_block():
             yield SimpleNamespace(type="response.in_progress")
@@ -123,7 +110,6 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
             yield SimpleNamespace(type="response.in_progress")
 
         adapter, events = _adapter_with_recording_client(_one_keepalive_then_block())
-        owner_tid = threading.get_ident()
 
         def _consume(stream, *, model, on_event):
             del model
@@ -155,6 +141,4 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
                 timeout=300,
             )
 
-        stranger = [(a, t) for a, t in events if t != owner_tid]
-        assert not stranger, f"non-owner activity: {stranger}"
-        assert ("client.close", owner_tid) in events, events
+        assert events == []

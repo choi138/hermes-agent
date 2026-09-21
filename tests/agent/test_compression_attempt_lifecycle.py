@@ -68,7 +68,7 @@ def _messages():
 
 
 class TestWorkerTeardownOnCeiling:
-    def test_cooperative_worker_joined_within_grace(self):
+    def test_cooperative_worker_joined_within_grace(self, monkeypatch):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —
         the sabotage check for this test is removing the
@@ -76,6 +76,20 @@ class TestWorkerTeardownOnCeiling:
         `worker_done.is_set()` False when the host returns."""
         original = [{"role": "user", "content": "keep"}]
         worker_done = threading.Event()
+        join_entered = threading.Event()
+        from agent import conversation_compression as compression
+        from tools.thread_context import propagate_context_to_thread
+
+        # This test needs an admitted worker. Warm the lazy context imports
+        # before its tiny deadline; setup now counts against the total budget.
+        propagate_context_to_thread(lambda: None)()
+        real_join = compression._join_cancelled_worker
+
+        def join_worker(future, grace_seconds):
+            join_entered.set()
+            return real_join(future, grace_seconds)
+
+        monkeypatch.setattr(compression, "_join_cancelled_worker", join_worker)
 
         def cooperative_worker(fence: CompressionCommitFence):
             # Continuous progress (the #97488 'last progress 0.0s ago'
@@ -87,11 +101,10 @@ class TestWorkerTeardownOnCeiling:
                     break
                 fence.touch_progress()
                 time.sleep(0.01)
-            # Cooperative-but-not-instant exit: the unwind after seeing the
-            # poison takes real time (rollback, telemetry). Long enough that
-            # a host WITHOUT the bounded-grace join returns first; far
-            # inside the 5s grace for a host WITH it.
-            time.sleep(0.08)
+            # Release the cooperative unwind only when the host starts its
+            # join. This proves teardown ordering without a timing race.
+            if not join_entered.wait(2):
+                return original, "unjoined"
             worker_done.set()
             return (original, "late")
 

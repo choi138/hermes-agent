@@ -21,8 +21,11 @@ These tests pin the contract:
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from agent.context_compressor import (
     ContextCompressor,
@@ -31,6 +34,7 @@ from agent.context_compressor import (
 )
 from agent.conversation_compression import (
     CompressionCommitFence,
+    _join_cancelled_worker,
     resolve_compression_fallback_route,
     run_compress_context_with_progress_timeout,
 )
@@ -42,6 +46,23 @@ CHAIN_ENTRY = {
     "api_key": "sk-fallback",
     "timeout": 45,
 }
+
+
+@pytest.fixture(autouse=True)
+def warm_worker_context():
+    # These subsecond budgets test admitted workers, not cold context imports.
+    # Production correctly counts that setup against the total deadline.
+    from tools.thread_context import propagate_context_to_thread
+
+    propagate_context_to_thread(lambda: None)()
+
+
+def test_worker_that_finished_with_timeout_is_not_retained_as_an_orphan():
+    completed = Future()
+    completed.set_exception(TimeoutError("deadline expired before dispatch"))
+    assert _join_cancelled_worker(completed, 0)
+    still_running = Future()
+    assert not _join_cancelled_worker(still_running, 0)
 
 
 def _patch_chain(chain):
@@ -129,6 +150,82 @@ def test_stalled_summary_attempts_configured_fallback_chain():
     assert msgs == compressed, "the fallback attempt's compression must be published"
     assert prompt == "summarized-prompt"
     assert not timeouts, "no continue-without-compression degrade after a recovery"
+
+
+def test_fallback_shares_the_original_total_deadline():
+    original = [{"role": "user", "content": "keep-me"}]
+    worker = _StalledSummaryWorker([{"role": "user", "content": "summary"}])
+    try:
+        _run(worker, chain=[CHAIN_ENTRY], timeouts=[], messages=original)
+    finally:
+        worker.release.set()
+    assert len(worker.fences) == 2
+    assert worker.fences[1]._deadline == worker.fences[0]._deadline
+
+
+def test_large_fallback_idle_timeout_cannot_extend_total_budget():
+    original = [{"role": "user", "content": "keep-me"}]
+    worker = _StalledSummaryWorker([], stall_attempts=2)
+    timeouts = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        host = pool.submit(_run, worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original)
+        try:
+            messages, _ = host.result(timeout=1.5)
+            assert messages is original
+            assert worker.attempts == 2
+            assert timeouts
+            assert all(fence.is_cancelled for fence in worker.fences)
+        finally:
+            worker.release.set()
+
+
+def test_total_exhaustion_does_not_start_another_provider_attempt():
+    original = [{"role": "user", "content": "keep-me"}]
+    worker = _StalledSummaryWorker([])
+    try:
+        messages, _ = _run(worker, chain=[CHAIN_ENTRY], timeouts=[], messages=original,
+                           idle=0.1, ceiling=0.1)
+    finally:
+        worker.release.set()
+    assert messages is original
+    assert worker.attempts == 1
+
+
+def test_shared_deadline_preserves_an_already_admitted_fallback_commit():
+    original = [{"role": "user", "content": "keep-me"}]
+    compressed = [{"role": "user", "content": "summary"}]
+    primary_release, commit_release = threading.Event(), threading.Event()
+    committing, overrun = threading.Event(), threading.Event()
+    fences = []
+
+    def worker(fence):
+        fences.append(fence)
+        if len(fences) == 1:
+            primary_release.wait(5)
+            return original, "late"
+        assert fence.begin_commit()
+        try:
+            committing.set()
+            commit_release.wait(5)
+            return compressed, "saved-prompt"
+        finally:
+            fence.finish_commit()
+
+    with _patch_chain([CHAIN_ENTRY]), ThreadPoolExecutor(max_workers=1) as pool:
+        host = pool.submit(
+            run_compress_context_with_progress_timeout, worker=worker, messages=original,
+            system_prompt_fallback="unchanged", idle_timeout_seconds=0.05,
+            total_ceiling_seconds=0.3, on_commit_overrun=lambda *_args: overrun.set(),
+        )
+        try:
+            assert committing.wait(2)
+            assert overrun.wait(2), "fallback reset the total deadline"
+            assert not host.done(), "an admitted commit was abandoned"
+            commit_release.set()
+            assert host.result(timeout=2) == (compressed, "saved-prompt")
+        finally:
+            primary_release.set()
+            commit_release.set()
 
 
 def test_retry_runs_on_a_host_published_fence():
