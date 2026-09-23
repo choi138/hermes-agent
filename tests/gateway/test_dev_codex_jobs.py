@@ -31,6 +31,9 @@ def test_duplicate_ingress_returns_same_job(tmp_path):
     first = store.create(ingress_key="discord:1:3", source=source, prompt="fix", workspace="/repo")
     second = store.create(ingress_key="discord:1:3", source=source, prompt="fix", workspace="/repo")
     assert first.id == second.id
+    busy = store.create(ingress_key="discord:other:4", source={"platform": "discord", "chat_id": "other"},
+                        prompt="edit", workspace="/repo")
+    assert busy.id == first.id
     assert store.active_for_source("discord", "1", "2").id == first.id
     store.update(first.id, "done", result="ready")
     assert store.pending()[0].result == "ready"

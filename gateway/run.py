@@ -23777,19 +23777,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id = source.thread_id or source.prospective_thread_id or ""
             active = store.active_for_source(platform, source.chat_id, thread_id)
             ingress_key = f"{platform}:{source.chat_id}:{message_id}"
-            existing = store.latest_for_source(platform, source.chat_id, thread_id)
             if active and active.ingress_key != ingress_key:
                 content = f"진행 중인 Mac Codex 작업이 있습니다: `{active.id}`"
                 job = None
             else:
+                job_source = source.to_dict()
+                if not job_source.get("thread_id") and source.prospective_thread_id:
+                    job_source["thread_id"] = source.prospective_thread_id
                 job = store.create(
-                    ingress_key=ingress_key, source=source.to_dict(),
+                    ingress_key=ingress_key, source=job_source,
                     prompt=event.text or "", workspace=config["workspace"],
                 )
-                content = f"Mac Codex 작업 접수: `{job.id}`. 완료되면 이 스레드에 결과를 보냅니다."
-                if not hasattr(self, "_dev_codex_wakeup"):
-                    self._dev_codex_wakeup = asyncio.Event()
-                self._dev_codex_wakeup.set()
+                if job.ingress_key != ingress_key:
+                    content = f"같은 Mac 작업 폴더에서 진행 중인 작업이 있습니다: `{job.id}`"
+                    job = None
+                else:
+                    content = f"Mac Codex 작업 접수: `{job.id}`. 완료되면 이 스레드에 결과를 보냅니다."
+                    if not hasattr(self, "_dev_codex_wakeup"):
+                        self._dev_codex_wakeup = asyncio.Event()
+                    self._dev_codex_wakeup.set()
         adapter = self._adapter_for_source(source)
         if adapter is None:
             return
@@ -23846,14 +23852,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             content = (f"Mac Codex 작업 `{job.id}` 완료\n{job.result}"
                                        if job.status == "done" else
                                        f"Mac Codex 작업 `{job.id}` 중단: {job.error}")
+                            if len(content) > 1900:
+                                result_file = f"{config['remote_root']}/{job.id}/result.txt"
+                                content = content[:1750] + f"\n… 전체 결과: `{result_file}`"
                             if job.ack_message_id:
                                 sent = await adapter.edit_message(
                                     chat_id=source.chat_id, message_id=job.ack_message_id,
-                                    content=content[:1900],
+                                    content=content,
                                 )
                             else:
                                 sent = await adapter.send(
-                                    source.chat_id, content[:1900],
+                                    source.chat_id, content,
                                     metadata=self._thread_metadata_for_source(source),
                                 )
                             if getattr(sent, "success", False):

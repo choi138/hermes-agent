@@ -131,6 +131,15 @@ class JobStore:
         now = time.time()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM jobs WHERE ingress_key=?", (ingress_key,)).fetchone()
+            if row is not None:
+                return self._job(row)
+            row = db.execute(
+                "SELECT * FROM jobs WHERE workspace=? AND status IN ('queued','running') "
+                "ORDER BY created_at LIMIT 1", (workspace,),
+            ).fetchone()
+            if row is not None:
+                return self._job(row)
             db.execute(
                 "INSERT OR IGNORE INTO jobs(id, ingress_key, source, prompt, workspace, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
