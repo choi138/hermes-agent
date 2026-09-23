@@ -10,7 +10,7 @@ import os
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1193,6 +1193,28 @@ class TestMCPServerTask:
                     await server.shutdown()
             finally:
                 clear_session_cwd()
+
+        asyncio.run(_test())
+
+    def test_start_remote_context_does_not_set_local_stdio_cwd(self):
+        """A remote prompt cwd cannot be used to spawn a local stdio child."""
+        from mcp import StdioServerParameters
+        from tools.mcp_tool import MCPServerTask
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+        p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
+
+        async def _test():
+            with patch("tools.mcp_tool_transport._runtime_cwd.resolve_context_cwd",
+                       return_value=PurePosixPath("/Users/remote/workspace")), \
+                 patch("tools.mcp_tool.StdioServerParameters", wraps=StdioServerParameters) as params, \
+                 p_stdio, p_cs:
+                server = MCPServerTask("remote_cwd")
+                await server.start({"command": sys.executable, "args": ["-c", "pass"]})
+                assert params.call_args.kwargs["cwd"] is None
+                await server.shutdown()
 
         asyncio.run(_test())
 

@@ -8,6 +8,7 @@ import os
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Dict, Optional, Set
 from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
@@ -300,7 +301,10 @@ class MCPServerTransportMixin:
         # wins; an existing session/TERMINAL_CWD anchor becomes the default; else native (None).
         stdio_cwd = config.get("cwd")
         if stdio_cwd is None:
-            stdio_cwd = _runtime_cwd.resolve_context_cwd() or None
+            context_cwd = _runtime_cwd.resolve_context_cwd()
+            # A remote prompt backend yields PurePosixPath, which names a directory on
+            # the remote host. The stdio child is spawned here, so inherit this host's cwd.
+            stdio_cwd = context_cwd if isinstance(context_cwd, Path) else None
         server_params = _core.StdioServerParameters(
             command=command, args=args, env=safe_env or None, cwd=stdio_cwd,
             # Windows pipes can split non-UTF-8 bytes at chunk boundaries; substitute, don't raise.
