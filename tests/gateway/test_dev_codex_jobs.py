@@ -70,16 +70,19 @@ def test_work_host_start_survives_caller_and_is_idempotent(tmp_path):
     root.mkdir()
     (root / "worker.py").write_bytes(WORKER.read_bytes())
     codex = tmp_path / "codex"
-    codex.write_text(
-        "#!/usr/bin/env python3\n"
+    codex.write_text("#!/usr/bin/env fake_node\n")
+    codex.chmod(0o755)
+    fake_node = tmp_path / "fake_node"
+    fake_node.write_text(
+        f"#!{sys.executable}\n"
         "import json, pathlib, sys, time\n"
-        "args=sys.argv[1:]\n"
+        "args=sys.argv[2:]\n"
         "path=pathlib.Path(args[args.index('-o')+1])\n"
         "print(json.dumps({'type':'thread.started','thread_id':'fake-session'}), flush=True)\n"
         "time.sleep(0.2)\n"
         "path.write_text('implemented and checked')\n"
     )
-    codex.chmod(0o755)
+    fake_node.chmod(0o755)
     command = [sys.executable, str(WORKER), "start", "abc123", str(root)]
     payload = json.dumps({"prompt": "fix it", "workspace": str(repo), "codex_bin": str(codex)})
     first = json.loads(subprocess.check_output(command, input=payload.encode()))

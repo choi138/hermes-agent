@@ -77,11 +77,12 @@ def _start(job_dir: Path, root: Path) -> dict:
         if not workspace.is_dir() or not (workspace / ".git").exists():
             raise ValueError(f"Mac workspace is not a git repository: {workspace}")
         codex_bin = payload.get("codex_bin") or "codex"
-        if shutil.which(codex_bin) is None:
+        resolved_bin = shutil.which(codex_bin)
+        if resolved_bin is None:
             raise ValueError("codex CLI is unavailable in the SSH environment")
         (job_dir / "prompt.txt").write_text(payload["prompt"], encoding="utf-8")
         (job_dir / "workspace.txt").write_text(str(workspace), encoding="utf-8")
-        (job_dir / "codex_bin.txt").write_text(codex_bin, encoding="utf-8")
+        (job_dir / "codex_bin.txt").write_text(resolved_bin, encoding="utf-8")
         return _launch(job_dir, root, resume=False)
     except Exception as exc:
         value = {"status": "blocked", "error": str(exc)[:500]}
@@ -123,6 +124,8 @@ def _run(job_dir: Path, mode: str) -> int:
     state = _read(status_path)
     workspace = (job_dir / "workspace.txt").read_text(encoding="utf-8")
     codex_bin = (job_dir / "codex_bin.txt").read_text(encoding="utf-8")
+    codex_env = os.environ.copy()
+    codex_env["PATH"] = str(Path(codex_bin).parent) + os.pathsep + codex_env.get("PATH", "")
     result_path = job_dir / "result.txt"
     if mode == "resume":
         command = [codex_bin, "exec", "resume", "--json", "-o", str(result_path),
@@ -137,7 +140,8 @@ def _run(job_dir: Path, mode: str) -> int:
         prompt = (job_dir / "prompt.txt").read_text(encoding="utf-8")
     events_path = job_dir / f"{mode}.jsonl"
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True, cwd=workspace) as proc:
+                          stderr=subprocess.STDOUT, text=True, cwd=workspace,
+                          env=codex_env) as proc:
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(prompt)
         proc.stdin.close()
