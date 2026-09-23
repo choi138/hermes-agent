@@ -136,7 +136,7 @@ def _run(job_dir: Path, mode: str) -> int:
                   "Finish and report verification.")
     else:
         command = [codex_bin, "exec", "--json", "-o", str(result_path),
-                   "-C", workspace, "-s", "workspace-write", "--approve-for-me", "-"]
+                   "-C", workspace, "--approve-for-me", "-"]
         prompt = (job_dir / "prompt.txt").read_text(encoding="utf-8")
     events_path = job_dir / f"{mode}.jsonl"
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

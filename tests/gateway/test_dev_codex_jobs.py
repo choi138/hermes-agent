@@ -80,6 +80,7 @@ def test_work_host_start_survives_caller_and_is_idempotent(tmp_path):
         f"#!{sys.executable}\n"
         "import json, pathlib, sys, time\n"
         "args=sys.argv[2:]\n"
+        "if '--approve-for-me' in args and '-s' in args: sys.exit(2)\n"
         "path=pathlib.Path(args[args.index('-o')+1])\n"
         "print(json.dumps({'type':'thread.started','thread_id':'fake-session'}), flush=True)\n"
         "time.sleep(0.2)\n"
