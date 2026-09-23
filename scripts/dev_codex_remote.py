@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -80,9 +81,14 @@ def _start(job_dir: Path, root: Path) -> dict:
         resolved_bin = shutil.which(codex_bin)
         if resolved_bin is None:
             raise ValueError("codex CLI is unavailable in the SSH environment")
+        codex_shell = payload.get("codex_shell") or ""
+        if codex_shell and (not Path(codex_shell).is_absolute() or
+                            not os.access(codex_shell, os.X_OK)):
+            raise ValueError("codex_shell must be an executable absolute Mac path")
         (job_dir / "prompt.txt").write_text(payload["prompt"], encoding="utf-8")
         (job_dir / "workspace.txt").write_text(str(workspace), encoding="utf-8")
         (job_dir / "codex_bin.txt").write_text(resolved_bin, encoding="utf-8")
+        (job_dir / "codex_shell.txt").write_text(codex_shell, encoding="utf-8")
         return _launch(job_dir, root, resume=False)
     except Exception as exc:
         value = {"status": "blocked", "error": str(exc)[:500]}
@@ -124,6 +130,8 @@ def _run(job_dir: Path, mode: str) -> int:
     state = _read(status_path)
     workspace = (job_dir / "workspace.txt").read_text(encoding="utf-8")
     codex_bin = (job_dir / "codex_bin.txt").read_text(encoding="utf-8")
+    shell_file = job_dir / "codex_shell.txt"
+    codex_shell = shell_file.read_text(encoding="utf-8") if shell_file.exists() else ""
     codex_env = os.environ.copy()
     codex_env["PATH"] = str(Path(codex_bin).parent) + os.pathsep + codex_env.get("PATH", "")
     result_path = job_dir / "result.txt"
@@ -138,6 +146,9 @@ def _run(job_dir: Path, mode: str) -> int:
         command = [codex_bin, "exec", "--json", "-o", str(result_path),
                    "-C", workspace, "--approve-for-me", "-"]
         prompt = (job_dir / "prompt.txt").read_text(encoding="utf-8")
+    if codex_shell:
+        bin_dir = shlex.quote(str(Path(codex_bin).parent))
+        command = [codex_shell, "-lic", f"export PATH={bin_dir}:$PATH; exec {shlex.join(command)}"]
     events_path = job_dir / f"{mode}.jsonl"
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True, cwd=workspace,

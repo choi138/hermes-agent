@@ -53,6 +53,7 @@ def config_for(config: dict[str, Any] | None) -> dict[str, Any]:
         "ssh_key": str(raw.get("ssh_key") or terminal.get("ssh_key") or "").strip(),
         "remote_root": str(raw.get("remote_root") or "").strip(),
         "codex_bin": str(raw.get("codex_bin") or "codex").strip(),
+        "codex_shell": str(raw.get("codex_shell") or "").strip(),
         "route": str(raw.get("route") or "dev").strip(),
     }
 
@@ -236,7 +237,8 @@ class RemoteCodex:
         if proc.returncode:
             raise RuntimeError((proc.stderr or proc.stdout).strip()[:500])
         payload = json.dumps({"prompt": job.prompt, "workspace": job.workspace,
-                              "codex_bin": self.config["codex_bin"]})
+                              "codex_bin": self.config["codex_bin"],
+                              "codex_shell": self.config["codex_shell"]})
         return json.loads(self._run(self._worker_command("start", job.id), input_text=payload))
 
     def status(self, job_id: str) -> dict[str, Any]:

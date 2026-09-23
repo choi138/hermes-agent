@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
         "ssh_key": "",
         "remote_root": "",
         "codex_bin": "codex",
+        "codex_shell": "",
     },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
