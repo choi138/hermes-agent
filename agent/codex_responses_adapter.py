@@ -676,8 +676,23 @@ def classify_responses_route(agent: Any) -> ResponsesRouteFlags:
     lower = str(getattr(agent, "_base_url_lower", "") or base_url).lower()
     def _host_is(domain: str) -> bool:
         return hostname == domain or hostname.endswith("." + domain)
+    from hermes_cli.config_providers import get_provider_backend_family
+    provider_id = str(provider or "").strip().lower()
+    requested_provider = str(getattr(agent, "requested_provider", "") or "").strip().lower()
+    runtime_id = provider_id.split(":", 1)[1] if provider_id.startswith("custom:") else provider_id
+    try:
+        backend_family = get_provider_backend_family(
+            provider_id, requested_provider=requested_provider,
+        )
+    except Exception:
+        backend_family = ""
     return ResponsesRouteFlags(
-        is_codex_backend=provider == "openai-codex" or (_host_is("chatgpt.com") and "/backend-api/codex" in lower),
+        is_codex_backend=(
+            runtime_id == "openai-codex"
+            or (runtime_id == "custom" and requested_provider == "openai-codex")
+            or backend_family == "openai-codex"
+            or (_host_is("chatgpt.com") and "/backend-api/codex" in lower)
+        ),
         is_xai_responses=provider in {"xai", "xai-oauth"} or hostname == "api.x.ai",
         is_github_responses=_host_is("models.github.ai") or _host_is("githubcopilot.com"),
     )

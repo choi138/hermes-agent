@@ -15,6 +15,7 @@ from agent.anthropic_endpoints import (
     _is_deepseek_anthropic_endpoint, _is_kimi_family_endpoint, _is_nous_portal_endpoint,
     _is_third_party_anthropic_endpoint, _model_name_is_deepseek_thinking,
 )
+from hermes_cli.route_identity import normalize_route_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -564,6 +565,34 @@ def _keep_valid_latest_thinking(content: List[Any], signature_dead: bool) -> Lis
     return new_content
 
 
+def _is_signature_passthrough_endpoint(base_url: str | None) -> bool:
+    """Trust only a boolean opt-in on this profile's exact configured route."""
+    route = normalize_route_base_url(base_url)
+    if not route:
+        return False
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        config = load_user_config_effective(fail_closed=True)
+    except Exception:
+        logger.debug("Anthropic signature-passthrough config read failed", exc_info=True)
+        return False
+    providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        return False
+    for entry in providers.values():
+        if not isinstance(entry, dict) or entry.get("anthropic_signature_passthrough") is not True:
+            continue
+        configured_url = next(
+            (entry[key] for key in ("base_url", "url", "api")
+             if isinstance(entry.get(key), str) and entry[key].strip()),
+            None,
+        )
+        if configured_url and normalize_route_base_url(configured_url) == route:
+            return True
+    return False
+
+
 def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | None, model: str | None) -> None:
     """Strip or preserve thinking blocks per endpoint. Mutates ``result`` in place.
 
@@ -572,9 +601,14 @@ def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | No
     turn keeps signed blocks. Signatures are proprietary: third-party endpoints strip all thinking.
     Kimi replays as-is; DeepSeek needs unsigned blocks round-tripped but rejects signed ones. Nous
     Portal proxies Claude with sticky sessions and validates the same signatures, so it takes the
-    native path despite not being anthropic.com.
+    native path despite not being anthropic.com. Configured proxies may opt into that same
+    contract for their exact route.
     """
-    is_third_party = _is_third_party_anthropic_endpoint(base_url) and not _is_nous_portal_endpoint(base_url)
+    is_third_party = (
+        _is_third_party_anthropic_endpoint(base_url)
+        and not _is_nous_portal_endpoint(base_url)
+        and not _is_signature_passthrough_endpoint(base_url)
+    )
     is_kimi = _is_kimi_family_endpoint(base_url, model)
     is_deepseek = _is_deepseek_anthropic_endpoint(base_url) or (
         is_third_party and _model_name_is_deepseek_thinking(model)

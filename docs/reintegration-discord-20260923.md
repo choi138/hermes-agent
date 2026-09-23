@@ -1,8 +1,10 @@
 # Discord-first v2026.9.21 reintegration
 
 This branch starts from the official `v2026.9.21` tag (`d337b736aa`). This
-branch is not deployed. The production checkout was observed at
-`9502b418bd` on 2026-09-23; recheck its SHA immediately before any rollout.
+branch is not currently deployed. A first single-process canary ran at
+20:27 KST on 2026-09-23 and was rolled back at 20:31 before live acceptance.
+The running production code is again `9502b418bd`; recheck its SHA immediately
+before another rollout.
 
 ## Production contract observed on 2026-09-23
 
@@ -188,7 +190,9 @@ existing bot for a controlled live canary, not loss of its current capabilities.
    one-failure sweep was caused
    by an obsolete expectation that `TERMINAL_ENV` be absent; the dispatcher
    deliberately pins `TERMINAL_ENV=local` for workspace safety. Do not
-   resurrect the reverted direct Discord-to-Mac intake.
+   resurrect the reverted direct Discord-to-Mac intake. After the provider
+   boundary patches, another complete sweep on 2026-09-23 passed the same
+   1,007 files: **10,069 passed, 0 failed, 35 skipped**, exit 0, in 972.1s.
 2. Rollback snapshot and restore drill are complete under
    `/home/justin/.hermes/backups/discord-reintegration-20260923-h8bZ4H`.
    `database-manifest.json` records 21 SQLite snapshots, all with
@@ -215,9 +219,11 @@ existing bot for a controlled live canary, not loss of its current capabilities.
    use the installed external plugin, and verify real Discord/LLM turns, Graphiti
    recall, model routes, Kanban intake/dispatch, progress and recovery, all
    four profile identities, and the separate bridge. Roll back immediately
-   on failed checks. No live canary or service restart has happened yet. The
-   existing gateway still had two active agent turns at 20:12 KST, so the
-   cutover is waiting for an idle window or explicit interruption choice.
+   on failed checks. The first cutover at 20:27 KST was rolled back at 20:31
+   before a real user turn was accepted. Subsequent provider-route regressions
+   were reproduced and patched locally. At 21:09 KST, the replacement runtime
+   had not yet received those patches and the old gateway had zero active
+   agent turns. Recheck both immediately before another cutover.
 
 ## Single-process cutover and rollback plan
 

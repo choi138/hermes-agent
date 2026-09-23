@@ -98,6 +98,47 @@ def find_provider_entry(providers: Any, key: Any) -> Tuple[Any, Optional[Dict[st
     return None, None
 
 
+def _runtime_provider_id(value: Any) -> str:
+    provider_id = coerce_provider_id(value).lower().replace(" ", "-")
+    return provider_id.split(":", 1)[1] if provider_id.startswith("custom:") else provider_id
+
+
+def get_provider_config_entry(
+    provider_id: str, *, requested_provider: Optional[str] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Find the active route's config, retaining a named provider behind ``custom``.
+
+    A concrete fallback provider wins over the primary's stale requested id.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        return None
+    current = _runtime_provider_id(provider_id)
+    requested = _runtime_provider_id(requested_provider)
+    candidates = (requested, current) if current == "custom" else (current,)
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        entry = providers.get(candidate)
+        if isinstance(entry, dict):
+            return candidate, entry
+        for key, entry in providers.items():
+            if isinstance(entry, dict) and candidate in (
+                _runtime_provider_id(key), _runtime_provider_id(entry.get("name")),
+            ):
+                return _runtime_provider_id(key), entry
+    return None
+
+
+def get_provider_backend_family(
+    provider_id: str, *, requested_provider: Optional[str] = None,
+) -> str:
+    resolved = get_provider_config_entry(provider_id, requested_provider=requested_provider)
+    raw = resolved[1].get("backend_family") if resolved else None
+    return raw.strip().lower().replace("_", "-").replace(" ", "-") if isinstance(raw, str) else ""
+
+
 # camelCase aliases commonly used in hand-written provider configs.
 _CAMEL_ALIASES: Dict[str, str] = {
     "apiKey": "api_key",
@@ -119,7 +160,8 @@ _KNOWN_PROVIDER_KEYS = {
     "api_mode", "transport", "model", "default_model", "models", "models_discovered",
     "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
-    "catalog_provider", "session_affinity_header"}
+    "catalog_provider", "session_affinity_header", "backend_family",
+    "anthropic_signature_passthrough"}
 
 
 def _pick_provider_base_url(entry: Dict[str, Any], provider_key: str) -> str:
@@ -242,6 +284,9 @@ def _normalize_custom_provider_entry(
     _put("model", _stripped("model", "default_model"))
     # Catalogued vendor whose models this endpoint resells (metadata lookups only, never routing).
     _put("catalog_provider", _stripped("catalog_provider"))
+    _put("backend_family", _stripped("backend_family"))
+    if entry.get("anthropic_signature_passthrough") is True:
+        normalized["anthropic_signature_passthrough"] = True
 
     # ``models_discovered`` marks a mapping auto-discovered by Hermes, not hand-curated.
     models_dict, discovered = _normalize_provider_models(entry.get("models"))
@@ -290,7 +335,8 @@ def _custom_provider_entry_to_provider_config(
     for field in (
         "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
         "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
-        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider"):
+        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider",
+        "backend_family", "anthropic_signature_passthrough"):
         if field in normalized:
             provider_entry[field] = normalized[field]
     if "model" in normalized:
