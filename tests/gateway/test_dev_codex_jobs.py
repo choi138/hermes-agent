@@ -17,11 +17,19 @@ from gateway.session import Platform, SessionSource
 WORKER = Path(__file__).resolve().parents[2] / "scripts" / "dev_codex_remote.py"
 
 
-def test_dev_route_only_dispatches_mutating_discord_requests():
+def test_dev_route_dispatches_direct_edit_requests_not_discussion():
     config = config_for({"dev_codex": {"enabled": True}})
+    assert should_dispatch(platform="discord", route="dev", prompt="!dev 이 버그 고쳐줘", config=config)
     assert should_dispatch(platform="discord", route="dev", prompt="이 버그 고쳐줘", config=config)
+    assert should_dispatch(platform="discord", route="dev", prompt="우리 ERD 수정해줘", config=config)
+    assert should_dispatch(platform="discord", route="dev", prompt="Please fix the test", config=config)
     assert not should_dispatch(platform="discord", route="dev", prompt="왜 느렸어?", config=config)
     assert not should_dispatch(platform="discord", route="dev", prompt="고쳐야 하는 부분이 있어?", config=config)
+    assert not should_dispatch(platform="discord", route="dev", prompt="수정 가능한 건 프로그램명뿐이에요. 어떻게 생각해?", config=config)
+    assert not should_dispatch(platform="discord", route="dev", prompt="수정 가능한 건 프로그램명뿐이에요. 우리 ERD에서 뭐 변경해줘야 할 거 있나?", config=config)
+    assert not should_dispatch(platform="discord", route="dev", prompt="수정 가능한 건 프로그램명뿐이에요. 이 질문에 대답해줘", config=config)
+    assert not should_dispatch(platform="discord", route="dev", prompt="!dev ", config=config)
+    assert not should_dispatch(platform="discord", route="chat", prompt="!dev 이 버그 고쳐줘", config=config)
     assert not should_dispatch(platform="slack", route="dev", prompt="fix this", config=config)
 
 

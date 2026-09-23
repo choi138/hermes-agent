@@ -59,25 +59,23 @@ def config_for(config: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def should_dispatch(*, platform: str, route: str, prompt: str, config: dict[str, Any]) -> bool:
-    """Only explicit development actions in the selected Discord dev lane."""
+    """Send direct edit requests, not discussion about edits, to Mac Codex."""
     if platform != "discord" or not config.get("enabled"):
         return False
     if route != config.get("route"):
         return False
     text = prompt.strip()
     if text.startswith("!dev "):
-        return True
-    if text.endswith("?") and not re.search(
-        r"can you\s+(?:please\s+)?(?:implement|fix|refactor|build|edit|update)"
-        r"|(?:고쳐|수정|구현|만들어|반영)\s*(?:줘|줄래|주세요)",
-        text, re.IGNORECASE,
-    ):
-        return False
-    # A dev route also contains read-only coding questions.  Those should
-    # retain the normal conversational path.
+        return bool(text[5:].strip())
+    # The dev model route also handles architecture questions. Match an
+    # instruction at the end of the message so quoted requirements such as
+    # "수정 가능한 건..." cannot turn a question into an edit job.
     return bool(re.search(
-        r"\b(implement|fix|refactor|upgrade|update|migrate|build|edit|modify|commit)\b"
-        r"|구현|고쳐|수정|리팩터|업그레이드|업데이트|마이그레이션|반영|만들어|커밋|병합",
+        r"(?:고쳐|수정|구현|만들어|반영|리팩터링|업데이트|커밋|병합)(?:해)?\s*"
+        r"(?:줘|주세요|줄래|주실래요|주실 수 있나요)\s*[.!?~]*$"
+        r"|^(?:(?:please|can you|could you)\s+)?"
+        r"(?:fix|implement|refactor|build|edit|update|modify|commit|merge)\b"
+        r"(?!\s+(?:explain|describe|tell))",
         text, re.IGNORECASE,
     ))
 
