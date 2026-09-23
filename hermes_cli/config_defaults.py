@@ -11,18 +11,6 @@ DEFAULT_CONFIG = {
     # Purpose-based route catalog. Empty keeps routing fully dormant; users
     # opt into evaluation under model_routes.router.mode.
     "model_routes": {},
-    # Optional Discord dev-route handoff to a durable Mac Codex process.
-    "dev_codex": {
-        "enabled": False,
-        "route": "dev",
-        "workspace": "",
-        "ssh_host": "",
-        "ssh_user": "",
-        "ssh_key": "",
-        "remote_root": "",
-        "codex_bin": "codex",
-        "codex_shell": "",
-    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the
