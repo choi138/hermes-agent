@@ -16590,6 +16590,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._start_loop_heartbeat_task()
 
+        from gateway.dev_codex_jobs import config_for as _dev_codex_config_for
+        if _dev_codex_config_for(_load_gateway_config())["enabled"]:
+            self._spawn_supervised(self._dev_codex_job_watcher, "dev_codex_job_watcher")
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
@@ -23755,6 +23759,113 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("Discord semantic progress cancellation edit failed: %s", exc)
 
+    async def _accept_dev_codex_job(self, event, source, config, progress_id) -> None:
+        """Persist one Discord request and acknowledge its stable job ID."""
+        from gateway.dev_codex_jobs import JobStore, validate_config
+
+        error = validate_config(config)
+        message_id = str(getattr(event, "message_id", None) or source.message_id or "")
+        if not message_id:
+            error = "Discord message ID is required for deduplicated dev work"
+        store = getattr(self, "_dev_codex_store", None)
+        if store is None and not error:
+            store = self._dev_codex_store = JobStore()
+        if error:
+            content = f"Mac Codex 작업을 시작하지 못했습니다: {error}"
+        else:
+            platform = source.platform.value
+            thread_id = source.thread_id or source.prospective_thread_id or ""
+            active = store.active_for_source(platform, source.chat_id, thread_id)
+            ingress_key = f"{platform}:{source.chat_id}:{message_id}"
+            existing = store.latest_for_source(platform, source.chat_id, thread_id)
+            if active and active.ingress_key != ingress_key:
+                content = f"진행 중인 Mac Codex 작업이 있습니다: `{active.id}`"
+                job = None
+            else:
+                job = store.create(
+                    ingress_key=ingress_key, source=source.to_dict(),
+                    prompt=event.text or "", workspace=config["workspace"],
+                )
+                content = f"Mac Codex 작업 접수: `{job.id}`. 완료되면 이 스레드에 결과를 보냅니다."
+                if not hasattr(self, "_dev_codex_wakeup"):
+                    self._dev_codex_wakeup = asyncio.Event()
+                self._dev_codex_wakeup.set()
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        if progress_id:
+            result = await adapter.edit_message(
+                chat_id=source.chat_id, message_id=progress_id, content=content,
+            )
+            ack_id = progress_id if getattr(result, "success", False) else ""
+        else:
+            ack_id = ""
+        if not ack_id:
+            result = await adapter.send(
+                source.chat_id, content, metadata=self._thread_metadata_for_source(source),
+            )
+            ack_id = str(getattr(result, "message_id", None) or "")
+        if not error and job and ack_id:
+            store.set_ack(job.id, ack_id)
+
+    async def _dev_codex_job_watcher(self) -> None:
+        """Reconnect queued/running Mac jobs and publish terminal results."""
+        from gateway.dev_codex_jobs import JobStore, RemoteCodex, config_for
+
+        store = getattr(self, "_dev_codex_store", None)
+        if store is None:
+            store = self._dev_codex_store = JobStore()
+        wakeup = getattr(self, "_dev_codex_wakeup", None)
+        if wakeup is None:
+            wakeup = self._dev_codex_wakeup = asyncio.Event()
+        while self._running:
+            config = config_for(_load_gateway_config())
+            if config["enabled"]:
+                for job in store.pending():
+                    try:
+                        if job.status in {"queued", "running"}:
+                            remote = RemoteCodex(config)
+                            state = await asyncio.to_thread(
+                                remote.start if job.status == "queued" else remote.status,
+                                job if job.status == "queued" else job.id,
+                            )
+                            if state.get("status") == "interrupted":
+                                state = await asyncio.to_thread(remote.start, job)
+                            status = state.get("status")
+                            if status == "missing" and job.status == "running":
+                                store.update(job.id, "blocked", error="Mac job directory is missing; inspect before retry")
+                            elif status in {"running", "done", "blocked"}:
+                                store.update(job.id, status, result=state.get("result", ""),
+                                             error=state.get("error", ""))
+                            job = store.get(job.id)
+                        if job.status in {"done", "blocked"} and not job.notified:
+                            source = SessionSource.from_dict(job.source)
+                            adapter = self._adapter_for_source(source)
+                            if adapter is None:
+                                continue
+                            content = (f"Mac Codex 작업 `{job.id}` 완료\n{job.result}"
+                                       if job.status == "done" else
+                                       f"Mac Codex 작업 `{job.id}` 중단: {job.error}")
+                            if job.ack_message_id:
+                                sent = await adapter.edit_message(
+                                    chat_id=source.chat_id, message_id=job.ack_message_id,
+                                    content=content[:1900],
+                                )
+                            else:
+                                sent = await adapter.send(
+                                    source.chat_id, content[:1900],
+                                    metadata=self._thread_metadata_for_source(source),
+                                )
+                            if getattr(sent, "success", False):
+                                store.mark_notified(job.id)
+                    except Exception:
+                        logger.warning("Mac Codex job %s sync failed", job.id, exc_info=True)
+            wakeup.clear()
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -23977,6 +24088,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # API-call-only prompt suffix. With moods disabled, shadow retains its
         # detached, zero-latency M1 behavior in TurnRunner.run_sync.
         self._set_pending_mood_prompt(session_key, "")
+        router_cfg = {}
         if not getattr(event, "internal", False):
             try:
                 if getattr(getattr(self, "config", None), "multiplex_profiles", False):
@@ -24012,6 +24124,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception:
                 logger.warning("model router enforce stage failed open", exc_info=True)
+
+        # Dispatch selected dev work before building an agent.  The job ID
+        # survives conversation resets and gateway restarts.
+        if not getattr(event, "internal", False):
+            from gateway.dev_codex_jobs import config_for, should_dispatch
+            dev_config = config_for(router_cfg)
+            route = self._session_state(session_key).conversation.active_route_name
+            if should_dispatch(platform=_platform_name, route=route,
+                               prompt=event.text or "", config=dev_config):
+                await self._accept_dev_codex_job(
+                    event, source, dev_config, _semantic_progress_message_id,
+                )
+                return
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
