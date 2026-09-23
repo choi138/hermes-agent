@@ -174,6 +174,20 @@ def requested_effort(reasoning_config: Optional[dict]) -> Optional[str]:
     return str(reasoning_config.get("effort") or "").strip().lower() or None
 
 
+def reasoning_is_pinned(config: Optional[dict]) -> bool:
+    """Only an explicit user selection is a pin; route defaults stay automatic."""
+    return isinstance(config, dict) and config.get("selection") == "pinned"
+
+
+def reasoning_for_model(current: Optional[dict], config: dict, model: str) -> Optional[dict]:
+    """Keep a session pin across model changes; let the wire reject unsupported levels."""
+    if reasoning_is_pinned(current):
+        return dict(current)
+    from hermes_constants import resolve_reasoning_config
+
+    return resolve_reasoning_config(config, model)
+
+
 def clamp_reasoning_config(reasoning_config: Optional[dict], supported: Sequence[str] = OPENAI_COMPAT_WIRE_EFFORTS) -> Optional[dict]:
     """Return ``reasoning_config`` with its ``effort`` clamped onto ``supported`` (non-dicts and
     configs without an effort pass through untouched).

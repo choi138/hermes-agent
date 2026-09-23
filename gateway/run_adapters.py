@@ -53,6 +53,18 @@ UNRESOLVED_PROFILE_HOME = _UnresolvedProfileHome()
 class GatewayAdapterLifecycleMixin:
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
 
+    def _iter_gateway_adapters(self):
+        """Yield each live default or multiplexed adapter once for gateway-wide sinks."""
+        seen: set[int] = set()
+        adapter_maps = [getattr(self, "adapters", {})]
+        adapter_maps.extend((getattr(self, "_profile_adapters", {}) or {}).values())
+        for adapter_map in adapter_maps:
+            for adapter in list(adapter_map.values()):
+                if adapter is None or id(adapter) in seen:
+                    continue
+                seen.add(id(adapter))
+                yield adapter
+
     @staticmethod
     async def _wait_or_detach(task: "asyncio.Future", timeout: float) -> bool:
         """Wait up to ``timeout`` for ``task``; on deadline (or our own cancellation) detach it. Not
@@ -1145,6 +1157,7 @@ class GatewayAdapterLifecycleMixin:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
         adapter.set_message_handler(message_handler or self._primary_message_handler())
+        adapter.set_content_delivered_handler(self._record_content_delivered)
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(busy_session_handler or self._primary_busy_session_handler())

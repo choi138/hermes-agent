@@ -21,7 +21,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vault_list", "browser_vault_unlock", "browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code",  # ride with the browser
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
-    "todo_list", "memory",
+    "todo_list", "memory", "notes_write", "notes_read", "memory_propose",
+    "model_status", "model_switch",
     "session_search",
     "clarify",
     "execute_code", "delegate_task",
@@ -124,7 +125,8 @@ TOOLSETS = {
     ),
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
-    "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    "memory": _ts("Persistent memory across sessions (personal notes + user profile)",
+                  ["memory", "notes_write", "notes_read", "memory_propose"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
@@ -154,6 +156,18 @@ TOOLSETS = {
         "block for human input, heartbeat during long ops, comment on threads, attach "
         "files, and (for orchestrators) list, unblock, and fan out tasks.",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")],
+    ),
+    # A dispatcher worker gets task-scoped lifecycle tools, not the board-wide
+    # orchestrator surface. Normal Discord turns get a single intake tool.
+    "kanban_worker": _ts(
+        "Task-scoped Kanban worker lifecycle tools",
+        ["kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+         "kanban_comment", "kanban_create", "kanban_link"],
+    ),
+    "kanban_submit": _ts(
+        "Submit one durable asynchronous Kanban task",
+        ["kanban_task"],
+        defer_to_tool_search=False,
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),

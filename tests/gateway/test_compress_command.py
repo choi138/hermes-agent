@@ -52,6 +52,7 @@ def _make_runner(history: list[dict[str, str]]):
     )
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.get_reasoning_override.return_value = None
     runner.session_store.load_transcript.return_value = history
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()

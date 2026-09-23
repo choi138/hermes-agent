@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Any
+from urllib.parse import urlsplit
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
@@ -465,6 +466,17 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    # A base URL is not necessarily non-secret: some providers encode auth in
+    # userinfo or query parameters. On restart, provider resolution restores
+    # the configured URL, so omit those URLs from the routing index entirely.
+    base_url = cleaned.get("base_url")
+    if base_url:
+        try:
+            parsed = urlsplit(base_url)
+            if "@" in parsed.netloc or parsed.query or parsed.fragment:
+                cleaned.pop("base_url")
+        except ValueError:
+            cleaned.pop("base_url")
     return cleaned or None
 
 
@@ -517,9 +529,15 @@ class SessionEntry:
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    # Same-turn restart recovery. Optional so pre-upgrade routing rows remain readable.
+    active_turn: Optional[Dict[str, Any]] = None
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
+    # Secret-free /reasoning selection. The names also read rows written by the
+    # previous production gateway, so existing pins survive the upgrade.
+    runtime_reasoning_effort: Optional[str] = None
+    runtime_reasoning_selection: str = "auto"
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
@@ -549,10 +567,15 @@ class SessionEntry:
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
+        if self.active_turn:
+            result["active_turn"] = dict(self.active_turn)
         result.update((name, getattr(self, name)) for name in self._RESET_FIELDS)
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.runtime_reasoning_effort:
+            result["runtime_reasoning_effort"] = self.runtime_reasoning_effort
+            result["runtime_reasoning_selection"] = self.runtime_reasoning_selection
         if self.transport_profile:
             result["transport_profile"] = self.transport_profile
         if self.origin:
@@ -574,6 +597,17 @@ class SessionEntry:
         if not isinstance(token, str) or not token:
             # The pair is written atomically; a partial/malformed pair must not auto-resume.
             token = started_at = None
+        turn_record = data.get("active_turn")
+        if not (
+            isinstance(turn_record, dict)
+            and isinstance(turn_record.get("turn_id"), str) and turn_record["turn_id"]
+            and isinstance(turn_record.get("boot_id"), str) and turn_record["boot_id"]
+            and turn_record.get("status") in {"running", "interrupted", "resuming"}
+            and _parse_iso(turn_record.get("started_at")) is not None
+            and type(turn_record.get("resume_count")) is int
+            and turn_record["resume_count"] >= 0
+        ):
+            turn_record = None
 
         session_key, session_id = data["session_key"], data["session_id"]
         # CWE-22: session_id becomes a filename (strict); session_key allows interior ``/``.
@@ -586,6 +620,13 @@ class SessionEntry:
         plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
         transport_profile = data.get("transport_profile")
+        from hermes_constants import parse_reasoning_effort
+        raw_effort = data.get("runtime_reasoning_effort")
+        reasoning_effort = (
+            raw_effort.strip().lower()
+            if isinstance(raw_effort, str) and parse_reasoning_effort(raw_effort) is not None
+            else None
+        )
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
@@ -594,7 +635,12 @@ class SessionEntry:
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
+            active_turn=dict(turn_record) if turn_record is not None else None,
             model_override=sanitize_model_override(data.get("model_override")),
+            runtime_reasoning_effort=reasoning_effort,
+            runtime_reasoning_selection=(
+                "pinned" if reasoning_effort and data.get("runtime_reasoning_selection") == "pinned" else "auto"
+            ),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             **plain,
         )
@@ -1098,6 +1144,60 @@ class SessionStore(
         with self._lock:
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
+
+    def set_reasoning_override(self, session_key: str, config: Optional[Dict[str, Any]]) -> bool:
+        """Durably publish a session reasoning selection before changing live state.
+
+        ``None`` releases the selection. A missing session is not an acknowledged write.
+        The stored shape remains compatible with the previous production gateway.
+        """
+        from dataclasses import replace
+        from hermes_constants import parse_reasoning_effort
+
+        if config is None:
+            effort, selection = None, "auto"
+        else:
+            if not isinstance(config, dict):
+                raise ValueError("Invalid reasoning override")
+            effort = "none" if config.get("enabled") is False else config.get("effort")
+            if not isinstance(effort, str) or parse_reasoning_effort(effort) is None:
+                raise ValueError("Invalid reasoning effort")
+            effort = effort.strip().lower()
+            selection = config.get("selection", "auto")
+            if selection not in ("auto", "pinned"):
+                raise ValueError("Invalid reasoning selection")
+
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            if (entry.runtime_reasoning_effort, entry.runtime_reasoning_selection) == (effort, selection):
+                return True
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries[session_key]
+            data[session_key] = replace(
+                entry, runtime_reasoning_effort=effort,
+                runtime_reasoning_selection=selection,
+            ).to_dict()
+            self._persist_routing_data(data, generation)
+            entry.runtime_reasoning_effort = effort
+            entry.runtime_reasoning_selection = selection
+            return True
+
+    def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Read a persisted selection without creating a new session."""
+        from hermes_constants import parse_reasoning_effort
+
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.runtime_reasoning_effort:
+                return None
+            parsed = parse_reasoning_effort(entry.runtime_reasoning_effort)
+            if parsed is None:
+                return None
+            if entry.runtime_reasoning_selection == "pinned":
+                parsed["selection"] = "pinned"
+            return parsed
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

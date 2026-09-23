@@ -8,7 +8,8 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator, Optional
 
 # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
 _UNSET: Any = object()
@@ -55,6 +56,30 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # Request-local proof that the client resumes SessionDB history. No env fallback
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
+
+
+@dataclass(frozen=True)
+class TrustedGatewaySource:
+    """Admitted gateway provenance; never read from environment or model input."""
+
+    platform: str
+    profile: str
+    chat_id: str
+    thread_id: str
+    user_id: str
+    session_key: str
+    session_id: str
+    message_id: str
+    scope_id: str = ""
+    parent_chat_id: str = ""
+    role_authorized: bool = False
+    is_bot: bool = False
+    dispatch_wake: Optional[Callable[[], None]] = field(default=None, repr=False, compare=False)
+
+
+_TRUSTED_GATEWAY_SOURCE: ContextVar[Optional[TrustedGatewaySource]] = ContextVar(
+    "HERMES_TRUSTED_GATEWAY_SOURCE", default=None,
+)
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -120,6 +145,9 @@ def set_session_vars(
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None,
+    role_authorized: bool = False, is_bot: bool = False,
+    trusted_gateway_source: bool = False,
+    dispatch_wake: Optional[Callable[[], None]] = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -140,6 +168,17 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_TRUSTED_GATEWAY_SOURCE.set(
+        TrustedGatewaySource(
+            platform=str(platform or ""), profile=str(profile or ""),
+            chat_id=str(chat_id or ""), thread_id=str(thread_id or ""),
+            user_id=str(user_id or ""), session_key=str(session_key or ""),
+            session_id=str(session_id or ""), message_id=str(message_id or ""),
+            scope_id=str(scope_id or ""), parent_chat_id=str(parent_chat_id or ""),
+            role_authorized=bool(role_authorized), is_bot=bool(is_bot),
+            dispatch_wake=dispatch_wake,
+        ) if trusted_gateway_source else None
+    ))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -154,6 +193,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TRUSTED_GATEWAY_SOURCE.set(None)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -167,7 +207,13 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _TRUSTED_GATEWAY_SOURCE.set(None)
     _runtime_cwd("clear_session_cwd")
+
+
+def get_trusted_gateway_source() -> Optional[TrustedGatewaySource]:
+    """Return gateway-admitted provenance, with no process-env fallback."""
+    return _TRUSTED_GATEWAY_SOURCE.get()
 
 
 def get_session_env(name: str, default: str = "") -> str:

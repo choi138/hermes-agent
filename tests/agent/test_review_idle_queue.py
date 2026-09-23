@@ -20,6 +20,7 @@ import pytest
 from agent.review_idle_queue import (
     ReviewIdleQueue,
     _IDLE_SETTLE_S,
+    _POLL_INTERVAL_S,
     defer_max_age_s,
     defer_mode,
 )
@@ -91,6 +92,63 @@ def test_enqueue_coalesces_per_session_newest_wins_oldest_age():
     # time so a busy session cannot push its own age-out forever.
     assert item.kwargs["messages_snapshot"] == ["new"]
     assert item.enqueued_at == 100.0
+
+
+def test_rejected_single_flight_submission_keeps_latest_pending_snapshot():
+    q, clock = _make_queue()
+    agent = _FakeAgent()
+    clock["t"] = 100.0
+    q.enqueue(agent, "s1", {"messages_snapshot": ["old"], "task_cfg": {}})
+    q.note_turn_started()
+    q.note_turn_finished()
+    clock["t"] += _IDLE_SETTLE_S + 1
+    item = q._pop_dispatchable()
+    assert item is not None
+    q.enqueue(agent, "s1", {"messages_snapshot": ["new"], "task_cfg": {}})
+
+    q._restore_rejected(item)
+
+    with q._lock:
+        pending = q._pending["s1"]
+    assert pending.kwargs["messages_snapshot"] == ["new"]
+    assert pending.enqueued_at == item.enqueued_at
+
+
+def test_dispatcher_restores_rejected_submission_and_waits_before_retry(monkeypatch):
+    from agent import review_idle_queue as riq
+
+    q, clock = _make_queue()
+    agent = _FakeAgent()
+    q.enqueue(agent, "s1", {"messages_snapshot": ["old"], "task_cfg": {}})
+    q.note_turn_started()
+    q.note_turn_finished()
+    clock["t"] += _IDLE_SETTLE_S + 1
+
+    class _StopAfterFirstWait:
+        calls = 0
+
+        def wait(self):
+            self.calls += 1
+            if self.calls > 1:
+                raise StopIteration
+
+        def set(self):
+            pass
+
+    q._wake = _StopAfterFirstWait()
+    q._dispatch = lambda _item: False
+    monkeypatch.setattr(q, "_still_enabled", lambda _item: True)
+    delays = []
+    monkeypatch.setattr(riq.time, "sleep", lambda seconds: delays.append(seconds))
+
+    with pytest.raises(StopIteration):
+        q._run()
+
+    with q._lock:
+        pending = q._pending["s1"]
+    assert pending.kwargs["messages_snapshot"] == ["old"]
+    assert pending.enqueued_at == 0.0
+    assert delays == [_POLL_INTERVAL_S]
 
 
 def test_dispatch_waits_for_sustained_quiet():
@@ -171,13 +229,15 @@ def test_nested_turns_require_all_to_finish():
 # ── the decision wrapper ─────────────────────────────────────────
 
 
-def _wrapper_agent(monkeypatch, defer="auto", managed=True):
+def _wrapper_agent(monkeypatch, defer="auto", managed=True, **agent_changes):
     """A minimal object wearing the real _spawn_background_review."""
     import run_agent
     from agent import review_idle_queue as riq
 
     agent = _FakeAgent()
     agent._delegate_depth = 0
+    for name, value in agent_changes.items():
+        setattr(agent, name, value)
     calls = {"enqueued": [], "spawned": []}
 
     monkeypatch.setattr(
@@ -204,8 +264,70 @@ def test_wrapper_defers_managed_local_auto(monkeypatch):
     assert len(calls["enqueued"]) == 1
     assert calls["spawned"] == []
     key, kwargs = calls["enqueued"][0]
-    assert key == "sess-x"
+    assert key.endswith(":sess-x")
     assert kwargs["review_memory"] is True
+
+
+def test_wrapper_queue_key_separates_profiles_a_b_a(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    spawn, calls = _wrapper_agent(monkeypatch, defer="auto", managed=True)
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for home in homes:
+        home.mkdir()
+    for home in (homes[0], homes[1], homes[0]):
+        token = set_hermes_home_override(home)
+        try:
+            assert spawn([{"role": "user", "content": "hi"}], review_memory=True)
+        finally:
+            reset_hermes_home_override(token)
+
+    keys = [key for key, _kwargs in calls["enqueued"]]
+    assert keys[0] == keys[2]
+    assert keys[0] != keys[1]
+
+
+def test_deferred_dispatch_keeps_enqueuing_profile(monkeypatch, tmp_path):
+    from hermes_constants import (
+        hermes_home_key, reset_hermes_home_override, set_hermes_home_override,
+    )
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    q, clock = _make_queue()
+    seen = []
+    q._server_idle = lambda: seen.append(("idle", hermes_home_key())) or True
+    monkeypatch.setattr(
+        "agent.background_review.load_background_review_settings",
+        lambda: (seen.append(("enabled", hermes_home_key())) or True, {}),
+    )
+    agent = _FakeAgent()
+    agent._spawn_background_review_now = lambda **_kw: seen.append(("spawn", hermes_home_key()))
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        expected_home = hermes_home_key()
+        q.enqueue(agent, "session-a", {"task_cfg": {}})
+    finally:
+        reset_hermes_home_override(token)
+
+    token = set_hermes_home_override(profile_b)
+    try:
+        q.note_turn_started()
+        q.note_turn_finished()
+        clock["t"] += _IDLE_SETTLE_S + 1
+        item = q._pop_dispatchable()
+        assert item is not None
+        assert item.context.run(q._still_enabled, item)
+        q._dispatch(item)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert seen == [
+        ("idle", expected_home), ("enabled", expected_home), ("spawn", expected_home),
+    ]
 
 
 def test_wrapper_spawns_immediately_for_non_managed(monkeypatch):
@@ -213,6 +335,25 @@ def test_wrapper_spawns_immediately_for_non_managed(monkeypatch):
     spawn([{"role": "user", "content": "hi"}], review_skills=True)
     assert calls["enqueued"] == []
     assert len(calls["spawned"]) == 1
+
+
+def test_wrapper_reports_rejection_without_consuming_review_cadence(monkeypatch):
+    spawn, calls = _wrapper_agent(
+        monkeypatch, managed=False, _persist_disabled=True,
+    )
+    accepted = spawn([{"role": "user", "content": "hi"}], review_memory=True)
+    assert accepted is False
+    assert calls["enqueued"] == calls["spawned"] == []
+
+
+def test_wrapper_reports_disabled_review_as_not_accepted(monkeypatch):
+    spawn, calls = _wrapper_agent(monkeypatch, managed=False)
+    monkeypatch.setattr(
+        "agent.background_review.load_background_review_settings",
+        lambda: (False, {}),
+    )
+    assert spawn([{"role": "user", "content": "hi"}], review_skills=True) is False
+    assert calls["enqueued"] == calls["spawned"] == []
 
 
 def test_wrapper_defer_never_is_old_behavior(monkeypatch):

@@ -150,6 +150,13 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
         elif _file_has_terminal_config or env_var not in os.environ:
             os.environ[env_var] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
 
+    # The dispatcher owns the worker's local workspace even if the assignee
+    # profile normally uses SSH. Reapply after profile config has been bridged.
+    if os.environ.get("_HERMES_KANBAN_EXECUTION_BACKEND"):
+        from hermes_cli.kanban_runtime import apply_worker_execution_contract
+
+        apply_worker_execution_contract(os.environ, terminal_config=terminal_config)
+
     browser_config = defaults.get("browser", {})
     if "inactivity_timeout" in browser_config:
         os.environ["BROWSER_INACTIVITY_TIMEOUT"] = str(browser_config["inactivity_timeout"])

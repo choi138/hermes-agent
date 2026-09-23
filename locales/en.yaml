@@ -240,6 +240,8 @@ gateway:
     choice_hide:               "hide reasoning from replies"
     set_global:                "🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
     set_global_save_failed:    "🧠 ✓ Reasoning effort set to `{effort}` (session only — config save failed)\n_(takes effect on next message)_"
+    session_save_failed: "Reasoning was not changed because the session selection could not be saved. Retry /reasoning."
+    global_clear_failed: "The global setting was saved, but the previous session selection could not be cleared. Retry /reasoning reset."
     set_session:               "🧠 ✓ Reasoning effort set to `{effort}` (session only — add `--global` to persist)\n_(takes effect on next message)_"
 
   reload_mcp:

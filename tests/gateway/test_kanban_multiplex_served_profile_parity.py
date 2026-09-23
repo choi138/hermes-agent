@@ -67,7 +67,8 @@ def test_worker_for_served_profile_gets_its_own_env_and_toolset_pin(served, monk
 
     env = spawned["env"]
     assert env["HERMES_HOME"] == str(served.alpha)
-    assert "HERMES_MODEL" not in env and "TERMINAL_ENV" not in env
+    assert "HERMES_MODEL" not in env
+    assert env["TERMINAL_ENV"] == "local"
     assert "--toolsets" in spawned["argv"]
 
 

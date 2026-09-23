@@ -39,6 +39,9 @@ class _FakeSessionDB:
 class _FakeGateway:
     """Minimal stand-in with just enough state for ``stop()`` to run."""
 
+    _stop_mention_inbox_services = gw_mod.GatewayStartupMixin._stop_mention_inbox_services
+    _stop_agent_health_sink = gw_mod.GatewayShutdownMixin._stop_agent_health_sink
+
     def __init__(self, events):
         self._events = events
         self._running = True

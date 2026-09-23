@@ -1871,6 +1871,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._content_delivered_handler: Optional[Callable[[str, Optional[int]], None]] = None
         self._no_message_handler_logged: bool = False
         self._reaction_handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
         # Runner-owned boundary for normalized events: auth/profile state never lives in an adapter.
@@ -2230,6 +2231,20 @@ class BasePlatformAdapter(ABC):
     def set_message_handler(self, handler: MessageHandler) -> None:
         """Set the incoming-message handler (MessageEvent -> optional response str)."""
         self._message_handler = handler
+
+    def set_content_delivered_handler(
+        self, handler: Optional[Callable[[str, Optional[int]], None]],
+    ) -> None:
+        """Install the runner's callback for acknowledged user-visible content."""
+        self._content_delivered_handler = handler
+
+    def _notify_content_delivered(self, session_key: str, run_generation: Optional[int]) -> None:
+        handler = self._content_delivered_handler
+        if handler is not None:
+            try:
+                handler(session_key, run_generation)
+            except Exception:
+                logger.debug("Content-delivered callback failed", exc_info=True)
 
     def set_platform_event_handler(
         self, handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]]) -> None:
@@ -4085,7 +4100,9 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                turn_id=getattr(event, "_gateway_active_turn_id", None))
+            event._gateway_delivery_obligation_id = obligation_id
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4369,12 +4386,17 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        processing_cancelled = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
                 delivery_attempted = True
-                delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                succeeded = bool(getattr(result, "success", False))
+                delivery_succeeded = delivery_succeeded or succeeded
+                if succeeded:
+                    self._notify_content_delivered(
+                        session_key, getattr(interrupt_event, "_hermes_run_generation", None))
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4460,6 +4482,7 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            processing_cancelled = True
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
@@ -4483,6 +4506,16 @@ class BasePlatformAdapter(ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if (
+                not processing_cancelled
+                and getattr(event, "_gateway_active_turn_delivery_pending", False)
+                and (delivery_succeeded or getattr(event, "_gateway_delivery_obligation_id", None))
+            ):
+                # Retiring the durable turn awaits storage I/O; cancellation there must not
+                # strand the adapter's typing task or per-session guard.
+                finish_turn = getattr(self.gateway_runner, "_finish_durable_active_turn_after_delivery", None)
+                if callable(finish_turn):
+                    await finish_turn(event)
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained

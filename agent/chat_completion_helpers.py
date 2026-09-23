@@ -721,6 +721,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    from agent.reasoning_pin import validate_agent_request
+
+    validate_agent_request(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
@@ -746,6 +749,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     # request transform. No-op unless this really is the OpenAI SDK, so the
     # MoA facade above and the suite's stand-in clients are unaffected.
     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
+    validate_agent_request(agent, api_kwargs)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1441,7 +1445,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
-        qwen_session_metadata=_qwen_meta)
+        qwen_session_metadata=_qwen_meta, provider=agent.provider)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
         return transport.build_kwargs(provider_profile=_profile, **_common)
@@ -1480,12 +1484,15 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     from agent.opencode_affinity import merge_session_affinity_headers
 
     kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
-    return merge_session_affinity_headers(
+    kwargs = merge_session_affinity_headers(
         kwargs,
         getattr(agent, "provider", None),
         getattr(agent, "base_url", None),
         getattr(agent, "session_id", None),
     )
+    from agent.reasoning_pin import validate_agent_request
+
+    return validate_agent_request(agent, kwargs)
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -1955,8 +1962,10 @@ def _reresolve_fallback_reasoning_config(agent) -> None:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.
         from hermes_cli.config import load_config
-        from hermes_constants import resolve_reasoning_config
-        agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
+        from agent.reasoning_effort import reasoning_for_model
+        agent.reasoning_config = reasoning_for_model(
+            getattr(agent, "reasoning_config", None), load_config() or {}, agent.model,
+        )
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)
@@ -2002,14 +2011,35 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.model_route_fallback import (
+        _next_outage_route_fallback, _reset_outage_route_fallback_walk,
+        record_route_provider_outcome,
+    )
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    route_outage = reason in {
+        FailoverReason.billing, FailoverReason.rate_limit,
+        FailoverReason.upstream_rate_limit, FailoverReason.overloaded,
+        FailoverReason.server_error,
+    }
+    if not route_outage:
+        _reset_outage_route_fallback_walk(agent)
+    if reason in {
+        FailoverReason.billing, FailoverReason.rate_limit,
+        FailoverReason.overloaded, FailoverReason.server_error,
+        FailoverReason.timeout,
+    }:
+        record_route_provider_outcome(agent, False, reason.value)
     while True:
-        if agent._fallback_index >= len(agent._fallback_chain):
-            return _fallback_chain_exhausted(agent, reason)
-        fb = agent._fallback_chain[agent._fallback_index]
-        agent._fallback_index += 1
+        # The explicitly selected route's healthy fallbacks precede the global
+        # chain. A missing/stale route intent leaves the old chain unchanged.
+        fb = _next_outage_route_fallback(agent) if route_outage else None
+        if fb is None:
+            if agent._fallback_index >= len(agent._fallback_chain):
+                return _fallback_chain_exhausted(agent, reason)
+            fb = agent._fallback_chain[agent._fallback_index]
+            agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)
         if getattr(agent, "_unavailable_fallback_keys", None) is None:
             agent._unavailable_fallback_keys = set()
@@ -2198,8 +2228,15 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
 
 def _managed_summary_call(agent, api_request_id: str, request, callback, *, retry_count: int):
     from agent import relay_llm
+
+    def validated_callback(final_request):
+        from agent.reasoning_pin import validate_agent_request
+
+        validate_agent_request(agent, final_request)
+        return callback(final_request)
+
     return relay_llm.execute_current(
-        request, callback,
+        request, validated_callback,
         name=str(getattr(agent, "provider", "") or "provider"), model_name=str(getattr(agent, "model", "") or ""),
         metadata={"api_mode": str(getattr(agent, "api_mode", "") or "chat_completions"),
             "api_request_id": api_request_id, "call_role": "iteration_summary", "retry_count": retry_count},
@@ -2912,6 +2949,9 @@ class _StreamingCall(StreamingWaitMonitor):
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
+        from agent.reasoning_pin import validate_agent_request
+
+        validate_agent_request(self.agent, stream_kwargs)
         return request_client.chat.completions.create(**stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
@@ -3269,6 +3309,9 @@ class _StreamingCall(StreamingWaitMonitor):
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
+            from agent.reasoning_pin import validate_agent_request
+
+            validate_agent_request(self.agent, final_kwargs)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

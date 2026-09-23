@@ -155,6 +155,16 @@ def _effective_watchdog_leash(runner: object) -> float:
 class GatewayShutdownMixin:
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
+    async def _stop_agent_health_sink(self) -> None:
+        sink = getattr(self, "_agent_health_sink", None)
+        self._agent_health_sink = None
+        if sink is None:
+            return
+        try:
+            await sink.stop()
+        except Exception:
+            logger.debug("Agent health sink stop failed", exc_info=True)
+
     @dataclasses.dataclass
     class _StopContext:
         """State threaded through the ``_stop_*`` phases of one ``stop()`` run."""
@@ -748,6 +758,10 @@ class GatewayShutdownMixin:
             platform=platform, platform_state=platform_state, error_code=error_code,
             error_message=error_message, **extra,
         )
+        self._record_platform_health_transition(
+            platform, platform_state=platform_state,
+            error_code=error_code, error_message=error_message,
+        )
 
     # Per-platform circuit breaker (pause/resume): reconnect watcher + /platform pause|resume.
     def _pause_failed_platform(self, platform, *, reason: str = "") -> None:
@@ -867,6 +881,7 @@ class GatewayShutdownMixin:
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 await self.async_session_store.mark_resume_pending(_sk, reason)
+                await self.async_session_store.mark_active_turn_interrupted(_sk, reason)
                 marked.append(_sk)
         return marked
 
@@ -1891,6 +1906,8 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
+        await self._stop_mention_inbox_services()
+        await self._stop_agent_health_sink()
         for platform, adapter in list(self.adapters.items()):
             await self._bounded_adapter_teardown(adapter, platform)
         # Disconnect secondary-profile adapters (multiplex mode).

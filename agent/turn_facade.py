@@ -28,6 +28,8 @@ class TurnFacadeMixin:
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
+        resume_turn: bool = False,
+        turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -35,8 +37,6 @@ class TurnFacadeMixin:
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
         # (#84423).
         from agent.background_review import cancel_background_review_for_live_turn
-
-        cancel_background_review_for_live_turn(self)
 
         from agent import relay_runtime
         from agent.aux_accounting import reset_accounting_context, set_accounting_context
@@ -47,6 +47,8 @@ class TurnFacadeMixin:
             set_conversation_context,
         )
         from agent.prompt_cache_scope import declared_conversation_scope_safe
+        from agent.background_review_coordinator import get_background_review_coordinator
+        from agent.background_review_policy import is_primary_foreground_agent
         from agent.review_idle_queue import QUEUE as _review_queue
         from agent.subagent_lifecycle import bind_subagent_parent
         from agent.interrupt_scope import track_in_interrupt_scope
@@ -60,7 +62,7 @@ class TurnFacadeMixin:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
-        relay_turn_id = f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        relay_turn_id = turn_id or f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
@@ -73,20 +75,30 @@ class TurnFacadeMixin:
         token = affinity_token = acct_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
+        review_coordinator = get_background_review_coordinator()
+        coordinator_turn_started = False
 
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
             _review_queue.note_turn_started()
+            if is_primary_foreground_agent(self):
+                review_coordinator.foreground_started()
+                coordinator_turn_started = True
+                owner_token = getattr(self, "_background_review_owner_token", None)
+                if owner_token:
+                    review_coordinator.cancel_pending(str(owner_token))
+            cancel_background_review_for_live_turn(self)
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
             )
             if admission.early_result is not None:
-                carry_unadmitted_user_message(
-                    admission.early_result, user_message, persist_user_message,
-                    timestamp=persist_user_timestamp, display_kind=persist_user_display_kind,
-                    display_metadata=persist_user_display_metadata, platform_id=persist_user_platform_id,
-                )
+                if not resume_turn:
+                    carry_unadmitted_user_message(
+                        admission.early_result, user_message, persist_user_message,
+                        timestamp=persist_user_timestamp, display_kind=persist_user_display_kind,
+                        display_metadata=persist_user_display_metadata, platform_id=persist_user_platform_id,
+                    )
                 relay_outcome = (
                     "cancelled" if admission.early_result.get("interrupted") else "timed_out"
                 )
@@ -142,6 +154,7 @@ class TurnFacadeMixin:
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
+                        resume_turn=resume_turn, turn_id=turn_id,
                     )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
@@ -203,6 +216,8 @@ class TurnFacadeMixin:
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
+                    if coordinator_turn_started:
+                        review_coordinator.foreground_finished()
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""

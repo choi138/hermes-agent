@@ -741,6 +741,10 @@ _plugin_compat_prev_getattr = __getattr__
 
 
 def __getattr__(name):  # PEP 562 — chained onto the module's own __getattr__
+    if name in {"bind_read_only_mcp_tool", "_load_raw_mcp_server_config",
+                "_strict_loopback_mcp_url_is_safe"}:
+        from tools import mcp_tool_readonly
+        return getattr(mcp_tool_readonly, name)
     target = _PLUGIN_COMPAT_LAZY.get(name)
     if target is None:
         return _plugin_compat_prev_getattr(name)

@@ -15,9 +15,13 @@ from typing import Any, Callable, List, Optional
 class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
+    event: Any = None  # inbound event for detached shadow routing
+    turn_resume_marker: Optional[dict] = None  # validated same-turn startup recovery
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False
+    mention_inbox_execution_id: Optional[str] = None
+    mention_inbox_execution_observer: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"
@@ -64,6 +68,7 @@ class TurnContext:
     mute_notification_reply: bool = False
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
+    tool_policy: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False

@@ -190,6 +190,8 @@ def check_api_response(
 
     # Fold provider usage into compressor / anchors / session counters / state.db
     # (agent/turn_usage.py). A rearmed budget also clears the preflight-block latch.
+    from agent.model_route_fallback import record_route_provider_outcome
+    record_route_provider_outcome(agent, True, "recovered (live completion succeeded)")
     _usage_outcome = record_response_usage(
         agent, response, messages=messages, api_call_count=api_call_count,
         api_duration=api_duration, compression_attempts=compression_attempts,

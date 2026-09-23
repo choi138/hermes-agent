@@ -60,6 +60,7 @@ def _loaded_status(content: str, rendered_len: int, max_chars: int, user_authore
 def list_context_file_sources(
     cwd: Optional[str] = None, context_length: Optional[int] = None, allow_install_tree_fallback: bool = False,
     home_override: "Path | None" = None, skip_soul: bool = False,
+    task_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """One dict per context file Hermes considered, in the builder's priority order.
 
@@ -67,23 +68,35 @@ def list_context_file_sources(
     unless *allow_install_tree_fallback*). Keys: ``label``, ``path``, ``chars``, ``est_tokens``, ``loaded``
     and ``status`` ∈ loaded / truncated / flagged / shadowed / blocked / empty / unreadable / suppressed.
     """
-    cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
     max_chars = _pb._get_context_file_max_chars(context_length)
-    suppressed = _pb._project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback)
-    sources: List[Dict[str, Any]] = []
-    winner: Optional[str] = None
-    for kind, label, path, content in _pb.discover_context_files(cwd_path):
-        if not content:
-            status = _empty_status(path)
-        elif suppressed:
-            status = "suppressed"
-        elif winner in (None, kind):
-            winner = kind
-            # The builder caps the rendered ``## label`` section, not the raw file.
-            status = _loaded_status(content, len(f"## {label}\n\n{content}"), max_chars)
-        else:
-            status = "shadowed"
-        sources.append(_entry(label, path, content, status))
+    from agent.prompt_backend import BackendPath, read_backend, resolve_prompt_backend
+
+    def project_sources(cwd_path, suppressed: bool) -> List[Dict[str, Any]]:
+        sources: List[Dict[str, Any]] = []
+        winner: Optional[str] = None
+        for kind, label, path, content in _pb.discover_context_files(cwd_path):
+            if not content:
+                status = _empty_status(path)
+            elif suppressed:
+                status = "suppressed"
+            elif winner in (None, kind):
+                winner = kind
+                # The builder caps the rendered ``## label`` section, not the raw file.
+                status = _loaded_status(content, len(f"## {label}\n\n{content}"), max_chars)
+            else:
+                status = "shadowed"
+            sources.append(_entry(label, path, content, status))
+        return sources
+
+    backend = resolve_prompt_backend(task_id, cwd)
+    if backend.is_remote:
+        sources = read_backend(
+            backend, lambda execute: project_sources(BackendPath.working_directory(execute), False),
+        ) or []
+    else:
+        cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
+        suppressed = _pb._project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback)
+        sources = project_sources(cwd_path, suppressed) if cwd_path.is_dir() else []
 
     if not skip_soul:
         home = Path(home_override) if home_override is not None else _pb.get_hermes_home()
@@ -104,11 +117,13 @@ def context_file_sources_for_agent(agent: Any) -> List[Dict[str, Any]]:
     from agent.runtime_cwd import resolve_context_cwd
     from agent.system_prompt import _agent_home
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
-    cwd = None if launch_artifact else resolve_context_cwd()
+    task_id = getattr(agent, "session_id", None)
+    cwd = None if launch_artifact else resolve_context_cwd(task_id)
     ctx_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     return list_context_file_sources(
         cwd=str(cwd) if cwd is not None else None, context_length=ctx_len if isinstance(ctx_len, int) else None,
         allow_install_tree_fallback=getattr(agent, "platform", None) in ("cli", "tui"), home_override=_agent_home(agent),
+        task_id=task_id,
     )
 
 

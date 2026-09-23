@@ -319,8 +319,8 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
         # Dispatcher-spawned kanban workers always get the lifecycle handoff
         # tools, even when the assignee profile restricts its chat toolsets.
         if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
-                and _is_dispatcher_owned_worker() and "kanban" not in enabled):
-            enabled.append("kanban")
+                and _is_dispatcher_owned_worker() and "kanban_worker" not in enabled):
+            enabled.append("kanban_worker")
         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
     else:
         from toolsets import get_all_toolsets
@@ -330,8 +330,26 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # toolset is stripped even when a composite (hermes-cli) re-enables it.
     # This ensures that even if a composite toolset (like hermes-cli) is enabled, any tools belonging to a
     # disabled toolset are strictly stripped out. See issue #17309.
+    individual_tool_denies: set[str] = set()
     if disabled_toolsets:
-        _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+        named_toolsets = []
+        for name in disabled_toolsets:
+            if not validate_toolset(name) and registry.get_entry(name) is not None:
+                individual_tool_denies.add(name)
+            else:
+                named_toolsets.append(name)
+        _apply_toolset_selection(tools, named_toolsets, quiet_mode, disable=True)
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        # An inherited profile-wide Kanban selection must not turn a worker
+        # into a board orchestrator or allow Discord intake from its task turn.
+        worker_tools = set(resolve_toolset("kanban_worker"))
+        tools.difference_update(
+            (set(resolve_toolset("kanban")) | set(resolve_toolset("kanban_submit")))
+            - worker_tools
+        )
+        if not _is_delegated_child_context() and _is_dispatcher_owned_worker():
+            tools.update(worker_tools)
+    tools.difference_update(individual_tool_denies)
     return tools
 
 
@@ -604,7 +622,7 @@ def _resolve_active_context_length() -> int:
 # =============================================================================
 
 # Intercepted by the agent loop (need agent-level state); dispatch returns a stub error.
-_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task", "model_status", "model_switch"}
 
 # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
 # prompts keep working); schemas advertise only new names.

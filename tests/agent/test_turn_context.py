@@ -292,6 +292,28 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+@pytest.mark.parametrize("recall", ["", "# Graphiti Recall\n- remembered fact"])
+def test_graphiti_lookup_status_stays_out_of_prefetch_sidecar(recall):
+    agent, mm = _agent_with_memory_manager()
+    status = (
+        "# Graphiti Lookup Status\n"
+        "source: graphiti_historical_memory\n"
+        "routing_policy: graphiti_first\n"
+        "status: ok\n"
+        "candidate_count: 1"
+    )
+    mm.prefetch_all.return_value = f"{recall}\n\n{status}" if recall else status
+
+    ctx = _build(agent, user_message="What did we decide about the deploy pipeline?")
+
+    assert ctx.ext_prefetch_cache == recall
+    if recall:
+        assert recall in ctx.messages[-1]["api_content"]
+        assert "Graphiti Lookup Status" not in ctx.messages[-1]["api_content"]
+    else:
+        assert "api_content" not in ctx.messages[-1]
+
+
 # ── Per-turn author ──────────────────────────────────────────────────────────
 
 

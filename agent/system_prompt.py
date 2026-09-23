@@ -290,6 +290,7 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
         _kanban_guidance = KANBAN_GUIDANCE
     tool_guidance = [
         memory_guidance,
+        _pb.NOTES_GUIDANCE if "notes_write" in names else None,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
         _kanban_guidance,
@@ -646,9 +647,11 @@ def _context_files_part(agent: Any, ctx_len: Optional[int], soul_loaded: bool) -
     if agent.skip_context_files:
         return []
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
+    task_id = getattr(agent, "session_id", None)
     return [_pb.build_context_files_prompt(
-        cwd=None if launch_artifact else resolve_context_cwd(), skip_soul=soul_loaded, context_length=ctx_len,
-        allow_install_tree_fallback=agent.platform in ("cli", "tui"), home_override=_agent_home(agent))]
+        cwd=None if launch_artifact else resolve_context_cwd(task_id), skip_soul=soul_loaded, context_length=ctx_len,
+        allow_install_tree_fallback=agent.platform in ("cli", "tui"), home_override=_agent_home(agent),
+        task_id=task_id)]
 
 
 def _join_tier(parts: List[Optional[str]]) -> str:

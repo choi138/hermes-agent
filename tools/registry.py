@@ -191,6 +191,9 @@ class ToolEntry:
     description: str
     emoji: str
     max_result_size_chars: int | float | None = None
+    # Internal capabilities may be registered for host-side dispatch without
+    # becoming part of the model's tool schema.
+    expose_to_model: bool = True
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
@@ -492,7 +495,7 @@ class ToolRegistry:
         by the first ``check_fn``."""
         memo: Dict[Callable, bool] = {}
         members = (e for e in entries if e.toolset == toolset)
-        return any(not e.check_fn or _memo_check(e.check_fn, memo) for e in members)
+        return any(e.expose_to_model and (not e.check_fn or _memo_check(e.check_fn, memo)) for e in members)
 
     def get_entry(self, name: str, *, scope: Optional[str] = None) -> Optional[ToolEntry]:
         """Active profile's entry by name, falling back to global."""
@@ -656,7 +659,7 @@ class ToolRegistry:
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None):
+        scope: Optional[str] = None, expose_to_model: bool = True):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -720,7 +723,8 @@ class ToolRegistry:
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides)
+                dynamic_schema_overrides=dynamic_schema_overrides,
+                expose_to_model=expose_to_model)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
@@ -834,7 +838,7 @@ class ToolRegistry:
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
-            if not entry:
+            if not entry or not entry.expose_to_model:
                 continue
             if entry.check_fn and not _memo_check(entry.check_fn, check_results):
                 if not quiet:

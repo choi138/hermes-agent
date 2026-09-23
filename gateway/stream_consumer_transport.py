@@ -40,7 +40,11 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        result = await self.adapter.edit_message(**kwargs)
+        raw = getattr(result, "raw_response", None)
+        if getattr(result, "success", False) and not (isinstance(raw, dict) and raw.get("skipped")):
+            self._notify_content_delivered()
+        return result
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a
@@ -177,6 +181,7 @@ class StreamTransportMixin:
             logger.debug("send_draft raised, disabling draft transport for this run: %s", e)
         else:
             if getattr(result, "success", False):
+                self._notify_content_delivered()
                 self._last_sent_text = text  # parity with the edit-based no-op skip
                 return True
             # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
@@ -287,6 +292,7 @@ class StreamTransportMixin:
             return False
         if not getattr(result, "success", False):
             return False
+        self._notify_content_delivered()
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
@@ -450,6 +456,7 @@ class StreamTransportMixin:
         if not result.success:
             self._edit_supported = False
             return False
+        self._notify_content_delivered()
         self._already_sent = True
         self._last_sent_text = text
         if result.message_id:

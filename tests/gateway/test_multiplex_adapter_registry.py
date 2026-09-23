@@ -193,6 +193,9 @@ class _SecondaryRecoveryAdapter:
     def set_message_handler(self, handler):
         self.message_handler = handler
 
+    def set_content_delivered_handler(self, handler):
+        self.content_delivered_handler = handler
+
     def set_fatal_error_handler(self, handler):
         self.fatal_error_handler = handler
 

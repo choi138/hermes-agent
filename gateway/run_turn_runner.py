@@ -15,6 +15,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -948,6 +949,10 @@ class TurnRunner:
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
                         ),
+                        on_content_delivered=(
+                            lambda: self._runner._record_content_delivered(
+                                ctx.session_key or "", ctx.run_generation)
+                        ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                     )
@@ -1159,6 +1164,8 @@ class TurnRunner:
             agent = self._build_fresh_agent(
                 turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr, skip_context_files,
             )
+            if ctx.tool_policy is not None:
+                runner._record_gateway_tool_policy(agent, ctx.tool_policy)
             if cache_lock and cache is not None:
                 with cache_lock:
                     # Record the snapshot's session_id with message_count so the cross-process guard
@@ -1240,12 +1247,91 @@ class TurnRunner:
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
+    def _bind_runtime_update_callback(self, agent) -> None:
+        """Connect agent runtime tools to this conversation's durable gateway state."""
+        runner = self._runner
+        session_key = self._ctx.session_key
+        agent._gateway_session_key = session_key
+
+        def _runtime_update_callback(
+            *, scope: str, model_override=None, reasoning_config=None,
+            require_persistence: bool = False,
+        ) -> Optional[bool]:
+            if scope != "session" or not session_key:
+                if require_persistence:
+                    raise RuntimeError("Session persistence unavailable")
+                return None
+
+            model_changed = bool(model_override)
+            reasoning_changed = reasoning_config is not None
+            state = runner._session_state(session_key).conversation
+            route_name = str(getattr(agent, "_active_route_name", "") or "").strip()
+            route_changed = route_name != state.active_route_name
+
+            def publish_live_state() -> None:
+                if model_changed:
+                    state.model_override = dict(model_override)
+                if reasoning_changed:
+                    state.reasoning_override = dict(reasoning_config) or None
+                if route_changed:
+                    state.active_route_name = route_name
+
+            if not model_changed and not reasoning_changed:
+                if require_persistence:
+                    raise RuntimeError("No session runtime update to persist")
+                publish_live_state()  # a satisfied route can still establish route intent
+                return None
+
+            store = getattr(runner, "session_store", None)
+            if store is None:
+                if require_persistence:
+                    raise RuntimeError("Session persistence unavailable")
+                publish_live_state()
+                return None
+
+            if require_persistence and model_changed and reasoning_changed:
+                # The current SessionStore has separate writes, not an atomic
+                # compound update. Explicit user pins only change reasoning.
+                raise RuntimeError("Atomic model and reasoning persistence unavailable")
+            if not require_persistence:
+                # A route switch has already changed the live agent. Keep the
+                # gateway cache aligned even if its best-effort write fails.
+                publish_live_state()
+            if model_changed:
+                store.set_model_override(session_key, model_override)
+            if reasoning_changed:
+                saved = store.set_reasoning_override(
+                    session_key, dict(reasoning_config) or None,
+                )
+                if saved is not True:
+                    raise RuntimeError("Session reasoning selection was not persisted")
+            if require_persistence:
+                # Pin/release commits before it becomes visible in either cache.
+                publish_live_state()
+                return True
+            return None
+
+        agent.runtime_update_callback = _runtime_update_callback
+
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
                                    stream_delta_cb, interim_assistant_cb, want_interim_messages):
         """Per-message state — callbacks and reasoning config change every turn, so they aren't
         baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
+        # Cached agents keep their guardrail object. Remove the previous approved
+        # execution's receipt guard before installing this turn's policy.
+        base_guardrails = getattr(agent, "_mention_inbox_base_tool_guardrails", None)
+        if base_guardrails is not None:
+            agent._tool_guardrails = base_guardrails
+        if ctx.mention_inbox_execution_id is not None:
+            from gateway.run_mention_inbox import _install_mention_inbox_pretool_guard
+
+            if ctx.mention_inbox_execution_observer is None:
+                raise RuntimeError("approved mention-inbox execution observer is unavailable")
+            _install_mention_inbox_pretool_guard(
+                agent, ctx.mention_inbox_execution_id, ctx.mention_inbox_execution_observer,
+            )
         agent._notification_config = ctx.user_config
         agent._notification_platform = ctx.source.platform
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
@@ -1258,6 +1344,24 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
+        if ctx.mention_inbox_execution_id is not None:
+            from gateway.run_mention_inbox import _compose_mention_inbox_execution_callbacks
+
+            base_complete = agent.tool_complete_callback
+            execution_start, execution_complete = _compose_mention_inbox_execution_callbacks(
+                execution_id=ctx.mention_inbox_execution_id,
+                observer=ctx.mention_inbox_execution_observer,
+                voice_callback=agent.tool_start_callback,
+            )
+            agent.tool_start_callback = execution_start
+            if base_complete is None:
+                agent.tool_complete_callback = execution_complete
+            else:
+                def combined_complete(call_id, tool_name, args, result):
+                    base_complete(call_id, tool_name, args, result)
+                    execution_complete(call_id, tool_name, args, result)
+
+                agent.tool_complete_callback = combined_complete
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
@@ -1266,6 +1370,7 @@ class TurnRunner:
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
         self._merge_turn_request_overrides(agent, turn_route)
+        self._bind_runtime_update_callback(agent)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
@@ -1625,6 +1730,36 @@ class TurnRunner:
         )
         ctx = self._ctx
         persist_override: Optional[Any] = ctx.persist_user_message
+        ctx.turn_resume_marker = None
+        marker = getattr(ctx.event, "_hermes_turn_resume", None)
+        if isinstance(marker, dict) and isinstance(marker.get("turn_id"), str) and marker["turn_id"] and agent_history:
+            entry = self._runner.session_store._entries.get(ctx.session_key) if ctx.session_key else None
+            record = getattr(entry, "active_turn", None)
+            record_matches = (
+                isinstance(record, dict)
+                and record.get("turn_id") == marker["turn_id"]
+                and record.get("resume_count") == marker.get("resume_count")
+                and record.get("status") == "resuming"
+            )
+            if marker.get("record_backed") is True:
+                accepted = record_matches
+            else:
+                from agent.turn_resume import is_interrupt_closer_message
+
+                tail = agent_history[-1]
+                accepted = bool(
+                    record_matches and getattr(entry, "resume_pending", False)
+                    and isinstance(tail, dict)
+                    and (
+                        tail.get("role") == "tool"
+                        or (tail.get("role") == "assistant" and tail.get("tool_calls"))
+                        or is_interrupt_closer_message(tail)
+                    )
+                )
+            if accepted:
+                ctx.turn_resume_marker = marker
+                ctx.message = ""
+                return None, None
         self._prepend_pending_note("_pending_model_notes")
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
@@ -1697,30 +1832,49 @@ class TurnRunner:
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
-            api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
+            resume_marker = ctx.turn_resume_marker
+            api_message = "" if resume_marker else _wrap_current_message_with_observed_context(
+                self._native_image_run_message(), observed_group_context,
+            )
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
                                          "is_bot": bool(getattr(ctx.source, "is_bot", False))}
-            if persist_user_message_override is not None:
+            if resume_marker:
+                kwargs["resume_turn"] = True
+                kwargs["turn_id"] = resume_marker["turn_id"]
+                if ctx.event is not None:
+                    ctx.event._gateway_active_turn_id = resume_marker["turn_id"]
+            elif persist_user_message_override is not None:
                 kwargs["persist_user_message"] = persist_user_message_override
             elif observed_group_context:
                 kwargs["persist_user_message"] = ctx.message
-            if ctx.persist_user_display_kind:
+            if ctx.persist_user_display_kind and not resume_marker:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
                 kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
-            if ctx.persist_user_display_metadata:
+            if ctx.persist_user_display_metadata and not resume_marker:
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
-            if ctx.moa_config is not None:
+            if ctx.moa_config is not None and not resume_marker:
                 kwargs["moa_config"] = ctx.moa_config
-            if persist_user_timestamp_override is not None:
+            if persist_user_timestamp_override is not None and not resume_marker:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
-            if ctx.inbound_message_id is not None:
+            if ctx.inbound_message_id is not None and not resume_marker:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            if not resume_marker and ctx.session_key:
+                turn_id = f"{ctx.session_id}:{ctx.session_id}:{uuid.uuid4().hex[:8]}"
+                begin = getattr(getattr(self._runner, "session_store", None), "begin_active_turn", None)
+                if callable(begin):
+                    try:
+                        if begin(ctx.session_key, turn_id, getattr(self._runner, "_boot_id", "unknown-boot")):
+                            kwargs["turn_id"] = turn_id
+                            if ctx.event is not None:
+                                ctx.event._gateway_active_turn_id = turn_id
+                    except Exception:
+                        logger.warning("Could not record agent turn for %s", ctx.session_key, exc_info=True)
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
@@ -1939,12 +2093,37 @@ class TurnRunner:
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
+        if ctx.event is not None:
+            shadow_runtime = {
+                "model": str(model or ""),
+                "provider": str(runtime_kwargs.get("provider") or ""),
+                "api_mode": str(runtime_kwargs.get("api_mode") or ""),
+            }
+            if isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    shadow_runtime["reasoning_effort"] = "none"
+                elif reasoning_config.get("effort"):
+                    shadow_runtime["reasoning_effort"] = str(reasoning_config["effort"])
+            try:
+                runner._schedule_model_router_shadow(
+                    event=ctx.event, session_key=ctx.session_key or "",
+                    runtime=shadow_runtime, user_config=ctx.user_config,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "model router shadow scheduling failed open for session=%s (%s)",
+                    ctx.session_key or "?", type(exc).__name__,
+                )
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        # Volatile mood text uses the per-call prompt rail, not the cached-agent signature.
+        mood_suffix = runner._consume_pending_mood_prompt(ctx.session_key)
+        agent.ephemeral_system_prompt = (combined_ephemeral + mood_suffix) or None
+        runner._bind_active_model_route(agent, ctx.session_key)
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
@@ -1975,6 +2154,7 @@ class TurnRunner:
         # about to shrink.
         common = {
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
+            "turn_id": result.get("turn_id"),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),

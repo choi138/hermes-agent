@@ -22,6 +22,12 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.run_mention_inbox import (
+    _constrain_mention_inbox_toolsets,
+    _has_mention_inbox_execution_marker,
+    _mention_inbox_session_source,
+    _validated_mention_inbox_execution,
+)
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
@@ -399,8 +405,9 @@ class GatewayTurnMixin:
             with suppress(Exception):
                 event.source = source
 
+        session_source = _mention_inbox_session_source(event, source)
         if expected_session_key:
-            derived_session_key = self._session_key_for_source(source)
+            derived_session_key = self._session_key_for_source(session_source)
             if derived_session_key != expected_session_key:
                 logger.warning(
                     "Dropping internally routed event after route recovery: expected session=%s derived=%s",
@@ -422,7 +429,7 @@ class GatewayTurnMixin:
             # Internal wakes observe reset policy without counting as user activity, or periodic
             # notifications keep the routing key alive across every daily/idle boundary.
             session_entry = await self.async_session_store.get_or_create_session(
-                source, touch_activity=not bool(getattr(event, "internal", False)),
+                session_source, touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
         if not strict_session and pinned_session_id:
@@ -2127,6 +2134,10 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        execution_id, execution_observer = _validated_mention_inbox_execution(
+            event,
+            self._delivery_adapter_for(source) if _has_mention_inbox_execution_marker(event) else None,
+        )
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2147,6 +2158,24 @@ class GatewayTurnMixin:
         if not isinstance(prepared, self._PreparedTurn):
             return prepared
         history, message_text = prepared.history, prepared.message_text
+
+        # Route after the session boundary is settled, before constructing the turn agent.
+        self._set_pending_mood_prompt(session_key, "")
+        if not getattr(event, "internal", False):
+            try:
+                from gateway.run import _load_gateway_config
+                from gateway.run_model_router import _model_router_mode, _mood_injection_enabled
+                with self._profile_scope_for_source(source):
+                    router_cfg = _load_gateway_config()
+                    router_mode = _model_router_mode(router_cfg)
+                    if router_mode == "enforce" or (
+                        router_mode == "shadow" and _mood_injection_enabled(router_cfg)
+                    ):
+                        await self._model_router_stage(
+                            event, source, session_key, mode=router_mode, user_config=router_cfg,
+                        )
+            except Exception:
+                logger.warning("model router pre-dispatch stage failed open", exc_info=True)
 
         try:
             hook_ctx = {
@@ -2170,20 +2199,45 @@ class GatewayTurnMixin:
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
-            agent_result = await self._run_agent(
-                message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
-                session_id=_run_start_session_id, session_key=session_key,
-                run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
-                inbound_message_id=str(event.message_id) if event.message_id else None,
-                channel_prompt=event.channel_prompt, moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=prepared.persist_user_message,
-                persist_user_timestamp=prepared.persist_user_timestamp,
-                persist_user_display_kind=prepared.persist_user_display_kind,
-                persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
-                message_type=event.message_type,
-                scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
-            )
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
+                    session_id=_run_start_session_id, session_key=session_key,
+                    run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
+                    inbound_message_id=str(event.message_id) if event.message_id else None,
+                    channel_prompt=event.channel_prompt, moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=prepared.persist_user_message,
+                    persist_user_timestamp=prepared.persist_user_timestamp,
+                    persist_user_display_kind=prepared.persist_user_display_kind,
+                    persist_user_display_metadata={
+                        "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
+                    message_type=event.message_type,
+                    scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                    mention_inbox_execution_id=execution_id,
+                    mention_inbox_execution_observer=execution_observer,
+                    event=event,
+                )
+                if isinstance(agent_result, dict):
+                    event._gateway_turn_result_seen = True
+                    event._gateway_turn_result_interrupted = bool(agent_result.get("interrupted"))
+            except BaseException:
+                if execution_observer is not None:
+                    try:
+                        await execution_observer.run_failed(execution_id)
+                    except Exception:
+                        logger.exception("mention-inbox execution failure receipt failed")
+                raise
+            if execution_observer is not None:
+                try:
+                    await execution_observer.run_completed(execution_id, agent_result)
+                except Exception:
+                    logger.exception("mention-inbox execution finalization failed")
+                    try:
+                        await execution_observer.run_failed(execution_id)
+                    except Exception:
+                        logger.exception("mention-inbox fallback failure receipt failed")
+                if isinstance(agent_result, dict):
+                    agent_result["final_response"] = "NO_REPLY"
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -2232,6 +2286,14 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            with self._profile_scope_for_source(source):
+                hard_masked = await self._handle_gateway_hard_refusal(
+                    session_key, session_entry.session_id, source, agent_result,
+                )
+                if hard_masked == 0:
+                    await self._handle_gateway_soft_refusal(
+                        session_key, session_entry.session_id, source, agent_result, message_text,
+                    )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -2358,6 +2420,59 @@ class GatewayTurnMixin:
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
         return enabled, disabled
 
+    def _identity_profile_for_source(self, source: SessionSource) -> str:
+        """Name the profile executing this source without inventing a Hermes profile."""
+        from gateway.session_identity import identity_of
+
+        identity = identity_of(source)
+        if identity is not None:
+            return identity.runtime_profile
+        return str(getattr(source, "profile", "") or self._active_profile_name())
+
+    def _tool_policy_for_source(
+        self, user_config: dict, source: SessionSource,
+        enabled_toolsets: List[str], disabled_toolsets: Optional[List[str]] = None,
+    ):
+        """Resolve one immutable schema policy before building the session agent."""
+        from gateway.run import _platform_config_key
+        from gateway.tool_policy import resolve_gateway_tool_policy
+
+        return resolve_gateway_tool_policy(
+            user_config,
+            platform=_platform_config_key(source.platform),
+            source=source,
+            identity_profile=self._identity_profile_for_source(source),
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets or (),
+        )
+
+    @staticmethod
+    def _record_gateway_tool_policy(agent: Any, tool_policy: Any):
+        """Attach the final schema footprint at agent creation, never on cache reuse."""
+        from gateway.tool_policy import (
+            apply_gateway_tool_schema_policy,
+            canonical_tool_schema_metrics,
+            schema_budget_bytes,
+            schema_within_budget,
+        )
+
+        agent.tools = apply_gateway_tool_schema_policy(tool_policy.name, agent.tools or ())
+        metrics = canonical_tool_schema_metrics(agent.tools or ())
+        budget = schema_budget_bytes(tool_policy.name)
+        within_budget = schema_within_budget(tool_policy.name, metrics)
+        log = logger.info if within_budget else logger.warning
+        log(
+            "Gateway tool policy: policy=%s identity_profile=%s tools=%d "
+            "schema_bytes=%d schema_tokens_est=%d schema_hash=%s "
+            "schema_budget_bytes=%s schema_within_budget=%s",
+            tool_policy.name, tool_policy.identity_profile, metrics.count,
+            metrics.json_bytes, metrics.estimated_tokens, metrics.schema_hash,
+            budget if budget is not None else "none", str(within_budget).lower(),
+        )
+        agent._gateway_tool_policy_name = tool_policy.name
+        agent._gateway_identity_profile = tool_policy.identity_profile
+        return metrics
+
     async def _run_background_task_inner(
         self, prompt: str, source: "SessionSource", task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
@@ -2391,6 +2506,10 @@ class GatewayTurnMixin:
 
             platform_key = _platform_config_key(source.platform)
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
+            tool_policy = self._tool_policy_for_source(
+                user_config, source, enabled_toolsets, disabled_toolsets,
+            )
+            enabled_toolsets = list(tool_policy.enabled_toolsets)
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
@@ -2439,6 +2558,7 @@ class GatewayTurnMixin:
                     # See #60955.
                     fallback_model=self._refresh_fallback_model(),
                 )
+                self._record_gateway_tool_policy(agent, tool_policy)
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
                 finally:
@@ -2672,7 +2792,10 @@ class GatewayTurnMixin:
     def _proxy_error_result(text: str) -> Dict[str, Any]:
         return {"final_response": text, "messages": [], "api_calls": 0, "tools": []}
 
-    def _proxy_stream_consumer(self, source: "SessionSource", event_message_id, _thread_metadata, _run_still_current):
+    def _proxy_stream_consumer(
+        self, source: "SessionSource", event_message_id, _thread_metadata,
+        _run_still_current, session_key: str, run_generation: Optional[int],
+    ):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
         from gateway.run import _load_gateway_config, _platform_config_key
         _scfg = getattr(getattr(self, "config", None), "streaming", None)
@@ -2700,6 +2823,9 @@ class GatewayTurnMixin:
             return GatewayStreamConsumer(
                 adapter=_adapter, chat_id=source.chat_id, config=_consumer_cfg,
                 metadata=_thread_metadata, on_before_finalize=_pause_typing_before_finalize,
+                on_content_delivered=(
+                    lambda: self._record_content_delivered(session_key or "", run_generation)
+                ),
                 initial_reply_to_id=event_message_id, run_still_current=_run_still_current,
             )
         except Exception as _sc_err:
@@ -2711,6 +2837,9 @@ class GatewayTurnMixin:
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
         scheduled_heartbeat: bool = False,
+        mention_inbox_execution_id: Optional[str] = None,
+        mention_inbox_execution_observer: Any = None,
+        event: Any = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2770,7 +2899,9 @@ class GatewayTurnMixin:
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
         _stream_consumer = (
             None if scheduled_heartbeat
-            else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
+            else self._proxy_stream_consumer(
+                source, event_message_id, _thread_metadata, _run_still_current,
+                session_key, run_generation)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
@@ -4185,11 +4316,16 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
+        mention_inbox_execution_id: Optional[str] = None,
+        mention_inbox_execution_observer: Any = None,
+        event: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            if mention_inbox_execution_id is not None:
+                raise RuntimeError("approved mention-inbox execution requires local tool receipts")
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -4199,6 +4335,26 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
+        if mention_inbox_execution_id is not None:
+            if mention_inbox_execution_observer is None:
+                raise RuntimeError("approved mention-inbox execution observer is unavailable")
+            approved_toolsets = mention_inbox_execution_observer.enabled_toolsets(
+                mention_inbox_execution_id
+            )
+            enabled_toolsets = _constrain_mention_inbox_toolsets(
+                configured=disp.enabled_toolsets,
+                disabled=disp.disabled_toolsets,
+                approved=approved_toolsets,
+            )
+            disp = dataclasses.replace(
+                disp,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=sorted(set(disp.disabled_toolsets or ()) - set(enabled_toolsets)) or None,
+            )
+        tool_policy = self._tool_policy_for_source(
+            disp.user_config, source, disp.enabled_toolsets, disp.disabled_toolsets,
+        )
+        disp = dataclasses.replace(disp, enabled_toolsets=list(tool_policy.enabled_toolsets))
         if scheduled_heartbeat:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
             # liveness notices would create a user-visible ping before its final result is known.
@@ -4222,6 +4378,10 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            mention_inbox_execution_id=mention_inbox_execution_id,
+            mention_inbox_execution_observer=mention_inbox_execution_observer,
+            tool_policy=tool_policy,
+            event=event,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

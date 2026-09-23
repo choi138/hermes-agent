@@ -54,7 +54,7 @@ FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit 
 # used to strand the reply in ``failed`` until the next restart), but only after a backoff that grows
 # with the attempts already spent, so a platform-side outage is not hammered by the redelivery timer.
 # A whole-chat death (blocked bot, deleted group, deactivated user) is never retried: the target is gone.
-_RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
+_RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded", "lifecycle_deferred"})
 # One tier per in-process retry; the last budgeted attempt is left to the boot sweep (retry_not_before).
 _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
 assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
@@ -197,11 +197,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            turn_id TEXT
         )"""
     )
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "turn_id" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+        add_column_if_missing(conn, "delivery_obligations", "turn_id", "turn_id TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_obligations_turn "
+        "ON delivery_obligations(session_key, turn_id)"
+    )
 
 
 def _transaction():
@@ -264,19 +271,48 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      preserve_existing: bool = False, turn_id: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
+    stored_profile = str(adapter_profile).strip() if adapter_profile else "default"
     with _DB_LOCK, _transaction() as conn:
+        if preserve_existing:
+            existing = conn.execute(
+                "SELECT session_key,platform,chat_id,thread_id,content,adapter_profile,turn_id "
+                "FROM delivery_obligations WHERE obligation_id=?", (obligation_id,),
+            ).fetchone()
+            expected = (session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+                        content, stored_profile)
+            if existing is not None:
+                if tuple(existing[:6]) != expected or (turn_id and existing[6] not in (None, turn_id)):
+                    raise ValueError("Delivery obligation payload conflict")
+                if turn_id and existing[6] is None:
+                    conn.execute(
+                        "UPDATE delivery_obligations SET turn_id=? WHERE obligation_id=?",
+                        (turn_id, obligation_id),
+                    )
+                return
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, turn_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             content, now, now, pid, started, stored_profile, turn_id))
     _prune()
+
+
+def has_turn_obligation(session_key: str, turn_id: str) -> bool:
+    """Whether this exact agent turn already handed an answer to the delivery ledger."""
+    if not session_key or not turn_id:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute(
+            "SELECT 1 FROM delivery_obligations WHERE session_key=? AND turn_id=? LIMIT 1",
+            (session_key, turn_id),
+        ).fetchone() is not None
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -289,6 +325,26 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def defer_lifecycle_claim(obligation_id: str, *, attempts: int) -> bool:
+    """Defer a busy lifecycle finalizer without changing its bounded claim budget.
+
+    Only this process's exact claim may be deferred. A concurrent completion,
+    newer claim, or another gateway's row is never overwritten.
+    """
+    pid, started = _owner_stamp()
+    if started is None:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', updated_at=?, last_error='lifecycle_deferred'
+               WHERE obligation_id=? AND state IN ('pending', 'attempting', 'failed')
+                 AND owner_pid IS ? AND owner_started_at IS ? AND attempts=?""",
+            (time.time(), obligation_id, pid, started, attempts),
+        )
+    return bool(cursor.rowcount)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:

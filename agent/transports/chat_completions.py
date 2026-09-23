@@ -474,7 +474,13 @@ class ChatCompletionsTransport(ProviderTransport):
         _profile = params.get("provider_profile")
         sanitized = self.convert_messages(messages, model=model, base_url=params.get("base_url"), provider_profile=_profile)
         if _profile:
-            return self._build_kwargs_from_profile(_profile, model, sanitized, tools, params)
+            kwargs = self._build_kwargs_from_profile(_profile, model, sanitized, tools, params)
+            from agent.reasoning_pin import validate_pinned_request
+
+            return validate_pinned_request(
+                kwargs, params.get("reasoning_config"), api_mode=self.api_mode,
+                provider=params.get("provider"), base_url=params.get("base_url"), provider_profile=_profile,
+            )
 
         sanitized = _swap_developer_role(sanitized, params.get("model_lower", (model or "").lower()))
         api_kwargs = _base_kwargs(model, sanitized, tools, params)
@@ -544,9 +550,15 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs["extra_body"] = extra_body
         if params.get("request_overrides"):
             api_kwargs.update(params["request_overrides"])
-        return _finish_kwargs(
+        kwargs = _finish_kwargs(
             api_kwargs, sanitized, params,
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
+        )
+        from agent.reasoning_pin import validate_pinned_request
+
+        return validate_pinned_request(
+            kwargs, params.get("reasoning_config"), api_mode=self.api_mode,
+            provider=params.get("provider"), base_url=base_url,
         )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):

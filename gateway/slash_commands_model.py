@@ -385,6 +385,7 @@ class GatewayModelCommandsMixin:
             # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
             # The record step already evicted the cached agent, so the pin lands on the rebuild.
             from gateway.run import _platform_config_key
+            await self.async_session_store.get_or_create_session(source)
             reply += "\n" + self._apply_reasoning_selection(
                 ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                 persist_global=ctx.persist_global and global_error is None)
@@ -638,10 +639,20 @@ class GatewayModelCommandsMixin:
             logger.error("Failed to save config key %s: %s", key_path, e)
             return False
 
-    def _set_reasoning_override(self, session_key: str, value) -> None:
-        """Store (or clear with None) the session reasoning override and drop the cached agent."""
+    def _set_reasoning_override(self, session_key: str, value) -> bool:
+        """Persist first; a failed write must not mutate the live selection."""
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return False
+        try:
+            if store.set_reasoning_override(session_key, value) is not True:
+                return False
+        except Exception:
+            logger.warning("Failed to persist session reasoning selection", exc_info=True)
+            return False
         self._set_session_reasoning_override(session_key, value)
         self._evict_cached_agent(session_key)
+        return True
 
     def _apply_reasoning_selection(
         self, session_key: str, platform_key: str, value: str, persist_global: bool = False,
@@ -659,22 +670,27 @@ class GatewayModelCommandsMixin:
         if value == "reset":
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
-            self._set_session_reasoning_override(session_key, None)
+            if not self._set_reasoning_override(session_key, None):
+                return t("gateway.reasoning.session_save_failed")
             self._reasoning_config = self._load_reasoning_config()
-            self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
 
         parsed = parse_reasoning_effort(value)
         if parsed is None:
             return t("gateway.reasoning.unknown_arg", arg=value)
-        self._reasoning_config = parsed
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
-                self._set_reasoning_override(session_key, None)
+                if not self._set_reasoning_override(session_key, None):
+                    return t("gateway.reasoning.global_clear_failed")
+                self._reasoning_config = parsed
                 return t("gateway.reasoning.set_global", effort=value)
-            self._set_reasoning_override(session_key, parsed)
+            if not self._set_reasoning_override(session_key, {**parsed, "selection": "pinned"}):
+                return t("gateway.reasoning.session_save_failed")
+            self._reasoning_config = parsed
             return t("gateway.reasoning.set_global_save_failed", effort=value)
-        self._set_reasoning_override(session_key, parsed)
+        if not self._set_reasoning_override(session_key, {**parsed, "selection": "pinned"}):
+            return t("gateway.reasoning.session_save_failed")
+        self._reasoning_config = parsed
         return t("gateway.reasoning.set_session", effort=value)
 
     async def _try_send_choice_picker(
@@ -706,6 +722,8 @@ class GatewayModelCommandsMixin:
         # See #30479.
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
+        if raw_args and args not in _REASONING_DISPLAY_TOGGLES:
+            await self.async_session_store.get_or_create_session(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
         # Effective model (session /model override wins) so per-model reasoning_overrides display.
         _session_model = str(
@@ -744,6 +762,12 @@ class GatewayModelCommandsMixin:
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
             return self._apply_reasoning_selection(session_key, platform_key, value)
 
+        # A bare /reasoning can be the first message in a chat.  The picker
+        # callback persists its choice, so create the session before exposing
+        # a picker whose selection would otherwise fail to save.
+        picker_adapter = self._delivery_adapter_for(event.source)
+        if picker_adapter is not None and getattr(type(picker_adapter), "send_choice_picker", None) is not None:
+            await self.async_session_store.get_or_create_session(_reasoning_source)
         picker_sent = await self._try_send_choice_picker(
             event,
             session_key,

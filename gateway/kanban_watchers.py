@@ -13,7 +13,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
@@ -37,8 +37,36 @@ _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
 
 
+async def _wait_for_dispatcher_wake(
+    wake_event: Optional[asyncio.Event], interval: float,
+    keep_running: Callable[[], bool],
+) -> bool:
+    """Wait for committed intake or the next periodic tick without delaying shutdown."""
+    slept = 0.0
+    while slept < interval and keep_running():
+        wait_for = min(1.0, interval - slept)
+        if wake_event is None:
+            await asyncio.sleep(wait_for)
+            slept += wait_for
+            continue
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=wait_for)
+            return True
+        except asyncio.TimeoutError:
+            slept += wait_for
+    return False
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    def _wake_kanban_dispatcher(self) -> None:
+        """Wake the dispatcher from an authenticated intake worker thread."""
+        event = getattr(self, "_kanban_dispatch_wake_event", None)
+        loop = getattr(self, "_gateway_loop", None)
+        if event is None or loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(event.set)
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -276,7 +304,11 @@ class GatewayKanbanWatchersMixin:
         dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+        wake_event = getattr(self, "_kanban_dispatch_wake_event", None)
         while self._running:
+            # Clear before the tick so an intake committed during work is not lost.
+            if wake_event is not None:
+                wake_event.clear()
             try:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
@@ -321,7 +353,9 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            await self._sleep_between_ticks(interval)
+            await _wait_for_dispatcher_wake(
+                wake_event, interval, lambda: bool(self._running),
+            )
 
         self._release_kanban_dispatcher_lock()
 

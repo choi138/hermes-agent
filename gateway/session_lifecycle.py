@@ -149,6 +149,60 @@ class SessionLifecycleMixin:
             self._set_turn_marker_locked(session_key, entry, None, None)
         return True
 
+    def begin_active_turn(
+        self, session_key: str, turn_id: str, boot_id: str, resume_count: int = 0,
+    ) -> bool:
+        """Persist the agent turn identity before dispatch without publishing a failed write."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            record = {
+                "turn_id": turn_id,
+                "boot_id": boot_id,
+                "status": "resuming" if resume_count else "running",
+                "started_at": _now().isoformat(),
+                "resume_count": resume_count,
+            }
+            candidate = entry.to_dict()
+            candidate["active_turn"] = record
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            entry.active_turn = record
+            return True
+
+    def mark_active_turn_interrupted(self, session_key: str, reason: str) -> bool:
+        """Keep a gateway-interrupted turn eligible across a cooperative shutdown."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.active_turn:
+                return False
+            record = {**entry.active_turn, "status": "interrupted",
+                      "interrupted_reason": reason, "interrupted_at": _now().isoformat()}
+            candidate = entry.to_dict()
+            candidate["active_turn"] = record
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            entry.active_turn = record
+            return True
+
+    def finish_active_turn(
+        self, session_key: str, turn_id: Optional[str] = None, *,
+        force: bool = False, turn_interrupted: bool = False,
+    ) -> bool:
+        """CAS-retire a turn; preserve a gateway-interrupted one for the next boot."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.active_turn:
+                return False
+            if turn_id is not None and entry.active_turn.get("turn_id") != turn_id:
+                return False
+            if not force and turn_interrupted and entry.active_turn.get("status") == "interrupted":
+                return False
+            candidate = entry.to_dict()
+            candidate.pop("active_turn", None)
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            entry.active_turn = None
+            return True
+
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.

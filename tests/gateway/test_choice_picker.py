@@ -14,10 +14,10 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, SessionStore
 
 
 def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", chat_id="67890"):
@@ -47,7 +47,7 @@ class _NoPickerAdapter:
     """Adapter with no choice-picker capability."""
 
 
-def _make_runner(adapter=None):
+def _make_runner(adapter=None, sessions_dir=None):
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.adapters = {}
     runner._ephemeral_system_prompt = ""
@@ -62,6 +62,8 @@ def _make_runner(adapter=None):
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    if sessions_dir is not None:
+        runner.session_store = SessionStore(sessions_dir, GatewayConfig())
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     runner._delivery_adapter_for = lambda source: adapter
     runner._thread_metadata_for_source = lambda source, anchor=None: {}
@@ -74,7 +76,7 @@ class TestReasoningChoicePicker:
     async def test_bare_reasoning_sends_picker_when_adapter_supports_it(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         adapter = _PickerAdapter()
-        runner = _make_runner(adapter)
+        runner = _make_runner(adapter, tmp_path / "sessions")
 
         result = await runner._handle_reasoning_command(_make_event("/reasoning"))
 
@@ -95,18 +97,21 @@ class TestReasoningChoicePicker:
         change as typing the argument (single application path)."""
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         adapter = _PickerAdapter()
-        runner = _make_runner(adapter)
+        runner = _make_runner(adapter, tmp_path / "sessions")
         event = _make_event("/reasoning")
         session_key = runner._session_key_for_source(event.source)
+        assert runner.session_store.get_reasoning_override(session_key) is None
 
         await runner._handle_reasoning_command(event)
+        assert runner.session_store.lookup_by_session_key(session_key) is not None
         on_choice = adapter.calls[0]["on_choice_selected"]
 
         reply = await on_choice(event.source.chat_id, "ultra")
 
         assert "ultra" in reply
         override = runner._session_reasoning_overrides.get(session_key)
-        assert override == {"enabled": True, "effort": "ultra"}
+        assert override == {"enabled": True, "effort": "ultra", "selection": "pinned"}
+        assert runner.session_store.get_reasoning_override(session_key) == override
 
 
 class TestFastChoicePicker:
@@ -144,5 +149,4 @@ class TestFastChoicePicker:
         assert runner._service_tier == "priority"
         assert runner._session_service_tier_overrides
         assert not (tmp_path / "config.yaml").exists()
-
 

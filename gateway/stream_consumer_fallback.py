@@ -27,6 +27,8 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=reply_to_id,
                 metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            if result.success:
+                self._notify_content_delivered()
             if not (result.success and result.message_id):
                 self._edit_supported = False
                 return reply_to_id
@@ -226,6 +228,7 @@ class StreamFallbackMixin:
         for attempt in range(2):
             result = await self.adapter.send(**kwargs)
             if getattr(result, "success", False):
+                self._notify_content_delivered()
                 break
             retry_delay = self._fallback_flood_retry_delay(result)
             if attempt or retry_delay is None:
@@ -320,6 +323,7 @@ class StreamFallbackMixin:
             _md["_interim_send"] = True
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
             if result.success:
+                self._notify_content_delivered()
                 self._already_sent = True
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
@@ -356,6 +360,7 @@ class StreamFallbackMixin:
             # Do NOT set _already_sent: commentary is interim, and the flag would
             # suppress the real final after multiple tool calls.
             if result.success:
+                self._notify_content_delivered()
                 self._notify_new_message()
                 # Lets run.py confirm whether an interim send carried the final.
                 # Record the exact delivered text so run.py can confirm whether an interim "preview"

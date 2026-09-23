@@ -23,6 +23,7 @@ def test_actual_wiring_retains_observers_and_controls_across_muted_turn():
             _clarify_callback_sync=lambda *a: "yes",
             _notice_callback_sync=lambda *a: observed.append(("notice", a)),
             _attach_session_title_callback=lambda *a: None)
+        holder._bind_runtime_update_callback = lambda agent: TurnRunner._bind_runtime_update_callback(holder, agent)
         agent = StatusOutputMixin()
         agent.suppress_status_output = True
         TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)

@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import time
+import uuid
 from contextlib import suppress
 from contextvars import copy_context
 from datetime import datetime
@@ -36,9 +37,80 @@ from typing import Any, Dict, Optional, Tuple
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+_MAX_SAME_TURN_RESUMES = 2
+
+
+def _orphaned_active_turn(entry, boot_id: Optional[str]) -> Optional[dict]:
+    """Only a previous boot's running turn or an explicit drain interrupt is recoverable."""
+    record = getattr(entry, "active_turn", None)
+    if not isinstance(record, dict):
+        return None
+    if record.get("status") == "interrupted":
+        return record
+    if record.get("status") in {"running", "resuming"} and record.get("boot_id") != boot_id:
+        return record
+    return None
+
 
 class GatewayStartupMixin:
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
+
+    def _start_agent_health_sink(self) -> None:
+        """Start best-effort operator alerts after adapters are wired."""
+        if getattr(self, "_agent_health_sink", None) is not None:
+            return
+        try:
+            from gateway.agent_health_sink import AgentHealthSink
+
+            sink = AgentHealthSink.from_environment(self)
+            if sink is None:
+                return
+            self._agent_health_sink = sink
+            sink.start()
+        except Exception:
+            self._agent_health_sink = None
+            logger.debug("Agent health sink unavailable", exc_info=True)
+
+    async def _start_mention_inbox_services(self) -> None:
+        """Attach Work Inbox routers before startup-replayed inbound reaches Discord."""
+        from gateway.run import _async_profile_runtime_scope, _load_gateway_config
+        from hermes_constants import get_process_hermes_home
+        from plugins.mention_inbox.operational import MentionInboxGatewayService, parse_mention_inbox_config
+
+        async def start_one(profile: str, home: Path, adapter: Any) -> None:
+            try:
+                async with _async_profile_runtime_scope(home):
+                    config = parse_mention_inbox_config(_load_gateway_config())
+                    service = MentionInboxGatewayService(
+                        config, adapter, db_path=home / "mention_inbox" / "inbox.db",
+                    )
+                    await service.start()
+                    self._mention_inbox_services.append(service)
+                    health = service.health()
+                    logger.info(
+                        "Mention inbox profile=%s status=%s category=%s",
+                        profile, health.get("status"), health.get("error_category"),
+                    )
+            except Exception:
+                logger.warning("Mention inbox profile=%s entered degraded startup state", profile, exc_info=True)
+
+        launch_home = Path(get_process_hermes_home()).resolve()
+        await start_one("active", launch_home, self.adapters.get(Platform.DISCORD))
+        if not getattr(self.config, "multiplex_profiles", False):
+            return
+        from hermes_cli.profiles import profiles_to_serve
+
+        for profile, home in profiles_to_serve(multiplex=True):
+            if Path(home).resolve() == launch_home:
+                continue
+            adapter = getattr(self, "_profile_adapters", {}).get(profile, {}).get(Platform.DISCORD)
+            await start_one(profile, Path(home), adapter)
+
+    async def _stop_mention_inbox_services(self) -> None:
+        services = getattr(self, "_mention_inbox_services", [])
+        self._mention_inbox_services = []
+        if services:
+            await asyncio.gather(*(service.stop() for service in services), return_exceptions=True)
 
     @staticmethod
     def _log_agent_budget() -> None:
@@ -426,7 +498,9 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, defer_lifecycle_claim, mark_delivered, mark_failed,
+            )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -438,6 +512,28 @@ class GatewayStartupMixin:
                 continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
+                continue
+            # Lifecycle results require exact content and attachment readback.
+            # The generic marker/split send path could duplicate an ACK-lost
+            # result, so a failed lookup or busy finalizer never falls through.
+            try:
+                from agent.task_lifecycle.handoff import lifecycle_obligation, deliver_result
+                if await asyncio.to_thread(lifecycle_obligation, row["obligation_id"]):
+                    confirmed = await deliver_result(
+                        row["obligation_id"], adapter,
+                        adapter_profile=row.get("profile") or "default",
+                    )
+                    redelivered += int(confirmed)
+                    continue
+            except Exception:
+                logger.warning("obligation %s: lifecycle reconciliation deferred",
+                               row["obligation_id"], exc_info=True)
+                try:
+                    await asyncio.to_thread(
+                        defer_lifecycle_claim, row["obligation_id"], attempts=row["attempts"],
+                    )
+                except Exception:
+                    logger.debug("lifecycle claim deferral failed", exc_info=True)
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -535,11 +631,17 @@ class GatewayStartupMixin:
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
+                    if not entry.suspended
                     and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and (
+                        _orphaned_active_turn(entry, getattr(self, "_boot_id", None)) is not None
+                        or (
+                            entry.resume_pending
+                            and entry.resume_reason in self._AUTO_RESUME_REASONS
+                            and not (entry.active_turn and entry.active_turn.get("boot_id") == getattr(self, "_boot_id", None))
+                        )
+                    )
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -571,12 +673,43 @@ class GatewayStartupMixin:
             logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
         return False
 
+    async def _reconcile_answered_turns(self) -> int:
+        """Retire previous-boot turns whose exact answer is already in the ledger.
+
+        Run before auto-resume, including for delivered rows that the redelivery sweep
+        does not claim. A failed ledger read leaves the record intact for inspection.
+        """
+        from gateway.delivery_ledger import has_turn_obligation
+
+        try:
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
+                candidates = [
+                    (entry.session_key, entry.active_turn.get("turn_id"))
+                    for entry in self.session_store._entries.values()
+                    if isinstance(entry.active_turn, dict) and entry.active_turn.get("turn_id")
+                ]
+        except Exception:
+            logger.warning("Could not enumerate active turns for delivery reconciliation", exc_info=True)
+            return 0
+        retired = 0
+        for session_key, turn_id in candidates:
+            try:
+                if not await asyncio.to_thread(has_turn_obligation, session_key, turn_id):
+                    continue
+                if await self.async_session_store.finish_active_turn(session_key, turn_id):
+                    await self.async_session_store.clear_resume_pending(session_key)
+                    retired += 1
+            except Exception:
+                logger.warning("Could not reconcile answered turn for %s", session_key, exc_info=True)
+        return retired
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
-        ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
-        ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
-        sessions with a running agent are skipped so none is resumed twice."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
+        """Re-enter fresh orphaned agent turns, with legacy resume-note fallback."""
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window,
+            _is_fresh_gateway_interruption,
+        )
         window = _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
@@ -584,9 +717,35 @@ class GatewayStartupMixin:
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
-                continue
+            record = _orphaned_active_turn(entry, getattr(self, "_boot_id", None))
+            if record is not None:
+                # The delivery sweep only claims recoverable rows. A delivered or still-owned
+                # answer is just as conclusive: never re-pay for its agent turn.
+                try:
+                    from gateway.delivery_ledger import has_turn_obligation
+                    if has_turn_obligation(entry.session_key, record.get("turn_id")):
+                        if self.session_store.finish_active_turn(entry.session_key, record.get("turn_id")):
+                            self.session_store.clear_resume_pending(entry.session_key)
+                        continue
+                except Exception:
+                    logger.warning("Skipping auto-resume for %s: delivery ledger unavailable",
+                                   entry.session_key, exc_info=True)
+                    continue
+                stamp = record.get("interrupted_at") or record.get("started_at")
+                if not _is_fresh_gateway_interruption(stamp, window_secs=window):
+                    self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
+                    self.session_store.clear_resume_pending(entry.session_key)
+                    continue
+                prior_resumes = record.get("resume_count", 0)
+                if prior_resumes >= _MAX_SAME_TURN_RESUMES:
+                    self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
+                    self.session_store.clear_resume_pending(entry.session_key)
+                    logger.warning("Abandoning %s after %d same-turn resume attempts", entry.session_key, prior_resumes)
+                    continue
+            else:
+                marker = entry.last_resume_marked_at or entry.updated_at
+                if marker is not None and (now - marker).total_seconds() > window:
+                    continue
             # Already being resumed (e.g. scheduled at startup, still in-flight) — no second turn.
             if self._is_session_running(entry.session_key):
                 continue
@@ -600,6 +759,20 @@ class GatewayStartupMixin:
                 continue
             if not self._resume_owner_authorized(entry.session_key, source):
                 continue
+            turn_id = record["turn_id"] if record is not None else (
+                f"{entry.session_id}:{entry.session_id}:{uuid.uuid4().hex[:8]}"
+            )
+            resume_count = (record["resume_count"] if record is not None else 0) + 1
+            try:
+                recorded = self.session_store.begin_active_turn(
+                    entry.session_key, turn_id, getattr(self, "_boot_id", "unknown-boot"),
+                    resume_count=resume_count,
+                )
+            except Exception:
+                logger.warning("Could not claim same-turn resume for %s", entry.session_key, exc_info=True)
+                continue
+            if not recorded:
+                continue
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
             _resume_state = self._session_state(entry.session_key)
@@ -608,6 +781,10 @@ class GatewayStartupMixin:
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event._hermes_turn_resume = {
+                "turn_id": turn_id, "resume_count": resume_count,
+                "record_backed": record is not None,
+            }
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )
@@ -1390,9 +1567,11 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
+        await self._reconcile_answered_turns()
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
+        await self._start_mention_inbox_services()
         await self._finish_startup_restore()
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
@@ -1525,6 +1704,7 @@ class GatewayStartupMixin:
         if await self._abort_startup_if_shutdown_requested():
             return True
         self.delivery_router.adapters = self.adapters
+        self._start_agent_health_sink()
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()

@@ -191,7 +191,10 @@ def _review_should_defer(agent: Any, task_cfg: Optional[Dict[str, Any]]) -> bool
 
 
 def _review_queue_key(agent: Any) -> str:
-    return str(getattr(agent, "session_id", None) or id(agent))
+    from hermes_constants import hermes_home_key
+
+    session_key = str(getattr(agent, "session_id", None) or id(agent))
+    return f"{hermes_home_key()}:{session_key}"
 
 
 def _notify_context_engine_session_end(agent: Any, messages: Optional[list]) -> None:
@@ -773,22 +776,26 @@ class AIAgent(
     _summarize_background_review_actions = _forward_static("agent.background_review", "summarize_background_review_actions")
 
     def _spawn_background_review(self, messages_snapshot: List[Dict], review_memory: bool = False,
-                                 review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False) -> None:
+                                 review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False) -> bool:
         """Post-turn review entry point: decide WHEN, then spawn.
 
         A review whose runtime is the MANAGED LOCAL llama-server is queued for machine idle (``defer: auto``)
         instead of hitting the user's GPU mid-session; everything else spawns immediately. ``explicit``
-        (/refine) is never deferred but does not touch the ``focus``-keyed delegate/enabled gates.
+        (/refine) is never deferred; only automatic reviews require a primary foreground agent.
         """
         # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
-        if focus is None and getattr(self, "_delegate_depth", 0) > 0:
-            return
+        from agent.background_review_policy import is_primary_foreground_agent
+
+        if not (review_memory or review_skills):
+            return False
+        if focus is None and not explicit and not is_primary_foreground_agent(self):
+            return False
         task_cfg = None
-        if focus is None:
+        if focus is None and not explicit:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
-                return
+                return False
 
         # Structural clone at the single chokepoint: the fork sanitizes in place, and a shallow copy would
         # alias the live history's nested tool_calls/content.
@@ -801,48 +808,72 @@ class AIAgent(
         if focus is None and not explicit and _review_should_defer(self, task_cfg):
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
-            return
-        self._spawn_background_review_now(**kwargs)
+            return True
+        return self._spawn_background_review_now(**kwargs) is not False
 
     def _spawn_background_review_now(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                      review_skills: bool = False, focus: Optional[str] = None,
                                      task_cfg: Optional[Dict[str, Any]] = None, _requeue_attempts: int = 0,
-                                     explicit: bool = False) -> None:
-        """Spawn the background memory/skill review thread.
+                                     explicit: bool = False) -> bool:
+        """Submit a review to the process-wide single-flight worker.
 
-        ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
-        ``focus`` is /refine steering text; ``task_cfg`` is the pre-loaded config block (None on direct calls).
-        ``explicit`` (/refine) forks under the ``refine_review`` write origin, keeping the full
-        memory operation set. A deferred review preempted by a live turn is requeued (bounded)
-        rather than lost.
+        The run token is installed only when the worker starts, so queued work does not
+        block a later foreground turn. Deferred reviews keep their bounded requeue path.
         """
         from agent.background_review import (
             finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
         )
+        from agent.background_review_coordinator import (
+            ensure_background_review_owner_token, get_background_review_coordinator,
+        )
         from tools.thread_context import propagate_context_to_thread
 
-        review_run = prepare_background_review_run(self)
-        if review_run is None:
-            return
-        try:
-            target, _prompt = spawn_background_review_thread(
-                self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                focus=focus, task_cfg=task_cfg, review_run=review_run, explicit=explicit,
-            )
+        if not (review_memory or review_skills):
+            return False
+        if task_cfg is None:
+            from agent.background_review import load_background_review_settings
 
-            def _target_with_requeue() -> None:
+            _enabled, task_cfg = load_background_review_settings()
+
+        coordinator = get_background_review_coordinator()
+        try:
+            coordinator.configure(
+                idle_grace_seconds=float(task_cfg.get("idle_grace_seconds", 2.0)),
+                dedupe_ttl_seconds=float(task_cfg.get("dedupe_ttl_seconds", 3600.0)),
+                queue_limit=int(task_cfg.get("queue_limit", 64)),
+            )
+        except (TypeError, ValueError, AttributeError):
+            logger.warning("Invalid background review coordinator settings; keeping last valid values")
+
+        def _target_factory(memory_flag: bool, skills_flag: bool):
+            def _run() -> bool:
+                review_run = prepare_background_review_run(self)
+                if review_run is None:
+                    return False
+                try:
+                    target, _prompt = spawn_background_review_thread(
+                        self, messages_snapshot, review_memory=memory_flag, review_skills=skills_flag,
+                        focus=focus, task_cfg=task_cfg, review_run=review_run, explicit=explicit,
+                    )
+                except Exception:
+                    finish_background_review_run(self, review_run)
+                    raise
                 target()
                 self._maybe_requeue_preempted_review(review_run, dict(
-                    messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+                    messages_snapshot=messages_snapshot, review_memory=memory_flag, review_skills=skills_flag,
                     focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1,
                     explicit=explicit))
+                return not review_run.cancel_requested.is_set()
 
-            # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
-            # right profile.
-            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
-        except Exception:
-            finish_background_review_run(self, review_run)
-            raise
+            # Capture the owning profile while the foreground turn still has its scope.
+            return propagate_context_to_thread(_run)
+
+        disposition = coordinator.submit(
+            owner_token=ensure_background_review_owner_token(self),
+            messages_snapshot=messages_snapshot, review_memory=review_memory,
+            review_skills=review_skills, target_factory=_target_factory,
+        )
+        return disposition != "queue_full"
 
     _REVIEW_REQUEUE_MAX_ATTEMPTS = 3
 

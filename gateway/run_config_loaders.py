@@ -186,6 +186,16 @@ class GatewayConfigLoadersMixin:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                try:
+                    persisted = store.get_reasoning_override(resolved_session_key)
+                except Exception:
+                    logger.warning("Failed to restore session reasoning selection", exc_info=True)
+                else:
+                    if persisted is not None:
+                        self._set_session_reasoning_override(resolved_session_key, persisted)
+                        return persisted
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:

@@ -233,6 +233,19 @@ def build_memory_guidance(
 MEMORY_GUIDANCE = build_memory_guidance(True, True)
 USER_PROFILE_GUIDANCE = build_memory_guidance(False, True)
 
+NOTES_GUIDANCE = (
+    "Curated notes (notes_write/notes_read) hold durable declarative facts: "
+    "decisions, incidents, preferences, relationships, and project facts. "
+    "Use the memory tool for standing instructions about your behavior; put "
+    "reusable procedures in skills and raw task progress in session history. "
+    "notes_write is two-step: propose with evidence returns nearby notes and "
+    "a token, then confirm a verdict. Prefer NOOP if a nearby note already "
+    "covers the fact, or UPDATE/SUPERSEDE over ADD for the same topic. "
+    "Cite an episode UUID or a substantive verbatim journal quote, never "
+    "injected memory or a secret. If a fact only seems promising, queue "
+    "memory_propose and continue."
+)
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect relevant cross-session "
     "context exists, use session_search to recall it before asking them to repeat themselves."
@@ -1563,7 +1576,11 @@ def _read_context_file(path: Path) -> str:
     if not path.exists():
         return ""
     try:
-        return (_read_text_with_timeout(path) or "").strip()
+        from agent.prompt_backend import BackendPath
+        # The outer backend deadline already bounds all SSH reads. Do not leave
+        # an inner reader thread using an SSH probe after its owner closes it.
+        content = path.read_text(encoding="utf-8") if isinstance(path, BackendPath) else _read_text_with_timeout(path)
+        return (content or "").strip()
     except Exception as e:
         logger.debug("Could not read %s: %s", path, e)
         return ""
@@ -1715,9 +1732,15 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
                              read_path=str(cwd_path / ".cursorrules"))
 
 
+def _load_project_context(cwd_path: Path, context_length: Optional[int]) -> str:
+    return (_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
+            or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length))
+
+
 def build_context_files_prompt(
     cwd: Optional[str] = None, skip_soul: bool = False, context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False, home_override: "Path | None" = None,
+    task_id: Optional[str] = None,
 ) -> str:
     """Discover and load context files for the system prompt (each capped, see ``_get_context_file_max_chars``).
 
@@ -1725,16 +1748,25 @@ def build_context_files_prompt(
     AGENTS.md chain (git root → cwd) → CLAUDE.md (cwd) → .cursorrules + .cursor/rules/*.mdc (cwd). SOUL.md
     from HERMES_HOME is independent and always included unless *skip_soul* (already the identity slot).
     """
-    cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
-    if _project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback):
-        logger.warning(
-            "skipping project-context discovery: working-directory resolution fell back to the Hermes "
-            "install tree (%s) — set terminal.cwd to your project directory", cwd_path,
-        )
-        sections = []
+    from agent.prompt_backend import BackendPath, read_backend, resolve_prompt_backend
+
+    backend = resolve_prompt_backend(task_id, cwd)
+    if backend.is_remote:
+        project_context = read_backend(
+            backend,
+            lambda execute: _load_project_context(BackendPath.working_directory(execute), context_length),
+        ) or ""
     else:
-        sections = [_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
-                    or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length)]
+        cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
+        if _project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback):
+            logger.warning(
+                "skipping project-context discovery: working-directory resolution fell back to the Hermes "
+                "install tree (%s) — set terminal.cwd to your project directory", cwd_path,
+            )
+            project_context = ""
+        else:
+            project_context = _load_project_context(cwd_path, context_length) if cwd_path.is_dir() else ""
+    sections = [project_context]
     if not skip_soul:
         sections.append(load_soul_md(context_length, home_override=home_override))
     sections = [s for s in sections if s]

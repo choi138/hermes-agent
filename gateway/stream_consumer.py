@@ -118,7 +118,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        on_content_delivered: Optional[Callable[[], Any]] = None):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
@@ -127,6 +128,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
+        self._on_content_delivered = on_content_delivered
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
@@ -438,6 +440,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 self._on_new_message()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _notify_content_delivered(self) -> None:
+        """Advance the output clock only after a content-bearing transport ACK."""
+        callback = self._on_content_delivered
+        if callback is None:
+            return
+        try:
+            result = callback()
+            if inspect.iscoroutine(result):
+                result.close()  # callbacks must not delay the delivery path
+        except Exception:
+            logger.debug("on_content_delivered callback error", exc_info=True)
 
     @staticmethod
     def _signal_flush(flush_event) -> None:

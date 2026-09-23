@@ -419,8 +419,8 @@ def test_background_review_explicit_focus_runs_even_in_subagent(monkeypatch):
     assert len(forks) == 1, "explicit focus review must run even in a subagent"
 
 
-def test_background_review_registers_before_start_runs_and_cleans_up(monkeypatch):
-    """The parent must own a unique review run before the worker can start."""
+def test_background_review_registers_when_worker_starts_and_cleans_up(monkeypatch):
+    """Queued work does not hold a run token; the executing worker owns one."""
     seen = {}
 
     class RecordingReviewAgent(FakeReviewAgent):
@@ -441,21 +441,16 @@ def test_background_review_registers_before_start_runs_and_cleans_up(monkeypatch
         review_memory=True,
     )
 
-    run = agent._background_review_run
-    assert run is not None
+    assert agent._background_review_run is None
     assert len(CapturingThread.targets) == 1
-    assert not run.request_done.is_set()
-
-    observed_done = ObservedEvent()
-    run.request_done = observed_done
     CapturingThread.targets[0]()
 
+    run = seen["run"]
     fork = seen["background_review_agent_during_run"]
     assert fork is not None
-    assert seen["run"] is run
+    assert run is not None
     assert seen["active_children_during_run"] == [fork]
-    assert observed_done.is_set()
-    assert observed_done.set_calls == 1
+    assert run.request_done.is_set()
     assert agent._background_review_run is None
     assert agent._background_review_agent is None
     assert agent._active_children == []
@@ -511,15 +506,16 @@ def test_live_turn_waits_for_review_exit_before_relay_and_turn_context(monkeypat
         messages_snapshot=[{"role": "user", "content": "hello"}],
         review_memory=True,
     )
-    run = agent._background_review_run
-    assert run is not None
-    observed_done = ObservedEvent()
-    run.request_done = observed_done
+    assert agent._background_review_run is None
 
     monkeypatch.setattr(run_agent_module.threading, "Thread", _REAL_THREAD)
     worker = _REAL_THREAD(target=CapturingThread.targets[0], daemon=True)
     worker.start()
     assert review_entered.wait(2.0)
+    run = agent._background_review_run
+    assert run is not None
+    observed_done = ObservedEvent()
+    run.request_done = observed_done
 
     def on_boundary():
         seen["review_returned_at_boundary"] = review_returned.is_set()
@@ -557,8 +553,8 @@ def test_live_turn_waits_for_review_exit_before_relay_and_turn_context(monkeypat
     assert live_result == {"boundary_reached": True}
 
 
-def test_live_turn_cancels_review_during_startup_before_provider(monkeypatch):
-    """A review cancelled before its worker runs must never call its provider."""
+def test_live_turn_drops_pending_review_before_provider(monkeypatch):
+    """A new turn drops a queued stale snapshot before the worker runs."""
     provider_calls = []
     boundary_reached = threading.Event()
 
@@ -576,11 +572,10 @@ def test_live_turn_cancels_review_during_startup_before_provider(monkeypatch):
         messages_snapshot=[{"role": "user", "content": "hello"}],
         review_memory=True,
     )
-    run = agent._background_review_run
-    assert run is not None
+    assert agent._background_review_run is None
 
     _install_live_turn_boundary(monkeypatch, boundary_reached.set)
-    relay_calls = _install_relay_recorder(monkeypatch, run)
+    relay_calls = _install_relay_recorder(monkeypatch)
     live_result = {}
     live = _REAL_THREAD(
         target=_run_wrapped_live_turn_to_boundary,
@@ -588,22 +583,20 @@ def test_live_turn_cancels_review_during_startup_before_provider(monkeypatch):
         daemon=True,
     )
     live.start()
-    assert run.cancel_requested.wait(2.0)
-
+    live.join(timeout=2.0)
     worker = _REAL_THREAD(target=CapturingThread.targets[0], daemon=True)
     worker.start()
     worker.join(timeout=2.0)
-    live.join(timeout=2.0)
 
     assert not worker.is_alive()
     assert not live.is_alive()
     assert boundary_reached.is_set()
     assert provider_calls == []
-    assert run.request_done.is_set()
+    assert agent._background_review_run is None
     assert relay_calls == [
-        ("acquire", True),
-        ("begin", True),
-        ("start_task_run", True),
+        ("acquire", False),
+        ("begin", False),
+        ("start_task_run", False),
     ]
     assert live_result == {"boundary_reached": True}
 
@@ -648,12 +641,13 @@ def test_live_turn_proceeds_when_review_acknowledgement_times_out(monkeypatch):
         messages_snapshot=[{"role": "user", "content": "hello"}],
         review_memory=True,
     )
-    run = agent._background_review_run
-    assert run is not None
+    assert agent._background_review_run is None
     monkeypatch.setattr(run_agent_module.threading, "Thread", _REAL_THREAD)
     worker = _REAL_THREAD(target=CapturingThread.targets[0], daemon=True)
     worker.start()
     assert review_entered.wait(2.0)
+    run = agent._background_review_run
+    assert run is not None
 
     boundary_calls = []
     _install_live_turn_boundary(
@@ -735,10 +729,12 @@ def test_live_turn_interrupts_legacy_review_but_keeps_foreground_priority(monkey
     assert agent.session_id == "test-session"
 
 
-def test_stale_review_cleanup_cannot_clear_or_signal_newer_review(monkeypatch):
-    """A retired worker's late cleanup must be scoped to its own run identity."""
+def test_next_review_waits_for_prior_cleanup(monkeypatch):
+    """Single-flight covers cleanup as well as provider calls."""
     first_cleanup_entered = threading.Event()
     allow_first_cleanup = threading.Event()
+    second_started = threading.Event()
+    second_run_holder = {}
     instance_count = 0
 
     class BlockingCleanupReviewAgent(FakeReviewAgent):
@@ -753,6 +749,11 @@ def test_stale_review_cleanup_cannot_clear_or_signal_newer_review(monkeypatch):
                 first_cleanup_entered.set()
                 assert allow_first_cleanup.wait(2.0)
 
+        def run_conversation(self, **kwargs):
+            if self.index == 1:
+                second_run_holder["run"] = agent._background_review_run
+                second_started.set()
+
     monkeypatch.setattr(run_agent_module, "AIAgent", BlockingCleanupReviewAgent)
     CapturingThread.targets = []
     monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
@@ -763,30 +764,27 @@ def test_stale_review_cleanup_cannot_clear_or_signal_newer_review(monkeypatch):
         messages_snapshot=[{"role": "user", "content": "first"}],
         review_memory=True,
     )
-    first_run = agent._background_review_run
+    assert agent._background_review_run is None
     first_worker = _REAL_THREAD(target=CapturingThread.targets[0], daemon=True)
     first_worker.start()
     assert first_cleanup_entered.wait(2.0)
-    assert first_run.request_done.is_set()
+    assert agent._background_review_run is None
 
     AIAgent._spawn_background_review(
         agent,
         messages_snapshot=[{"role": "user", "content": "second"}],
         review_memory=True,
     )
-    second_run = agent._background_review_run
-    second_target = CapturingThread.targets[1]
-    assert second_run is not first_run
-    assert not second_run.request_done.is_set()
+    assert len(CapturingThread.targets) == 1
+    assert not second_started.is_set()
 
     allow_first_cleanup.set()
     first_worker.join(timeout=2.0)
 
     assert not first_worker.is_alive()
-    assert agent._background_review_run is second_run
-    assert not second_run.request_done.is_set()
-
-    second_target()
+    assert second_started.is_set()
+    second_run = second_run_holder["run"]
+    assert second_run is not None
     assert second_run.request_done.is_set()
     assert agent._background_review_run is None
 

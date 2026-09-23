@@ -998,9 +998,10 @@ def _read_discord_prompt_timeout() -> int:
 
 
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
+from plugins.platforms.discord.mention_inbox_adapter import DiscordMentionInboxMixin
 
 
-class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1122,6 +1123,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        self._mention_inbox_parent_channels: Dict[str, str] = {}
+        self._mention_inbox_thread_locks: Dict[str, asyncio.Lock] = {}
+        self._mention_inbox_router: Any = None
+        self._mention_inbox_execution_observer: Any = None
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -1890,6 +1895,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        # Typing loops are not part of BasePlatformAdapter._background_tasks.
+        # Stop them before the client is closed or replaced on reconnect.
+        for chat_id in list(getattr(self, "_typing_tasks", {})):
+            await self.stop_typing(chat_id)
         # Cancel the liveness probe first so it can't fire a spurious fatal/reconnect mid-teardown.
         await self._cancel_liveness_task()
         # Leave voice *before* cancelling the bot task: VoiceClient.disconnect() needs the main
@@ -3024,8 +3033,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                send_kwargs: Dict[str, Any] = {"content": chunk, "reference": chunk_reference}
+                if metadata and metadata.get("mention_inbox_no_mentions"):
+                    send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
+                if metadata and i == 0 and metadata.get("mention_inbox_nonce") is not None:
+                    send_kwargs["nonce"] = metadata["mention_inbox_nonce"]
                 try:
-                    msg = await channel.send(content=chunk, reference=chunk_reference)
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     if chunk_reference is not None and self._is_reply_reference_rejected(e):
                         logger.warning(
@@ -3033,7 +3047,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             self.name, reply_to,
                         )
                         reference = None
-                        msg = await channel.send(content=chunk, reference=None)
+                        send_kwargs["reference"] = None
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -4172,10 +4187,66 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
 
 
+    async def send_lifecycle_result(self, *, chat_id: str, content: str, attachment=None):
+        """Send one exact result; ambiguous sends are reconciled by readback."""
+        if not self._client or not self._client.user:
+            raise RuntimeError("Discord is not connected")
+        if not content or len(content) > self.MAX_MESSAGE_LENGTH:
+            raise ValueError("Lifecycle result must fit one Discord message")
+        channel = self._client.get_channel(int(chat_id)) or await self._client.fetch_channel(int(chat_id))
+        if self._is_forum_parent(channel):
+            raise ValueError("Lifecycle result requires the original channel or thread")
+        upload = None
+        try:
+            if attachment is not None:
+                import io
+                if not isinstance(attachment["data"], bytes) or len(attachment["data"]) > 8 * 1024 * 1024:
+                    raise ValueError("Lifecycle attachment exceeds supported size")
+                upload = discord.File(io.BytesIO(attachment["data"]), filename=attachment["name"])
+            message = await channel.send(
+                content=content, files=[upload] if upload else [],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return SendResult(success=True, message_id=str(message.id))
+        finally:
+            if upload is not None:
+                upload.close()
+
+    async def find_lifecycle_result(self, channel_id: str, content: str):
+        """Find an exact own-message match after a lifecycle send lost its ACK."""
+        if not self._client or not self._client.user:
+            raise RuntimeError("Discord is not connected")
+        channel = self._client.get_channel(int(channel_id)) or await self._client.fetch_channel(int(channel_id))
+        async for message in channel.history(limit=100):
+            if message.author.id == self._client.user.id and message.content == content:
+                return str(message.id)
+        return None
+
+    async def read_lifecycle_result(self, channel_id: str, message_id: str):
+        """Read back the exact bot message and downloaded attachment bytes."""
+        if not self._client or not self._client.user:
+            raise RuntimeError("Discord is not connected")
+        channel = self._client.get_channel(int(channel_id)) or await self._client.fetch_channel(int(channel_id))
+        message = await channel.fetch_message(int(message_id))
+        if message.author.id != self._client.user.id:
+            raise ValueError("Result message belongs to a different author")
+        attachments = []
+        for item in message.attachments:
+            if item.size > 8 * 1024 * 1024:
+                raise ValueError("Lifecycle attachment exceeds supported size")
+            data = await item.read()
+            if len(data) != item.size:
+                raise ValueError("Discord attachment size does not match downloaded bytes")
+            attachments.append({"name": item.filename, "bytes": len(data),
+                                "sha256": hashlib.sha256(data).hexdigest()})
+        return {"message_id": str(message.id), "channel_id": str(message.channel.id),
+                "content_digest": hashlib.sha256(message.content.encode()).hexdigest(),
+                "attachments": attachments}
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing loop (POST typing every 12s; indicator lasts ~10s).
         TYPING_START is unreliable for bots in DMs; 429 sleeps ``retry_after``; CancelledError ends it."""
-        if not self._client:
+        if not self._client or self._disconnecting:
             return
         if chat_id in self._typing_tasks:
             return
@@ -4206,7 +4277,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                # A replacement may start while this cancelled task unwinds.
+                if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                    self._typing_tasks.pop(chat_id, None)
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
     async def stop_typing(self, chat_id: str) -> None:
@@ -5967,9 +6040,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     and not self._is_bot_tag_debounce_continuation(message)
                 ):
                     return False
+        mention_inbox_agent_passthrough = False
+        route_channel_id = str(getattr(message.channel, "id", ""))
+        if route_channel_id:
+            route_result = await self._route_mention_inbox_message_result(
+                message,
+                thread_id=route_channel_id,
+                parent_channel_id=parent_channel_id,
+                raw_content=raw_content,
+                check_registered_thread=is_thread,
+            )
+            if route_result is not None and bool(route_result.handled):
+                return True
+            agent_text = None if route_result is None else getattr(route_result, "agent_text", None)
+            if isinstance(agent_text, str) and agent_text.strip():
+                normalized_content = agent_text
+                mention_inbox_agent_passthrough = True
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
-        if not is_thread and not isinstance(message.channel, discord.DMChannel):
+        if not mention_inbox_agent_passthrough and not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
             skip_thread = bool(channel_keys & no_thread_channels) or (
@@ -6010,9 +6099,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         referenced_attachments = []
         reference = getattr(message, "reference", None)
         resolved_reference = getattr(reference, "resolved", None) if reference else None
-        if resolved_reference is not None:
+        if resolved_reference is not None and not mention_inbox_agent_passthrough:
             referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
-        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
+        inherited_attachments = [] if mention_inbox_agent_passthrough else snapshot_attachments + referenced_attachments
+        all_attachments = list(message.attachments) + inherited_attachments
         if normalized_content.startswith("/"):
             msg_type = MessageType.COMMAND
         elif all_attachments:
@@ -6031,6 +6121,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"
+        if mention_inbox_agent_passthrough:
+            chat_name = "Work Inbox"
         # Channel topic (TextChannels only); forum-parented threads inherit the parent topic.
         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
         guild = getattr(message, "guild", None)
@@ -6064,7 +6156,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # and prepend it. DMs skipped (every DM triggers the bot); in-flight arrivals not captured.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
+        if not _is_dm and not mention_inbox_agent_passthrough and self._discord_history_backfill():
             # Backfill on a gap: mention-gated channels, any thread (processing/restart gaps), any
             # reply (hydrate context around the referenced message). DMs/fresh auto-threads: nothing.
             _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
@@ -6094,7 +6186,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
         reply_to_id = None
         reply_to_text = None
-        if message.reference:
+        if message.reference and not mention_inbox_agent_passthrough:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None

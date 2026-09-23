@@ -27,6 +27,10 @@ def _agent_with_real_chokepoint():
     agent = MagicMock()
     agent.valid_tool_names = {"memory"}
     agent._delegate_depth = 0
+    agent.platform = "cli"
+    agent._persist_disabled = False
+    agent._memory_write_origin = None
+    agent._memory_write_context = None
     agent._spawn_background_review = AIAgent._spawn_background_review.__get__(agent)
     return agent
 

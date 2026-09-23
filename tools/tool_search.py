@@ -136,6 +136,14 @@ def _core_tool_names() -> frozenset[str]:
 # their schema; once enabled they stay direct unless the deferral list names them.
 _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
 
+
+def _toolset_keeps_tools_eager(toolset_name: str) -> bool:
+    """A small, policy-gated static surface can opt out of catalog deferral."""
+    from toolsets import TOOLSETS
+
+    definition = TOOLSETS.get(toolset_name)
+    return isinstance(definition, dict) and definition.get("defer_to_tool_search") is False
+
 # Event-triggered tools deferred BY DEFAULT (a catalog stub suffices). Keep the curated
 # list in DEFAULT_CONFIG so config discovery and runtime behavior cannot drift. An explicit
 # ``defer`` list replaces this wholesale ([] = everything eager). ``clarify`` is deliberately
@@ -156,7 +164,10 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
         return False
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
     return toolset is not None and (
-        toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)
+        toolset.startswith("mcp-") or (
+            toolset not in _DIRECT_SURFACE_TOOLSETS
+            and not _toolset_keeps_tools_eager(toolset)
+        ))
 
 
 def _tool_def_names(tool_defs: Iterable[Dict[str, Any]]) -> Iterable[str]:

@@ -40,6 +40,8 @@ def _wire(user_config):
         process_task_id=None,
         process_baseline=None,
         run_generation=0,
+        mention_inbox_execution_id=None,
+        mention_inbox_execution_observer=None,
     )
     holder = types.SimpleNamespace(
         _ctx=ctx,
@@ -53,6 +55,7 @@ def _wire(user_config):
         _notice_callback_sync=lambda *a, **k: None,
         _attach_session_title_callback=lambda agent, ctx: None,
     )
+    holder._bind_runtime_update_callback = lambda agent: TurnRunner._bind_runtime_update_callback(holder, agent)
     TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)
     return agent
 

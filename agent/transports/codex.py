@@ -803,7 +803,12 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["extra_body"].setdefault("prompt_cache_key", kwargs.get("prompt_cache_key", cache_key))
 
         _bound_prompt_cache_key_field(kwargs.get("extra_body"))
-        return kwargs
+        from agent.reasoning_pin import validate_pinned_request
+
+        return validate_pinned_request(
+            kwargs, params.get("reasoning_config"), api_mode=self.api_mode,
+            provider=params.get("provider"), base_url=params.get("base_url"),
+        )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Codex Responses API response to NormalizedResponse."""

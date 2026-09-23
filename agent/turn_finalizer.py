@@ -12,6 +12,7 @@ from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.background_review_policy import is_successful_review_outcome
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -629,14 +630,21 @@ def finalize_turn(
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 
-    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used.
+    _review_eligible = is_successful_review_outcome(
+        agent, final_response=final_response, completed=completed, failed=failed,
+        interrupted=interrupted, exit_reason=_turn_exit_reason,
+        cleanup_failed=bool(_cleanup_errors),
+    )
+    if not _review_eligible and hasattr(agent, "_review_skill_count_before_turn"):
+        agent._iters_since_skill = agent._review_skill_count_before_turn
+
+    # Skill trigger is checked NOW — based on successful foreground work.
     _should_review_skills = (
-        agent._skill_nudge_interval > 0
+        _review_eligible
+        and agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
         and "skill_manage" in agent.valid_tool_names
     )
-    if _should_review_skills:
-        agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -649,16 +657,20 @@ def finalize_turn(
     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
     if (
-        final_response
-        and not interrupted
+        _review_eligible
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
         with suppress(Exception):
-            agent._spawn_background_review(
+            _accepted = agent._spawn_background_review(
                 messages_snapshot=list(messages), review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
             )
+            if _accepted is not False:
+                if _should_review_memory:
+                    agent._turns_since_memory = 0
+                if _should_review_skills:
+                    agent._iters_since_skill = 0
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.

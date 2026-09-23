@@ -10,7 +10,7 @@ logical cwd via `_SESSION_CWD`.
 import logging
 import os
 from contextvars import ContextVar, Token
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,11 @@ def clear_session_cwd() -> None:
 def reset_session_cwd(token: Token) -> None:
     """Restore the logical cwd that was active before the matching ``set_session_cwd``."""
     _SESSION_CWD.reset(token)
+
+
+def _session_cwd_override() -> str:
+    override = _SESSION_CWD.get()
+    return "" if override is _UNSET else str(override).strip()
 
 
 def scope_terminal_cwd() -> str:
@@ -92,8 +97,16 @@ def resolve_agent_cwd() -> Path:
     return _resolve_configured_cwd(override_is_final=False) or Path(os.getcwd())
 
 
-def resolve_context_cwd() -> Path | None:
-    """Configured cwd for context-file discovery, or None (build_context_files_prompt then falls back to the
-    launch dir). An existing configured path is honored verbatim — including the Hermes source tree, a
-    legitimate workspace when developing Hermes; fallback-directory policy lives in the caller."""
-    return _resolve_configured_cwd(override_is_final=True)
+def resolve_context_cwd(task_id: str | None = None) -> Path | PurePosixPath | None:
+    """Configured project cwd without testing a remote path on the controller.
+
+    A missing explicit local path is also kept: it must not turn into the
+    ``None`` sentinel that authorizes discovery in the launch directory.
+    """
+    from agent.prompt_backend import resolve_prompt_backend
+
+    backend = resolve_prompt_backend(task_id)
+    if backend.is_remote:
+        return PurePosixPath(backend.cwd)
+    raw = _session_cwd_override() or scope_terminal_cwd().strip()
+    return Path(raw).expanduser() if raw else None

@@ -70,6 +70,46 @@ _PROFILE_MANAGED_ENV_KEYS: frozenset[str] = frozenset({
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_CLI_PATH", "COPILOT_ACP_BASE_URL",
 })
 
+# A dispatcher-issued Kanban worker contract outranks profile .env, managed
+# env, and terminal config. Capture only process-provided pins on entry: an
+# ordinary session's .env must not be able to create the private marker.
+_KANBAN_EXECUTION_BACKEND_ENV = "_HERMES_KANBAN_EXECUTION_BACKEND"
+_KANBAN_WORKER_IDENTITY_ENV = {"HERMES_HOME", "HERMES_PROFILE", "HERMES_TENANT"}
+
+
+def _capture_kanban_worker_runtime_pins() -> dict[str, str]:
+    if not os.environ.get(_KANBAN_EXECUTION_BACKEND_ENV):
+        return {}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if (
+            key == _KANBAN_EXECUTION_BACKEND_ENV
+            or key.startswith("HERMES_KANBAN_")
+            or key in _KANBAN_WORKER_IDENTITY_ENV
+        )
+    }
+
+
+def _restore_kanban_worker_runtime_pins(pins: dict[str, str]) -> None:
+    if not pins:
+        os.environ.pop(_KANBAN_EXECUTION_BACKEND_ENV, None)
+        return
+
+    for key in tuple(os.environ):
+        if (
+            key == "_HERMES_GATEWAY"
+            or key.startswith("_HERMES_KANBAN_")
+            or key.startswith("HERMES_KANBAN_")
+            or key in _KANBAN_WORKER_IDENTITY_ENV
+        ) and key not in pins:
+            os.environ.pop(key, None)
+    os.environ.update(pins)
+
+    from hermes_cli.kanban_runtime import apply_worker_execution_contract
+
+    apply_worker_execution_contract(os.environ)
+
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     """KEY names assigned in a dotenv file (including empty ``KEY=``), via the same tokenizer that installs
@@ -400,6 +440,7 @@ def load_hermes_dotenv(
     # profile — see the multiplex guard below.
     from hermes_constants import get_process_hermes_home
     home_path = Path(hermes_home) if hermes_home else get_process_hermes_home()
+    kanban_worker_pins = _capture_kanban_worker_runtime_pins()
 
     # Multiplex gateway: while a routed profile-home override is active, copying that profile's .env
     # into os.environ would expose its credentials to sibling turns and every spawned child. Unscoped
@@ -482,6 +523,7 @@ def load_hermes_dotenv(
     # cron standalone runs) call load_hermes_dotenv() repeatedly and used to flip the effective backend back
     # to the stale .env value mid-session (#29186, #67323).
     _reapply_terminal_config_bridge(home_path)
+    _restore_kanban_worker_runtime_pins(kanban_worker_pins)
 
     return loaded
 

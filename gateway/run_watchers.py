@@ -243,6 +243,10 @@ class GatewaySessionWatchersMixin:
             try:
                 if (timeout := self._session_stall_timeout_seconds()) > 0:
                     await self._check_session_stalls(timeout)
+                health_silence = self._agent_health_silence_timeout_seconds()
+                health_deadline = self._agent_health_turn_deadline_seconds()
+                if health_silence > 0 or health_deadline > 0:
+                    await self._check_output_silence(health_silence, health_deadline)
             except Exception as exc:
                 logger.debug("Session stall watcher error: %s", exc)
             await _interruptible_sleep(self, max(1, int(float(interval))))

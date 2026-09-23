@@ -2317,9 +2317,11 @@ def switch_model(
     # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
     # YAML False = disabled).
     try:
-        from hermes_constants import resolve_reasoning_config
+        from agent.reasoning_effort import reasoning_for_model
         from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        agent.reasoning_config = reasoning_for_model(
+            getattr(agent, "reasoning_config", None), _sm_load_config() or {}, agent.model,
+        )
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )

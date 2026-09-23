@@ -1330,7 +1330,13 @@ class GatewayInboundMixin:
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        turn_starts = getattr(self, "_turn_started_at", None)
+        if turn_starts is None:
+            turn_starts = self._turn_started_at = {}
+        turn_starts[_quick_key] = _claim_state.turn.started_ts
+        self._cache_session_source(_quick_key, source)
 
+        _agent_result = None
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -1361,7 +1367,7 @@ class GatewayInboundMixin:
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
             # recovery pass.
-            await self._clear_durable_active_turn(event)
+            await self._clear_durable_active_turn(event, defer_delivery=bool(_agent_result))
             # Release only this turn's generation. Eviction may immediately admit a replacement
             # through the cold path; an unconditional release here would then clear the replacement
             # sentinel/agent and lease. Reset/stop release their stale slot before installing a
@@ -1748,33 +1754,73 @@ class GatewayInboundMixin:
         event._gateway_active_turn_token = token
         return True
 
-    async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
-        """Best-effort CAS clear of the marker owned by *event* (3 attempts; never blocks agent/lease
-        release — a stale marker is bounded by the agent timeout and clean-start discard)."""
+    async def _clear_durable_active_turn(
+        self, event: "MessageEvent", *, defer_delivery: bool = False,
+    ) -> bool:
+        """Clear this event's active marker; retire its turn only after answer handoff.
+
+        The agent returns before the adapter records/sends its final reply. Keep a completed
+        turn until that later boundary has a durable ledger row or a platform ACK.
+        """
         session_key = getattr(event, "_gateway_active_turn_session_key", None)
         token = getattr(event, "_gateway_active_turn_token", None)
+        turn_id = getattr(event, "_gateway_active_turn_id", None)
+        marker_cleared = False
         try:
-            if not session_key or not token:
-                return False
-            last_error: Optional[Exception] = None
-            for attempt in range(1, 4):
-                try:
-                    return bool(await self.async_session_store.clear_turn_active(session_key, token))
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < 3:
-                        logger.debug(
-                            "Retrying active-turn marker cleanup for %s (%d/3): %s",
-                            session_key, attempt, exc,
+            if session_key and token:
+                last_error: Optional[Exception] = None
+                for attempt in range(1, 4):
+                    try:
+                        marker_cleared = bool(
+                            await self.async_session_store.clear_turn_active(session_key, token)
                         )
-            logger.warning(
-                "Could not clear active-turn marker for %s after 3 attempts: %s", session_key, last_error,
-            )
-            return False
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 3:
+                            logger.debug(
+                                "Retrying active-turn marker cleanup for %s (%d/3): %s",
+                                session_key, attempt, exc,
+                            )
+                if last_error is not None and not marker_cleared:
+                    logger.warning(
+                        "Could not clear active-turn marker for %s after 3 attempts: %s",
+                        session_key, last_error,
+                    )
+            if session_key and turn_id:
+                interrupted = bool(getattr(event, "_gateway_turn_result_interrupted", False))
+                if defer_delivery and not interrupted:
+                    event._gateway_active_turn_delivery_session_key = session_key
+                    event._gateway_active_turn_delivery_pending = True
+                else:
+                    try:
+                        await self.async_session_store.finish_active_turn(
+                            session_key, turn_id,
+                            turn_interrupted=interrupted or bool(getattr(self, "_draining", False)),
+                        )
+                    except Exception:
+                        logger.warning("Could not retire active turn for %s", session_key, exc_info=True)
+            return marker_cleared
         finally:
             for attr in ("_gateway_active_turn_session_key", "_gateway_active_turn_token"):
                 with suppress(AttributeError):
                     delattr(event, attr)
+
+    async def _finish_durable_active_turn_after_delivery(self, event: "MessageEvent") -> bool:
+        """CAS-retire a completed turn after its answer was ledgered or acknowledged."""
+        if not getattr(event, "_gateway_active_turn_delivery_pending", False):
+            return False
+        session_key = getattr(event, "_gateway_active_turn_delivery_session_key", None)
+        turn_id = getattr(event, "_gateway_active_turn_id", None)
+        if not session_key or not turn_id:
+            return False
+        try:
+            return bool(await self.async_session_store.finish_active_turn(session_key, turn_id))
+        except Exception:
+            logger.warning("Could not retire delivered turn for %s", session_key, exc_info=True)
+            return False
+        finally:
+            event._gateway_active_turn_delivery_pending = False
 
     def _install_plugin_message_injector(self) -> None:
         """Publish this live gateway's plugin message scheduler."""

@@ -39,6 +39,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        turn_id=kw.get("turn_id"),
+        preserve_existing=kw.get("preserve_existing", False),
     )
 
 
@@ -96,7 +98,7 @@ def _orphan(oid):
 
 
 class TestSchemaMigration:
-    def test_adds_adapter_profile_to_existing_ledger(self):
+    def test_adds_turn_id_without_changing_existing_delivery(self):
         conn = sqlite3.connect(dl._db_path())
         try:
             conn.execute(
@@ -116,20 +118,42 @@ class TestSchemaMigration:
                     last_error TEXT
                 )"""
             )
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, content, state,
+                    attempts, created_at, updated_at)
+                   VALUES ('old', 'session', 'slack', 'C1', 'old answer', 'delivered', 1, 1, 1)"""
+            )
             dl._initialize_schema(conn)
             columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
             }
+            old = conn.execute(
+                "SELECT content, state, attempts, turn_id FROM delivery_obligations WHERE obligation_id='old'"
+            ).fetchone()
         finally:
             conn.close()
 
         assert "adapter_profile" in columns
+        assert "turn_id" in columns
+        assert old == ("old answer", "delivered", 1, None)
 
 
 class TestStateMachine:
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+    def test_preserved_answer_can_gain_turn_id_without_resending(self):
+        _record(turn_id=None)
+        dl.mark_delivered("ob-1")
+
+        _record(turn_id="turn-1", preserve_existing=True)
+
+        assert _row("ob-1")["state"] == "delivered"
+        assert dl.has_turn_obligation("agent:main:slack:channel:C1", "turn-1")
+        with pytest.raises(ValueError, match="payload conflict"):
+            _record(turn_id="another-turn", preserve_existing=True)
 
 
 class TestObligationId:

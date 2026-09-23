@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from run_agent import AIAgent
 from agent.turn_finalizer import finalize_turn
 
@@ -60,10 +62,9 @@ def _stub_agent_for_finalize(agent: AIAgent) -> None:
     agent._db_flush_scan_prefix = None
 
 
-def _run_finalize(agent: AIAgent) -> None:
+def _run_finalize(agent: AIAgent, **overrides) -> None:
     """Call finalize_turn with conditions that would trigger background review."""
-    finalize_turn(
-        agent,
+    args = dict(
         final_response="ok",
         api_call_count=1,
         interrupted=False,
@@ -77,6 +78,8 @@ def _run_finalize(agent: AIAgent) -> None:
         _should_review_memory=True,
         _turn_exit_reason="text_response(1)",
     )
+    args.update(overrides)
+    finalize_turn(agent, **args)
 
 
 def test_default_skip_background_review_is_false() -> None:
@@ -109,6 +112,24 @@ def test_finalize_turn_fires_review_when_flag_unset() -> None:
     _stub_agent_for_finalize(agent)
     _run_finalize(agent)
     agent._spawn_background_review.assert_called_once()
+
+
+@pytest.mark.parametrize("overrides,agent_changes", [
+    ({"_turn_exit_reason": "max_iterations_reached(1/1)"}, {}),
+    ({"failed": True}, {}),
+    ({"interrupted": True}, {}),
+    ({}, {"_delegate_depth": 1}),
+    ({}, {"_persist_disabled": True}),
+])
+def test_finalizer_keeps_review_due_after_unreviewable_turn(overrides, agent_changes) -> None:
+    agent = _make_agent()
+    _stub_agent_for_finalize(agent)
+    for name, value in agent_changes.items():
+        setattr(agent, name, value)
+    due = agent._iters_since_skill
+    _run_finalize(agent, **overrides)
+    agent._spawn_background_review.assert_not_called()
+    assert agent._iters_since_skill == due
 
 
 def test_cron_construction_sets_skip_background_review() -> None:

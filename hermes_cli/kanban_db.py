@@ -1063,6 +1063,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Gateway-owned intake provenance survives archival so a lost response cannot
+-- create another task when the same Discord message is retried.
+CREATE TABLE IF NOT EXISTS kanban_intake_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash    TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    actor_profile   TEXT NOT NULL,
+    assignee        TEXT NOT NULL,
+    source_context  TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_intake_operations (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash    TEXT NOT NULL,
+    operation       TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    source_context  TEXT NOT NULL,
+    result_json     TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1072,6 +1094,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_intake_receipt_task   ON kanban_intake_receipts(task_id);
+CREATE INDEX IF NOT EXISTS idx_intake_operation_task ON kanban_intake_operations(task_id);
 """
 
 
@@ -2125,7 +2149,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
-def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
+def recompute_ready(
+    conn: sqlite3.Connection, failure_limit: int = None,
+    *, _manage_transaction: bool = True,
+) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
@@ -2140,7 +2167,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
+    transaction = write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    with transaction:
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -3641,11 +3669,14 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, _manage_transaction: bool = True,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
-    with write_txn(conn):
+    transaction = write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    with transaction:
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3819,6 +3850,7 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    _manage_transaction: bool = True,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
@@ -3827,7 +3859,8 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
+    transaction = write_txn(conn) if _manage_transaction else contextlib.nullcontext(conn)
+    with transaction:
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -3869,7 +3902,7 @@ def specify_triage_task(
         )
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
-    recompute_ready(conn)
+    recompute_ready(conn, _manage_transaction=_manage_transaction)
     return True
 
 
@@ -3923,7 +3956,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in (
+        "task_comments", "task_events", "task_runs", "kanban_notify_subs",
+        "kanban_intake_operations", "kanban_intake_receipts",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
@@ -4461,6 +4497,16 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+from hermes_cli.kanban_db_intake import (  # noqa: E402
+    KanbanIntakeConflict,
+    _insert_notify_sub,
+    create_intake_task,
+    get_intake_source_context,
+    record_intake_operation,
+    replay_intake_operation,
+    retry_failed_task,
+    update_task_fields,
 )
 
 

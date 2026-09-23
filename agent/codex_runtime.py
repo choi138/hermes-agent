@@ -14,6 +14,7 @@ from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.background_review_policy import is_successful_review_outcome
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
@@ -600,25 +601,43 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
 def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_user_message: Any,
                        should_review_memory: bool) -> dict[str, Any]:
     """Post-turn bookkeeping mirroring the chat_completions loop; returns usage fields."""
-    # run_conversation() already bumped _turns_since_memory / _user_turn_count; only _iters_since_skill is ours.
-    agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+    review_eligible = is_successful_review_outcome(
+        agent, final_response=turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+        failed=turn.error is not None, interrupted=turn.interrupted,
+    )
+    # The preflight already ticked the memory cadence. Only healthy top-level work
+    # advances the skill cadence; failed Codex transcripts cannot become review input.
+    if review_eligible and agent._skill_nudge_interval > 0 and "skill_manage" in agent.valid_tool_names:
+        agent._iters_since_skill = (
+            getattr(agent, "_iters_since_skill", 0) + max(int(turn.tool_iterations or 0), 1)
+        )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn, messages=messages)
-    # Skill nudge check AFTER iters were incremented (same as chat_completions).
-    should_review_skills = (0 < agent._skill_nudge_interval <= agent._iters_since_skill
-                            and "skill_manage" in agent.valid_tool_names)
-    if should_review_skills:
-        agent._iters_since_skill = 0
+    should_review_skills = (
+        review_eligible and 0 < agent._skill_nudge_interval <= agent._iters_since_skill
+        and "skill_manage" in agent.valid_tool_names
+    )
+    should_review_memory = bool(should_review_memory and review_eligible)
     # External memory sync skipped on interrupt/error (no partial transcripts).
     if not turn.interrupted and turn.error is None:
         _call_guarded(getattr(agent, "_sync_external_memory_for_turn", None), "external memory sync raised", kwargs=dict(
             original_user_message=original_user_message, final_response=turn.final_text, interrupted=False, messages=messages,
         ))
-    # Background review fork: only when a trigger tripped AND a real final response exists.
-    if turn.final_text and not turn.interrupted and (should_review_memory or should_review_skills):
-        _call_guarded(getattr(agent, "_spawn_background_review", None), "background review spawn raised", kwargs=dict(
-            messages_snapshot=list(messages), review_memory=should_review_memory, review_skills=should_review_skills,
-        ))
+    if (review_eligible and not getattr(agent, "skip_background_review", False)
+            and (should_review_memory or should_review_skills)):
+        try:
+            accepted = agent._spawn_background_review(
+                messages_snapshot=list(messages), review_memory=should_review_memory,
+                review_skills=should_review_skills,
+            )
+            if accepted is not False:
+                if should_review_memory:
+                    agent._turns_since_memory = 0
+                if should_review_skills:
+                    agent._iters_since_skill = 0
+        except Exception:
+            logger.debug("background review spawn raised", exc_info=True)
     return usage_result
 
 
@@ -626,6 +645,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                               effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    from agent.reasoning_pin import validate_pinned_request
+
+    validate_pinned_request(
+        {}, getattr(agent, "reasoning_config", None), api_mode="codex_app_server",
+    )
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
@@ -1077,6 +1101,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
         from hermes_cli.providers import is_actual_route
+        from agent.reasoning_pin import validate_agent_request
 
         if is_actual_route(
             getattr(agent, "provider", ""),
@@ -1087,7 +1112,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        validate_agent_request(agent, stream_kwargs)
+        stream_kwargs = bypass_sdk_request_transform(stream_kwargs)
+        validate_agent_request(agent, stream_kwargs)
+        return active_client.responses.create(**stream_kwargs)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)

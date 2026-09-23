@@ -270,6 +270,15 @@ class GatewayAgentCacheMixin:
             # One structured reset instead of a drifting pop-list. Turn-lease tokens are deliberately NOT
             # cleared here — _release_turn_lease owns them.
             state.turn.clear()
+        starts = getattr(self, "_turn_started_at", None)
+        if isinstance(starts, dict):
+            starts.pop(session_key, None)
+        for attr in ("_output_silence_notified", "_turn_deadline_enforced", "_output_silence_user_waiting"):
+            latches = getattr(self, attr, None)
+            if isinstance(latches, dict):
+                for latch_key in list(latches):
+                    if isinstance(latch_key, tuple) and latch_key and latch_key[0] == session_key:
+                        latches.pop(latch_key, None)
         # Turn boundary: a running-agent slot was just released; persist the new (lower) in-flight count
         # so the dashboard readout stays current. Preserves gateway_state (see _persist_active_agents).
         self._persist_active_agents()

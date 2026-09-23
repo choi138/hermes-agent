@@ -10,9 +10,9 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, SessionStore
 
 
 def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", chat_id="67890"):
@@ -26,7 +26,7 @@ def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", 
     return MessageEvent(text=text, source=source)
 
 
-def _make_runner():
+def _make_runner(sessions_dir=None):
     """Create a bare GatewayRunner without calling __init__."""
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.adapters = {}
@@ -43,6 +43,8 @@ def _make_runner():
     runner.hooks.loaded_hooks = []
     runner._session_db = None
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    if sessions_dir is not None:
+        runner.session_store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
     return runner
 
 
@@ -106,7 +108,7 @@ class TestReasoningCommand:
         )
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
-        runner = _make_runner()
+        runner = _make_runner(hermes_home / "sessions")
         event = _make_event(f"/reasoning {effort}")
         session_key = runner._session_key_for_source(event.source)
 
@@ -115,6 +117,7 @@ class TestReasoningCommand:
         assert runner._session_reasoning_overrides[session_key] == {
             "enabled": True,
             "effort": effort,
+            "selection": "pinned",
         }
 
 
@@ -216,4 +219,3 @@ class TestLoadShowReasoningCoercion:
             tmp_path, monkeypatch,
             'display:\n  show_reasoning: true\n',
         ) is True
-

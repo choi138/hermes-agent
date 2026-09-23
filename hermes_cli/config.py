@@ -1256,6 +1256,9 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
+    # Keep this import deferred: model_routes uses ConfigIssue from this module.
+    from hermes_cli.model_routes import validate_model_routes
+    issues.extend(validate_model_routes(config))
     return issues
 
 

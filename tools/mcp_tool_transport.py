@@ -341,7 +341,8 @@ class MCPServerTransportMixin:
 
     async def _preflight_content_type(self, url: str, *, headers: Optional[dict] = None,
                                       ssl_verify: bool = True, client_cert=None, timeout: float = 5.0,
-                                      strict_redirect_headers: bool = False) -> None:
+                                      strict_redirect_headers: bool = False,
+                                      follow_redirects: bool = True) -> None:
         """Probe *url* before the SDK connects: a plain web page would make the SDK sit out the full
         ``connect_timeout`` before an opaque ``CancelledError``; this raises NonMcpEndpointError within
         ``timeout``. Allow-list based: only a 2xx with a definite non-MCP content type is rejected, and
@@ -369,7 +370,7 @@ class MCPServerTransportMixin:
             configured_header_names={key.lower() for key in probe_headers})
         try:
             async with _build_client(
-                    follow_redirects=True, timeout=_httpx.Timeout(timeout), transport=probe_transport,
+                    follow_redirects=follow_redirects, timeout=_httpx.Timeout(timeout), transport=probe_transport,
                     **_present(mounts=_mcp_proxy_mounts(_httpx, url, ssl_verify, client_cert, self.name))) as client:
                 resp = await client.head(url, headers=probe_headers)  # cheapest; GET on 405/501
                 if resp.status_code in (405, 501):
@@ -433,7 +434,8 @@ class MCPServerTransportMixin:
             raise
 
     def _sse_transport(self, url: str, headers: dict, connect_timeout: float,
-                       ssl_verify, client_cert, oauth_auth, strict_cfg_headers: bool):
+                       ssl_verify, client_cert, oauth_auth, strict_cfg_headers: bool,
+                       follow_redirects: bool = True):
         """``sse_client`` context manager for ``transport: sse`` entries."""
         if strict_cfg_headers:  # fail closed: SSE cannot enforce the redirect boundary
             raise ValueError(f"MCP server '{self.name}': strict_redirect_headers is "
@@ -454,7 +456,7 @@ class MCPServerTransportMixin:
         def _sse_client_factory(headers=None, timeout=None, auth=None):
             inner_transport = _httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
             return _httpx_mod.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=follow_redirects,
                 timeout=timeout if timeout is not None else _httpx_mod.Timeout(30.0, read=300.0),
                 transport=_make_mcp_body_cap_transport(_httpx_mod, inner_transport),
                 **_present(mounts=_mcp_proxy_mounts(_httpx_mod, url, ssl_verify, client_cert, self.name),
@@ -464,14 +466,15 @@ class MCPServerTransportMixin:
 
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
-                                   strict_cfg_headers: bool, configured_header_names: set):
+                                   strict_cfg_headers: bool, configured_header_names: set,
+                                   follow_redirects: bool = True):
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
         if not _core._MCP_NEW_HTTP:
-            if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
+            if strict_cfg_headers or not follow_redirects:  # old SDK cannot enforce either policy
                 raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
-                                  "enforce the portable redirect-header boundary "
-                                  "(strict_redirect_headers). Upgrade the mcp package.")
+                                  "enforce strict_redirect_headers or follow_redirects: false. "
+                                  "Upgrade the mcp package.")
             return _core.streamablehttp_client(url, headers=headers, timeout=float(connect_timeout), verify=ssl_verify,
                                                **_present(auth=oauth_auth))
         # Explicit AsyncClient matching the SDK's create_mcp_http_client defaults; MUST come from the
@@ -482,7 +485,7 @@ class MCPServerTransportMixin:
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
-        client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
+        client_kwargs: dict = {"follow_redirects": follow_redirects, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
                                "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
@@ -516,16 +519,19 @@ class MCPServerTransportMixin:
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = _core.LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
+        follow_redirects = config.get("follow_redirects", True)
+        if type(follow_redirects) is not bool:
+            raise ValueError(f"MCP server '{self.name}': follow_redirects must be a boolean")
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
         if config.get("transport") == "sse":
-            return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
+            return await self._serve_transport(self._sse_transport(*common, follow_redirects), "SSE", float(connect_timeout))
         if self._sse_fallback:
             # A prior connect already proved this server SSE-only: skip the doomed Streamable
             # HTTP attempt on reconnects instead of flapping into the retry budget.
             logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
-            return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
-        transport = self._streamable_http_transport(*common, configured_header_names)
+            return await self._serve_transport(self._sse_transport(*common, follow_redirects), "SSE", float(connect_timeout))
+        transport = self._streamable_http_transport(*common, configured_header_names, follow_redirects)
         label = "HTTP" if _core._MCP_NEW_HTTP else "legacy HTTP"
         try:
             return await self._serve_transport(transport, label, float(connect_timeout))
@@ -542,7 +548,7 @@ class MCPServerTransportMixin:
             # transport must not silently switch transports), never on a timeout (not a
             # transport mismatch — ``_is_streamable_http_rejection`` matches neither), and never
             # with ``strict_redirect_headers`` (SSE cannot enforce that boundary).
-            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
+            if (self._ever_connected or common[-1] or not follow_redirects or not _is_streamable_http_rejection(exc)):
                 if http_detail != str(_unwrap_exception_group(exc)):  # opaque SDK error + a recorded rejection
                     raise ConnectionError(f"MCP server '{self.name}': Streamable HTTP connect failed "
                                           f"({http_detail})") from exc
@@ -554,7 +560,7 @@ class MCPServerTransportMixin:
                 self.name, http_detail)
             try:
                 self._sse_fallback = True
-                return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
+                return await self._serve_transport(self._sse_transport(*common, follow_redirects), "SSE", float(connect_timeout))
             except Exception as sse_exc:
                 if self._ever_connected:  # SSE session was live and dropped: transient, keep the latch
                     raise

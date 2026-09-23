@@ -1448,6 +1448,8 @@ def _run_conversation_turn(
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1455,10 +1457,24 @@ def _run_conversation_turn(
     store when ``user_message`` carries API-only synthetic prefixes; timestamp / platform id are
     stored as metadata (platform id lets restart drain recovery dedup). ``persist_user_display_*``:
     display-only event rendering; the model still receives the message unchanged."""
-    if moa_config is None:
+    if moa_config is None and not resume_turn:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             user_message, persist_user_message
         )
+
+    composed_final = None
+    if resume_turn:
+        from agent.turn_resume import prepare_resume_history, resume_entry_reason
+
+        conversation_history, composed_final = prepare_resume_history(list(conversation_history or []))
+        if not conversation_history or not any(
+            isinstance(row, dict) and row.get("role") == "user" for row in conversation_history
+        ):
+            raise ValueError("same-turn resume requires a persisted user turn")
+        logger.info("same-turn resume: session=%s tail=%s", agent.session_id,
+                    resume_entry_reason(conversation_history))
+        user_message = ""
+        persist_user_message = None
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
@@ -1492,6 +1508,8 @@ def _run_conversation_turn(
             # MoA turns append per-call aggregated context to the API copy of the
             # user message, so no byte-stable api_content sidecar can be stamped.
             moa_active=bool(moa_config),
+            resume_turn=resume_turn,
+            turn_id_override=turn_id,
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
@@ -1516,9 +1534,12 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    if composed_final is not None:
+        s.final_response = composed_final
+        s._turn_exit_reason = "resume_composed_final"
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
-    if agent.api_mode == "codex_app_server":
+    if agent.api_mode == "codex_app_server" and composed_final is None:
         codex_result = agent._run_codex_app_server_turn(
             user_message=s.user_message, original_user_message=s.original_user_message,
             messages=s.messages, effective_task_id=s.effective_task_id,
@@ -1532,7 +1553,10 @@ def _run_conversation_turn(
         s.api_call_count = int(codex_result.get("api_calls") or 0)
         s.active_system_prompt = _sync_failover_system_message(agent, None, s.active_system_prompt)
 
-    while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while composed_final is None and (
+        (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
@@ -1605,6 +1629,8 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1633,8 +1659,18 @@ def run_conversation(
             persist_user_platform_id=persist_user_platform_id,
             moa_config=moa_config,
             turn_author=turn_author,
+            resume_turn=resume_turn,
+            turn_id=turn_id,
         )
-    result = export_current_turn_boundary(agent, result, user_message)
+    boundary_message = user_message
+    if resume_turn:
+        boundary_message = next(
+            (row.get("content") for row in reversed(conversation_history or [])
+             if isinstance(row, dict) and row.get("role") == "user"), None,
+        )
+    result = export_current_turn_boundary(agent, result, boundary_message)
+    if resume_turn and isinstance(result, dict) and turn_id:
+        result.setdefault("turn_id", turn_id)
     _close_durable_failed_turn(agent, result)
     return result
 

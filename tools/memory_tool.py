@@ -255,6 +255,12 @@ def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
     """Replay a staged write against the store, bypassing the gate (/memory approve)."""
+    # The approval queue also holds Notes writes. They must be replayed by
+    # their own file-backed store before checking the built-in MEMORY.md target.
+    if payload.get("tool") == "notes_write":
+        from agent.memory_pipeline import apply_notes_pending
+
+        return apply_notes_pending(payload)
     action, target = payload.get("action"), payload.get("target", "memory")
     target_error = _memory_target_error(store, target)
     if target_error is not None:

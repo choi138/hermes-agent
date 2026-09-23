@@ -135,6 +135,15 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     return result
 
 
+def _notes(function_name: str) -> InlineToolExecutor:
+    def execute(agent, args: dict, ctx: InlineToolContext) -> Any:
+        from tools.notes_tool import dispatch_notes_tool_for_agent
+
+        return dispatch_notes_tool_for_agent(agent, function_name, args)
+
+    return execute
+
+
 _read_preview = _callback_tool(
     "tools.read_preview_tool", "read_preview_tool", "read_preview_callback",
     ("start", "start"), ("count", "count"),
@@ -195,6 +204,18 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _model_status(agent, args: dict, ctx: InlineToolContext) -> str:
+    from agent.runtime_control import model_status
+
+    return model_status(agent)
+
+
+def _model_switch(agent, args: dict, ctx: InlineToolContext) -> str:
+    from agent.runtime_control import dispatch_model_switch
+
+    return dispatch_model_switch(agent, args)
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "todo_list": _tool(
@@ -209,6 +230,11 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     ),
     "session_search": _session_search,
     "memory": _memory,
+    "notes_write": _notes("notes_write"),
+    "notes_read": _notes("notes_read"),
+    "memory_propose": _notes("memory_propose"),
+    "model_status": _model_status,
+    "model_switch": _model_switch,
     "clarify": _tool(
         "tools.clarify_tool", "clarify_tool",
         ("question", "question", ""), ("choices", "choices"), ("multi_select", "multi_select", False),
@@ -242,16 +268,18 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "delegate_task": lambda agent, args, ctx: agent._dispatch_delegate_task(args),
 }
 
-# ``invoke_tool`` (concurrent path) consults the memory manager right after these three
+# ``invoke_tool`` (concurrent path) consults the memory manager right after these
 # names and before the remaining inline tools; ``message_agent`` falls through to the
 # registry there (Bot Mode DM is only injected into the sequential path's schema).
-INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({"todo_list", "session_search", "memory"})
+INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({
+    "todo_list", "session_search", "memory", "notes_write", "notes_read", "memory_propose",
+})
 
 
 def resolve_invoke_tool_executor(agent, function_name: str) -> Optional[InlineToolExecutor]:
     """Inline executor for ``invoke_tool`` (concurrent path), or None for registry dispatch.
 
-    Precedence: todo_list/session_search/memory, then memory-manager tools, then the
+    Precedence: built-in agent-level memory/todo/search tools, then memory-manager tools, then the
     remaining inline tools (``message_agent`` excluded).
     """
     if function_name in INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES:

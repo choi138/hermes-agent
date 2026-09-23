@@ -318,7 +318,8 @@ def _resolve_name_collisions(name: str, candidates: List[_Candidate]) -> List[_C
 
 
 def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: Callable,
-                         scope: Callable[[], Optional[str]], lazy: bool, key=None) -> List[str]:
+                         scope: Callable[[], Optional[str]], lazy: bool, key=None,
+                         model_visible: bool = True) -> List[str]:
     """Register candidates under toolset ``mcp-{name}``; returns the names that landed. The
     ownership pre-check is advisory (servers connect in parallel): ``registry.register()`` is
     the atomic gate and its verdict is re-read after every call. *key* is the connection whose
@@ -345,7 +346,8 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
             continue
         registry.register(
             name=c.registry_name, toolset=toolset_name, schema=c.schema, handler=c.handler, check_fn=check_fn,
-            is_async=False, description=c.schema.get("description") or "", scope=scope_value)
+            is_async=False, description=c.schema.get("description") or "", scope=scope_value,
+            expose_to_model=model_visible)
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
             if scope_value is not None:
@@ -401,7 +403,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
-        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
+        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key,
+        model_visible=_parse_boolish(config.get("model_visible", True), default=True))
     if registered:
         _write_schema_cache(name, server, config, should_register)
     return registered
@@ -505,7 +508,8 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             name, _select_utility_schemas(name, server, config), server.tool_timeout)
         names = _register_candidates(
             name, _resolve_name_collisions(name, candidates),
-            check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key)
+            check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key,
+            model_visible=_parse_boolish(config.get("model_visible", True), default=True))
         if names:
             registered_servers += 1
             with _core._lock:
@@ -529,7 +533,8 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
     candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
     registered = _register_candidates(
-        name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)
+        name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True,
+        model_visible=_parse_boolish(config.get("model_visible", True), default=True))
     if registered:
         with _core._lock:
             key = _server_key(name)

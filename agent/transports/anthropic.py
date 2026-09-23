@@ -57,9 +57,15 @@ class AnthropicTransport(ProviderTransport):
     ) -> Dict[str, Any]:
         """Build Anthropic messages.create() kwargs (converts messages and tools internally)."""
         from agent.anthropic_adapter import build_anthropic_kwargs
-        return build_anthropic_kwargs(
+        kwargs = build_anthropic_kwargs(
             model=model, messages=messages, tools=tools,
             **{key: params.get(key, default) for key, default in _BUILD_KWARG_DEFAULTS.items()},
+        )
+        from agent.reasoning_pin import validate_pinned_request
+
+        return validate_pinned_request(
+            kwargs, params.get("reasoning_config"), api_mode=self.api_mode,
+            provider=params.get("provider"), base_url=params.get("base_url"),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

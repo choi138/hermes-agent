@@ -2186,6 +2186,8 @@ from gateway.run_voice import GatewayVoiceMixin
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
 from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
+from gateway.run_model_router import GatewayModelRouterMixin, _model_router_mode
+from gateway.run_agent_health import GatewayAgentHealthMixin
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
@@ -3383,6 +3385,7 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
 class GatewayRunner(
     GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
+    GatewayModelRouterMixin, GatewayAgentHealthMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
     GatewayAgentCacheMixin, GatewayProfileReconcileMixin):
@@ -3551,8 +3554,25 @@ class GatewayRunner(
 
     def _init_lifecycle_state(self) -> None:
         """Initialise run/exit/restart flags, per-session state, and completion-delivery bookkeeping."""
+        import uuid
+
+        self._boot_id = uuid.uuid4().hex
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
+        self._mention_inbox_services: list[Any] = []
+        self._agent_health_sink = None
+        self._turn_started_at: Dict[str, float] = {}
+        self._last_content_sent_at: Dict[str, float] = {}
+        self._output_silence_notified: Dict[tuple[str, int], bool] = {}
+        self._turn_deadline_enforced: Dict[tuple[str, int], bool] = {}
+        self._output_silence_user_waiting: Dict[tuple[str, int], bool] = {}
+        self._agent_health_platform_states: Dict[str, str] = {}
+        self._agent_health_previous_status: Optional[dict] = None
+        self._agent_health_lifecycle_evidence: Optional[dict] = None
+        self._agent_health_previous_heartbeat: Optional[dict] = None
+        self._agent_health_previous_exit_diag: Optional[str] = None
+        self._agent_health_previous_memory_line: Optional[str] = None
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._kanban_dispatch_wake_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
@@ -4258,6 +4278,7 @@ class GatewayRunner(
         # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _identity_profile = self._identity_profile_for_source(context.source)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -4270,10 +4291,15 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=_identity_profile,
             async_delivery=_async_delivery,
-            cron_session="")
+            cron_session="",
+            role_authorized=bool(context.source.role_authorized),
+            is_bot=bool(context.source.is_bot),
+            trusted_gateway_source=True,
+            dispatch_wake=self._wake_kanban_dispatcher)
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
