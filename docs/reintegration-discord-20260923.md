@@ -181,7 +181,7 @@ rollback restore test and reviewed commit are complete.** Focused
 parity evidence is not a live acceptance result. The user approved use of the
 existing bot for a controlled live canary, not loss of its current capabilities.
 
-## Release gates still open
+## Release gate status
 
 1. The final full Gateway rerun after the Kanban compatibility fix passed:
    **10,069 passed, 0 failed, 35 skipped** across 1,007 files. The earlier
@@ -189,21 +189,35 @@ existing bot for a controlled live canary, not loss of its current capabilities.
    by an obsolete expectation that `TERMINAL_ENV` be absent; the dispatcher
    deliberately pins `TERMINAL_ENV=local` for workspace safety. Do not
    resurrect the reverted direct Discord-to-Mac intake.
-2. Finish and verify the rollback snapshot of production code, configuration,
-   and active SQLite state for all four profiles. The old runtime and service
-   units have been copied without changing the running gateway; the live DB
-   backups and restore verification are in progress. Check the separate
-   company Discord bridge and establish the exact old-service restoration
-   path before touching the live gateway.
-3. Review and commit the reintegration branch. Prepare a separate runtime on
-   the server without starting a second gateway with the existing bot token.
+2. Rollback snapshot and restore drill are complete under
+   `/home/justin/.hermes/backups/discord-reintegration-20260923-h8bZ4H`.
+   `database-manifest.json` records 21 SQLite snapshots, all with
+   `quick_check=ok`; four restored `state.db` copies (default, anju, raiden,
+   shinei) had matching SHA-256 and `quick_check=ok`. These are per-database
+   online snapshots, not one simultaneous cross-database transaction. The
+   old runtime, four profile configurations, and both service units remain
+   preserved. The separate company bridge is active and outside this cutover.
+3. Commit `65dc4f1f2d` was copied into the separate Linux runtime
+   `/home/justin/hermes-v2026.9.21-reintegration-20260923`. Five key source
+   and lockfile hashes match the local commit. The archive has no `.git`, so
+   `.hermes_build_sha` stamps `65dc4f1f2d` for runtime status verification.
+   The locked Python 3.11
+   environment installed 113 packages with `all` and `messaging` extras;
+   Gateway imports and CLI help passed with an isolated `HERMES_HOME`. The
+   external Graphiti plugin's three files were installed under
+   `~/.hermes/plugins/graphiti_canonical` with matching hashes and 700/600
+   permissions; the new runtime loads it and reports `is_available=True`
+   against the production configuration. The running old runtime still uses
+   its bundled provider. No second gateway process was started.
 4. The user approved a controlled canary on the **existing bot** instead of
    creating a staging bot. Only after gates 1–3 pass, perform a time-boxed,
    single-gateway rollout (never run a second process with the same bot token),
-   install the external plugin, and verify real Discord/LLM turns, Graphiti
+   use the installed external plugin, and verify real Discord/LLM turns, Graphiti
    recall, model routes, Kanban intake/dispatch, progress and recovery, all
    four profile identities, and the separate bridge. Roll back immediately
-   on failed checks. No live canary or service restart has happened yet.
+   on failed checks. No live canary or service restart has happened yet. The
+   existing gateway still had two active agent turns at 20:12 KST, so the
+   cutover is waiting for an idle window or explicit interruption choice.
 
 ## Single-process cutover and rollback plan
 
