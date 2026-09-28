@@ -1099,19 +1099,17 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        if read_remote_script is not None:
+            try:
+                script_text, unsafe = _sanitize_remote_script_text(
+                    read_remote_script(str(script_path)))
+            except Exception:
+                # An unreadable backend script must not bypass lifecycle checks.
+                return True
+        else:
+            script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
-            # The callback's output crosses the same trust boundary as a
-            # local read — sanitize it identically before it enters the
-            # recursion (binary skip + size fail-closed).
-            script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path))
-            )
-            if unsafe:
-                return True
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's

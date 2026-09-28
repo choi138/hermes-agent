@@ -178,6 +178,8 @@ terminal:
   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy
+  sync_back_max_bytes: 2147483648  # Maximum state archive bytes
+  sync_back_timeout: 30           # SSH lock, transfer and retry budget (seconds)
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
@@ -534,7 +536,10 @@ When in doubt, set `terminal.backend` back to `local` and verify that commands r
 
 For the **SSH**, **Modal**, and **Daytona** backends, Hermes pushes your `~/.hermes/` state (credential files, skills, cache) into the remote sandbox during the session, and on teardown **syncs changed state files back** to their original host locations. Files that differ from what was originally pushed (compared by content hash) are applied back in place; new remote files under a synced directory (e.g. a skill the agent created remotely) are mapped back to the corresponding host path. Upload-only credential files are never overwritten on the host.
 
-- The sync-back retries up to 3 times with backoff and refuses to extract remote archives larger than 2 GiB.
+- SSH requires `python3` on the remote host for sync-back. It scans only mapped, non-credential directories and downloads changed or new regular files; unrelated remote state and unchanged file contents are not transferred. Symlinks and sockets are skipped.
+- SSH shares `terminal.sync_back_timeout` (default 30 seconds) across lock waits, transfer and retry backoff, checking the remaining budget during extraction and application. Timeouts, size-limit failures and missing remote Python stop without retry; remote files remain available for recovery. Other connection failures retry at most 3 times within the remaining budget. Before applying a completed download, SSH saves a recovery batch under `HERMES_HOME/.sync-back-pending`. If local application is interrupted, the next sync restores that batch before uploading; failed recovery blocks upload. Each restored file is replaced atomically. Before downloading, SSH also records the remote identity, mappings and push hashes in `HERMES_HOME/.sync-back-intent.json`. If downloading fails, the next sync retries that recovery before any upload; a failed recovery or a different remote identity blocks upload. Completed recovery clears its matching intent. Failures before intent creation and power-loss durability are outside this guarantee.
+- `terminal.sync_back_max_bytes` (default 2 GiB) caps archives. SSH enforces the cap during streaming and on extracted content; Modal and Daytona retain their bulk-download and three-attempt retry behavior.
+- The downloaded archive is staged under the system temp directory (`hermes-sync-back-<pid>-*`); leftovers from a hard-killed process are reclaimed on the next sync-back.
 - Docker and Singularity use bind mounts (live host filesystem view) and don't need this.
 - This covers Hermes state (`~/.hermes/`), **not** arbitrary working-tree files inside the sandbox — have the agent copy important artifacts out explicitly (e.g. `scp`, `modal volume put`) before the sandbox is destroyed.
 

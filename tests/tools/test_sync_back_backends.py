@@ -497,8 +497,8 @@ class TestDaytonaCleanup:
 class TestBulkDownloadWiring:
     """Verify each backend passes bulk_download_fn to FileSyncManager."""
 
-    def test_ssh_passes_bulk_download_fn(self, monkeypatch):
-        """SSHEnvironment should pass _ssh_bulk_download to FileSyncManager."""
+    def test_ssh_passes_selective_download_fn(self, monkeypatch):
+        """SSHEnvironment should pass _ssh_download_changes to FileSyncManager."""
         monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
         monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/root")
@@ -519,8 +519,8 @@ class TestBulkDownloadWiring:
 
         SSHEnvironment(host="h", user="u")
 
-        assert "bulk_download_fn" in captured_kwargs
-        assert callable(captured_kwargs["bulk_download_fn"])
+        assert "selective_download_fn" in captured_kwargs
+        assert callable(captured_kwargs["selective_download_fn"])
 
 
     def test_daytona_passes_bulk_download_fn(self, monkeypatch):

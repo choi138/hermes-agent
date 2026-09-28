@@ -209,7 +209,7 @@ class TestSSHBulkUpload:
             mock_env._ssh_bulk_upload(files)
 
         extract_cmd = popen_cmds[1][-1]
-        assert "tar xf -" in extract_cmd
+        assert 'tar "$@" -xf -' in extract_cmd
         assert "--no-overwrite-dir" not in extract_cmd
 
     def test_remote_tar_capability_is_detected_once(self, mock_env):
@@ -225,27 +225,17 @@ class TestSSHBulkUpload:
         probe_cmd = mock_run.call_args[0][0]
         assert probe_cmd[-1] == "LC_ALL=C tar --help 2>&1 | grep -q -- --no-overwrite-dir"
 
-    def test_archive_paths_cannot_be_parsed_as_tar_options(self, mock_env, tmp_path):
-        """File-only archive members must follow an explicit option terminator."""
+    def test_archive_paths_cannot_be_parsed_as_tar_options(self, mock_env, tmp_path, monkeypatch):
+        """Leading-dash and newline filenames survive the real tar pipeline."""
+        remote_home = tmp_path / "remote"
+        mock_env._remote_home = str(remote_home)
+        mock_env._remote_tar_no_overwrite_dir = False
+        monkeypatch.setattr(mock_env, "_build_ssh_command", lambda: ["bash", "-c"])
         source = tmp_path / "payload"
         source.write_text("safe", encoding="utf-8")
-        remote = "/home/testuser/.hermes/skills/--checkpoint-action=exec=sh"
-        popen_cmds = []
-
-        def capture_popen(cmd, **kwargs):
-            popen_cmds.append(cmd)
-            return _mock_proc()
-
-        with patch.object(
-            subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0),
-        ), patch.object(subprocess, "Popen", side_effect=capture_popen):
-            mock_env._ssh_bulk_upload([(str(source), remote)])
-
-        tar_cmd = popen_cmds[0]
-        separator = tar_cmd.index("--")
-        assert tar_cmd[separator + 1:] == ["skills/--checkpoint-action=exec=sh"]
+        destination = remote_home / ".hermes" / "--checkpoint-action=exec=sh\nsecond line"
+        mock_env._ssh_bulk_upload([(str(source), str(destination))])
+        assert destination.read_text() == "safe"
 
     def test_remote_path_escape_is_rejected_before_spawning(self, mock_env, tmp_path):
         """Changing archive construction must not weaken staging containment."""
@@ -481,3 +471,68 @@ class TestSSHBulkUploadEdgeCases:
 
         mock_tar.kill.assert_called_once()
         mock_tar.wait.assert_called_once()
+
+
+def test_real_tar_upload_preserves_existing_directories(mock_env, tmp_path, monkeypatch):
+    """Native tar must accept the stream without changing destination directory modes."""
+    import stat
+    home = tmp_path / "remote"
+    base = home / ".hermes"
+    skills = base / "skills"
+    skills.mkdir(parents=True)
+    base.chmod(0o700)
+    skills.chmod(0o711)
+    source = tmp_path / "payload"
+    source.write_bytes(b"test bytes" * 10000)
+    mock_env._remote_home = str(home)
+    mock_env._remote_tar_no_overwrite_dir = None
+    monkeypatch.setattr(mock_env, "_build_ssh_command", lambda: ["bash", "-c"])
+    destination = skills / "a name\nwith newline.txt"
+    mock_env._ssh_bulk_upload([(str(source), str(destination))])
+    assert destination.read_bytes() == source.read_bytes()
+    assert stat.S_IMODE(base.stat().st_mode) == 0o700
+    assert stat.S_IMODE(skills.stat().st_mode) == 0o711
+
+
+@pytest.mark.parametrize("archive_format", ["native", "gnu"])
+def test_real_tar_upload_preserves_dot_underscore_files(mock_env, tmp_path, monkeypatch, archive_format):
+    """Sidecars are mapped file bytes, not instructions to restore Mac metadata."""
+    home = tmp_path / "remote"
+    source = tmp_path / "payload"
+    source.write_bytes(b"ordinary content")
+    sidecar = tmp_path / "sidecar"
+    # Matches the malformed metadata sidecar that broke Linux -> macOS uploads.
+    sidecar.write_bytes(bytes(163))
+    destination = home / ".hermes/cache/a name.txt"
+    dot_file = destination.with_name("._" + destination.name)
+    mock_env._remote_home = str(home)
+    mock_env._remote_tar_no_overwrite_dir = None
+    monkeypatch.setattr(mock_env, "_build_ssh_command", lambda: ["bash", "-c"])
+    tail = tmp_path / "tail"
+    tail.write_bytes(b"following archive member")
+    tail_destination = destination.with_name("following.txt")
+    files = [(str(source), str(destination)), (str(sidecar), str(dot_file)),
+             (str(tail), str(tail_destination))]
+    if archive_format == "gnu":
+        # Exercise a Linux-format stream against the native extractor, even on Mac.
+        import tarfile
+        import sys
+        archive = tmp_path / "gnu.tar"
+        with tarfile.open(archive, "w", format=tarfile.GNU_FORMAT) as tar:
+            for source_path, remote_path in files:
+                tar.add(source_path, arcname="./" + os.path.relpath(remote_path, home / ".hermes"))
+        real_popen = subprocess.Popen
+
+        def gnu_stream(cmd, **kwargs):
+            if cmd[0] == "tar":
+                cmd = [sys.executable, "-c",
+                       "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
+                       str(archive)]
+            return real_popen(cmd, **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", gnu_stream)
+    for _ in range(2):
+        mock_env._ssh_bulk_upload(files)
+        assert destination.read_bytes() == source.read_bytes()
+        assert dot_file.read_bytes() == sidecar.read_bytes()
+        assert tail_destination.read_bytes() == tail.read_bytes()

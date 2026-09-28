@@ -486,7 +486,8 @@ class SSHEnvironment(BaseEnvironment):
                         upload_fn=self._scp_upload,
                         delete_fn=self._ssh_delete,
                         bulk_upload_fn=self._ssh_bulk_upload,
-                        bulk_download_fn=self._ssh_bulk_download,
+                        selective_download_fn=self._ssh_download_changes,
+                        sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]),
                         shared_state=shared_state,
                     )
                     self._sync_manager.sync(force=True)
@@ -1049,7 +1050,8 @@ class SSHEnvironment(BaseEnvironment):
         # OSError with winerror 1314 (privilege not held).  Catch only
         # that specific error and fall back to a plain copy; all other
         # OSErrors (e.g. disk full, bad path) are re-raised as normal.
-        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging:
+        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging, \
+                tempfile.TemporaryDirectory(prefix="hermes-ssh-list-") as manifest_dir:
             archive_members: list[str] = []
             payload_bytes = 0
             for host_path, remote_path, rel_remote in validated_files:
@@ -1072,26 +1074,34 @@ class SSHEnvironment(BaseEnvironment):
             # Archive files explicitly instead of archiving '.'.  That omits
             # directory entries entirely, so BSD tar cannot chmod an existing
             # base/parent directory even though it lacks --no-overwrite-dir.
-            # The option terminator prevents a remote filename beginning with
-            # '-' from being interpreted by the local tar command.
+            # A NUL-delimited manifest keeps filenames out of tar's option parser
+            # and avoids command-line limits for large file sets.
+            manifest = Path(manifest_dir) / "files"
+            manifest.write_bytes(b"".join(os.fsencode("./" + name) + b"\0" for name in archive_members))
             tar_cmd = [
-                "tar", "-chf", "-", "-C", staging, "--", *archive_members,
+                "tar", "-chf", "-", "-C", staging, "--null", "-T", str(manifest),
             ]
             ssh_cmd = self._build_ssh_command()
             # Preserve source file modes even under a restrictive remote
             # umask (common for service accounts). ``-p`` is supported by
             # both GNU tar and macOS/BSD tar; the archive contains file
             # entries only, so existing parent-directory modes stay intact.
-            extract_cmd = "tar xf - -p"
+            extract_cmd = 'tar "$@" -xf - -p'
             if self._supports_remote_tar_no_overwrite_dir():
                 # Retain the GNU defense in depth from #17767.  The file-only
                 # archive makes the fallback safe on BSD tar as well.
                 extract_cmd += " --no-overwrite-dir"
             extract_cmd += f" -C {shlex.quote(base)}"
+            extract_cmd = (
+                'case "$(tar --version 2>/dev/null)" in '
+                "*bsdtar*) set -- --no-mac-metadata --options '!mac-ext' ;; "
+                '*) set -- ;; esac; '
+            ) + extract_cmd
             ssh_cmd.append(extract_cmd)
 
             tar_proc = subprocess.Popen(
                 tar_cmd,
+                env={**os.environ, "COPYFILE_DISABLE": "1"},
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1531,3 +1541,36 @@ class SSHEnvironment(BaseEnvironment):
                             control_socket.unlink()
                         except OSError:
                             pass
+
+
+    def read_guard_script(self, path: str, *, cwd: str, max_bytes: int) -> str | None:
+        """Read remote guard input without syncing files or mutating the shell snapshot.
+
+        Transport failures propagate so an uncompleted safety check cannot allow execution.
+        Missing paths and directories are not scripts; oversized text is returned one byte
+        over budget for the lifecycle scanner to reject, as on the ordinary read path.
+        """
+        command = (
+            f"cd -- {shlex.quote(cwd)} || exit 2; "
+            f"if test -f {shlex.quote(path)}; then "
+            f"head -c {max_bytes + 1} < {shlex.quote(path)} || exit 2; "
+            f"elif test -d {shlex.quote(path)} || ! test -e {shlex.quote(path)}; then exit 1; "
+            "else echo 'Refusing non-regular guard input' >&2; exit 2; fi"
+        )
+        result = subprocess.run(
+            self._build_ssh_command() + [command], timeout=10,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
+        if result.returncode == 1:
+            return None
+        if result.returncode != 0:
+            raise EnvironmentConnectionError(
+                f"Guard script read failed (rc={result.returncode}): {result.stderr.strip()}",
+                retry_hint=f"Guard read on {self.host} failed; retry after checking SSH.")
+        return result.stdout
+
+
+    def _ssh_download_changes(self, dest: Path, request: dict, timeout: float) -> None:
+        from tools.environments.ssh_sync_back import download_changes
+
+        download_changes(self._build_ssh_command(), dest, request, timeout)
