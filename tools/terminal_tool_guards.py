@@ -142,12 +142,18 @@ def _foreground_background_guidance(command: str) -> str | None:
 
 
 def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes: int) -> Optional[str]:
-    """Best-effort script read: host filesystem first, then a bounded
-    ``env.execute('head -c ... < path')`` for remote backends. Binary content
+    """SSH reads use a bounded transport-only path, without command file sync.
+    Other backends try the host filesystem, then ``env.execute('head -c ... < path')``. Binary content
     (NUL byte) is not a script: feeding it to the guard tokenizes machine code
     into bogus paths and crashes the scanner, so it yields None."""
     if env is None:
         return None
+    from tools.environments.ssh import SSHEnvironment
+
+    if isinstance(env, SSHEnvironment):
+        # The same path on the gateway host need not be the remote script. Read
+        # from the execution host, without re-entering sync for every reference.
+        return env.read_guard_script(script_path, cwd=guard_cwd, max_bytes=max_bytes)
     try:
         local_path = Path(script_path).expanduser()
         if not local_path.is_absolute():

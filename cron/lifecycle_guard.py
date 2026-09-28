@@ -1162,8 +1162,19 @@ def _contains_unsafe_gateway_action(
                 if candidate_executed:
                     return _budget_exhausted(budget, "remote reads", depth)
                 break
+            try:
+                remote_text = read_remote_script(str(script_path))
+            except Exception as exc:
+                # Backend callbacks have different transport exceptions. Keep failures local
+                # to this reference: the outer direct-scan fallback cannot inspect its contents.
+                if candidate_executed:
+                    return _refuse_unreadable(
+                        budget, script_path,
+                        f"`{script_path}` backend read failed ({type(exc).__name__})",
+                    )
+                continue
             script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
+                remote_text, max_bytes=budget.bytes_remaining
             )
             if unsafe:
                 if candidate_executed:

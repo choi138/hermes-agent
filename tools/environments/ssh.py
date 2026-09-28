@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import shlex
@@ -81,7 +82,8 @@ class SSHEnvironment(BaseEnvironment):
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
+            bulk_upload_fn=self._ssh_bulk_upload, selective_download_fn=self._ssh_download_changes,
+            sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]))
         self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -185,7 +187,10 @@ class SSHEnvironment(BaseEnvironment):
         # Symlink staging avoids fragile GNU tar --transform rules. On Windows
         # without Developer Mode symlink creation raises OSError winerror 1314;
         # only that case falls back to a plain copy, other OSErrors re-raise.
-        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging:
+        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging, \
+                tempfile.TemporaryDirectory(prefix="hermes-ssh-list-") as manifest_dir:
+            manifest = Path(manifest_dir) / "files"
+            members = []
             for host_path, remote_path in files:
                 try:
                     rel_remote = os.path.relpath(remote_path, base)
@@ -193,6 +198,7 @@ class SSHEnvironment(BaseEnvironment):
                     raise RuntimeError(f"remote path {remote_path!r} is not under sync base {base!r}") from exc
                 if rel_remote == "." or rel_remote.startswith("../"):
                     raise RuntimeError(f"remote path {remote_path!r} escapes sync base {base!r}")
+                members.append(os.fsencode("./" + rel_remote) + b"\0")
                 staged = os.path.join(staging, rel_remote)
                 os.makedirs(os.path.dirname(staged), exist_ok=True)
                 try:
@@ -202,10 +208,25 @@ class SSHEnvironment(BaseEnvironment):
                         raise
                     shutil.copy2(host_path, staged)
 
-            # --no-overwrite-dir keeps tar from stamping the staging dir's mode onto
-            # existing dirs (e.g. /home/<user>); a umask-002 0775 home breaks sshd StrictModes.
-            ssh_cmd = self._build_ssh_command() + [f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}"]
-            tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging, "."], stdin=subprocess.DEVNULL,
+            # Archive only files: no directory metadata can overwrite destination modes.
+            # GNU --no-overwrite-dir is rejected by macOS bsdtar. A NUL-delimited
+            # manifest works with both and preserves unusual names without argv limits.
+            manifest.write_bytes(b"".join(members))
+            # bsdtar interprets ._ files as AppleDouble metadata by default,
+            # which can fail extraction or silently consume mapped sidecars.
+            # Disable both reader-side AppleDouble merging and metadata restoration.
+            # GNU tar has no such behavior and rejects these bsdtar options.
+            extract = (
+                'case "$(tar --version 2>/dev/null)" in '
+                "*bsdtar*) set -- --no-mac-metadata --options '!mac-ext' ;; "
+                '*) set -- ;; esac; '
+                f'tar "$@" -xf - -C {shlex.quote(base)}'
+            )
+            ssh_cmd = self._build_ssh_command() + [extract]
+            # On macOS, also retain explicit ._ members when creating the archive.
+            tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging,
+                                         "--null", "-T", str(manifest)], stdin=subprocess.DEVNULL,
+                                        env=client_env_with({"COPYFILE_DISABLE": "1"}),
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 ssh_proc = subprocess.Popen(ssh_cmd, stdin=tar_proc.stdout,
@@ -230,38 +251,42 @@ class SSHEnvironment(BaseEnvironment):
                 raise EnvironmentConnectionError(
                     "SSH bulk upload timed out",
                     retry_hint=f"Bulk file sync to {self.host} timed out — check the connection and retry.")
-            if tar_proc.returncode != 0:
-                raise RuntimeError(f"tar create failed (rc={tar_proc.returncode}): "
-                                   f"{tar_stderr_raw.decode(errors='replace').strip()}")
             if ssh_proc.returncode != 0:
                 raise _sync_error(f"tar extract over SSH failed (rc={ssh_proc.returncode}): "
                                   f"{ssh_stderr.decode(errors='replace').strip()}",
                                   f"File sync over SSH to {self.host}", what="the connection")
+            if tar_proc.returncode != 0:
+                raise RuntimeError(f"tar create failed (rc={tar_proc.returncode}): "
+                                   f"{tar_stderr_raw.decode(errors='replace').strip()}")
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
-    def _ssh_bulk_download(self, dest: Path) -> None:
-        """Download remote .hermes/ as a tar archive."""
-        # Tar from / with the full path so archive entries keep absolute paths
-        # (home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
-        # Live sockets inside .hermes (gateway.sock and friends) cannot be archived: tar prints
-        # "socket ignored" and some builds exit 2, which failed every sync-back and left a
-        # multi-GB temp tar behind on each retry. Exclude them up front.
-        ssh_cmd = self._build_ssh_command() + [
-            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
-        with open(dest, "wb") as f:
-            result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120)
+    def read_guard_script(self, path: str, *, cwd: str, max_bytes: int) -> str | None:
+        """Read remote guard input without syncing files or mutating the shell snapshot.
+
+        Transport failures propagate so an uncompleted safety check cannot allow execution.
+        Missing paths and directories are not scripts; oversized text is returned one byte
+        over budget for the lifecycle scanner to reject, as on the ordinary read path.
+        """
+        command = (
+            f"cd -- {shlex.quote(cwd)} || exit 2; "
+            f"if test -f {shlex.quote(path)}; then "
+            f"head -c {max_bytes + 1} < {shlex.quote(path)} || exit 2; "
+            f"elif test -d {shlex.quote(path)} || ! test -e {shlex.quote(path)}; then exit 1; "
+            "else echo 'Refusing non-regular guard input' >&2; exit 2; fi"
+        )
+        result = self._run_ssh(command, timeout=10)
+        if result.returncode == 1:
+            return None
         if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace").strip()
-            # A socket not named *.sock is the only rc=2 we knowingly accept, and only when
-            # nothing else was reported — anchored to the diagnostic suffix so a filename merely
-            # containing "socket ignored" cannot sneak through. Every other status still fails.
-            diagnostic_lines = [line for line in stderr.splitlines() if line.strip()]
-            tolerated = result.returncode == 2 and bool(diagnostic_lines) and all(
-                line.endswith(": socket ignored") for line in diagnostic_lines)
-            if not tolerated:
-                raise _sync_error(f"SSH bulk download failed: {stderr}",
-                                  f"File sync from {self.host}")
+            raise _sync_error(
+                f"Guard script read failed (rc={result.returncode}): {result.stderr.strip()}",
+                f"Guard read on {self.host}")
+        return None if "\x00" in result.stdout else result.stdout
+
+    def _ssh_download_changes(self, dest: Path, request: dict, timeout: float) -> None:
+        from tools.environments.ssh_sync_back import download_changes
+
+        download_changes(self._build_ssh_command(), dest, request, timeout)
 
     def _ssh_delete(self, remote_paths: list[str]) -> None:
         self._run_ssh_checked(quoted_rm_command(remote_paths), 10, "remote rm failed",
