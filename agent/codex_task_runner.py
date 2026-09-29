@@ -20,7 +20,10 @@ import subprocess
 import tempfile
 import time
 
-TIER_EFFORTS = {"light": "low", "standard": "medium", "deep": "high", "max": "max"}
+TIER_EFFORTS = {
+    "light": "low", "standard": "medium", "deep": "high",
+    "xhigh": "xhigh", "max": "max",
+}
 MAX_SPEC_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 
@@ -46,8 +49,17 @@ class WorkerSelection:
     def metadata(self):
         selected = self.pinned_tier if self.policy == "pinned" else self.requested_tier
         return {"requested_tier": self.requested_tier, "selected_tier": selected,
-                "policy": self.policy, "source": "user_pin" if self.policy == "pinned" else "auto",
+                "policy": self.policy,
+                "source": "user_pin" if self.policy == "pinned" else "legacy_tier",
                 "effort": TIER_EFFORTS[selected]}
+
+    @classmethod
+    def for_effort(cls, effort, *, pinned=False):
+        tiers = {value: key for key, value in TIER_EFFORTS.items()}
+        if effort not in tiers:
+            raise ValueError("Unsupported effort")
+        tier = tiers[effort]
+        return cls(tier, "pinned" if pinned else "auto", tier if pinned else None)
 
 
 def _absolute_existing(value):
@@ -66,8 +78,9 @@ class TaskRequest:
     selection: WorkerSelection = field(default_factory=WorkerSelection)
     sandbox: str = "read-only"
     timeout: float = 600
-    model: str = "gpt-6-astra"
+    model: str = "gpt-5.6-terra"
     cli: str = "codex"
+    policy_input: dict | None = None
 
     def __post_init__(self):
         if os.name != "posix":
@@ -98,8 +111,10 @@ class TaskRequest:
         out = self.output_dir.stat()
         if not stat.S_ISDIR(out.st_mode) or out.st_uid != os.getuid() or out.st_mode & 0o022:
             raise ValueError("Output directory must be caller-owned and not writable by others")
+        _checked_policy_receipt(None, self)
 
     def argv(self):
+        _checked_policy_receipt(None, self)
         if self.cli == "claude":
             return ["claude", "--print", "--verbose", "--output-format", "stream-json",
                     "--no-session-persistence", "--model", self.model,
@@ -111,9 +126,99 @@ class TaskRequest:
                 f'model_reasoning_effort="{self.selection.metadata()["effort"]}"',
                 "-s", self.sandbox, "-C", str(self.workdir), "--json", "-"]
 
-    def inspect(self):
+    def inspect(self, policy_receipt=None):
+        effort = self.selection.metadata()["effort"]
         return {"status": "planned", "argv": self.argv(), "selection": self.selection.metadata(),
-                "sandbox": self.sandbox, "timeout_seconds": self.timeout}
+                "sandbox": self.sandbox, "timeout_seconds": self.timeout,
+                "policy": _checked_policy_receipt(policy_receipt, self),
+                "configuration": {
+                    "requested": {"model": self.model, "effort": effort},
+                    "serialized": {"model": self.model, "effort": effort},
+                    "observed": {"model": None, "effort": None},
+                },
+                "acceptance": {"status": "unknown", "independent_validation": False}}
+
+
+def _checked_policy_receipt(receipt, request):
+    """Recompute policy at the executor boundary; a receipt is not authority."""
+    selected = {"model": request.model, "effort": request.selection.metadata()["effort"]}
+    if request.cli == "codex":
+        from agent.codex_worker_policy import PolicyInput, decide_worker
+        if request.policy_input is None:
+            values = {"model_override": request.model,
+                      "effort_override": selected["effort"]}
+            if request.selection.policy == "pinned":
+                values.pop("effort_override")
+                values["pinned_effort"] = selected["effort"]
+        else:
+            if not isinstance(request.policy_input, dict):
+                raise ValueError("Policy input must be a mapping")
+            values = json.loads(json.dumps(request.policy_input))
+            if len(json.dumps(values)) > 65536:
+                raise ValueError("Policy input exceeds size limit")
+            if "handoff_refs" in values:
+                if not isinstance(values["handoff_refs"], list):
+                    raise ValueError("Handoff references must be a list or tuple")
+                values["handoff_refs"] = tuple(values["handoff_refs"])
+        try:
+            expected = decide_worker(PolicyInput(**values)).receipt()
+        except TypeError as exc:
+            raise ValueError("Invalid policy input fields") from exc
+        if expected["action"] != "spawn":
+            raise ValueError("Policy forbids execution: " + expected["next_action"])
+        if expected["selected"] != selected:
+            raise ValueError("Policy selection does not match execution configuration")
+        if receipt is not None and receipt != expected:
+            raise ValueError("Policy receipt does not match recomputed execution policy")
+        return expected
+    if request.policy_input is not None:
+        raise ValueError("Codex policy input cannot be applied to Claude")
+    if receipt is None:
+        return {"policy_version": None, "action": "spawn", "task_class": None,
+                "selected": selected, "reason": "Claude explicit pass-through",
+                "override_source": "caller_override", "attempt": 1}
+    if not isinstance(receipt, dict) or len(json.dumps(receipt)) > 65536:
+        raise ValueError("Invalid policy receipt")
+    if receipt.get("action") != "spawn" or receipt.get("selected") != selected:
+        raise ValueError("Policy receipt forbids execution or mismatches configuration")
+    return json.loads(json.dumps(receipt))
+
+
+def _runtime_evidence(path):
+    observed = {"model": None, "effort": None}
+    usage = None
+    try:
+        with open(path, "rb") as stream:
+            for raw in stream:
+                try:
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if event.get("type") in ("thread.started", "turn.started", "session.config"):
+                    if isinstance(event.get("model"), str):
+                        observed["model"] = event["model"]
+                    if event.get("reasoning_effort") in ("low", "medium", "high", "xhigh", "max"):
+                        observed["effort"] = event["reasoning_effort"]
+                candidate = event.get("usage")
+                if event.get("type") == "turn.completed":
+                    candidate = candidate if isinstance(candidate, dict) else {}
+                    normalized = {}
+                    for key in ("input_tokens", "cached_input_tokens", "output_tokens",
+                                "reasoning_tokens", "cache_write_input_tokens"):
+                        value = (candidate.get("reasoning_output_tokens", candidate.get(key))
+                                 if key == "reasoning_tokens" else candidate.get(key))
+                        normalized[key] = value if type(value) is int and value >= 0 else None
+                    if usage is None:
+                        usage = normalized
+                    else:
+                        usage = {key: (usage[key] + value if usage[key] is not None
+                                       and value is not None else None)
+                                 for key, value in normalized.items()}
+    except OSError:
+        pass
+    return observed, usage
 
 
 def _private_file(path):
@@ -164,7 +269,8 @@ def _stop_group(process):
 
 
 def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
-             output_limit=MAX_OUTPUT_BYTES, before_spawn=None, prompt_bytes=None):
+             output_limit=MAX_OUTPUT_BYTES, before_spawn=None, prompt_bytes=None,
+             policy_receipt=None):
     """Run using real binary pipes; ``popen`` is a Python-only testing seam.
 
     Each stream is bounded. Over-limit and artifact I/O errors are failures,
@@ -192,11 +298,26 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
     if not prompt or len(prompt) > MAX_SPEC_BYTES:
         raise ValueError("SPEC must be nonempty and within size limit")
     prompt.decode("utf-8")  # Reject malformed text; no guessing or replacement.
+    effort = request.selection.metadata()["effort"]
+    policy = _checked_policy_receipt(policy_receipt, request)
     run_dir = Path(tempfile.mkdtemp(prefix="codex-task-", dir=request.output_dir))
     result = {"status": "launch_failed", "exit_code": 127, "process_returncode": None,
               "selection": request.selection.metadata(), "sandbox": request.sandbox,
               "model": request.model, "cli": request.cli,
               "timeout_seconds": request.timeout, "artifact_dir": str(run_dir),
+              "policy": policy,
+              "configuration": {
+                  "requested": {"model": request.model, "effort": effort},
+                  "serialized": {"model": request.model, "effort": effort},
+                  "observed": {"model": None, "effort": None},
+              },
+              "execution": {"status": "launch_failed", "cli_exit_code": None},
+              "acceptance": {"status": "unknown", "independent_validation": False},
+              "metrics": {
+                  "attempt": policy.get("attempt", 1), "wall_time_seconds": None,
+                  "usage": None, "worker_cost_usd": None,
+                  "coordinator_usage": None, "review_usage": None,
+              },
               "input_receipt": {"sha256": hashlib.sha256(prompt).hexdigest(),
                                 "bytes": len(prompt), "written_bytes": 0, "pipe_complete": False}}
     process = None
@@ -289,6 +410,14 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
             result["process_returncode"] = process.returncode
             for stream in (process.stdin, process.stdout, process.stderr):
                 stream.close()
+    observed, usage = _runtime_evidence(run_dir / "events.jsonl")
+    result["configuration"]["observed"] = observed
+    result["metrics"]["usage"] = usage
+    result["metrics"]["wall_time_seconds"] = round(time.monotonic() - started, 6)
+    result["execution"] = {
+        "status": result["status"],
+        "cli_exit_code": result["process_returncode"],
+    }
     # If this write/flush fails, propagate it: the CLI must exit nonzero.
     with _private_file(run_dir / "status.json") as status_file:
         status_file.write((json.dumps(result, ensure_ascii=True) + "\n").encode())

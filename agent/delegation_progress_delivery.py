@@ -61,7 +61,7 @@ def ssh_transport(argv, data, timeout, *, popen=subprocess.Popen):
 
 
 class SSHSender:
-    def __init__(self, host, remote_python, runtime_root, helper, allow_threads, *, timeout=40, transport=ssh_transport):
+    def __init__(self, host, remote_python, runtime_root, helper, allow_threads, *, timeout=40, transport=ssh_transport, server_state_dir=None):
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,200}', host):
             raise ValueError('ssh_host')
         for path in (remote_python, runtime_root, helper):
@@ -72,23 +72,30 @@ class SSHSender:
         if isinstance(timeout, bool) or not math.isfinite(timeout) or not 0 < timeout <= 60:
             raise ValueError('sender_timeout')
         self.host, self.remote_python, self.runtime_root, self.helper = host, remote_python, runtime_root, helper
+        if server_state_dir is not None and (not Path(server_state_dir).is_absolute() or any(ord(c) < 32 for c in server_state_dir)):
+            raise ValueError('server_state_dir')
+        self.server_state_dir = server_state_dir
         self.allow_threads, self.timeout, self.transport = tuple(allow_threads), timeout, transport
 
-    def argv(self, reconcile_message=None):
+    def argv(self, reconcile_message=None, *, recover_journal=False):
         remote = [self.remote_python, self.helper, '--runtime-root', self.runtime_root]
+        if self.server_state_dir:
+            remote.extend(['--delivery-state-dir', self.server_state_dir])
         for thread in self.allow_threads:
             remote.extend(['--allow-thread', thread])
         if reconcile_message is not None:
             if not identifier(reconcile_message):
                 raise ValueError('message_identity')
             remote.extend(['--reconcile-message', reconcile_message])
+        if recover_journal:
+            remote.append('--recover-journal')
         return ['/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                 '-o', 'StrictHostKeyChecking=yes', '--', self.host, shlex.join(remote)]
 
-    def send(self, value, *, reconcile_message=None):
+    def send(self, value, *, reconcile_message=None, recover_journal=False):
         validate(value, self.allow_threads)
         try:
-            raw = self.transport(self.argv(reconcile_message), json.dumps(value, ensure_ascii=True).encode(), self.timeout)
+            raw = self.transport(self.argv(reconcile_message, recover_journal=recover_journal), json.dumps(value, ensure_ascii=True).encode(), self.timeout)
             result = decode(raw)
             if result in ({'status': 'rejected'}, {'status': 'uncertain'}):
                 return result
@@ -112,7 +119,31 @@ class Delivery:
             raise ValueError('delivery_identity')
         return state
 
-    def drain_one(self, *, reconcile_message=None):
+    def claim_notice(self, *, dry_run=False):
+        """Fence the automatic path BEFORE a coordinator sends this exact event."""
+        from contextlib import nullcontext
+        with nullcontext() if dry_run else _lock(self.progress.directory / 'delivery.lock'):
+            message = self.progress.peek()
+            if not message or message.get('operation') != 'NOTICE':
+                raise ValueError('claim_requires_notice_head_drain_card_first')
+            manifest = self.progress.manifest
+            if message['run_id'] != manifest.run_id or message['thread_id'] != manifest.thread_id:
+                raise ValueError('outbox_identity')
+            value = {k: message[k] for k in ('run_id', 'sequence', 'thread_id', 'content', 'operation', 'event_id')}
+            value.update(content_digest=hashlib.sha256(value['content'].encode()).hexdigest(), card_receipt=None)
+            validate(value, {manifest.thread_id})
+            state = self._load()
+            key = str(message['sequence'])
+            if key in state['records']:
+                raise ValueError('already_attempted_use_get_only_reconciliation')
+            if not dry_run:
+                state['records'][key] = {'status': 'uncertain'}
+                _atomic(self.path, state)
+            # This payload must go through the same server helper and journal.
+            # Arbitrary Discord POSTs cannot supply a durable run/response binding.
+            return {'event_id': message['event_id'], 'payload': value}
+
+    def drain_one(self, *, reconcile_message=None, reported_message=None, recover_journal=False):
         # Also fences Python consumers that aren't inside the lifetime watcher.
         with _lock(self.progress.directory / 'delivery.lock'):
             message = self.progress.peek()
@@ -124,8 +155,18 @@ class Delivery:
                 raise ValueError('outbox_identity')
             value = {k: message[k] for k in ('run_id', 'sequence', 'thread_id', 'content')}
             value['content_digest'] = hashlib.sha256(value['content'].encode()).hexdigest()
-            validate(value, {manifest.thread_id})
             state = self._load()
+            if 'operation' in message:
+                value.update(operation=message['operation'], event_id=message['event_id'], card_receipt=None)
+                if message['operation'] == 'CARD_PATCH':
+                    value['card_receipt'] = state.get('card')
+                if reported_message is not None:
+                    if message['operation'] != 'NOTICE' or reconcile_message is not None:
+                        raise ValueError('reported_message_requires_notice_head')
+                    reconcile_message = reported_message
+            elif reported_message is not None:
+                raise ValueError('reported_message_requires_v2')
+            validate(value, {manifest.thread_id})
             key = str(value['sequence'])
             record = state['records'].get(key)
             if key in state['records'] and (not isinstance(record, dict) or record.get('status') not in ('verified', 'uncertain', 'rejected')):
@@ -133,7 +174,7 @@ class Delivery:
             if record and record.get('status') == 'verified':
                 validate_receipt(record, value)
             else:
-                if record and record.get('status') == 'uncertain' and reconcile_message is None:
+                if record and record.get('status') == 'uncertain' and reconcile_message is None and not recover_journal:
                     return {'status': 'uncertain'}
                 if record and record.get('status') not in ('uncertain', 'rejected'):
                     raise ValueError('delivery_state')
@@ -141,18 +182,23 @@ class Delivery:
                 state['records'][key] = {'status': 'uncertain'}
                 _atomic(self.path, state)
                 try:
-                    result = self.sender.send(value, reconcile_message=reconcile_message)
+                    kwargs = {'reconcile_message': reconcile_message}
+                    if recover_journal and record and record.get('status') == 'uncertain':
+                        kwargs['recover_journal'] = True
+                    result = self.sender.send(value, **kwargs)
                     if result not in ({'status': 'rejected'}, {'status': 'uncertain'}):
                         validate_receipt(result, value)
-                        if any(r.get('message_id') == result['message_id'] for k, r in state['records'].items() if k != key):
+                        if value.get('operation') != 'CARD_PATCH' and any(r.get('message_id') == result['message_id'] for k, r in state['records'].items() if k != key):
                             raise ValueError('duplicate_discord_message')
                 except Exception:
                     result = {'status': 'uncertain'}
-                if reconcile_message is not None and result == {'status': 'rejected'}:
+                if (reconcile_message is not None or kwargs.get('recover_journal')) and result == {'status': 'rejected'}:
                     # GET rejection says nothing about whether the earlier POST
                     # succeeded. Never turn failed reconciliation into POST retry.
                     result = {'status': 'uncertain'}
                 state['records'][key] = result
+                if result['status'] == 'verified' and value.get('operation') == 'CARD_CREATE':
+                    state['card'] = result
                 _atomic(self.path, state)
                 if result['status'] != 'verified':
                     return result

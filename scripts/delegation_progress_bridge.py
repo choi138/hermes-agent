@@ -22,11 +22,15 @@ def main(argv=None):
     parser.add_argument('--runtime-root', required=True)
     parser.add_argument('--helper-path', required=True)
     parser.add_argument('--allow-thread', action='append', required=True)
-    parser.add_argument('--interval', type=float, default=300)
+    parser.add_argument('--interval', type=float, default=1200)
     parser.add_argument('--poll-interval', type=float, default=10)
     parser.add_argument('--sender-timeout', type=float, default=40)
     parser.add_argument('--max-runtime', type=float, default=86400, help='Finite foreground lifetime; pending state survives exit 75')
     parser.add_argument('--reconcile-message', help='GET-only verification of exact pending Discord message ID')
+    parser.add_argument('--recover-journal', action='store_true', help='Recover uncertain delivery through GET-only server journal lookup')
+    parser.add_argument('--server-state-dir', help='Private durable server journal directory')
+    parser.add_argument('--record-reported-message', help='GET-verify and acknowledge the exact NOTICE head sent by coordinator')
+    parser.add_argument('--once', action='store_true', help='Drain at most one item, then exit')
     parser.add_argument('--dry-run', action='store_true', help='Validate and preview; no writes or SSH')
     args = parser.parse_args(argv)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -46,9 +50,10 @@ def main(argv=None):
         manifest = Manifest.load(args.manifest)
         if manifest.thread_id not in args.allow_thread:
             raise ValueError('thread_not_allowed')
-        progress = Progress(manifest, args.state_dir, interval=args.interval)
+        progress = Progress(manifest, args.state_dir, interval=args.interval, light_poll=True)
         sender = SSHSender(args.ssh_host, args.remote_python, args.runtime_root, args.helper_path,
-                           args.allow_thread, timeout=args.sender_timeout)
+                           args.allow_thread, timeout=args.sender_timeout,
+                           server_state_dir=args.server_state_dir or str(Path(args.runtime_root) / '.delegation-progress-delivery'))
         sender.argv(args.reconcile_message)  # Validate even in dry-run.
         if args.dry_run:
             progress.tick(dry_run=True)
@@ -59,25 +64,33 @@ def main(argv=None):
         delivery = Delivery(progress, sender)
         deadline = time.monotonic() + args.max_runtime
         reconcile = args.reconcile_message
+        reported = args.record_reported_message
         with progress.watcher():
             while True:
                 updated = Manifest.load(args.manifest)
                 if updated.binding() != manifest.binding():
                     raise ValueError('manifest_identity_changed')
                 progress.manifest = updated
-                result = progress.tick()
+                result = ({'stopped': progress._load()['stopped']} if args.once and (reported or reconcile)
+                          else progress.tick())
                 while progress.peek() is not None:
-                    receipt = delivery.drain_one(reconcile_message=reconcile)
+                    receipt = delivery.drain_one(reconcile_message=reconcile, reported_message=reported,
+                                                 recover_journal=args.recover_journal)
                     reconcile = None
+                    reported = None
                     emit(receipt)
                     if receipt['status'] != 'verified':
                         return 75
-                if result['stopped']:
+                    if args.once:
+                        return 0
+                if args.once:
+                    return 0
+                if progress._load()['stopped']:
                     emit({'status': 'stopped_and_delivered', 'run_id': manifest.run_id})
                     return 0
                 if time.monotonic() >= deadline:
                     emit({'status': 'lifetime_expired', 'run_id': manifest.run_id})
-                    return 75
+                    return 76
                 time.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
     except KeyboardInterrupt:
         emit({'status': 'interrupted_pending_preserved'})

@@ -170,7 +170,7 @@ def test_f1_pairing_old_completion_and_duplicates_across_restart(lane):
     assert progress.tick()["snapshot"]["tests"]["status"] == "passed"
     (repo / "new_edit.py").write_text("value=2\n")
     snapshot = progress.tick()["snapshot"]
-    assert "현재 변경 전체의 재검증 여부는 미확인" in render(snapshot)
+    assert "현재 코드 적용 미확인" in render(snapshot)
 
 
 def install_runner(repo):
@@ -204,9 +204,12 @@ def test_f1_real_canonical_runner_and_skip_counts(lane, monkeypatch):
 def test_f2_incomplete_running_observation_does_not_rearm_wait(lane):
     _, art, progress = lane
     progress.tick()
+    while progress.peek():
+        progress.ack(progress.peek()['id'])
     progress.manifest = replace(progress.manifest, cli_status="needs_user")
-    first = progress.tick()["queued"][0]
-    progress.ack(first["id"])
+    first = [m for m in progress.tick()['queued'] if m['operation'] == 'NOTICE'][0]
+    while progress.peek():
+        progress.ack(progress.peek()['id'])
     progress.manifest = replace(progress.manifest, cli_status="running")
     with (art / "events.jsonl").open("a") as stream:
         stream.write("{broken-json}\n")
@@ -222,8 +225,9 @@ def test_f2_incomplete_running_observation_does_not_rearm_wait(lane):
 def test_f2_legacy_wait_state_requires_observed_resume(lane):
     _, _, progress = lane
     progress.manifest = replace(progress.manifest, cli_status="needs_user")
-    first = progress.tick()["queued"][0]
-    progress.ack(first["id"])
+    first = [m for m in progress.tick()['queued'] if m['operation'] == 'NOTICE'][0]
+    while progress.peek():
+        progress.ack(progress.peek()['id'])
     legacy = json.loads(progress.path.read_text())
     legacy.pop("waiting", None)
     legacy["terminal_seen"].append("needs_user")

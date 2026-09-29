@@ -6,6 +6,7 @@ Manifest paths are operator authority; event contents never supply authority.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -67,8 +68,17 @@ class Manifest:
     pid: int | None = None
     process_start: str | None = None
     schema_version: int = SCHEMA_VERSION
+    code_scope: tuple[str, ...] = ()
+    worker_cli: str = 'codex'
 
     def __post_init__(self):
+        if self.worker_cli not in ('codex', 'claude'):
+            raise ValueError('worker_cli')
+        if (not isinstance(self.code_scope, (tuple, list)) or len(self.code_scope) > 1024 or
+                any(not isinstance(p, str) or not re.fullmatch(r'[A-Za-z0-9_./-]{1,200}', p) or
+                    p.startswith('/') or '..' in p.split('/') or not file_class(p) for p in self.code_scope)):
+            raise ValueError('code_scope')
+        object.__setattr__(self, 'code_scope', tuple(sorted(set(self.code_scope))))
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise ValueError("manifest_schema")
         if not isinstance(self.run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", self.run_id):
@@ -119,9 +129,15 @@ class Manifest:
         return cls.from_dict(json.loads(_read(path.parent, path.name, 32768)))
 
     def binding(self):
-        return _digest(_json({key: str(getattr(self, key)) for key in (
+        values = {key: str(getattr(self, key)) for key in (
             "run_id", "worktree", "approved_root", "artifact_root", "thread_id",
-            "event_path", "receipt_path")}))
+            "event_path", "receipt_path")}
+        if self.code_scope:
+            values['code_scope'] = self.code_scope
+        # Preserve existing Codex bindings, bind the additional adapter explicitly.
+        if self.worker_cli != 'codex':
+            values['worker_cli'] = self.worker_cli
+        return _digest(_json(values))
 
 
 @contextmanager
@@ -275,8 +291,8 @@ def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512
                 meta, path = record.split(b"\t", 1)
                 heads[os.fsdecode(path)] = meta.decode().split()[2]
         names = sorted(set(statuses) | set(index) | set(heads), key=lambda path: (path not in statuses, path))
-        allowed = [path for path in names if file_class(path)]
-        result["excluded"] = len(names) - len(allowed)
+        allowed = list(manifest.code_scope) if manifest.code_scope else [path for path in names if file_class(path)]
+        result["excluded"] = len(set(names) - set(allowed))
         if len(allowed) > max_files:
             result["errors"].append("files_truncated")
             result["omitted"] += len(allowed) - max_files
@@ -291,7 +307,7 @@ def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512
                 entry["content"] = _digest(content)
             except FileNotFoundError:
                 # Missing tracked paths are deletions; absent untracked paths raced status.
-                if path not in heads and path not in index:
+                if path not in heads and path not in index and path not in manifest.code_scope:
                     entry["known"] = False
                     result["errors"].append("file_changed_during_observation")
             except (OSError, ValueError) as exc:
@@ -332,7 +348,8 @@ def _changes(previous, current, *, head_changed=False):
         if old and new:
             if old["head"] != new["head"]:
                 kinds.append("committed")
-            elif old["status"] != "  " and new["status"] == "  ":
+            elif (old["status"] != "  " and new["status"] == "  "
+                  and old["content"] != new["content"]):
                 kinds.append("reverted")
             if old["index"] != new["index"] and new["status"][0] not in (" ", "?"):
                 kinds.append("staged")
@@ -419,13 +436,15 @@ def _pytest_identity(command, *, canonical_only=False):
         words = shlex.split(command)
     except ValueError:
         return False
+    while words and re.fullmatch(r'HERMES_(?:PYTHON=[A-Za-z0-9_./-]+|TEST_FILE_RETRIES=0)', words[0]):
+        words.pop(0)
     if not words:
         return False
     executable = Path(words[0]).name
     if words[:2] == ["bash", "scripts/run_tests.sh"] or words[:1] == ["scripts/run_tests.sh"]:
         args = words[2:] if words[0] == "bash" else words[1:]
-        if args[:1] == ["-j"]:
-            if len(args) < 2 or not re.fullmatch(r"[1-9][0-9]?", args[1]):
+        while args[:1] in (["-j"], ["--file-timeout"]):
+            if len(args) < 2 or not re.fullmatch(r"[1-9][0-9]{0,3}", args[1]):
                 return False
             args = args[2:]
         return bool(args) and all(re.fullmatch(r"tests/[A-Za-z0-9_./]+", arg) and ".." not in arg for arg in args)
@@ -472,6 +491,43 @@ def _test_summary(output, code, *, canonical=False):
     return {"status": "passed", "passed": counts["passed"], "skipped": counts.get("skipped", 0), "exit_code": 0}
 
 
+def _claude_event(value, state, now):
+    """Stream-json activity only; raw text/tool inputs never become report data.
+
+    Read-only Claude has no trusted test runner. A model's result text is never
+    treated as a test receipt or as accepted completion.
+    """
+    if not isinstance(value, dict):
+        return
+    kind = value.get('type')
+    message = value.get('message', {})
+    if kind not in ('assistant', 'user') or not isinstance(message, dict):
+        return
+    content = message.get('content', [])
+    if not isinstance(content, list):
+        return
+    for block in content[:256]:
+        if not isinstance(block, dict):
+            continue
+        block_kind = block.get('type')
+        if kind == 'assistant' and block_kind == 'tool_use' and block.get('name') in ('Read', 'Glob', 'Grep'):
+            raw_id, phase = block.get('id'), 'read_started'
+        elif kind == 'user' and block_kind == 'tool_result':
+            raw_id, phase = block.get('tool_use_id'), 'read_completed'
+        elif kind == 'assistant' and block_kind == 'text':
+            raw_id, phase = message.get('id'), 'response_observed'
+        else:
+            continue
+        if not isinstance(raw_id, str) or not 1 <= len(raw_id) <= 256:
+            continue
+        identity = _digest((raw_id + phase).encode())
+        if identity in state['seen_events']:
+            continue
+        state['seen_events'] = (state['seen_events'] + [identity])[-256:]
+        state['execution'] = {'phase': phase, 'observed_at': now}
+        state['execution_since_queue'] = True
+
+
 def _event(value, state, now):
     if not isinstance(value, dict) or value.get("type") not in ("item.started", "item.completed"):
         return
@@ -504,7 +560,8 @@ def _event(value, state, now):
     likely = _likely_pytest(command)
     if prior is None:
         runs[key] = {"command": command_hash, "test": likely, "completed": completed,
-                     "order": max((run["order"] for run in runs.values()), default=0) + 1}
+                     "order": max((run["order"] for run in runs.values()), default=0) + 1,
+                     "code_fingerprint": state.get('current_fingerprint') if not completed else None}
         if likely:
             state["latest_test"] = key
         # Match the existing bounded event-dedup window; no raw commands stored.
@@ -522,6 +579,10 @@ def _event(value, state, now):
                                    canonical=_pytest_identity(command, canonical_only=True))
                       if completed and trusted else {"status": "unknown" if completed else "in_progress"})
     state["tests"]["observed_at"] = now
+    state['tests']['run_id'] = state.get('run_id')
+    state['tests']['evidence_ref'] = identity
+    bound = runs[key].get('code_fingerprint')
+    state['tests']['code_fingerprint'] = bound if bound == state.get('current_fingerprint') else None
 
 
 def _events(manifest, state, now, *, limit=1024 * 1024):
@@ -555,7 +616,7 @@ def _events(manifest, state, now, *, limit=1024 * 1024):
             for line in data[:end].splitlines():
                 try:
                     value = json.loads(line)
-                    _event(value, state, now)
+                    (_claude_event if manifest.worker_cli == 'claude' else _event)(value, state, now)
                 except (ValueError, UnicodeError, RecursionError):
                     errors.append("events_invalid")
             cursor["offset"] += end  # Incomplete trailing record is retried, never persisted raw.
@@ -618,75 +679,7 @@ def safe_source_name(path):
     return path.replace('_', r'\_')
 
 
-def render(snapshot, *, limit=1200):
-    """Fixed factual operations plus bounded, escaped source names; no raw text."""
-    if not 200 <= limit <= 1900:
-        raise ValueError("message_limit")
-    lines = ["작업 진행 상황을 전해드려요."]
-    if snapshot.get("baseline"):
-        lines.append("• 기준 상태를 기록했어요. 기존 수정은 이번 구간의 변경으로 세지 않았어요.")
-    if not snapshot.get("available"):
-        lines.append("• 상태 확인 불가: 이번 보고 구간에 일부 관측을 읽지 못했거나 수집 한도에 걸렸어요. 변경 없음으로 판단하지 않았어요.")
-    changes = snapshot.get("changes", [])
-    if changes:
-        labels = {"source": "소스", "tests": "테스트", "docs": "문서", "build": "빌드 설정"}
-        counts = {key: sum(c["class"] == key for c in changes) for key in labels}
-        summary = ", ".join(f"{labels[key]} {count}개" for key, count in counts.items() if count)
-        lines.append(f"• 새로 확인: {summary} 파일의 내용·git 상태가 달라졌어요.")
-        operations = {"added": "파일 추가", "content": "파일 내용 변경", "staged": "스테이징",
-                      "reverted": "수정 되돌림", "deleted": "삭제", "committed": "커밋 반영", "status": "git 상태 변경"}
-        for change in changes[:5]:
-            observed = ["테스트 파일 추가" if kind == "added" and change['class'] == "tests" else operations[kind]
-                        for kind in change['kinds'] if kind in operations]
-            lines.append(f"• {safe_source_name(change['path'])}: {', '.join(observed)}.")
-        if len(changes) > 5:
-            lines.append(f"• 이름 목록에서 {len(changes) - 5}개 파일을 생략했어요.")
-        kinds = {kind for c in changes for kind in c["kinds"]}
-        special = [label for kind, label in (("staged", "스테이징"), ("committed", "커밋 반영"),
-                   ("reverted", "수정 되돌림"), ("deleted", "삭제")) if kind in kinds]
-        if special:
-            lines.append("• 확인된 상태 변화: " + ", ".join(special) + ".")
-    elif snapshot.get("available") and not snapshot.get("baseline"):
-        lines.append("• 새로 확인된 파일 변경 없음. 관측 사이의 작업까지 없었다고 단정하지는 않아요.")
-    phase = snapshot.get("execution", {}).get("phase", "unknown")
-    evidence = {"execution_started": "도구 실행 시작 기록이 있어요. 완료 여부는 확인 전이에요.",
-                "execution_completed": "도구 실행 완료 기록이 있어요. 기능 완성을 뜻하지는 않아요.",
-                "file_change_completed": "파일 변경 도구 완료 기록이 있어요. 실제 변경 범위는 git 관측 기준이에요."}
-    if snapshot.get("execution_since_queue") and phase in evidence:
-        lines.append("• 실행 근거: " + evidence[phase])
-    elif not changes and snapshot.get("liveness") == "alive":
-        lines.append("• 프로세스는 확인됐지만, 새 구현 활동 근거가 부족해요.")
-    tests = snapshot.get("tests", {"status": "unknown"})
-    test_text = {"unknown": "결과 확인 전이에요.",
-                 "in_progress": "시작 기록이 있어요. 완료 근거는 아직 없어요.",
-                 "failed": "마지막 pytest 실행 실패가 확인됐어요.",
-                 "passed": "마지막 개별 pytest 실행 통과가 확인됐어요. 현재 변경 전체의 재검증 여부는 미확인이에요."}
-    lines.append("• 테스트: " + test_text.get(tests["status"], test_text["unknown"]))
-    if tests.get("scope") == "canonical_command" and tests["status"] == "passed":
-        lines.append(f"• 최근 표준 테스트 명령: {tests['passed']}개 통과, {tests.get('skipped', 0)}개 건너뜀. 이후 수정의 승인 근거는 아니에요.")
-    elif tests.get("skipped"):
-        lines.append(f"• 최근 개별 테스트에서 {tests['skipped']}개를 건너뛰었어요.")
-    stage, status = snapshot.get("coordinator_stage"), snapshot.get("exit_status", "running")
-    if stage == "final_verified":
-        lines.append("• 레나 최종 검증 완료. 승인된 작업 범위의 진행 보고를 마칠게요.")
-        lines.append("• 운영 활성화 여부는 이 보고로 확인하지 않아요.")
-    elif stage == "stopped":
-        lines.append("• 명시적 중단 요청으로 진행 보고를 마칠게요. 작업 완료 판정은 아니에요.")
-    else:
-        if status == "cli_completed":
-            lines.append("• Codex 실행은 종료됐어요." if stage == "verifying" else "• Codex 실행 종료, 레나 검증 대기.")
-        elif status in TERMINAL:
-            lines.append("• Codex 실행 실패·중단이 확인됐어요. 후속 판단을 기다려요.")
-        elif status == "needs_user":
-            lines.append("• 사용자 확인 대기 중이에요.")
-        if stage == "verifying":
-            lines.append("• 레나 검증 진행 중: 조정자 상태에 명시됐어요. 결과는 아직 미확인이에요.")
-        lines.append("• 아직 미검증: 레나 검증·운영 활성화.")
-    text = "\n".join(lines)
-    if len(text) > limit:
-        suffix = "\n• 길이 제한으로 일부 설명을 생략했어요."
-        text = text[:limit - len(suffix)].rstrip('\\') + suffix
-    return text
+from agent.delegation_progress_policy import render, fingerprint, plan
 
 
 def _private_dir(path):
@@ -742,7 +735,7 @@ def _atomic(path, data):
             os.unlink(name)
 
 
-def validate_registration(request, manifest_path, state_dir, thread_id, task_label):
+def validate_registration(request, manifest_path, state_dir, thread_id, task_label, *, code_scope=()):
     path = _path(manifest_path, exists=False)
     root = _path(state_dir, exists=False)
     if path.exists() or path.is_relative_to(request.workdir) or root.is_relative_to(request.workdir):
@@ -751,14 +744,15 @@ def validate_registration(request, manifest_path, state_dir, thread_id, task_lab
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("private_manifest_parent_required")
     Manifest("registration-check", request.workdir, request.allowed_root, request.output_dir,
-             thread_id, task_label)
+             thread_id, task_label, code_scope=code_scope)
 
 
-def register_run(request, run_dir, manifest_path, state_dir, thread_id, task_label):
+def register_run(request, run_dir, manifest_path, state_dir, thread_id, task_label, *, code_scope=()):
     """Opt-in callback. Durable baseline precedes exclusive manifest publication."""
-    validate_registration(request, manifest_path, state_dir, thread_id, task_label)
+    validate_registration(request, manifest_path, state_dir, thread_id, task_label, code_scope=code_scope)
     manifest = Manifest(uuid.uuid4().hex, request.workdir, request.allowed_root, run_dir,
-                        thread_id, task_label, run_dir / "events.jsonl", run_dir / "status.json")
+                        thread_id, task_label, run_dir / "events.jsonl", run_dir / "status.json",
+                        code_scope=code_scope, worker_cli=request.cli)
     progress = Progress(manifest, state_dir)
     snapshot = progress.tick()["snapshot"]
     # A bounded inventory is a valid, explicitly partial baseline. A failed
@@ -790,6 +784,8 @@ def register_run(request, run_dir, manifest_path, state_dir, thread_id, task_lab
 def set_stage(manifest_path, stage, *, dry_run=False):
     """Explicit coordinator command; immutable routing remains unchanged."""
     from dataclasses import replace
+    if stage == "final_verified":
+        raise ValueError("final_verified_requires_begin_validation_and_record_validation")
     path = _path(manifest_path)
     manifest = replace(Manifest.load(path), coordinator_stage=stage)
     if not dry_run:
@@ -802,10 +798,10 @@ def set_stage(manifest_path, stage, *, dry_run=False):
 
 
 class Progress:
-    def __init__(self, manifest, state_dir, *, interval=300, clock=time.time, process_probe=None):
+    def __init__(self, manifest, state_dir, *, interval=1200, clock=time.time, process_probe=None, light_poll=False):
         if not isinstance(manifest, Manifest):
             raise ValueError("validated_manifest_required")
-        if isinstance(interval, bool) or not math.isfinite(interval) or interval <= 0:
+        if isinstance(interval, bool) or not math.isfinite(interval) or not 1 <= interval <= 86400:
             raise ValueError("interval")
         self.manifest = manifest
         self.root = _path(state_dir, exists=False)
@@ -816,17 +812,66 @@ class Progress:
         self.interval, self.clock, self.process_probe = interval, clock, process_probe
         self._watching = False
         self.manifest_error = False
+        self.light_poll = light_poll
+        self._collection_cache = None
+
+    def _stat_signature(self):
+        """Bounded metadata only. Uncertainty falls back to full collection."""
+        signatures = []
+        try:
+            paths = []
+            for directory, dirs, files in os.walk(self.manifest.worktree, followlinks=False):
+                dirs[:] = sorted(d for d in dirs if file_class(str(
+                    (Path(directory) / d / 'probe.py').relative_to(self.manifest.worktree))))
+                paths.append(Path(directory))  # additions/deletions alter directory metadata
+                paths.extend(Path(directory) / f for f in files
+                             if file_class(str((Path(directory) / f).relative_to(self.manifest.worktree))))
+                if len(paths) > 4096:
+                    return None
+            paths.extend(p for p in (self.manifest.event_path, self.manifest.receipt_path,
+                                    self.manifest.worktree / '.git') if p is not None)
+            for path in paths:
+                try:
+                    info = path.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        return None
+                    signatures.append((str(path), info.st_dev, info.st_ino, info.st_size,
+                                       info.st_mtime_ns, info.st_ctime_ns, info.st_mode))
+                except FileNotFoundError:
+                    signatures.append((str(path), None))
+            return signatures
+        except OSError:
+            return None
+
+    def _collect(self, state, now, *, force_full=False):
+        # Only background working-phase polling uses the cache. Public snapshots,
+        # validation tickets and every terminal/verification observation stay exact.
+        eligible = (not force_full and self.light_poll and self._watching and not state.get('validation')
+                    and self.manifest.coordinator_stage == 'working'
+                    and not state.get('receipt') and state['tests'].get('status') == 'unknown')
+        signature = self._stat_signature() if eligible else None
+        cached = self._collection_cache
+        if (signature is not None and cached and 0 <= now - cached[0] < 60
+                and signature == cached[1]):
+            return deepcopy(cached[2])
+        result = collect(self.manifest)
+        # Changes during collection cannot authorize a cache hit.
+        if signature is not None and result['available'] and signature == self._stat_signature():
+            self._collection_cache = (now, signature, deepcopy(result))
+        else:
+            self._collection_cache = None
+        return result
 
     def _load(self):
         try:
             state = json.loads(_read(self.directory, "state.json", 16 * 1024 * 1024))
         except FileNotFoundError:
-            return {"schema_version": SCHEMA_VERSION, "binding": self.manifest.binding(),
+            return {"schema_version": 2, "binding": self.manifest.binding(),
                     "previous": None, "accumulated": {}, "cumulative": {}, "last_queued_at": None,
                     "sequence": 0, "pending": [], "delivered": None, "stopped": False,
                     "tests": {"status": "unknown"}, "execution": {"phase": "unknown"},
                     "seen_events": [], "execution_since_queue": False, "terminal_seen": []}
-        if (not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION
+        if (not isinstance(state, dict) or state.get("schema_version") not in (1, 2)
                 or state.get("binding") != self.manifest.binding()):
             raise ValueError("state_identity_or_schema_mismatch")
         required = {"previous", "accumulated", "cumulative", "last_queued_at", "sequence",
@@ -844,6 +889,8 @@ class Progress:
             raise ValueError("invalid_state")
         if not isinstance(state.get("command_runs", {}), dict) or type(state.get("waiting", False)) is not bool:
             raise ValueError("invalid_state")
+        if state["schema_version"] == 1:
+            raise ValueError("v1_requires_explicit_migrate_or_legacy_drain")
         return state
 
     @contextmanager
@@ -865,8 +912,8 @@ class Progress:
             finally:
                 self._watching = False
 
-    def _observe(self, state, now):
-        observation = collect(self.manifest)
+    def _observe(self, state, now, *, force_full=False):
+        observation = self._collect(state, now, force_full=force_full)
         previous = state["previous"]
         delta = _changes(previous["files"], observation["files"],
                          head_changed=previous["head"] != observation["head"]) if previous else []
@@ -875,11 +922,10 @@ class Progress:
         # Incomplete global inventory must never make absent paths look deleted.
         if not observation["available"]:
             delta = [c for c in delta if c["path"] in observation["files"] and observation["files"][c["path"]]["known"]]
+        if delta:
+            state["latest_changes"] = delta
         for change in delta:
             path = change["path"]
-            old = state["accumulated"].get(path)
-            if old:
-                change["kinds"] = sorted(set(old["kinds"] + change["kinds"]))
             state["accumulated"][path] = change
             state["cumulative"][path] = change["class"]
         if observation["available"] or previous is None and "git_unavailable" not in observation["errors"]:
@@ -887,7 +933,16 @@ class Progress:
         elif previous:
             # Retain unknown/missing entries, update only independently read files.
             previous["files"].update({p: e for p, e in observation["files"].items() if e["known"]})
+        state['current_fingerprint'] = fingerprint(observation)
+        state['run_id'] = self.manifest.run_id
         errors = observation["errors"] + _events(self.manifest, state, now) + _receipt(self.manifest, state)
+        tests = state['tests']
+        tests['applicable'] = bool(tests.get('status') == 'passed' and tests.get('code_fingerprint') and
+                                  tests['code_fingerprint'] == state['current_fingerprint'] and
+                                  tests.get('run_id') == self.manifest.run_id)
+        from agent.delegation_progress_evidence import applicable_validation
+        validation = applicable_validation(self, state, observation)
+
         liveness = "unknown"
         if self.manifest.pid is not None:
             try:
@@ -905,11 +960,15 @@ class Progress:
         state["observation_errors"] = errors
         receipt = state.get("receipt", {})
         return {"run_id": self.manifest.run_id, "observed_at": now,
-                "baseline": previous is None, "available": observation["available"] and not errors,
+                "worker_cli": self.manifest.worker_cli,
+                "task_label": self.manifest.task_label, "code_fingerprint": state["current_fingerprint"],
+                "validation": validation,
+                "baseline": previous is None, "available": observation["available"] and not current_errors,
                 "errors": sorted(set(errors)), "omitted": observation["omitted"],
                 "current_errors": current_errors,
                 "last_complete_observation_at": state.get("last_complete_observation_at"),
-                "changes": list(state["accumulated"].values()),
+                "changes": delta, "display_changes": state.get("latest_changes", []),
+                "files_available": observation["available"],
                 "cumulative_classes": {key: list(state["cumulative"].values()).count(key)
                                        for key in ("source", "tests", "docs", "build")},
                 "coordinator_stage": self.manifest.coordinator_stage,
@@ -919,52 +978,36 @@ class Progress:
                 "exit_code": receipt.get("exit_code")}
 
     def snapshot(self, *, now=None):
-        return self._observe(self._load(), self.clock() if now is None else now)
+        state = self._load()
+        if state['stopped'] or state.get('closing'):
+            # Accepted run evidence belongs to its frozen code fingerprint,
+            # including while final deliveries are still awaiting acknowledgement.
+            return state['final_snapshot']
+        return self._observe(state, self.clock() if now is None else now, force_full=True)
 
     def _tick(self, state, now):
         if state["stopped"]:
             return {"snapshot": state["final_snapshot"], "queued": [], "stopped": True}
-        snapshot = self._observe(state, now)
-        snapshot["available"] = snapshot["available"] and not snapshot["errors"]
+        snapshot = state['final_snapshot'] if state.get('closing') else self._observe(state, now)
         queued = []
-        terminal = snapshot["exit_status"] if snapshot["exit_status"] != "running" else None
-        stage = self.manifest.coordinator_stage
-        if stage in ("final_verified", "stopped") and not self.manifest_error:
-            terminal = stage
-        # Migrate old states conservatively: a historical wait stays the same
-        # episode until a complete running observation proves resumed work.
-        state.setdefault("waiting", "needs_user" in state["terminal_seen"])
-        if snapshot["exit_status"] == "running" and not snapshot["current_errors"]:
-            state["waiting"] = False
-        immediate = (not state["waiting"] and not self.manifest_error if terminal == "needs_user"
-                     else terminal is not None and terminal not in state["terminal_seen"])
-        if state["last_queued_at"] is None:
-            state["last_queued_at"] = now
-        due = now - state["last_queued_at"] >= self.interval and not state["pending"]
-        if immediate or due:
-            if len(state["pending"]) >= 32:
-                raise ValueError("outbox_full")
-            state["sequence"] += 1
-            message = {"id": f"{self.manifest.run_id}:{state['sequence']}",
-                       "run_id": self.manifest.run_id, "sequence": state["sequence"],
-                       "thread_id": self.manifest.thread_id, "observed_at": now,
-                       "event": terminal if immediate else "periodic",
-                       "content": render(snapshot), "allowed_mentions": {"parse": [], "replied_user": False}}
-            state["pending"].append(message)
-            state["accumulated"] = {}
-            state["execution_since_queue"] = False
-            state["observation_errors"] = []
-            state["last_queued_at"] = now
-            if immediate:
-                if terminal == "needs_user":
-                    state["waiting"] = True
-                else:
-                    state["terminal_seen"].append(terminal)
-            queued.append(message)
-        if terminal in ("final_verified", "stopped"):
-            state["stopped"] = True
-            state["final_snapshot"] = snapshot
-        return {"snapshot": snapshot, "queued": queued, "stopped": state["stopped"]}
+        if state.get('closing'):
+            # Frozen accepted terminal observation. Delivery must drain before stop.
+            snapshot = state['final_snapshot']
+        else:
+            for operation, event_id, event, content in plan(state, snapshot, now, self.interval):
+                if len(state['pending']) >= 32:
+                    raise ValueError('outbox_full')
+                state['sequence'] += 1
+                message = {'id': f"{self.manifest.run_id}:{state['sequence']}",
+                           'run_id': self.manifest.run_id, 'sequence': state['sequence'],
+                           'thread_id': self.manifest.thread_id, 'observed_at': now,
+                           'operation': operation, 'event_id': event_id, 'event': event,
+                           'content': content, 'allowed_mentions': {'parse': [], 'replied_user': False}}
+                state['pending'].append(message)
+                queued.append(message)
+        if state.get('closing') and not state['pending']:
+            state['stopped'] = True
+        return {'snapshot': snapshot, 'queued': queued, 'stopped': state['stopped']}
 
     def tick(self, *, now=None, dry_run=False):
         now = self.clock() if now is None else now
@@ -997,6 +1040,8 @@ class Progress:
                 raise ValueError("ack_requires_exact_head_id")
             message = state["pending"].pop(0)
             state["delivered"] = {"id": message["id"], "observed_at": message["observed_at"]}
+            if state.get('closing') and not state['pending']:
+                state['stopped'] = True
             return {"acked": message_id}
         if dry_run:
             return consume(self._load())

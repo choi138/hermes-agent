@@ -24,6 +24,8 @@ Delegate coding tasks to [Codex](https://github.com/openai/codex) via the Hermes
 
 Requires the codex CLI and a git repository.
 
+**Default Mac operational entry:** load `references/mac-effort-progress-runtime.md` before delegating. The selected v3 `codex-progress-current` entry preserves the task-based model/effort policy and worker permissions, registers before spawn, and uses a launchd-owned progress supervisor. Use one conversational status card, 10s observation/30s ordinary edits, immediate worker-exit/review transitions coalesced within30s, immediate input/blocking/final exceptions, and one warning after20min without evidence. Ordinary saves/test retries create no extra notices. Start the supervisor in the parent's background terminal with completion notification; inspect its completion or attention result. Raw CLI calls and gateway lifecycle intake are not automatically monitored. Preserve resolved paths and existing state for in-flight runs.
+
 ## Prerequisites
 
 - Codex installed: `npm install -g @openai/codex`

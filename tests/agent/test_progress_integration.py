@@ -49,7 +49,9 @@ pathlib.Path('tests/test_pin.py').write_text('def test_pin(): pass\\n')
 print(json.dumps({'type':'item.completed','item':{'id':'first','type':'command_execution','status':'completed','command':'python -m pytest tests/test_pin.py -q','exit_code':0,'aggregated_output':'1 passed in 0.01s'}}))
 ''')
     fake.chmod(0o700)
-    result = subprocess.run([sys.executable, *launch_args(lane)],
+    result = subprocess.run([sys.executable, *launch_args(lane),
+                             '--progress-code-scope', 'runner.py',
+                             '--progress-code-scope', 'tests/test_pin.py'],
                             env=dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH']),
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
@@ -57,19 +59,25 @@ print(json.dumps({'type':'item.completed','item':{'id':'first','type':'command_e
     assert outputs[0]['status'] == 'progress_registered'
     assert 'PRIVATE_PROMPT_SENTINEL' not in result.stdout
     p = Progress(Manifest.load(manifest), state)
-    baseline_time = p._load()['last_queued_at']
+    assert p.manifest.code_scope == ('runner.py', 'tests/test_pin.py')
+    assert set(p._load()['previous']['files']) == set(p.manifest.code_scope)
+    baseline_time = p._load()['last_notice_at']
+    from agent.delegation_progress_delivery import Delivery
+    from tests.agent.test_delegation_progress_delivery import SenderFixture
+    assert Delivery(p, SenderFixture()).drain_one()['status'] == 'verified'
     tick = p.tick(now=baseline_time + 1)
-    assert tick['queued'][0]['event'] == 'cli_completed'
+    assert tick['snapshot']['exit_status'] == 'cli_completed'
+    assert not tick['stopped']
     assert tick['snapshot']['tests']['status'] == 'passed'
     assert {c['path'] for c in tick['snapshot']['changes']} == {'runner.py', 'tests/test_pin.py'}
-    assert 'runner.py' in tick['queued'][0]['content']
-    assert '테스트 파일 추가' in tick['queued'][0]['content']
+    assert '파일 내용 변경 관측' in render(tick['snapshot'])
+    assert 'runner.py' not in render(tick['snapshot'])
     # Complete this same real runner's outbox through the actual bridge CLI,
     # replacing only its SSH child with the explicit local executable fixture.
     import runpy
     from agent.delegation_progress import set_stage
     fixture = runpy.run_path(str(ROOT / 'tests/scripts/test_progress_bridge_cli.py'))
-    set_stage(manifest, 'final_verified')
+    set_stage(manifest, 'stopped')
     boot = fixture['bootstrap'](tmp_path, fixture['GOOD'])
     delivered = subprocess.run([sys.executable, str(boot), *fixture['bridge_args'](p, manifest)],
                                capture_output=True, text=True, timeout=15)
@@ -99,16 +107,18 @@ def test_named_changes_and_safe_fallback():
           ['@everyone.py', 'MEDIA:evil.py', 'https://evil.py', 'sk-' + 'a'*45 + '.py', 'x\n<@123>.py']]],
         tests={'status':'passed'}, coordinator_stage='working')
     text = render(snapshot)
-    assert 'agent/runner.py' in text and r'tests/test\_pin.py' in text
-    assert '테스트 파일 추가' in text and '파일 내용 변경' in text
-    assert '안전한 이름 표시 불가' in text
+    assert 'agent/runner.py' not in text and 'tests/test' not in text
+    assert '테스트 1개' in text and '파일 내용 변경' in text
+    assert 1 <= len(text.splitlines()) <= 2
     assert all(s not in text for s in ['@', 'MEDIA:', 'https:', 'sk-', '<@', 'a'*45])
-    assert len(text) <= 1200 and '생략' in text
+    assert len(text) <= 500
 
 
 def test_canonical_test_command_completion():
     from agent.delegation_progress import _pytest_identity, _test_summary
     assert _pytest_identity('bash scripts/run_tests.sh -j 2 tests/agent/test_fixture.py')
+    assert _pytest_identity('HERMES_PYTHON=/approved/python HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh -j 3 --file-timeout 180 tests/agent/test_fixture.py')
+    assert not _pytest_identity('HERMES_PYTHON=/approved/python')
     assert not _pytest_identity('echo bash scripts/run_tests.sh -j 2 tests/a.py')
     assert not _pytest_identity("bash -c 'echo 10 passed in 1.0s'")
     summary = _test_summary('10 passed, 2 skipped in 1.0s', 0)
@@ -129,7 +139,7 @@ def test_bounded_baseline_registration_is_durable_and_explicit(lane, monkeypatch
     progress = Progress(registered, state)
     assert progress._load()['previous'] is not None
     assert 'files_truncated' in progress._load()['observation_errors']
-    assert '상태 확인 불가' in render(progress.snapshot())
+    assert '파일 관측 일부 미수집' in render(progress.snapshot())
 
 
 def test_canonical_summary_requires_exact_command_identity_and_complete_summary():

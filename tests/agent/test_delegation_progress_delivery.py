@@ -73,7 +73,8 @@ def test_cross_thread_and_unsafe_payload_before_credentials():
         pytest.fail('credential loader must not execute')
     assert deliver(payload(), {'999'}, token_loader=forbidden)['status'] == 'rejected'
     for text in ['@everyone', 'MEDIA:/tmp/a', 'https://evil', 'x\x1b[2J']:
-        value = dict(payload(), content=text, content_digest=hashlib.sha256(text.encode()).hexdigest())
+        value = dict(payload(), content=text, content_digest=hashlib.sha256(text.encode()).hexdigest(),
+                 operation='CARD_CREATE', event_id='fixture-run:card:1', card_receipt=None)
         assert deliver(value, {'123456789'}, token_loader=forbidden)['status'] == 'rejected'
 
 
@@ -119,7 +120,7 @@ class SenderFixture:
     def send(self, value, *, reconcile_message=None):
         from scripts.delegation_progress_discord_send import receipt
         self.calls.append((value, reconcile_message))
-        return self.result if self.result is not None else receipt(value, str(987654321 + value['sequence']))
+        return self.result if self.result is not None else receipt(value, value['card_receipt']['message_id'] if value.get('card_receipt') else str(987654321 + value['sequence']))
 
 
 def test_receipt_fsync_before_ack_and_restart_without_resend(progress, monkeypatch):
@@ -170,17 +171,34 @@ def test_network_rejection_keeps_pending_for_explicit_restart(progress):
     assert Delivery(progress, sender).drain_one()['status'] == 'verified'
 
 
+def test_journal_get_rejection_preserves_uncertainty(progress):
+    from agent.delegation_progress_delivery import Delivery
+    calls = []
+    class JournalSender:
+        def send(self, value, **kwargs):
+            calls.append(kwargs)
+            return {'status': 'rejected' if kwargs.get('recover_journal') else 'uncertain'}
+    delivery = Delivery(progress, JournalSender())
+    assert delivery.drain_one()['status'] == 'uncertain'
+    assert delivery.drain_one(recover_journal=True)['status'] == 'uncertain'
+    assert delivery.drain_one()['status'] == 'uncertain'
+    assert len(calls) == 2 and progress.peek() is not None
+
+
 def test_duplicate_discord_id_and_cross_thread_never_ack(progress):
+    from dataclasses import replace
     from agent.delegation_progress import _atomic
     from agent.delegation_progress_delivery import Delivery
     from scripts.delegation_progress_discord_send import receipt
     sender = SenderFixture()
     first = Delivery(progress, sender).drain_one()
-    progress.tick(now=600)
+    progress.manifest = replace(progress.manifest, cli_status='needs_user')
+    progress.tick(now=1)
     class Duplicate:
         def send(self, value, **kwargs):
             return receipt(value, first['message_id'])
-    assert Delivery(progress, Duplicate()).drain_one()['status'] == 'uncertain'
+    assert Delivery(progress, Duplicate()).drain_one()['status'] == 'verified'  # same card PATCH
+    assert Delivery(progress, Duplicate()).drain_one()['status'] == 'uncertain'  # new NOTICE cannot reuse card
     state = progress._load()
     state['pending'][0]['thread_id'] = '999'
     _atomic(progress.path, state)
@@ -192,13 +210,15 @@ def test_duplicate_discord_id_and_cross_thread_never_ack(progress):
 def test_final_pending_is_drained_even_when_watcher_stopped(progress):
     from dataclasses import replace
     from agent.delegation_progress_delivery import Delivery
-    progress.manifest = replace(progress.manifest, coordinator_stage='final_verified')
-    assert progress.tick(now=301)['stopped']
     sender = SenderFixture()
+    delivery = Delivery(progress, sender)
+    delivery.drain_one()
+    progress.manifest = replace(progress.manifest, coordinator_stage='stopped')
+    assert not progress.tick(now=301)['stopped']
     with progress.watcher():
-        assert Delivery(progress, sender).drain_one()['sequence'] == 1
-        assert Delivery(progress, sender).drain_one()['sequence'] == 2
-    assert progress.peek() is None
+        assert delivery.drain_one()['operation'] == 'CARD_PATCH'
+        assert delivery.drain_one()['operation'] == 'NOTICE'
+    assert progress.peek() is None and progress._load()['stopped']
 
 
 def test_delivery_and_watcher_fencing(progress):
@@ -261,12 +281,12 @@ def test_get_mismatch_after_successful_post():
         assert deliver(payload(), {'123456789'}, token_loader=lambda:'FIXTURE_ONLY', connection=http) == {'status':'uncertain'}
 
 
-def test_get_only_reconciliation():
+def test_legacy_unbound_reconciliation_remains_uncertain():
     from scripts.delegation_progress_discord_send import deliver
     http = HTTPFixture()
     assert deliver(payload(), {'123456789'}, token_loader=lambda:'FIXTURE_ONLY', connection=http,
-                   reconcile_message='987654321')['status'] == 'verified'
-    assert [c[0] for c in http.calls] == ['GET']
+                   reconcile_message='987654321')['status'] == 'uncertain'
+    assert http.calls == []  # Legacy payload has no durable sender-response binding.
 
 
 def test_receipt_boolean_sequence_is_not_integer_identity():
@@ -283,8 +303,9 @@ def test_each_pathological_name_is_safe_fallback(name):
     from agent.delegation_progress import render
     text = render(dict(available=True, changes=[dict(path=name, **{'class':'source'}, kinds=['added'])],
                        tests={'status':'unknown'}))
-    assert '안전한 이름 표시 불가' in text
+    assert 1 <= len(text.splitlines()) <= 2
     assert name not in text
-    value = dict(payload(), content=text, content_digest=hashlib.sha256(text.encode()).hexdigest())
+    value = dict(payload(), content=text, content_digest=hashlib.sha256(text.encode()).hexdigest(),
+                 operation='CARD_CREATE', event_id='fixture-run:card:1', card_receipt=None)
     from scripts.delegation_progress_discord_send import validate
     validate(value, {'123456789'})

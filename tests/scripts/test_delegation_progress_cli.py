@@ -53,29 +53,26 @@ def invoke(lane, command, *args, check=True):
 
 def test_real_snapshot_tick_peek_ack_and_dry_run(fixture_lane):
     repo, _, _, _, state = fixture_lane
-    snapshot = json.loads(invoke(fixture_lane, "snapshot").stdout)
-    assert snapshot["baseline"] and not snapshot["changes"]
+    snapshot = json.loads(invoke(fixture_lane, 'snapshot').stdout)
+    assert snapshot['baseline'] and not snapshot['changes'] and not state.exists()
+    invoke(fixture_lane, 'tick', '--dry-run')
     assert not state.exists()
-    invoke(fixture_lane, "tick", "--dry-run")
-    assert not state.exists()
-    invoke(fixture_lane, "tick")
-    state_file = state / "cli-fixture" / "state.json"
+    result = json.loads(invoke(fixture_lane, 'tick').stdout)
+    message = json.loads(invoke(fixture_lane, 'peek').stdout)
+    assert message == result['queued'][0] and message['operation'] == 'CARD_CREATE'
+    state_file = state / 'cli-fixture/state.json'
     before = state_file.read_bytes()
-    (repo / "fixture.py").write_text("value=2\n")
-    preview = json.loads(invoke(fixture_lane, "tick", "--interval", ".001", "--dry-run").stdout)
-    assert preview["queued"] and state_file.read_bytes() == before
-    result = json.loads(invoke(fixture_lane, "tick", "--interval", ".001").stdout)
-    assert [c["path"] for c in result["snapshot"]["changes"]] == ["fixture.py"]
-    message = json.loads(invoke(fixture_lane, "peek").stdout)
-    assert message == result["queued"][0]
-    assert len(message["content"]) <= 1200
-    assert message["allowed_mentions"] == {"parse": [], "replied_user": False}
-    assert invoke(fixture_lane, "peek", "--format", "text").stdout.strip() == message["content"]
-    assert invoke(fixture_lane, "ack", "--id", "wrong", check=False).returncode == 74
-    invoke(fixture_lane, "ack", "--id", message["id"], "--dry-run")
-    assert json.loads(invoke(fixture_lane, "peek").stdout) == message
-    invoke(fixture_lane, "ack", "--id", message["id"])
-    assert json.loads(invoke(fixture_lane, "peek").stdout) is None
+    (repo / 'fixture.py').write_text('value=2\n')
+    preview = json.loads(invoke(fixture_lane, 'tick', '--interval', '1', '--dry-run').stdout)
+    assert preview['snapshot']['changes'] and state_file.read_bytes() == before
+    assert not preview['queued']
+    assert invoke(fixture_lane, 'tick', '--interval', '.001', check=False).returncode == 74
+    assert invoke(fixture_lane, 'peek', '--format', 'text').stdout.strip() == message['content']
+    assert invoke(fixture_lane, 'ack', '--id', 'wrong', check=False).returncode == 74
+    invoke(fixture_lane, 'ack', '--id', message['id'], '--dry-run')
+    assert json.loads(invoke(fixture_lane, 'peek').stdout) == message
+    invoke(fixture_lane, 'ack', '--id', message['id'])
+    assert json.loads(invoke(fixture_lane, 'peek').stdout) is None
 
 
 def wait_until(predicate, timeout=12):
@@ -89,33 +86,47 @@ def wait_until(predicate, timeout=12):
 
 def test_watch_fast_exit_duplicate_fencing_and_final_reload(fixture_lane):
     _, artifacts, data, manifest, state = fixture_lane
-    argv = [sys.executable, str(CLI), "watch", "--manifest", str(manifest),
-            "--state-dir", str(state), "--poll-interval", ".05", "--interval", "300"]
+    argv = [sys.executable, str(CLI), 'watch', '--manifest', str(manifest),
+            '--state-dir', str(state), '--poll-interval', '.05']
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    state_file = state / "cli-fixture" / "state.json"
+    state_file = state / 'cli-fixture/state.json'
     try:
         wait_until(state_file.exists)
-        duplicate = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        assert duplicate.returncode == 74
-        (artifacts / "status.json").write_text('{"status":"cli_completed","exit_code":0}')
-        wait_until(lambda: bool(json.loads(state_file.read_text())["pending"]))
-        pending = json.loads(invoke(fixture_lane, "peek").stdout)
-        assert pending["event"] == "cli_completed"
-        assert pending["sequence"] == 1
-        invoke(fixture_lane, "ack", "--id", pending["id"])
-        # Atomic operator edit, just like the coordinator integration contract.
-        data["coordinator_stage"] = "final_verified"
-        replacement = manifest.with_suffix(".tmp")
+        assert subprocess.run(argv, capture_output=True, text=True, timeout=10).returncode == 74
+        first = json.loads(invoke(fixture_lane, 'peek').stdout)
+        assert first['operation'] == 'CARD_CREATE'
+        invoke(fixture_lane, 'ack', '--id', first['id'])
+        (artifacts / 'status.json').write_text('{"status":"cli_completed","exit_code":0}')
+        wait_until(lambda: json.loads(state_file.read_text()).get('receipt'))
+        # Worker exit now queues an immediate transition before parent review.
+        wait_until(lambda: len(json.loads(state_file.read_text())['pending']) == 2)
+        for message in json.loads(state_file.read_text())['pending']:
+            invoke(fixture_lane, 'ack', '--id', message['id'])
+        assert process.poll() is None
+        data['coordinator_stage'] = 'stopped'
+        replacement = manifest.with_suffix('.tmp')
         replacement.write_text(json.dumps(data))
         os.replace(replacement, manifest)
-        stdout, stderr = process.communicate(timeout=15)
+        wait_until(lambda: json.loads(state_file.read_text()).get('closing'))
+        assert process.poll() is None
+        pending = json.loads(state_file.read_text())['pending']
+        assert [m['operation'] for m in pending] == ['CARD_PATCH', 'NOTICE']
+        for message in pending:
+            invoke(fixture_lane, 'ack', '--id', message['id'])
+        stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
-        outputs = [json.loads(line) for line in stdout.splitlines()]
-        assert [m["queued"][0]["event"] for m in outputs] == ["cli_completed", "final_verified"]
-        assert "레나 최종 검증 완료" in outputs[-1]["queued"][0]["content"]
+        assert json.loads(state_file.read_text())['stopped']
     finally:
         if process.poll() is None:
-            process.terminate()
+            data['coordinator_stage'] = 'stopped'
+            manifest.write_text(json.dumps(data))
+            for _ in range(20):
+                if state_file.exists():
+                    for message in json.loads(state_file.read_text())['pending']:
+                        invoke(fixture_lane, 'ack', '--id', message['id'], check=False)
+                if process.poll() is not None:
+                    break
+                time.sleep(.1)
         process.communicate(timeout=10)
 
 

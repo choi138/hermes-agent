@@ -42,7 +42,8 @@ original = runner.run_task
 child, limit = sys.argv[2], int(sys.argv[3])
 def popen(argv, **kw):
     return subprocess.Popen([sys.executable, child, *argv[1:]], **kw)
-runner.run_task = lambda request: original(request, popen=popen, output_limit=limit)
+runner.run_task = lambda request, **kwargs: original(
+    request, popen=popen, output_limit=limit, **kwargs)
 script = sys.argv[4]
 sys.argv = sys.argv[4:]
 ''' + setup + '\nrunpy.run_path(script, run_name="__main__")\n')
@@ -68,7 +69,9 @@ print("fake stderr", file=sys.stderr)
 def test_tiers_real_subprocess_serialization(inputs, tmp_path, tier, effort):
     parent = {"route": "chat", "reasoning_config": {"effort": "max", "selection": "pinned"}}
     before = json.dumps(parent)
-    result = run_stub(inputs, tmp_path, ECHO, tier=tier)
+    evidence = ("--deeper-analysis-evidence", "verified hard case", "--hard-judgment",
+                "--high-failure-cost", "--choice-reason", "max contract probe") if tier == "max" else ()
+    result = run_stub(inputs, tmp_path, ECHO, tier=tier, extra_args=evidence)
     assert result["status"] == "cli_completed"
     assert result["exit_code"] == 0
     run = Path(result["artifact_dir"])
@@ -246,7 +249,9 @@ def test_cli_help_dry_run_and_real_script_with_injected_process(inputs, tmp_path
     assert help_result.returncode == 0 and "--tier" in help_result.stdout
     dry = subprocess.run([sys.executable, str(script), *args, "--dry-run"], capture_output=True, text=True)
     assert dry.returncode == 0
-    assert json.loads(dry.stdout)["argv"][0] == "codex"
+    dry_receipt = json.loads(dry.stdout)
+    assert dry_receipt["argv"][0] == "codex"
+    assert dry_receipt["argv"][dry_receipt["argv"].index("-m") + 1] == "gpt-5.6-terra"
     assert "Literal" not in dry.stdout
     assert list(inputs["output_dir"].iterdir()) == []
     # Python DI bootstrap executes the actual __main__ CLI and argparse, with
@@ -261,7 +266,7 @@ original = runner.run_task
 child = sys.argv[2]
 def popen(argv, **kw):
     return subprocess.Popen([sys.executable, child, *argv[1:]], **kw)
-runner.run_task = lambda request: original(request, popen=popen)
+runner.run_task = lambda request, **kwargs: original(request, popen=popen, **kwargs)
 script = sys.argv[3]
 sys.argv = sys.argv[3:]
 runpy.run_path(script, run_name="__main__")
