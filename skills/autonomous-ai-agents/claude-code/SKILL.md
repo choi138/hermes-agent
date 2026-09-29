@@ -15,6 +15,10 @@ metadata:
 
 Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-reference) (Anthropic's autonomous coding agent CLI) via the Hermes terminal. Claude Code v2.x can read files, write code, run shell commands, spawn subagents, and manage git workflows autonomously.
 
+## Default Mac progress reporting for managed read-only work
+
+Before a parent-managed **read-only** Mac delegation, load `references/mac-progress-runtime.md`. Use the selected v3 task runner's existing Claude adapter and the shared launchd-owned progress supervisor: one conversational card, immediate critical transitions, one 20min no-evidence warning and receipt-backed final delivery. This adapter keeps `Read,Glob,Grep`, `dontAsk`, no persistence and strict empty MCP permissions. Do not widen it to make a canary or a write task pass. Interactive/write-enabled tmux workflows below retain their existing permission model and parent monitoring; arbitrary `claude` commands are not automatically intercepted.
+
 ## Prerequisites
 
 - **Install:** `npm install -g @anthropic-ai/claude-code`

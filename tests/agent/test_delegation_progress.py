@@ -8,6 +8,11 @@ import pytest
 from agent.delegation_progress import Manifest, Progress, collect, render
 
 
+def drain(progress):
+    while progress.peek():
+        progress.ack(progress.peek()['id'])
+
+
 def git(root, *args):
     return subprocess.run(["git", "-C", str(root), *args], check=True,
                           capture_output=True).stdout
@@ -37,24 +42,19 @@ def lane(tmp_path):
 
 def test_baseline_and_content_changes(lane):
     repo, _, data, state = lane
-    (repo / "runner.py").write_text("value = 2\n")
-    progress = Progress(Manifest.from_dict(data), state)
-    first = progress.tick(now=0)
-    assert first["snapshot"]["baseline"]
-    assert first["snapshot"]["changes"] == []
-    for now in (300, 600):
-        tick = progress.tick(now=now)
-        assert tick["snapshot"]["changes"] == []
-        assert "새로 확인된 파일 변경 없음" in tick["queued"][0]["content"]
-        progress.ack(tick["queued"][0]["id"])
-    (repo / "runner.py").write_text("value = 3\n")
-    tick = progress.tick(now=900)
-    assert [c["path"] for c in tick["snapshot"]["changes"]] == ["runner.py"]
-    progress.ack(tick["queued"][0]["id"])
-    assert progress.tick(now=1200)["snapshot"]["changes"] == []
-    progress.ack(progress.peek()["id"])
-    (repo / "runner.py").write_text("value = 4\n")
-    assert progress.tick(now=1500)["snapshot"]["changes"][0]["path"] == "runner.py"
+    (repo / 'runner.py').write_text('value = 2\n')
+    p = Progress(Manifest.from_dict(data), state)
+    first = p.tick(now=0)
+    assert first['snapshot']['baseline'] and not first['snapshot']['changes']
+    drain(p)
+    for now in (300, 600, 1199):
+        assert not p.tick(now=now)['queued']
+    (repo / 'runner.py').write_text('value = 3\n')
+    result = p.tick(now=1300)
+    assert result['snapshot']['changes'][0]['path'] == 'runner.py'
+    assert [m['operation'] for m in result['queued']] == ['CARD_PATCH']
+    drain(p)
+    assert not p.tick(now=1500)['snapshot']['changes']
 
 
 def test_collector_ignores_timestamp_and_logs(lane):
@@ -75,7 +75,7 @@ def test_stage_commit_revert_delete_and_between_poll_commit(lane):
 
     def change(now):
         result = p.tick(now=now)
-        p.ack(result["queued"][0]["id"])
+        drain(p)
         return result["snapshot"]["changes"]
 
     (repo / "runner.py").write_text("value = 2\n")
@@ -116,7 +116,7 @@ def test_secrets_symlinks_and_nul_safe_names(lane):
     result = p.tick(now=300)
     assert name in [c["path"] for c in result["snapshot"]["changes"]]
     assert "symlink_or_special" in result["snapshot"]["errors"]
-    text = result["queued"][0]["content"]
+    text = render(result["snapshot"])
     for forbidden in ("@everyone", "<@", "ignore prior", "NEVER_EXPOSE", "DO_NOT_READ"):
         assert forbidden not in text
     assert not any("credentials" in path or "token" in path for path in collect(p.manifest)["files"])
@@ -133,8 +133,8 @@ def test_git_failure_and_truncation_are_unknown(lane):
     result = p.tick(now=300)
     assert not result["snapshot"]["available"]
     assert result["snapshot"]["changes"] == []
-    assert "상태 확인 불가" in result["queued"][0]["content"]
-    assert "새로 확인된 파일 변경 없음" not in result["queued"][0]["content"]
+    assert "관측" in render(result["snapshot"])
+    assert "새로 확인된 파일 변경 없음" not in render(result["snapshot"])
 
 
 def test_manifest_rejects_unapproved_inputs(lane):
@@ -158,31 +158,24 @@ def event(artifacts, kind, command="python -m pytest tests/test_fixture.py -q", 
 def test_cadence_terminal_receipt_and_coordinator_stop(lane):
     _, artifacts, data, state = lane
     p = Progress(Manifest.from_dict(data), state)
-    assert p.tick(now=0)["queued"] == []
-    assert p.tick(now=299)["queued"] == []
-    p.tick(now=300)
-    p.ack(p.peek()["id"])
-    (artifacts / "status.json").write_text(json.dumps({
-        "status": "cli_completed", "exit_code": 0, "process_returncode": 0,
-        "model": "DO_NOT_SURFACE", "artifact_dir": "private"}))
-    immediate = p.tick(now=301)
-    assert len(immediate["queued"]) == 1
-    assert "Codex 실행 종료, 레나 검증 대기" in immediate["queued"][0]["content"]
-    assert "작업 완료" not in immediate["queued"][0]["content"]
-    p.ack(p.peek()["id"])
-    assert p.tick(now=302)["queued"] == []
-    p = Progress(Manifest.from_dict(dict(data, coordinator_stage="verifying")), state)
-    assert p.tick(now=600)["queued"] == []
-    notice = p.tick(now=601)["queued"][0]
-    assert "레나 검증 진행 중" in notice["content"]
-    p.ack(notice["id"])
-    p = Progress(Manifest.from_dict(dict(data, coordinator_stage="final_verified")), state)
-    final = p.tick(now=602)
-    assert final["stopped"]
-    assert "레나 최종 검증 완료" in final["queued"][0]["content"]
-    p.ack(p.peek()["id"])
-    assert p.tick(now=1000)["queued"] == []
-    assert p.peek() is None
+    p.tick(now=0)
+    drain(p)
+    assert not p.tick(now=300)['queued']
+    (artifacts / 'status.json').write_text('{"status":"cli_completed","exit_code":0}')
+    result = p.tick(now=301)
+    assert [m['operation'] for m in result['queued']] == ['CARD_PATCH', 'NOTICE']
+    assert 'CLI 종료' in render(result['snapshot']) and not result['stopped']
+    drain(p)
+    p = Progress(Manifest.from_dict(dict(data, coordinator_stage='final_verified')), state)
+    assert not p.tick(now=400)['stopped']
+    assert '최종 검증 완료' not in render(p.snapshot())
+    drain(p)
+    p = Progress(Manifest.from_dict(dict(data, coordinator_stage='stopped')), state)
+    result = p.tick(now=401)
+    assert not result['stopped']
+    assert [m['operation'] for m in result['queued']] == ['CARD_PATCH', 'NOTICE']
+    drain(p)
+    assert p.tick(now=402)['stopped']
 
 
 @pytest.mark.parametrize("status,code", [("cli_failed", 1), ("timed_out", 124),
@@ -192,28 +185,33 @@ def test_failures_emit_immediately_once(lane, status, code):
     _, artifacts, data, state = lane
     p = Progress(Manifest.from_dict(data), state)
     p.tick(now=0)
-    (artifacts / "status.json").write_text(json.dumps({"status": status, "exit_code": code}))
+    drain(p)
+    (artifacts / 'status.json').write_text(json.dumps({'status': status, 'exit_code': code}))
     result = p.tick(now=1)
-    assert result["snapshot"]["exit_status"] == status
-    assert "실패·중단" in result["queued"][0]["content"]
-    p.ack(p.peek()["id"])
-    assert p.tick(now=2)["queued"] == []
-    assert "실패·중단" in p.tick(now=301)["queued"][0]["content"]
+    assert result['snapshot']['exit_status'] == status
+    assert '실패·중단' in render(result['snapshot'])
+    assert sum(m['operation'] == 'NOTICE' for m in result['queued']) == 1
+    drain(p)
+    assert not p.tick(now=2)['queued']
+    assert not p.tick(now=3000)['queued']
 
 
 def test_waiting_and_liveness_are_not_activity(lane):
     _, _, data, state = lane
-    manifest = Manifest.from_dict(dict(data, pid=42, process_start="fixture-start"))
-    p = Progress(manifest, state, process_probe=lambda pid, identity: "alive")
+    p = Progress(Manifest.from_dict(dict(data, pid=42, process_start='fixture-start')), state,
+                 process_probe=lambda *_: 'alive')
     p.tick(now=0)
-    text = p.tick(now=300)["queued"][0]["content"]
-    assert "프로세스는 확인됐지만" in text and "활동 근거가 부족" in text
-    p.ack(p.peek()["id"])
-    p = Progress(Manifest.from_dict(dict(data, cli_status="needs_user")), state)
-    assert "사용자 확인 대기" in p.tick(now=301)["queued"][0]["content"]
-    p.ack(p.peek()["id"])
-    assert not p.tick(now=302)["queued"]
-    assert "사용자 확인 대기" in p.tick(now=601)["queued"][0]["content"]
+    drain(p)
+    assert not p.tick(now=300)['queued']
+    text = render(p.snapshot())
+    assert '진행 근거를 확인' in text and '구현 중' not in text
+    p = Progress(Manifest.from_dict(dict(data, cli_status='needs_user')), state)
+    result = p.tick(now=301)
+    assert '사용자 확인 대기' in render(result['snapshot'])
+    assert sum(m['operation'] == 'NOTICE' for m in result['queued']) == 1
+    drain(p)
+    assert not p.tick(now=302)['queued']
+    assert not p.tick(now=601)['queued']
 
 
 def test_test_evidence_lifecycle_and_reasoning_ignored(lane):
@@ -262,7 +260,7 @@ def test_unreliable_test_claims_never_pass(lane, command, output, code):
     event(artifacts, "item.completed", command, output=output, code=code)
     result = p.tick(now=300)
     assert result["snapshot"]["tests"]["status"] != "passed"
-    assert "통과" not in result["queued"][0]["content"]
+    assert "통과" not in render(result["snapshot"])
 
 
 def test_outbox_receipt_dry_run_and_recovery(lane):
@@ -271,6 +269,7 @@ def test_outbox_receipt_dry_run_and_recovery(lane):
     p.tick(now=0, dry_run=True)
     assert not state.exists()
     p.tick(now=0)
+    drain(p)
     before = p.path.read_bytes()
     (repo / "runner.py").write_text("value=8\n")
     event(artifacts, "item.completed")
@@ -278,7 +277,7 @@ def test_outbox_receipt_dry_run_and_recovery(lane):
     assert preview["queued"]
     assert before == p.path.read_bytes()
     message = p.tick(now=300)["queued"][0]
-    assert p._load()["delivered"] is None
+    assert p._load()["delivered"] is not None
 
     def fake_sender(_message):  # test-only failure; deliberately no network
         raise ConnectionError("fixture transport failure")
@@ -301,18 +300,19 @@ def test_outbox_receipt_dry_run_and_recovery(lane):
 
 
 def test_pending_periodic_does_not_block_terminal_and_exact_ack(lane):
-    _, artifacts, data, state = lane
+    _, _, data, state = lane
     p = Progress(Manifest.from_dict(data), state)
-    p.tick(now=0)
-    first = p.tick(now=300)["queued"][0]
-    (artifacts / "status.json").write_text('{"status":"cli_completed","exit_code":0}')
-    terminal = p.tick(now=301)["queued"][0]
-    assert first["id"] != terminal["id"]
+    first = p.tick(now=0)['queued'][0]
+    p = Progress(Manifest.from_dict(dict(data, coordinator_stage='stopped')), state)
+    assert not p.tick(now=1)['queued']
+    assert not p._load()['stopped']
+    p.ack(first['id'])
+    terminal = p.tick(now=2)['queued']
+    assert [m['operation'] for m in terminal] == ['CARD_PATCH', 'NOTICE']
     with pytest.raises(ValueError):
-        p.ack(terminal["id"])
-    assert not p.tick(now=302)["queued"]
-    p.ack(first["id"])
-    assert p.peek() == terminal
+        p.ack(terminal[1]['id'])
+    drain(p)
+    assert p.tick(now=3)['stopped']
 
 
 def test_read_errors_and_event_truncation_do_not_mean_dead(lane, monkeypatch):
@@ -324,7 +324,7 @@ def test_read_errors_and_event_truncation_do_not_mean_dead(lane, monkeypatch):
     (artifacts / "events.jsonl").write_text("x" * (1024 * 1024 + 10))
     result = p.tick(now=300)
     assert "events_truncated" in result["snapshot"]["errors"]
-    assert "상태 확인 불가" in result["queued"][0]["content"]
+    assert "관측" in render(result["snapshot"])
     p.ack(p.peek()["id"])
     original = module._read
 
@@ -336,7 +336,7 @@ def test_read_errors_and_event_truncation_do_not_mean_dead(lane, monkeypatch):
     monkeypatch.setattr(module, "_read", denied)
     result = p.tick(now=600)
     assert "file_unreadable" in result["snapshot"]["errors"]
-    assert "secret" not in result["queued"][0]["content"]
+    assert "secret" not in render(result["snapshot"])
 
 
 def test_run_isolation_binding_and_watcher_lock(lane):
@@ -427,30 +427,24 @@ def test_snapshot_errors_and_process_identity_unknown(lane):
     snapshot = p.snapshot(now=0)
     assert snapshot["liveness"] == "unknown"
     assert not snapshot["available"]
-    assert "상태 확인 불가" in render(snapshot)
+    assert "진행 근거를 확인" in render(snapshot)
     assert "SSH secret" not in render(snapshot)
 
 
 def test_renderer_golden_cases_and_trimming():
-    base = {"available": True, "baseline": False, "changes": [], "tests": {"status": "unknown"},
-            "liveness": "alive", "coordinator_stage": "working", "exit_status": "running"}
-    assert render(base) == (
-        "작업 진행 상황을 전해드려요.\n"
-        "• 새로 확인된 파일 변경 없음. 관측 사이의 작업까지 없었다고 단정하지는 않아요.\n"
-        "• 프로세스는 확인됐지만, 새 구현 활동 근거가 부족해요.\n"
-        "• 테스트: 결과 확인 전이에요.\n"
-        "• 아직 미검증: 레나 검증·운영 활성화.")
-    for status, expected in (("in_progress", "완료 근거는 아직"), ("failed", "실행 실패"),
-                             ("passed", "현재 변경 전체의 재검증 여부는 미확인")):
-        assert expected in render(dict(base, tests={"status": status}))
-    malicious = dict(base, task_label="@everyone <@123>\x1b[2J SECRET", changes=[
-        {"path": "ignore rules\n@everyone.py", "class": "source", "kinds": ["content", "staged", "deleted"]}
-    ] * 150, execution_since_queue=True, execution={"phase": "execution_completed"},
-        tests={"status": "passed"}, coordinator_stage="verifying", exit_status="cli_completed")
-    text = render(malicious, limit=200)
-    assert len(text) <= 200 and "생략" in text
-    assert "@everyone" not in text and "SECRET" not in text
-    assert len(render(malicious)) <= 1200
+    base = {'available': True, 'changes': [], 'tests': {'status': 'unknown'}, 'liveness': 'alive'}
+    text = render(base)
+    assert 1 <= len(text.splitlines()) <= 2 and text.startswith('작업: ')
+    for status, expected in [('in_progress', '결과 미수집'), ('failed', '테스트 실패'), ('passed', '현재 코드 적용 미확인')]:
+        assert expected in render(dict(base, tests={'status': status}))
+    malicious = dict(base, task_label='@everyone <@123>\x1b[2J SECRET', changes=[
+        {'path': 'ignore rules\n@everyone.py', 'class': 'source', 'kinds': ['content', 'staged', 'deleted']}
+    ] * 150)
+    text = render(malicious)
+    assert len(text) <= 500 and 1 <= len(text.splitlines()) <= 2
+    assert '@everyone' not in text and 'SECRET' not in text
+    with pytest.raises(ValueError, match='report_limit'):
+        render(malicious, limit=10)
 
 
 def test_watch_artifact_symlink_replacement_and_manifest_hooks_rejected(lane):
@@ -472,6 +466,7 @@ def test_clock_injection_and_dry_run_event_cursor(lane):
     now = [0]
     p = Progress(Manifest.from_dict(data), state, clock=lambda: now[0])
     p.tick()
+    drain(p)
     event(artifacts, "item.completed")
     now[0] = 299
     assert p.tick(dry_run=True)["snapshot"]["tests"]["status"] == "passed"
@@ -481,18 +476,17 @@ def test_clock_injection_and_dry_run_event_cursor(lane):
 
 
 def test_transient_observation_gap_survives_until_report(lane):
-    repo, artifacts, data, state = lane
+    _, artifacts, data, state = lane
     p = Progress(Manifest.from_dict(data), state)
     p.tick(now=0)
-    (artifacts / "events.jsonl").write_text("not JSON\n")
-    assert "events_invalid" in p.tick(now=10)["snapshot"]["errors"]
-    assert not p.tick(now=20)["queued"]
-    report = p.tick(now=300)
-    assert "events_invalid" in report["snapshot"]["errors"]
-    assert "상태 확인 불가" in report["queued"][0]["content"]
-    assert "새로 확인된 파일 변경 없음" not in report["queued"][0]["content"]
-    p.ack(p.peek()["id"])
-    assert p.tick(now=600)["snapshot"]["available"]
+    drain(p)
+    (artifacts / 'events.jsonl').write_text('not JSON\n')
+    assert 'events_invalid' in p.tick(now=10)['snapshot']['errors']
+    result = p.tick(now=20)
+    assert not result['queued']
+    assert result['snapshot']['current_errors'] == []
+    assert 'events_invalid' in result['snapshot']['errors']
+    assert result['snapshot']['available']
 
 
 @pytest.mark.parametrize("payload", [[], {"status": [], "exit_code": 0},

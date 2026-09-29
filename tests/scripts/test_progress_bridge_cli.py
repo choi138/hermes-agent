@@ -66,23 +66,24 @@ runpy.run_path(''' + repr(str(BRIDGE)) + ''', run_name='__main__')
 
 GOOD = '''import json, sys
 v = json.load(sys.stdin)
-assert set(v) == {'run_id','sequence','thread_id','content','content_digest'}
+assert set(v) == {'run_id','sequence','thread_id','content','content_digest','operation','event_id','card_receipt'}
 assert 'PRIVATE_PROMPT' not in json.dumps(v)
 print(json.dumps(dict(status='verified', run_id=v['run_id'], sequence=v['sequence'],
-    thread_id=v['thread_id'], content_digest=v['content_digest'], message_id=str(987654321+v['sequence']))))
+    thread_id=v['thread_id'], content_digest=v['content_digest'], operation=v['operation'], event_id=v['event_id'],
+    message_id=v['card_receipt']['message_id'] if v['card_receipt'] else str(987654321+v['sequence']))))
 '''
 
 
 def test_actual_bridge_final_pending_ack_then_exit(lane, tmp_path):
     p, manifest, _ = lane
     p.tick(now=300)
-    set_stage(manifest, 'final_verified')
+    set_stage(manifest, 'stopped')
     result = subprocess.run([sys.executable, str(bootstrap(tmp_path, GOOD)), *bridge_args(p, manifest)],
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.splitlines()[-1])['status'] == 'stopped_and_delivered'
     assert p.peek() is None
-    assert len(json.loads((p.directory / 'delivery.json').read_text())['records']) == 2
+    assert len(json.loads((p.directory / 'delivery.json').read_text())['records']) == 3
 
 
 @pytest.mark.parametrize('body', ['import sys; sys.stdin.read()',
@@ -150,10 +151,10 @@ def test_cli_exit_immediate_continues_review_and_concurrent_bridge_fenced(lane, 
         (artifacts / 'status.json').write_text('{"status":"cli_completed","exit_code":0}')
         wait_for(lambda: p._load()['delivered'] is not None)
         assert child.poll() is None
-        set_stage(manifest, 'final_verified')
+        set_stage(manifest, 'stopped')
         stdout, stderr = child.communicate(timeout=10)
         assert child.returncode == 0, stderr
-        assert len([v for v in stdout.splitlines() if json.loads(v)['status'] == 'verified']) == 2
+        assert len([v for v in stdout.splitlines() if json.loads(v)['status'] == 'verified']) >= 3
         assert p.peek() is None
     finally:
         if child.poll() is None:
