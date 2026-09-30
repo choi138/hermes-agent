@@ -21,7 +21,9 @@ MAX_RETAINED_RESULTS = 64
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
-    "termination_source", "notify_on_complete",
+    "termination_source", "notify_on_complete", "remote_root", "remote_connection", "remote_identity",
+    "observation_state", "last_observed_at", "observation_retry_at", "profile_home",
+    "cancel_requested", "cancel_confirmed", "execution_seconds", "observation_error", "observation_operation", "verification_scope",
 )
 
 
@@ -45,7 +47,7 @@ def _result_paths():
     return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
 
 
-def save_completed_result(session) -> None:
+def save_completed_result(session, *, strict=False) -> None:
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
@@ -55,6 +57,8 @@ def save_completed_result(session) -> None:
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
+    from tools.process_registry_followups import scrub_payload
+    record = scrub_payload(record)
     directory = get_hermes_home() / "logs" / "process-results"
     try:
         from hermes_constants import assert_named_profile_home_live
@@ -65,6 +69,8 @@ def save_completed_result(session) -> None:
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+        if strict:
+            raise
 
 
 def _owns_result(owner: str, parent: str | None) -> bool:
@@ -107,8 +113,13 @@ def load_completed_results(prefix: str = "") -> dict:
                 continue
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
+            # Original receipt fields are mandatory; only later protocol metadata is optional.
+            for key in _RESULT_FIELDS[:12]:
+                record[key]
+            if type(record['exit_code']) is not int:
+                raise ValueError('completed receipt lacks an integer exit code')
             session = ProcessSession(
-                **{key: record[key] for key in _RESULT_FIELDS},
+                **{key: record[key] for key in _RESULT_FIELDS if key in record},
                 exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()

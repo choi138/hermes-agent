@@ -436,7 +436,8 @@ class GatewayStartupMixin:
         try:
             await asyncio.to_thread(release_runtime_claim, obligation_id, error)
         except Exception:
-            logger.debug(log_fmt, obligation_id, exc_info=True)
+            from gateway.delivery_ledger import public_obligation_id
+            logger.debug(log_fmt, public_obligation_id(obligation_id), exc_info=True)
 
     def _schedule_flood_redelivery(self, platform, *, profile: Optional[str] = None) -> None:
         """Wake one deadline-driven ledger worker per bot identity, never sleep in a send."""
@@ -535,26 +536,47 @@ class GatewayStartupMixin:
                 except Exception:
                     logger.debug("lifecycle claim deferral failed", exc_info=True)
                 continue
+            from gateway.process_followups import AttentionSendPending
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                if row['obligation_id'].startswith('process-attention:'):
+                    from gateway.process_followups import _send_attention
+                    _, execution, token = row['obligation_id'].split(':')
+                    source = SessionSource(platform=Platform(row['platform']), chat_id=row['chat_id'], thread_id=row['thread_id'])
+                    result = await _send_attention(adapter, source, content, {**(metadata or {}), '_interim_send': True},
+                                                   execution, token, row['obligation_id'], runner=self)
+                    if result is None:
+                        continue  # Cancellation already abandoned this obligation.
+                else:
+                    result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+            except AttentionSendPending:
+                continue  # A live transport owns settlement; never launch a concurrent retry.
             except Exception as send_err:
-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+                from tools.environments.ssh_process import safe_error
+                from gateway.delivery_ledger import public_obligation_id
+                logger.warning("obligation %s: redelivery send raised: %s", public_obligation_id(row["obligation_id"]), safe_error(send_err))
+                if row['obligation_id'].startswith('process-attention:'):
+                    from gateway.delivery_ledger import mark_uncertain
+                    with _log_suppressed(logging.DEBUG, "attention outcome persistence failed", exc_info=True):
+                        await asyncio.to_thread(mark_uncertain, row['obligation_id'], safe_error(send_err))
+                    continue  # Keep attempting if persistence fails; never infer a rejected send.
                 result = None
+            from tools.environments.ssh_process import safe_error
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
+                    from gateway.delivery_ledger import public_obligation_id
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
+                        row["platform"], row["chat_id"], public_obligation_id(row["obligation_id"]), row["attempts"],
                     )
                 else:
                     await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        mark_failed, row["obligation_id"], safe_error(RuntimeError(str(getattr(result, "error", "") or "send failed")))
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
@@ -567,7 +589,8 @@ class GatewayStartupMixin:
         try:
             platform = Platform(row["platform"])
         except Exception:
-            logger.debug("obligation %s: unknown platform %r", row["obligation_id"], row.get("platform"))
+            from gateway.delivery_ledger import public_obligation_id
+            logger.debug("obligation %s: unknown platform %r", public_obligation_id(row["obligation_id"]), row.get("platform"))
             return None
         if "profile" in row:
             adapter = self._authorization_adapter(platform, row.get("profile"))
@@ -730,6 +753,14 @@ class GatewayStartupMixin:
                 except Exception:
                     logger.warning("Skipping auto-resume for %s: delivery ledger unavailable",
                                    entry.session_key, exc_info=True)
+                    continue
+                if record.get("process_followup"):
+                    from tools.process_registry_followups import require_reconciliation
+                    marker = record["process_followup"]
+                    require_reconciliation(marker["execution_id"], marker["token"])
+                    self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
+                    self.session_store.clear_resume_pending(entry.session_key)
+                    # No durable answer: effects are uncertain, so never replay the model turn.
                     continue
                 stamp = record.get("interrupted_at") or record.get("started_at")
                 if not _is_fresh_gateway_interruption(stamp, window_secs=window):

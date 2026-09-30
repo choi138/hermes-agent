@@ -509,6 +509,21 @@ class BaseEnvironment(ABC):
         See #94285.
         """
         self._before_execute()
+        return self._execute_prepared(
+            command, cwd, timeout=timeout, stdin_data=stdin_data,
+            rewrite_compound_background=rewrite_compound_background,
+            bounded_capture=bounded_capture, yield_handler=yield_handler)
+
+    def _execute_prepared(
+        self, command: str, cwd: str = "", *, timeout: int | None = None,
+        stdin_data: str | None = None, rewrite_compound_background: bool = True,
+        bounded_capture: bool = False,
+        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
+        """Execute after this call's successful _before_execute preparation.
+
+        SSH background dispatch persists its intent between preparation and execution.
+        Keep this per-call: never disable synchronization on the shared environment.
+        """
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default; callers

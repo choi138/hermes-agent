@@ -151,6 +151,7 @@ class SessionLifecycleMixin:
 
     def begin_active_turn(
         self, session_key: str, turn_id: str, boot_id: str, resume_count: int = 0,
+        *, process_followup: Optional[dict] = None,
     ) -> bool:
         """Persist the agent turn identity before dispatch without publishing a failed write."""
         with self._lock:
@@ -164,6 +165,8 @@ class SessionLifecycleMixin:
                 "started_at": _now().isoformat(),
                 "resume_count": resume_count,
             }
+            if process_followup:
+                record["process_followup"] = dict(process_followup)
             candidate = entry.to_dict()
             candidate["active_turn"] = record
             self._save_entry(session_key, entry_data=candidate, lock_held=True)

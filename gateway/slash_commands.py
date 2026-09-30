@@ -460,6 +460,9 @@ class GatewaySlashCommandsMixin(
 
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
         # earlier turn still count as "active": stop them; each returns as an interrupted completion.
+        # No agent was stopped here. Detached processes remain observable and
+        # retain their completion/report obligation; /stop must not silently
+        # suppress the result of a command it did not cancel.
         from tools.async_delegation import interrupt_for_session
         if interrupt_for_session(session_key=session_key, reason="stop_command",
                                  parent_session_id=str(getattr(session_entry, "session_id", "") or "")):

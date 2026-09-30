@@ -144,7 +144,7 @@ class _FakeStatusAdapter:
 
 
 @pytest.mark.asyncio
-async def test_stop_no_active_agent_survives_status_clear_failure():
+async def test_stop_no_active_agent_survives_status_clear_failure(monkeypatch, tmp_path):
     """A failing adapter clear must not break the /stop reply."""
     runner = object.__new__(GatewayRunner)
     runner._running_agents = {}
@@ -165,6 +165,12 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
     event = MessageEvent(
         text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
     )
+    from tools.process_registry import ProcessSession
+    from tools import process_registry_followups as ledger
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_idle_stop', command='true', session_key=key)
+    ledger.reserve(session)
     result = await runner._handle_stop_command(event)
+    assert ledger.get_state(session.id)['phase'] == 'pending'
 
     assert "no active" in str(getattr(result, "text", result)).lower()

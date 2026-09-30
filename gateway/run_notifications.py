@@ -1322,6 +1322,8 @@ class GatewayNotificationsMixin:
             return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
         try:
             metadata = {}
+            if evt.get("process_followup"):
+                metadata["process_followup"] = evt["process_followup"]
             session_key = str(evt.get("session_key") or "").strip()
             from agent.notification_presentation import diagnostic_process_event
             if diagnostic_process_event(evt):
@@ -1864,6 +1866,15 @@ class GatewayNotificationsMixin:
         from tools.process_registry import process_registry as _pr
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
+                from gateway.process_followups import reconcile_all
+                # One stalled reconciliation notice must not hold unrelated watch events.
+                pending = getattr(self, '_process_reconcile_task', None)
+                if pending is None or pending.done():
+                    task = asyncio.create_task(reconcile_all(self), name='process-followup-reconciliation')
+                    self._process_reconcile_task = task
+                    background = getattr(self, '_background_tasks', None)
+                    if background is not None:
+                        self._track_task_in(background, task)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.
@@ -2044,6 +2055,10 @@ class GatewayNotificationsMixin:
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
+                from tools.process_registry_followups import enabled
+                if agent_notify and enabled(session):
+                    # The durable ledger survives this watcher and owns fenced admission.
+                    break
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):

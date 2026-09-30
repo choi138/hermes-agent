@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -498,6 +499,15 @@ class GatewayAgentCacheMixin:
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
         # detached at dispatch and would otherwise run to completion and wake the session later.
         # Each interrupted unit still returns as a completion (status=interrupted, partial output).
+        # /stop interrupts only the admitted turn. Detached processes retain their
+        # completion obligation; /reset handles the conversation boundary separately.
+        with _log_suppressed(logging.WARNING, "Could not fence interrupted process verification", exc_info=True):
+            entry = self.session_store._entries.get(session_key)
+            marker = getattr(entry, "active_turn", None) or {}
+            followup = marker.get("process_followup")
+            if followup:
+                from tools.process_registry_followups import cancel
+                await asyncio.to_thread(cancel, followup['execution_id'])
         from tools.async_delegation import interrupt_for_session
         interrupt_for_session(
             session_key=session_key, reason=invalidation_reason,

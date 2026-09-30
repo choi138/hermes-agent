@@ -58,7 +58,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False):
+                 probe_only: bool = False, *, _status_only: bool = False):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
@@ -67,12 +67,43 @@ class SSHEnvironment(BaseEnvironment):
         # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
         # stability across reconnects keeps ControlMaster reuse working. A probe gets its own
         # per-instance socket so its cleanup() can never close the agent's shared master.
-        socket_key = f"{user}@{host}:{port}"
+        from hermes_constants import get_hermes_home
+        self._owns_control_master = probe_only
+        self._owned_control_sockets = set()
+        # Resolve Include/Match/ProxyJump and authentication settings through OpenSSH.
+        # Never log the resolved configuration (it can contain sensitive proxy arguments).
+        self._configuration_error = ""
+        try:
+            resolved = run_capture(
+                ["ssh", "-G", *self._target_flags("-p"), f"{user}@{host}"], timeout=5)
+            config = (resolved.stdout or "") if resolved.returncode == 0 else ""
+            if not config:
+                from tools.environments.ssh_process import safe_error
+                self._configuration_error = safe_error(RuntimeError(f"ssh -G rc={resolved.returncode}: {(resolved.stderr or '').strip()}"))
+        except (OSError, subprocess.SubprocessError) as exc:
+            from tools.environments.ssh_process import safe_error
+            self._configuration_error = safe_error(exc)
+            config = ""
+        # If resolution fails, don't guess which other connection is safe to reuse.
+        socket_key = json.dumps([user, host, port, key_path, str(get_hermes_home()),
+                                 os.environ.get("SSH_AUTH_SOCK", ""), config or self._session_id])
         if probe_only:
             socket_key = f"{socket_key}:probe:{self._session_id}"
         _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
+        self._owned_control_sockets.add(self.control_socket)
         _ensure_ssh_available()
+        # Recovery identifies the logical target, not an ephemeral agent/master.
+        # SSH still authenticates the host and the observer checks the execution identity.
+        stable_config = '\n'.join(line for line in config.splitlines()
+                                  if not line.lower().startswith('identityagent '))
+        recovery_key = json.dumps([user, host, port, key_path, str(get_hermes_home()), stable_config])
+        self._connection_identity = hashlib.sha256(recovery_key.encode()).hexdigest() if config else ""
+        if not config:
+            logger.warning("SSH configuration resolution unavailable (%s); using an isolated control master", self._configuration_error)
+        self._sync_manager = None
+        if _status_only:
+            return
         self._establish_connection()
         if probe_only:
             self._sync_manager = None
@@ -83,9 +114,14 @@ class SSHEnvironment(BaseEnvironment):
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
             bulk_upload_fn=self._ssh_bulk_upload, selective_download_fn=self._ssh_download_changes,
-            sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]))
-        self._sync_manager.sync(force=True)
+            sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]), fail_closed=True)
+        # Bootstrap has no synchronized-file dependency. Upload is required at
+        # the first ordinary execution boundary; status-only observation stays independent.
         self.init_session()
+
+    def _observe_process(self, root, execution, offset):
+        from tools.environments.ssh_process import observe
+        return observe(self, root, execution, offset)
 
     def _control_socket_for(self, send_env: tuple[str, ...]) -> Path:
         """One ControlMaster per SendEnv name-set, beside the plain target socket: a mux master only
@@ -94,16 +130,17 @@ class SSHEnvironment(BaseEnvironment):
         plain = Path(self.control_socket)
         if not send_env:
             return plain
-        # <target-id[:8]><names-hash[:8]>.sock: same length as the plain socket (macOS's 104-byte
-        # sun_path cap) and prefix-globbable so cleanup() finds every sibling without extra state.
-        digest = hashlib.sha256(" ".join(send_env).encode()).hexdigest()[:8]
-        return plain.with_name(f"{plain.stem[:8]}{digest}.sock")
+        # Hash the full connection identity and environment name set; retain exact paths
+        # for private cleanup instead of globbing sockets owned by another instance.
+        digest = hashlib.sha256(json.dumps([plain.stem, send_env]).encode()).hexdigest()[:16]
+        socket = plain.with_name(f"{digest}.sock")
+        if hasattr(self, "_owned_control_sockets"):
+            self._owned_control_sockets.add(socket)
+        return socket
 
     def _control_sockets(self) -> list[Path]:
-        """The plain socket plus every SendEnv-set sibling (shared 8-char target prefix)."""
-        plain = Path(self.control_socket)
-        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
-        return [plain, *(s for s in siblings if s != plain)]
+        """Only socket paths selected by this instance; never discover peers by glob."""
+        return sorted(getattr(self, "_owned_control_sockets", {Path(self.control_socket)}))
 
     def _target_flags(self, port_flag: str) -> list:
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""
@@ -124,8 +161,12 @@ class SSHEnvironment(BaseEnvironment):
         cmd.append(f"{self.user}@{self.host}")
         return cmd
 
-    def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
+    def _run_ssh(self, remote_cmd: str, timeout: float, *, stdin_data: str | None = None) -> subprocess.CompletedProcess:
         """Run one remote shell command over the multiplexed connection, capturing output."""
+        if stdin_data is not None:
+            return subprocess.run(self._build_ssh_command() + [remote_cmd], input=stdin_data,
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=timeout)
         return run_capture(self._build_ssh_command() + [remote_cmd], timeout=timeout)
 
     def _run_ssh_checked(self, remote_cmd: str, timeout: float, reason: str, subject: str) -> None:
@@ -312,6 +353,9 @@ class SSHEnvironment(BaseEnvironment):
         if self._sync_manager:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
+        # Shared masters belong to OpenSSH's ControlPersist lifecycle, never to a task.
+        if not getattr(self, "_owns_control_master", False):
+            return
         for socket in self._control_sockets():
             if not socket.exists():
                 continue

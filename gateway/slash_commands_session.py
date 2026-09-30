@@ -174,6 +174,12 @@ class GatewaySessionCommandsMixin:
         self._clear_conversation_scope(session_key, reason="session_reset")
         # In-flight async delegations end WITH the conversation: once the id rotates their
         # completions have no live owner. Expire by durable id, routing key as legacy fallback.
+        try:
+            from tools.process_registry_followups import cancel_for_session
+            await asyncio.to_thread(cancel_for_session, session_key)
+        except Exception as exc:
+            from tools.environments.ssh_process import safe_error
+            logger.warning('Process follow-up cancellation failed on reset for %s: %s', session_key, safe_error(exc))
         with contextlib.suppress(Exception):
             from tools.async_delegation import interrupt_for_session
             interrupt_for_session(session_key=session_key, reason="session_reset",

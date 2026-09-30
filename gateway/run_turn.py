@@ -3989,6 +3989,7 @@ class GatewayTurnMixin:
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                event=pending_event,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,

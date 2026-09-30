@@ -393,6 +393,8 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
 
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
+    if reason == "killed" and evt.get('cancellation_scope') == 'direct_process_group':
+        return 'direct command stopped after cancellation; detached descendants may remain (whole execution termination unconfirmed)'
     if reason == "killed":
         return f"terminated by {evt.get('termination_source') or 'Hermes'}"
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
@@ -404,7 +406,7 @@ def format_process_notification(evt: dict) -> "str | None":
     # watch_disabled and overflow events carry their own human-readable `message`;
     # otherwise overflow events would fall through to the completion formatter as a
     # phantom "process exited (exit code ?)".
-    if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released"):
+    if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released", "observation_unavailable"):
         return f"[IMPORTANT: {evt.get('message', '')}]"
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)

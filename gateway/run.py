@@ -3043,7 +3043,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     _cmd = evt.get("command", "unknown")
 
     # watch_disabled / overflow events carry their summary in `message` (process_registry formatter).
-    if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released"):
+    if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released", "observation_unavailable"):
         return f"[IMPORTANT: {evt.get('message', '')}]"
 
     if evt_type == "watch_match":
@@ -3078,7 +3078,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
             break
         evt_type = evt.get("type", "completion")
         if evt_type in {
-            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released"}:
+            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released", "observation_unavailable"}:
             watch_events.append(evt)
         elif evt_type == "async_delegation":
             requeue.append(evt)

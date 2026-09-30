@@ -1832,6 +1832,11 @@ class TurnRunner:
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
+            followup = (getattr(ctx.event, "metadata", None) or {}).get("process_followup")
+            if followup:
+                from tools.process_registry_followups import begin, finish
+                if not begin(followup["execution_id"], followup["token"]):
+                    return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
             resume_marker = ctx.turn_resume_marker
             api_message = "" if resume_marker else _wrap_current_message_with_observed_context(
                 self._native_image_run_message(), observed_group_context,
@@ -1869,15 +1874,58 @@ class TurnRunner:
                 begin = getattr(getattr(self._runner, "session_store", None), "begin_active_turn", None)
                 if callable(begin):
                     try:
-                        if begin(ctx.session_key, turn_id, getattr(self._runner, "_boot_id", "unknown-boot")):
+                        extra = {"process_followup": followup} if followup else {}
+                        recorded = begin(ctx.session_key, turn_id, getattr(self._runner, "_boot_id", "unknown-boot"), **extra)
+                        if followup and not recorded:
+                            raise RuntimeError("Follow-up turn marker was not persisted")
+                        if recorded:
                             kwargs["turn_id"] = turn_id
                             if ctx.event is not None:
                                 ctx.event._gateway_active_turn_id = turn_id
                     except Exception:
                         logger.warning("Could not record agent turn for %s", ctx.session_key, exc_info=True)
+                        if followup:
+                            raise
+                elif followup:
+                    raise RuntimeError("Follow-up requires durable active turn storage")
             from agent.notification_presentation import notification_turn
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
-                return agent.run_conversation(api_message, **kwargs)
+            if followup:
+                from tools.process_registry_followups import authorized
+                if not authorized(followup["execution_id"], followup["token"]):
+                    return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
+            if followup:
+                from tools.process_registry_followups import VERIFICATION_INSTRUCTION
+                api_message += "\n" + VERIFICATION_INSTRUCTION
+            if followup:
+                from tools.approval_human_wait import human_wait_seconds
+                from tools.process_registry_followups import record_timings
+                record_timings(followup['execution_id'], followup['token'], verification_started_at=time.time())
+                turn_clock = time.monotonic()
+                approval_baseline = human_wait_seconds(session_key)
+                model_baseline = getattr(agent, 'session_model_response_seconds', 0.0)
+            try:
+                from contextlib import nullcontext
+                from tools.process_registry_followups import verification_lease, task_request_scope
+                lease = verification_lease(followup['execution_id'], followup['token']) if followup else nullcontext()
+                request_scope = task_request_scope(ctx.message or '') if not followup else nullcontext()
+                with lease, request_scope, notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+                    result = agent.run_conversation(api_message, **kwargs)
+            finally:
+                if followup:
+                    record_timings(followup['execution_id'], followup['token'],
+                        verification_turn_seconds=max(0, time.monotonic() - turn_clock),
+                        approval_wait_seconds=max(0, human_wait_seconds(session_key) - approval_baseline),
+                        model_response_seconds=max(0, getattr(agent, 'session_model_response_seconds', 0.0) - model_baseline))
+            if followup:
+                finish(followup["execution_id"], followup["token"], result, kwargs.get("turn_id"))
+            return result
+        except Exception as exc:
+            if followup:
+                from tools.process_registry_followups import require_reconciliation
+                from tools.environments.ssh_process import safe_error
+                require_reconciliation(followup["execution_id"], followup["token"],
+                    reason='Live verification turn failed: ' + safe_error(exc))
+            raise
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the

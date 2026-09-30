@@ -221,7 +221,9 @@ class FileSyncManager:
         bulk_upload_fn: BulkUploadFn | None = None,
         bulk_download_fn: BulkDownloadFn | None = None,
         selective_download_fn: SelectiveDownloadFn | None = None,
-        sync_back_identity: str | None = None):
+        sync_back_identity: str | None = None,
+        fail_closed: bool = False):
+        self._fail_closed = fail_closed
         self._get_files_fn = get_files_fn
         self._upload_fn = upload_fn
         self._bulk_upload_fn = bulk_upload_fn
@@ -301,6 +303,8 @@ class FileSyncManager:
             # Do NOT advance _last_sync_time: bumping the rate-limit clock on failure would
             # suppress the retry for up to _sync_interval, contradicting the retry contract.
             logger.warning("file_sync: sync failed, rolled back state: %s", exc)
+            if self._fail_closed:
+                raise
 
     def _plan_sync(
         self, current_files: list[tuple[str, str]]
@@ -440,7 +444,15 @@ class FileSyncManager:
             # Windows: no flock — run without serialization
             yield
             return
-        lock_fd = open(lock_path, "w", encoding="utf-8")
+        wait_started = _monotonic()
+        try:
+            import psutil
+            owner_started_at = psutil.Process(os.getpid()).create_time()
+        except Exception:
+            owner_started_at = None
+        acquired_at = None
+        # Opening a contender must not truncate the current holder's diagnostic record.
+        lock_fd = open(lock_path, "a+", encoding="utf-8")
         try:
             if self._sync_back_deadline is None:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -452,6 +464,14 @@ class FileSyncManager:
                         break
                     except BlockingIOError:
                         _sleep(min(0.05, self._sync_back_remaining()))
+            acquired_at = _monotonic()
+            lock_fd.seek(0)
+            lock_fd.truncate()
+            json.dump({"pid": os.getpid(), "process_started_at": owner_started_at,
+                       "thread": threading.get_ident(),
+                       "acquired_at": time.time(), "phase": "file_sync"}, lock_fd)
+            lock_fd.flush()
+            logger.info("file_sync lock acquired: pid=%s wait_seconds=%.3f", os.getpid(), acquired_at - wait_started)
             yield
         finally:
             try:
@@ -459,6 +479,9 @@ class FileSyncManager:
             except (OSError, IOError):
                 pass
             lock_fd.close()
+            logger.info("file_sync lock released: pid=%s wait_seconds=%.3f held_seconds=%.3f",
+                        os.getpid(), (acquired_at or _monotonic()) - wait_started,
+                        _monotonic() - acquired_at if acquired_at is not None else 0)
 
     def _pending_sync_back(self) -> Path:
         return get_hermes_home() / ".sync-back-pending"

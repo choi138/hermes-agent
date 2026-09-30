@@ -198,3 +198,17 @@ async def test_reset_completes_when_cleanup_times_out(caplog):
     ), "expected the timeout warning to be logged"
     runner.session_store.reset_session.assert_called_once()
     assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_stops_delegation_when_followup_database_unavailable(monkeypatch):
+    from tools import process_registry_followups as ledger
+    from tools import async_delegation as delegation
+    runner = _make_runner_with_cached_agent(lambda: None)
+    stop = MagicMock()
+    monkeypatch.setattr(delegation, 'interrupt_for_session', stop)
+    def broken(*args):
+        raise OSError('state database unavailable')
+    monkeypatch.setattr(ledger, 'cancel_for_session', broken)
+    await runner._handle_reset_command(_make_event('/new'))
+    stop.assert_called_once()

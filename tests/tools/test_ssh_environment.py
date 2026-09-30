@@ -38,7 +38,7 @@ class TestBuildSSHCommand:
     @pytest.fixture(autouse=True)
     def _mock_connection(self, monkeypatch):
         monkeypatch.setattr("tools.environments.ssh.subprocess.run",
-                            lambda *a, **k: subprocess.CompletedProcess([], 0))
+                            lambda *a, **k: subprocess.CompletedProcess([], 0, stdout="hostname example.com\n", stderr=""))
         monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
                             lambda *a, **k: MagicMock(stdout=iter([]),
                                                       stderr=iter([]),
@@ -132,7 +132,7 @@ class TestControlSocketPath:
     @pytest.fixture(autouse=True)
     def _mock_connection(self, monkeypatch):
         monkeypatch.setattr("tools.environments.ssh.subprocess.run",
-                            lambda *a, **k: subprocess.CompletedProcess([], 0))
+                            lambda *a, **k: subprocess.CompletedProcess([], 0, stdout="hostname example.com\n", stderr=""))
         monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
                             lambda *a, **k: MagicMock(stdout=iter([]),
                                                       stderr=iter([]),
@@ -285,7 +285,7 @@ class TestSSHProbeOnly:
 
         assert normal.control_socket.exists()
         assert not first_probe.control_socket.exists()
-        assert len(control_exit_calls) == 1
+        assert len([cmd for cmd in control_exit_calls if "-O" in cmd]) == 1
 
 
 def _setup_ssh_env(monkeypatch, persistent: bool):
