@@ -1,6 +1,8 @@
 """SSH cleanup returns changed mapped files without copying an unrelated remote home."""
 import tarfile
 import time
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +27,15 @@ def make_env(tmp_path, monkeypatch):
     monkeypatch.setattr(ssh.SSHEnvironment, 'init_session', lambda self: None)
     monkeypatch.setattr(ssh.SSHEnvironment, '_build_ssh_command', lambda self, **kw: ['bash', '-c'])
     env = ssh.SSHEnvironment(host='test', user='test')
+    # Production uploads at the first execution boundary, not during construction.
+    # Keep this transport hermetic while committing the same initial push state.
+    def upload(files):
+        for source, destination in files:
+            Path(destination).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+    env._sync_manager._bulk_upload_fn = upload
+    env._before_execute()
     # Avoid BaseEnvironment.__del__ running a second cleanup during interpreter shutdown.
     env.cleanup = lambda: None
     return env, host, remote

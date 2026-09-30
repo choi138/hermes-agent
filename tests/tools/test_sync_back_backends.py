@@ -161,6 +161,9 @@ class TestSSHCleanup:
         import tempfile
         with tempfile.NamedTemporaryFile(delete=False, suffix=".sock") as tmp:
             env.control_socket = Path(tmp.name)
+        # Only an instance-owned master may be closed; ordinary task masters are shared.
+        env._owns_control_master = True
+        env._owned_control_sockets = {env.control_socket}
 
         def mock_run(cmd, **kwargs):
             cmd_str = " ".join(cmd)
