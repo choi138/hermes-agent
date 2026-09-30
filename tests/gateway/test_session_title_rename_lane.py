@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import types
 import weakref
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.run_turn_runner import TurnRunner
 
 
@@ -104,6 +106,97 @@ async def test_native_thread_rename_passes_only_the_initial_name_guard():
     )
 
     assert calls == [("999", "Semantic Session Title", "Initial words")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("primary_connected", [False, True])
+@pytest.mark.parametrize("live_transport", [False, True])
+async def test_native_title_rename_uses_secondary_profile_adapters(
+    tmp_path, monkeypatch, primary_connected, live_transport
+):
+    """A secondary's rename must work independently of the primary connection."""
+    home = tmp_path / ".hermes"
+    homes = {name: home / "profiles" / name for name in ("alpha", "beta")}
+    for profile_home in homes.values():
+        profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("agent.secret_scope._MULTIPLEX_ACTIVE", True)
+
+    calls = []
+
+    class Adapter:
+        def __init__(self, profile):
+            self.profile = profile
+
+        async def rename_thread(self, thread_id, name, *, only_if_current_name=None):
+            calls.append((self.profile, thread_id, name, only_if_current_name))
+            return True
+
+    adapters = {name: Adapter(name) for name in ("default", "alpha", "beta")}
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner.adapters = {Platform.DISCORD: adapters["default"]} if primary_connected else {}
+    runner._profile_adapters = {
+        name: {Platform.DISCORD: adapters[name]} for name in homes
+    }
+
+    expected = []
+    for turn, profile in enumerate(("alpha", "beta", "alpha")):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=f"thread-{profile}",
+            chat_type="thread",
+            thread_id=f"thread-{profile}",
+            profile=profile,
+            auto_thread_created=True,
+            auto_thread_initial_name=f"initial-{profile}",
+        )
+        if live_transport:
+            source._transport_adapter_ref = weakref.ref(adapters[profile])
+        title = f"Semantic title {turn} for {profile}"
+        with _profile_runtime_scope(homes[profile]):
+            await runner._rename_discord_auto_thread_for_session_title(
+                source, f"session-{profile}", title
+            )
+        expected.append((profile, source.thread_id, title, source.auto_thread_initial_name))
+        assert calls == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("primary_connected", [False, True])
+@pytest.mark.parametrize("secondary_connected", [False, True])
+async def test_native_title_rename_noops_without_a_renaming_adapter(
+    primary_connected, secondary_connected
+):
+    """A missing secondary or rename capability must never borrow the primary bot."""
+    rename = AsyncMock(return_value=True)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner.adapters = (
+        {Platform.DISCORD: types.SimpleNamespace(rename_thread=rename)}
+        if primary_connected else {}
+    )
+    runner._profile_adapters = {
+        "secondary": {Platform.DISCORD: object()} if secondary_connected else {}
+    }
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-secondary",
+        chat_type="thread",
+        thread_id="thread-secondary",
+        profile="secondary",
+        auto_thread_created=True,
+        auto_thread_initial_name="Initial words",
+    )
+
+    await runner._rename_discord_auto_thread_for_session_title(
+        source, "session-secondary", "Semantic title"
+    )
+
+    rename.assert_not_awaited()
 
 
 def test_title_thread_copy_preserves_transport_adapter_ref(monkeypatch):
