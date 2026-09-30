@@ -1260,6 +1260,21 @@ class GatewayInboundMixin:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if hasattr(event, "_hermes_turn_resume"):
+            routed_key = str((getattr(event, "metadata", None) or {}).get(
+                "gateway_session_key", "",
+            )).strip()
+            if not routed_key and getattr(event, "source", None) is not None:
+                routed_key = self._session_key_for_source(event.source)
+            try:
+                current = bool(await self.async_session_store.resume_owner_matches(
+                    routed_key, getattr(event, "_hermes_turn_resume", None), phase="queued",
+                ))
+            except Exception:
+                logger.warning("Recovery dispatch validation failed for %s", routed_key, exc_info=True)
+                current = False
+            if not current:
+                return None
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
@@ -1284,6 +1299,14 @@ class GatewayInboundMixin:
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
+        if hasattr(event, "_hermes_turn_resume"):
+            owned = self._peek_session_state(_quick_key)
+            if (
+                owned is not None
+                and owned.turn.agent is _AGENT_PENDING_SENTINEL
+                and owned.turn.event is event
+            ):
+                self._release_running_agent_state(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
@@ -1789,17 +1812,71 @@ class GatewayInboundMixin:
                     )
             if session_key and turn_id:
                 interrupted = bool(getattr(event, "_gateway_turn_result_interrupted", False))
+                recovery = getattr(event, "_gateway_turn_recovery", None)
+                resume_marker = getattr(event, "_hermes_turn_resume", None)
+                recovery_expected_count = (
+                    resume_marker.get("resume_count")
+                    if isinstance(resume_marker, dict)
+                    and type(resume_marker.get("resume_count")) is int
+                    else 0
+                )
+                resume_marker_count = (
+                    recovery_expected_count if isinstance(resume_marker, dict) else None
+                )
+                recovery_dispatch_token = (
+                    resume_marker.get("dispatch_token") if isinstance(resume_marker, dict) else None
+                )
+                recovery_kept = False
+                if isinstance(recovery, dict) and not interrupted:
+                    try:
+                        from gateway.turn_recovery import RETRY_WAIT, retry_delay_seconds
+                        recovery_kept = bool(
+                            await self.async_session_store.mark_active_turn_recovery(
+                                session_key,
+                                turn_id,
+                                expected_resume_count=recovery_expected_count,
+                                status=recovery["status"],
+                                failure_reason=recovery["failure_reason"],
+                                retry_delay=(
+                                    retry_delay_seconds(recovery_expected_count)
+                                    if recovery.get("status") == RETRY_WAIT else 0.0
+                                ),
+                                blocked_reason=recovery.get("blocked_reason"),
+                                expected_dispatch_token=recovery_dispatch_token,
+                                expected_identity=getattr(event, "_gateway_recovery_identity", None),
+                            )
+                        )
+                    except Exception:
+                        # Without a durable verdict, restart cannot prove that this
+                        # failed attempt was replay-safe.
+                        event._gateway_response_kind = "unsettled_failure"
+                        logger.warning(
+                            "Could not preserve failed active turn for %s", session_key, exc_info=True,
+                        )
+                    if recovery_kept:
+                        event._gateway_active_turn_recovery_kept = True
+                if resume_marker_count is not None:
+                    event._gateway_active_turn_expected_resume_count = resume_marker_count
                 if defer_delivery and not interrupted:
                     event._gateway_active_turn_delivery_session_key = session_key
                     event._gateway_active_turn_delivery_pending = True
-                else:
+                elif not recovery_kept:
                     try:
+                        finish_kwargs = {
+                            "turn_interrupted": interrupted
+                            or bool(getattr(self, "_draining", False)),
+                        }
+                        if hasattr(event, "_gateway_active_turn_expected_resume_count"):
+                            finish_kwargs["expected_resume_count"] = event._gateway_active_turn_expected_resume_count
+                        if recovery_dispatch_token is not None:
+                            finish_kwargs["expected_dispatch_token"] = recovery_dispatch_token
                         await self.async_session_store.finish_active_turn(
-                            session_key, turn_id,
-                            turn_interrupted=interrupted or bool(getattr(self, "_draining", False)),
+                            session_key, turn_id, **finish_kwargs,
                         )
                     except Exception:
                         logger.warning("Could not retire active turn for %s", session_key, exc_info=True)
+                elif recovery.get("status") == RETRY_WAIT:
+                    self._schedule_retryable_turn_wakeup(session_key, turn_id)
             return marker_cleared
         finally:
             for attr in ("_gateway_active_turn_session_key", "_gateway_active_turn_token"):
@@ -1815,7 +1892,24 @@ class GatewayInboundMixin:
         if not session_key or not turn_id:
             return False
         try:
-            return bool(await self.async_session_store.finish_active_turn(session_key, turn_id))
+            recovery = getattr(event, "_gateway_turn_recovery", None)
+            if getattr(event, "_gateway_active_turn_recovery_kept", False):
+                if isinstance(recovery, dict) and recovery.get("status") == "retry_wait":
+                    self._schedule_retryable_turn_wakeup(session_key, turn_id)
+                return True
+            if isinstance(recovery, dict):
+                return False
+            finish_kwargs = {}
+            if hasattr(event, "_gateway_active_turn_expected_resume_count"):
+                finish_kwargs["expected_resume_count"] = (
+                    event._gateway_active_turn_expected_resume_count
+                )
+            marker = getattr(event, "_hermes_turn_resume", None)
+            if isinstance(marker, dict) and marker.get("dispatch_token"):
+                finish_kwargs["expected_dispatch_token"] = marker["dispatch_token"]
+            return bool(await self.async_session_store.finish_active_turn(
+                session_key, turn_id, **finish_kwargs,
+            ))
         except Exception:
             logger.warning("Could not retire delivered turn for %s", session_key, exc_info=True)
             return False

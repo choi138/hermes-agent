@@ -64,3 +64,16 @@ def test_forensics_parser_reads_the_new_fields(tmp_path):
     assert [c["n"] for c in calls] == [3, 4]
     assert calls[0]["write"] == 28604 and calls[0]["id"] == "gen-1788636728-qMa1" and calls[0]["upstream"] == "Claude Platform on AWS"
     assert "write" not in calls[1] and "id" not in calls[1]
+
+
+def test_model_response_time_accumulates_without_token_usage(tmp_path, monkeypatch):
+    from agent.turn_usage import record_response_usage
+    import pytest
+    agent = _agent(tmp_path, monkeypatch)
+    try:
+        for duration in (.25, .75):
+            record_response_usage(agent, SimpleNamespace(usage=None), messages=[], api_call_count=1,
+                                  api_duration=duration, compression_attempts=0, max_compression_attempts=3)
+        assert agent.session_model_response_seconds == pytest.approx(1)
+    finally:
+        agent.close()

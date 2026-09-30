@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import shlex
@@ -57,7 +58,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False):
+                 probe_only: bool = False, *, _status_only: bool = False):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
@@ -66,12 +67,43 @@ class SSHEnvironment(BaseEnvironment):
         # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
         # stability across reconnects keeps ControlMaster reuse working. A probe gets its own
         # per-instance socket so its cleanup() can never close the agent's shared master.
-        socket_key = f"{user}@{host}:{port}"
+        from hermes_constants import get_hermes_home
+        self._owns_control_master = probe_only
+        self._owned_control_sockets = set()
+        # Resolve Include/Match/ProxyJump and authentication settings through OpenSSH.
+        # Never log the resolved configuration (it can contain sensitive proxy arguments).
+        self._configuration_error = ""
+        try:
+            resolved = run_capture(
+                ["ssh", "-G", *self._target_flags("-p"), f"{user}@{host}"], timeout=5)
+            config = (resolved.stdout or "") if resolved.returncode == 0 else ""
+            if not config:
+                from tools.environments.ssh_process import safe_error
+                self._configuration_error = safe_error(RuntimeError(f"ssh -G rc={resolved.returncode}: {(resolved.stderr or '').strip()}"))
+        except (OSError, subprocess.SubprocessError) as exc:
+            from tools.environments.ssh_process import safe_error
+            self._configuration_error = safe_error(exc)
+            config = ""
+        # If resolution fails, don't guess which other connection is safe to reuse.
+        socket_key = json.dumps([user, host, port, key_path, str(get_hermes_home()),
+                                 os.environ.get("SSH_AUTH_SOCK", ""), config or self._session_id])
         if probe_only:
             socket_key = f"{socket_key}:probe:{self._session_id}"
         _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
+        self._owned_control_sockets.add(self.control_socket)
         _ensure_ssh_available()
+        # Recovery identifies the logical target, not an ephemeral agent/master.
+        # SSH still authenticates the host and the observer checks the execution identity.
+        stable_config = '\n'.join(line for line in config.splitlines()
+                                  if not line.lower().startswith('identityagent '))
+        recovery_key = json.dumps([user, host, port, key_path, str(get_hermes_home()), stable_config])
+        self._connection_identity = hashlib.sha256(recovery_key.encode()).hexdigest() if config else ""
+        if not config:
+            logger.warning("SSH configuration resolution unavailable (%s); using an isolated control master", self._configuration_error)
+        self._sync_manager = None
+        if _status_only:
+            return
         self._establish_connection()
         if probe_only:
             self._sync_manager = None
@@ -81,9 +113,15 @@ class SSHEnvironment(BaseEnvironment):
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
-        self._sync_manager.sync(force=True)
+            bulk_upload_fn=self._ssh_bulk_upload, selective_download_fn=self._ssh_download_changes,
+            sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]), fail_closed=True)
+        # Bootstrap has no synchronized-file dependency. Upload is required at
+        # the first ordinary execution boundary; status-only observation stays independent.
         self.init_session()
+
+    def _observe_process(self, root, execution, offset):
+        from tools.environments.ssh_process import observe
+        return observe(self, root, execution, offset)
 
     def _control_socket_for(self, send_env: tuple[str, ...]) -> Path:
         """One ControlMaster per SendEnv name-set, beside the plain target socket: a mux master only
@@ -92,16 +130,17 @@ class SSHEnvironment(BaseEnvironment):
         plain = Path(self.control_socket)
         if not send_env:
             return plain
-        # <target-id[:8]><names-hash[:8]>.sock: same length as the plain socket (macOS's 104-byte
-        # sun_path cap) and prefix-globbable so cleanup() finds every sibling without extra state.
-        digest = hashlib.sha256(" ".join(send_env).encode()).hexdigest()[:8]
-        return plain.with_name(f"{plain.stem[:8]}{digest}.sock")
+        # Hash the full connection identity and environment name set; retain exact paths
+        # for private cleanup instead of globbing sockets owned by another instance.
+        digest = hashlib.sha256(json.dumps([plain.stem, send_env]).encode()).hexdigest()[:16]
+        socket = plain.with_name(f"{digest}.sock")
+        if hasattr(self, "_owned_control_sockets"):
+            self._owned_control_sockets.add(socket)
+        return socket
 
     def _control_sockets(self) -> list[Path]:
-        """The plain socket plus every SendEnv-set sibling (shared 8-char target prefix)."""
-        plain = Path(self.control_socket)
-        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
-        return [plain, *(s for s in siblings if s != plain)]
+        """Only socket paths selected by this instance; never discover peers by glob."""
+        return sorted(getattr(self, "_owned_control_sockets", {Path(self.control_socket)}))
 
     def _target_flags(self, port_flag: str) -> list:
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""
@@ -122,8 +161,12 @@ class SSHEnvironment(BaseEnvironment):
         cmd.append(f"{self.user}@{self.host}")
         return cmd
 
-    def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
+    def _run_ssh(self, remote_cmd: str, timeout: float, *, stdin_data: str | None = None) -> subprocess.CompletedProcess:
         """Run one remote shell command over the multiplexed connection, capturing output."""
+        if stdin_data is not None:
+            return subprocess.run(self._build_ssh_command() + [remote_cmd], input=stdin_data,
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=timeout)
         return run_capture(self._build_ssh_command() + [remote_cmd], timeout=timeout)
 
     def _run_ssh_checked(self, remote_cmd: str, timeout: float, reason: str, subject: str) -> None:
@@ -185,7 +228,10 @@ class SSHEnvironment(BaseEnvironment):
         # Symlink staging avoids fragile GNU tar --transform rules. On Windows
         # without Developer Mode symlink creation raises OSError winerror 1314;
         # only that case falls back to a plain copy, other OSErrors re-raise.
-        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging:
+        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging, \
+                tempfile.TemporaryDirectory(prefix="hermes-ssh-list-") as manifest_dir:
+            manifest = Path(manifest_dir) / "files"
+            members = []
             for host_path, remote_path in files:
                 try:
                     rel_remote = os.path.relpath(remote_path, base)
@@ -193,6 +239,7 @@ class SSHEnvironment(BaseEnvironment):
                     raise RuntimeError(f"remote path {remote_path!r} is not under sync base {base!r}") from exc
                 if rel_remote == "." or rel_remote.startswith("../"):
                     raise RuntimeError(f"remote path {remote_path!r} escapes sync base {base!r}")
+                members.append(os.fsencode("./" + rel_remote) + b"\0")
                 staged = os.path.join(staging, rel_remote)
                 os.makedirs(os.path.dirname(staged), exist_ok=True)
                 try:
@@ -202,10 +249,25 @@ class SSHEnvironment(BaseEnvironment):
                         raise
                     shutil.copy2(host_path, staged)
 
-            # --no-overwrite-dir keeps tar from stamping the staging dir's mode onto
-            # existing dirs (e.g. /home/<user>); a umask-002 0775 home breaks sshd StrictModes.
-            ssh_cmd = self._build_ssh_command() + [f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}"]
-            tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging, "."], stdin=subprocess.DEVNULL,
+            # Archive only files: no directory metadata can overwrite destination modes.
+            # GNU --no-overwrite-dir is rejected by macOS bsdtar. A NUL-delimited
+            # manifest works with both and preserves unusual names without argv limits.
+            manifest.write_bytes(b"".join(members))
+            # bsdtar interprets ._ files as AppleDouble metadata by default,
+            # which can fail extraction or silently consume mapped sidecars.
+            # Disable both reader-side AppleDouble merging and metadata restoration.
+            # GNU tar has no such behavior and rejects these bsdtar options.
+            extract = (
+                'case "$(tar --version 2>/dev/null)" in '
+                "*bsdtar*) set -- --no-mac-metadata --options '!mac-ext' ;; "
+                '*) set -- ;; esac; '
+                f'tar "$@" -xf - -C {shlex.quote(base)}'
+            )
+            ssh_cmd = self._build_ssh_command() + [extract]
+            # On macOS, also retain explicit ._ members when creating the archive.
+            tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging,
+                                         "--null", "-T", str(manifest)], stdin=subprocess.DEVNULL,
+                                        env=client_env_with({"COPYFILE_DISABLE": "1"}),
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 ssh_proc = subprocess.Popen(ssh_cmd, stdin=tar_proc.stdout,
@@ -230,38 +292,42 @@ class SSHEnvironment(BaseEnvironment):
                 raise EnvironmentConnectionError(
                     "SSH bulk upload timed out",
                     retry_hint=f"Bulk file sync to {self.host} timed out — check the connection and retry.")
-            if tar_proc.returncode != 0:
-                raise RuntimeError(f"tar create failed (rc={tar_proc.returncode}): "
-                                   f"{tar_stderr_raw.decode(errors='replace').strip()}")
             if ssh_proc.returncode != 0:
                 raise _sync_error(f"tar extract over SSH failed (rc={ssh_proc.returncode}): "
                                   f"{ssh_stderr.decode(errors='replace').strip()}",
                                   f"File sync over SSH to {self.host}", what="the connection")
+            if tar_proc.returncode != 0:
+                raise RuntimeError(f"tar create failed (rc={tar_proc.returncode}): "
+                                   f"{tar_stderr_raw.decode(errors='replace').strip()}")
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
-    def _ssh_bulk_download(self, dest: Path) -> None:
-        """Download remote .hermes/ as a tar archive."""
-        # Tar from / with the full path so archive entries keep absolute paths
-        # (home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
-        # Live sockets inside .hermes (gateway.sock and friends) cannot be archived: tar prints
-        # "socket ignored" and some builds exit 2, which failed every sync-back and left a
-        # multi-GB temp tar behind on each retry. Exclude them up front.
-        ssh_cmd = self._build_ssh_command() + [
-            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
-        with open(dest, "wb") as f:
-            result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120)
+    def read_guard_script(self, path: str, *, cwd: str, max_bytes: int) -> str | None:
+        """Read remote guard input without syncing files or mutating the shell snapshot.
+
+        Transport failures propagate so an uncompleted safety check cannot allow execution.
+        Missing paths and directories are not scripts; oversized text is returned one byte
+        over budget for the lifecycle scanner to reject, as on the ordinary read path.
+        """
+        command = (
+            f"cd -- {shlex.quote(cwd)} || exit 2; "
+            f"if test -f {shlex.quote(path)}; then "
+            f"head -c {max_bytes + 1} < {shlex.quote(path)} || exit 2; "
+            f"elif test -d {shlex.quote(path)} || ! test -e {shlex.quote(path)}; then exit 1; "
+            "else echo 'Refusing non-regular guard input' >&2; exit 2; fi"
+        )
+        result = self._run_ssh(command, timeout=10)
+        if result.returncode == 1:
+            return None
         if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace").strip()
-            # A socket not named *.sock is the only rc=2 we knowingly accept, and only when
-            # nothing else was reported — anchored to the diagnostic suffix so a filename merely
-            # containing "socket ignored" cannot sneak through. Every other status still fails.
-            diagnostic_lines = [line for line in stderr.splitlines() if line.strip()]
-            tolerated = result.returncode == 2 and bool(diagnostic_lines) and all(
-                line.endswith(": socket ignored") for line in diagnostic_lines)
-            if not tolerated:
-                raise _sync_error(f"SSH bulk download failed: {stderr}",
-                                  f"File sync from {self.host}")
+            raise _sync_error(
+                f"Guard script read failed (rc={result.returncode}): {result.stderr.strip()}",
+                f"Guard read on {self.host}")
+        return None if "\x00" in result.stdout else result.stdout
+
+    def _ssh_download_changes(self, dest: Path, request: dict, timeout: float) -> None:
+        from tools.environments.ssh_sync_back import download_changes
+
+        download_changes(self._build_ssh_command(), dest, request, timeout)
 
     def _ssh_delete(self, remote_paths: list[str]) -> None:
         self._run_ssh_checked(quoted_rm_command(remote_paths), 10, "remote rm failed",
@@ -287,6 +353,9 @@ class SSHEnvironment(BaseEnvironment):
         if self._sync_manager:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
+        # Shared masters belong to OpenSSH's ControlPersist lifecycle, never to a task.
+        if not getattr(self, "_owns_control_master", False):
+            return
         for socket in self._control_sockets():
             if not socket.exists():
                 continue

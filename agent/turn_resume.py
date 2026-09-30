@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.replay_cleanup import strip_dangling_tool_call_tail
+from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 
 
 INTERRUPT_CLOSER_PREFIX = "Operation interrupted"
@@ -20,6 +21,19 @@ def is_interrupt_closer_message(msg: Any) -> bool:
         return False
     content = msg.get("content")
     return isinstance(content, str) and content.strip().startswith(INTERRUPT_CLOSER_PREFIX)
+
+
+def is_failed_turn_closer_message(msg: Any) -> bool:
+    """Recognize only Hermes-authored failed-turn transcript boundaries."""
+    if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("tool_calls"):
+        return False
+    content = msg.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    # Transcript alternation repair joins consecutive assistant notices. Only a
+    # sequence made entirely of our exact notices is a failed-turn boundary.
+    return all(part.strip() in {FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE}
+               for part in content.strip().splitlines() if part.strip())
 
 
 def _is_empty_assistant_message(msg: Any) -> bool:
@@ -36,6 +50,7 @@ def prepare_resume_history(
     normalized = list(history or [])
     while normalized and (
         is_interrupt_closer_message(normalized[-1])
+        or is_failed_turn_closer_message(normalized[-1])
         or _is_empty_assistant_message(normalized[-1])
     ):
         normalized.pop()

@@ -1292,7 +1292,7 @@ def terminal_tool(
         if bounded_guard.timed_out:
             raise _Rejected(_error_json(
                 f"Terminal pre-execution guard did not finish within {guard_timeout}s "
-                "(process-identity probe wedged); the command was not run. Retry the call.",
+                "(identity verification or referenced-script scan timed out); the command was not run. Retry the call.",
                 status="error",
             ))
         # Pre-exec security checks (tirith + dangerous command detection);

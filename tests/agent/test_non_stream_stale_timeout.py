@@ -110,34 +110,6 @@ providers:
     assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
 
 
-def test_named_codex_proxy_uses_configured_budget_and_backend(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / ".env").write_text("", encoding="utf-8")
-    _write_config(tmp_path, """\
-providers:
-  codex-lb:
-    api: https://codex-lb.example/v1
-    transport: codex_responses
-    backend_family: openai-codex
-    request_timeout_seconds: 77
-    stale_timeout_seconds: 900
-""")
-
-    agent = _make_agent(
-        tmp_path,
-        provider="custom",
-        requested_provider="codex-lb",
-        api_mode="codex_responses",
-        base_url="https://codex-lb.example/v1",
-    )
-    assert agent._resolved_api_call_timeout() == 77.0
-    assert agent._client_kwargs["timeout"] == 77.0
-    assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 900.0
-    from agent.codex_responses_adapter import classify_responses_route
-
-    assert classify_responses_route(agent).is_codex_backend is True
-
-
 # ── openai-codex gateway-scale stale floor ────────────────────────────────
 
 

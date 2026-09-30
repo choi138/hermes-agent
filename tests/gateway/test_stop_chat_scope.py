@@ -24,6 +24,7 @@ class _FakeAgent:
 class _StoreEntry:
     def __init__(self, session_key):
         self.session_key = session_key
+        self.session_id = "fixture-session"
 
 
 class _FakeStore:
@@ -32,6 +33,16 @@ class _FakeStore:
 
     def get_or_create_session(self, source):
         return _StoreEntry(self._key)
+
+    def _generate_session_key(self, source):
+        return self._key
+
+    def lookup_by_session_key(self, session_key):
+        return _StoreEntry(self._key) if session_key == self._key else None
+
+    def cancel_active_turn_recovery(self, session_key, *, expected_session_id, reason):
+        # This fixture has no active recovery record; real SessionStore returns False.
+        return False
 
 
 def _slack_source(chat_type, chat_id, thread_id=None, user_id="U-alice", scope_id="T1"):

@@ -303,7 +303,8 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
 
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, chunk: emitted.append(chunk))
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: moved.append(_s.id))
+    monkeypatch.setattr(registry, "_release_finished_handles", lambda _s: moved.append(_s.id))
+    registry._running[session.id] = session
 
     registry._reader_loop(session)
 
@@ -334,7 +335,8 @@ def test_reader_waits_past_early_stdout_eof_before_publishing_completion(registr
 
     session = _make_session(sid="proc_early_eof")
     session.process = _StillRunningProcess()
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+    monkeypatch.setattr(registry, "_release_finished_handles", lambda _s: None)
+    registry._running[session.id] = session
 
     registry._reader_loop(session)
 
@@ -346,7 +348,8 @@ def test_failed_reader_wait_does_not_publish_false_completion(registry, monkeypa
     """A failed reap must leave the session running for later reconciliation."""
     session = _make_session(sid="proc_wait_failed")
     moved = []
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: moved.append(_s.id))
+    monkeypatch.setattr(registry, "_release_finished_handles", lambda _s: moved.append(_s.id))
+    registry._running[session.id] = session
 
     registry._finish_reader(
         session,
@@ -365,7 +368,8 @@ def test_failed_reader_wait_still_records_known_exit_status(registry, monkeypatc
     """A PTY child reaped by isalive() has its status; a raising wait must not lose it."""
     session = _make_session(sid="proc_pty_wait_failed")
     moved = []
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: moved.append(_s.id))
+    monkeypatch.setattr(registry, "_release_finished_handles", lambda _s: moved.append(_s.id))
+    registry._running[session.id] = session
 
     registry._finish_reader(
         session,
@@ -416,7 +420,8 @@ def _run_reader(registry, monkeypatch, chunks, sid="proc_utf8"):
     session.process = _FakeChunkProcess(chunks)
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+    monkeypatch.setattr(registry, "_release_finished_handles", lambda _s: None)
+    registry._running[session.id] = session
     registry._reader_loop(session)
     return session
 
@@ -474,7 +479,8 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
     session._pty = _FakePty([b"caf\xc3", b"\xa9\n"])
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+    monkeypatch.setattr(registry, "_release_finished_handles", lambda _s: None)
+    registry._running[session.id] = session
 
     registry._pty_reader_loop(session)
 
@@ -1314,6 +1320,7 @@ class TestCheckpoint:
     ):
         checkpoint = tmp_path / "procs.json"
         entry = {
+            "profile_home": str(__import__("hermes_constants").get_hermes_home()),
             "session_id": "proc_dead_scope",
             "command": "daemonize",
             "pid": 999999999,
@@ -1331,13 +1338,15 @@ class TestCheckpoint:
             assert registry.recover_from_checkpoint() == 0
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
-        assert json.loads(checkpoint.read_text()) == [entry]
+        saved = json.loads(checkpoint.read_text())
+        assert len(saved) == 1 and all(saved[0][key] == value for key, value in entry.items())
 
     def test_recover_dead_wrapper_drops_reaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
     ):
         checkpoint = tmp_path / "procs.json"
         entry = {
+            "profile_home": str(__import__("hermes_constants").get_hermes_home()),
             "session_id": "proc_dead_scope",
             "command": "daemonize",
             "pid": 999999999,
@@ -1375,7 +1384,9 @@ class TestCheckpoint:
             assert registry.get("proc_remote") is None
 
             data = json.loads(checkpoint.read_text())
-            assert data == []
+            assert len(data) == 1 and all(data[0][key] == value for key, value in original[0].items())
+            registry._write_checkpoint()
+            assert json.loads(checkpoint.read_text()) == data
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline
@@ -1387,6 +1398,8 @@ class TestCheckpoint:
             secret = "sk-secret1234567890"
             command = f"curl -H 'Authorization: Bearer {secret}' http://x"
             s = _make_session(sid="proc_secret", command=command)
+            from hermes_constants import get_hermes_home
+            s.profile_home = str(get_hermes_home())
             s.pid = 12345
             s.host_start_time = int(time.time())
             registry._running[s.id] = s

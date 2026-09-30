@@ -516,6 +516,21 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
+    cancel_requested: bool = False
+    cancel_confirmed: bool = False
+    execution_seconds: Optional[float] = None
+    profile_home: str = ""
+    remote_root: str = ""
+    remote_identity: dict = field(default_factory=dict)
+    remote_connection: dict = field(default_factory=dict)
+    remote_offset: int = 0
+    observation_state: str = ""
+    last_observed_at: float = 0.0
+    observation_error: str = ""
+    observation_operation: str = "dispatch"
+    verification_scope: dict = field(default_factory=dict)
+    observation_retry_at: float = 0.0
+    _finalize_lock: Any = field(default_factory=threading.Lock, repr=False)
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
@@ -544,6 +559,7 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _observation_wake: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
@@ -572,11 +588,13 @@ _WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
+    "cancel_requested", "cancel_confirmed", "execution_seconds", "profile_home", "remote_root", "remote_identity", "remote_connection", "remote_offset",
+    "observation_state", "last_observed_at", "observation_error", "observation_operation", "verification_scope", "observation_retry_at",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
-    f.name: ([] if f.name == "watch_patterns" else f.default)
+    f.name: (f.default_factory() if f.name in {"watch_patterns", "remote_identity", "remote_connection", "verification_scope"} else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
     if f.name in _CHECKPOINT_FIELDS
 }
@@ -595,6 +613,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._checkpoint_write_lock = threading.Lock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -1024,6 +1043,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
         from gateway.session_context import get_session_env
+        extra.setdefault('profile_home', str(get_hermes_home()))
 
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
@@ -1210,7 +1230,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "") -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
@@ -1224,18 +1244,93 @@ class ProcessRegistry(ProcessCheckpointMixin):
             f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
+        from tools.environments.ssh import SSHEnvironment
+        execute = env.execute
+        launch_options = {}
+        if isinstance(env, SSHEnvironment):
+            # A failed prerequisite cannot have launched the command. Run it before
+            # persisting dispatch intent, outside the uncertain-outcome catch below.
+            env._before_execute()
+            if not env._connection_identity:
+                raise RuntimeError(f"Cannot resolve SSH configuration for durable execution ({getattr(env, '_configuration_error', 'unknown')}); no command dispatched")
+            prerequisite = env._run_ssh("python3 -c 'import fcntl, os, signal, subprocess, tempfile, uuid'", timeout=10)
+            if prerequisite.returncode:
+                from tools.environments.base import EnvironmentConnectionError
+                from tools.environments.ssh_process import safe_error
+                diagnostic = safe_error(RuntimeError(prerequisite.stderr or prerequisite.stdout or 'no remote diagnostic'))
+                if prerequisite.returncode == 255:
+                    raise EnvironmentConnectionError(
+                        'SSH prerequisite transport/authentication failed (exit 255): ' + diagnostic,
+                        retry_hint='Restore SSH connectivity/authentication, then retry; no command was dispatched.')
+                raise EnvironmentConnectionError(
+                    f"SSH Python 3 prerequisite failed (exit {prerequisite.returncode}): " + diagnostic,
+                    retry_hint="Check Python 3 with fcntl and its environment on the SSH target, then retry; no command was dispatched.")
+            execute = env._execute_prepared
+            launch_options['stdin_data'] = command
+            from tools.environments.ssh_process import launch_command
+            from gateway.session_context import async_delivery_supported, get_session_env
+            from tools.terminal_tool_background import _stamp_gateway_routing
+            if notify_on_complete and async_delivery_supported():
+                session.notify_on_complete = True
+                _stamp_gateway_routing(session, get_session_env)
+                session.watcher_interval = 5
+            session.remote_root = temp_dir
+            session.remote_connection = {name: getattr(env, name) for name in ("host", "user", "port", "key_path")}
+            from hermes_constants import get_hermes_home
+            session.remote_connection.update(profile_home=str(get_hermes_home()), identity=env._connection_identity)
+            from agent.redact import redact_sensitive_text
+            from tools.process_registry_followups import task_request
+            session.verification_scope = {
+                'execution_id': session.id, 'parent_session_id': session.parent_session_id,
+                'source_message_id': get_session_env('HERMES_SESSION_MESSAGE_ID'),
+                'authorized_command': redact_sensitive_text(command, code_file=True, force=True),
+                'cwd': cwd or env.cwd,
+                'task_request': task_request(),
+                'followup_actions': ['inspect this execution and its artifacts', 'report evidence or remaining work'],
+                'automatic_repair_budget': 0,
+            }
+            session.observation_state = "dispatch_pending"
+            with self._lock:
+                self._running[session.id] = session
+            # Intent must reach disk before the external launch. Never replay an uncertain dispatch.
+            try:
+                self._write_checkpoint(strict=True)
+            except Exception:
+                with self._lock:
+                    self._running.pop(session.id, None)
+                raise
+            bg_command = launch_command(temp_dir, session.id, cwd or env.cwd)
         try:
-            result = env.execute(bg_command, timeout=timeout, rewrite_compound_background=False)
+            result = execute(bg_command, timeout=timeout, rewrite_compound_background=False, **launch_options)
             output = result.get("output", "").strip()
-            session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
+            if session.remote_root:
+                marker = 'HERMES_PROCESS_LAUNCH_V1:'
+                frames = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
+                session.pid = int(frames[0]) if len(frames) == 1 and frames[0].isdigit() and int(frames[0]) > 0 else None
+                if session.pid is None:
+                    from tools.environments.ssh_process import safe_error
+                    session.observation_state = 'unavailable'
+                    session.observation_operation = 'dispatch'
+                    diagnostic = safe_error(RuntimeError(output or 'missing launch acknowledgement'))
+                    session.observation_error = f"SSH launch outcome unconfirmed (exit {result.get('returncode', 'unknown')}): {diagnostic}"
+                    logger.warning('SSH launch outcome unconfirmed: %s: %s', session.id, session.observation_error)
+            else:
+                session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
             # No PID from the wrapper (syntax error, broken redirect): a failed launch,
             # not a fake running session.
-            if session.pid is None:
+            if session.pid is None and not session.remote_root:
                 session.mark_exited(int(result.get("returncode", -1)) or -1, "failed_start", "failed_start")
                 session.output_buffer = output
         except Exception as e:
-            session.mark_exited(-1, "failed_start", "failed_start")
-            session.output_buffer = f"Failed to start: {e}"
+            if session.remote_root:
+                session.observation_state = "unavailable"
+                from tools.environments.ssh_process import safe_error
+                session.observation_operation = "dispatch"
+                session.observation_error = safe_error(e)
+                logger.warning("SSH launch outcome unconfirmed: %s: %s", session.id, session.observation_error)
+            else:
+                session.mark_exited(-1, "failed_start", "failed_start")
+                session.output_buffer = f"Failed to start: {e}"
         if session.exited:
             with self._lock:
                 self._prune_if_needed()
@@ -1386,6 +1481,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
         """Background thread: poll a sandbox log file for non-local backends."""
+        if session.remote_root:
+            from tools.process_registry_remote import poll_remote
+            return poll_remote(self, session, env)
         q = shlex.quote
         # Byte offset already read from the log (bytes, not chars: the shell counts bytes).
         prev_output_bytes = 0
@@ -1434,9 +1532,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     self._finish_exited(session, exit_code)
                     return
             except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited, session.exit_code = True, -1
-                session.completion_reason, session.termination_source = "lost", "backend_lost"
+                # SSH uses its dedicated recoverable observer above. Other
+                # sandbox backends have no durable remote recovery protocol.
+                logger.warning("Sandbox backend lost: %s", session.id, exc_info=True)
+                session.mark_exited(-1, "lost", "backend_lost")
                 self._move_to_finished(session)
                 return
 
@@ -1495,22 +1594,41 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def _finish_exited(self, session: ProcessSession, exit_code) -> None:
         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish."""
-        session.mark_exited(exit_code)
-        self._move_to_finished(session)
+        # Publish completion only after the receipt and follow-up reservation are written.
+        with session._finalize_lock:
+            if session.remote_root:
+                session.exit_code = exit_code
+                session.completion_reason = "killed" if session.cancel_confirmed else "exited"
+            elif session.completion_reason != "killed":
+                session.exit_code = exit_code
+                session.completion_reason = "exited"
+            self._move_to_finished_serialized(session)
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
         """Move a session from running to finished.
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates.
         Returns True when this call is the one that persisted the session."""
+        with session._finalize_lock:
+            return self._move_to_finished_serialized(session)
+
+    def _move_to_finished_serialized(self, session: ProcessSession) -> bool:
         with self._lock:
             was_running = session.id in self._running
-            if was_running:
-                session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
+        if was_running:
+            session.exited_at = time.time()
+            # Disk/SQLite waits must not block every unrelated registry operation.
+            if session.remote_root:
+                save_completed_result(session, strict=True)
+            else:
                 save_completed_result(session)
-                self._running.pop(session.id)
+            from tools.process_registry_followups import enabled, reserve
+            if enabled(session):
+                reserve(session)
+        with self._lock:
+            if was_running:
+                session.exited = True
+                self._running.pop(session.id, None)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)
@@ -1523,7 +1641,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # buffered ``output_buffer``, never from the pipe.
         self._release_finished_handles(session)
         self._write_checkpoint()
-        if was_running and session.notify_on_complete:
+        from tools.process_registry_followups import enabled
+        if was_running and session.notify_on_complete and not enabled(session):
             notification = {
                 "type": "completion",
                 "session_id": session.id,
@@ -1550,6 +1669,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             "exit_code": session.exit_code,
             "completion_reason": session.completion_reason,
             "termination_source": session.termination_source,
+            **({'cancellation_scope': 'direct_process_group', 'execution_tree_termination_confirmed': False}
+               if session.remote_root and session.cancel_confirmed else {}),
         }
 
     def _release_finished_handles(self, session: ProcessSession):
@@ -1855,7 +1976,37 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     @staticmethod
     def _status_head(session: ProcessSession) -> dict:
-        return {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running"}
+        result = {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running"}
+        if session.remote_root:
+            if not session.exited and session.observation_state != "running":
+                result['status'] = 'unknown'
+                result['next_action'] = 'Execution remains tracked; outcome is unconfirmed. Poll the same session_id; do not rerun the command.'
+                if session.observation_state == 'identity_mismatch':
+                    result['next_action'] = 'Execution identity mismatch: manually reconcile the stored and remote identities; do not rerun the command.'
+            result.update(observation_state=session.observation_state, last_observed_at=session.last_observed_at)
+            if session.observation_error or session.observation_state not in {'running', 'exited'}:
+                result.update(
+                          observation_error=session.observation_error,
+                          observation_operation=session.observation_operation,
+                          observation_retry_at=session.observation_retry_at)
+            if session.cancel_requested or session.cancel_confirmed:
+                result.update(cancel_requested=session.cancel_requested, cancel_confirmed=session.cancel_confirmed,
+                              cancellation_scope='direct_process_group', execution_tree_termination_confirmed=False,
+                              cancellation_note='Cancellation targets the direct command process group; detached descendants may remain. Inspect remote effects before assuming the whole task stopped.')
+            if session.exited and session.notify_on_complete:
+                from tools.process_registry_followups import get_state
+                try:
+                    state = get_state(session.id)
+                    result["followup"] = {key: value for key, value in (state or {}).items() if key in {"phase", "reason", "report_delivered"}}
+                    if state and state.get('phase') == 'turn_finished' and not state.get('report_delivered'):
+                        result['followup']['next_action'] = 'Verification turn returned; report delivery is unresolved. Poll this session_id; do not claim the report was delivered.'
+                    if state and state.get("verification"):
+                        result["followup"]["outcome"] = state["verification"].get("outcome")
+                except Exception as exc:
+                    from tools.environments.ssh_process import safe_error
+                    result["followup"] = {"phase": "unavailable", "reason": safe_error(exc)}
+                    logger.warning('Follow-up status unavailable for %s: %s', session.id, safe_error(exc))
+        return result
 
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
@@ -1905,6 +2056,24 @@ class ProcessRegistry(ProcessCheckpointMixin):
         result = {
             **self._status_head(session), "output": "\n".join(selected),
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
+        if session.remote_root:
+            log_base = f'{session.remote_root}/hermes_bg_{session.id}'
+            if session.remote_identity.get('protocol') == 3:
+                log_base += '.claim/process'
+            if session.remote_identity.get('protocol') in (2, 3):
+                result['remote_log_path'] = log_base + '.log'
+            result.update(output_scope='retained_output',
+                          note='SSH output may omit backlog; inspect the remote log or artifacts when evidence is missing.')
+        if session.remote_root and session.notify_on_complete:
+            from tools.process_registry_followups import get_state
+            try:
+                state = get_state(session.id)
+                if state and state.get('verification'):
+                    result['verification'] = state['verification']
+            except Exception as exc:
+                from tools.environments.ssh_process import safe_error
+                result['verification'] = {'outcome': 'unavailable', 'reason': safe_error(exc)}
+                logger.warning('Verification status unavailable for %s: %s', session.id, safe_error(exc))
         if session.exited and observed_completion_output:
             self._completion_consumed.add(session_id)
         return result
@@ -2083,6 +2252,33 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
             self._terminate_host_pid(session.process.pid, session.host_start_time)
+        elif session.remote_root:
+            from tools.environments.ssh_process import request_cancel
+            # The observer uses the same lock: it cannot send a request until
+            # durable intent exists. A failed write restores the prior intent.
+            with session._finalize_lock:
+                if session.exited:
+                    return self._exit_snapshot(session, "already_exited")
+                previous = session.cancel_requested
+                session.cancel_requested = True
+                try:
+                    self._write_checkpoint(strict=True)
+                except Exception:
+                    session.cancel_requested = previous
+                    raise
+            session._observation_wake.set()
+            cancel_error = ''
+            try:
+                if session.env_ref is None:
+                    raise ConnectionError('SSH recovery unresolved; cancellation intent retained')
+                request_cancel(session.env_ref, session.remote_root, session.id)
+            except Exception as exc:
+                from tools.environments.ssh_process import safe_error
+                cancel_error = safe_error(exc)
+            return {"cancel_transport_error": cancel_error,"status": "cancellation_requested", "session_id": session.id,
+                    "termination_confirmed": False, "observation_state": session.observation_state,
+                    "cancellation_scope": "direct_process_group",
+                    "note": "Cancellation intent recorded; poll this session for the direct command outcome. Detached descendants may remain; inspect remote effects before assuming the whole task stopped."}
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:
@@ -2218,6 +2414,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # keep the capture pipe open; retain the existing completion owner.
             self._reconcile_local_exit(s)
             entry = {
+                **self._status_head(s),
                 "session_id": s.id,
                 "command": s.command[:200],
                 "cwd": s.cwd,
@@ -2225,7 +2422,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "owner_task_id": s.owner_task_id or s.task_id,
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
                 "uptime_seconds": int(time.time() - s.started_at),
-                "status": "exited" if s.exited else "running",
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
             }
             # Flag processes surfaced only because they share the gateway session (not the current task) —
@@ -2322,7 +2518,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def kill_all(
         self, task_id: Optional[str] = None, *, exclude_ids: frozenset = frozenset(),
         source: str = "kill_all", consume_output: bool = False) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Request termination; count accepted requests/already-exited targets, not confirmed deaths."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
@@ -2330,7 +2526,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             ]
         return sum(
             self.kill_process(s.id, source=source, consume_output=consume_output).get("status")
-            in {"killed", "already_exited"}
+            in {"killed", "already_exited", "cancellation_requested"}
             for s in targets)
 
     # ----- Cleanup / Pruning -----
@@ -2376,10 +2572,10 @@ PROCESS_SCHEMA = {
         "terminal(background=true)). "
         "Completed results remain retrievable by session_id when resuming their owning conversation "
         "(up to 7 days, newest 64 results per profile; rolling output tail). "
-        "poll: status + new output. log: full output, paged. wait: block "
+        "poll: status + new output. log: retained output, paged. wait: block "
         "until exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
-        "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
+        "sends raw bytes, no newline. close: EOF stdin. kill: request termination; "
         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
         "receives its completion; `data` = one sentence on its purpose. Subagent-owned processes are otherwise "
         "killed when the subagent finishes and their notifications never reach the parent."

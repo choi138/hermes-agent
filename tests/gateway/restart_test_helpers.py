@@ -162,6 +162,15 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+    # Exercise production claim/CAS mutation rather than a truthy no-op MagicMock.
+    from threading import RLock
+    from gateway.session_lifecycle import SessionLifecycleMixin
+    runner.session_store._lock = RLock()
+    runner.session_store._entry_locked.side_effect = lambda key: runner.session_store._entries.get(key)
+    runner.session_store.recovery_is_quarantined.return_value = False
+    runner.session_store.claim_resume_active_turn.side_effect = lambda *args, **kwargs: (
+        SessionLifecycleMixin.claim_resume_active_turn(runner.session_store, *args, **kwargs)
+    )
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()

@@ -693,6 +693,8 @@ def _dispatch_authorized_once(
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
 
+    from tools.process_registry_followups import verification_tool_block
+    block_message = block_message or verification_tool_block(ref.name, ref.args)
     guardrail_decision = None
     if block_message is None:
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
@@ -741,6 +743,17 @@ def _run_agent_tool_execution_middleware(
 
     trace = middleware_trace if middleware_trace is not None else []
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
+    from tools.process_registry_followups import verification_tool_block
+    policy_block = verification_tool_block(function_name, function_args)
+    if policy_block:
+        # Before Relay/plugins as well as after rewrites at actual dispatch.
+        if begin_execution is not None:
+            begin_execution()
+        state.blocked = True
+        state.result = _blocked_tool_result(agent,
+            _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, trace),
+            block_message=policy_block, block_error_type="verification_read_only", guardrail_decision=None)
+        return state
     dispatch_lock = threading.Lock()
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:

@@ -1662,13 +1662,12 @@ def run_conversation(
             resume_turn=resume_turn,
             turn_id=turn_id,
         )
-    boundary_message = user_message
-    if resume_turn:
-        boundary_message = next(
-            (row.get("content") for row in reversed(conversation_history or [])
-             if isinstance(row, dict) and row.get("role") == "user"), None,
-        )
-    result = export_current_turn_boundary(agent, result, boundary_message)
+    result = export_current_turn_boundary(
+        agent,
+        result,
+        user_message,
+        gateway_input_owner=getattr(agent, "_current_turn_gateway_input_owner", None),
+    )
     if resume_turn and isinstance(result, dict) and turn_id:
         result.setdefault("turn_id", turn_id)
     _close_durable_failed_turn(agent, result)

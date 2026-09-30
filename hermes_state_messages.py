@@ -1385,6 +1385,80 @@ class SessionMessagesMixin:
             "THEN json_extract(display_metadata, '$.gateway_input_owner') END = ? LIMIT 1",
             (session_id, owner)) is not None
 
+    def get_turn_recovery_rows(
+        self, session_id: str, origin_owner: str, origin_row_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return strict, unfiltered audit rows from one proven gateway input onward.
+
+        This intentionally bypasses replay repair, deduplication, active-row filtering and
+        compression projection.  Malformed JSON is an error because recovery safety may not
+        reinterpret a corrupt tool call as an empty list.
+        """
+        if not isinstance(origin_owner, str) or not origin_owner:
+            raise ValueError("missing recovery origin owner")
+        with self._read_ctx() as conn:
+            # One SELECT owns the SQLite statement snapshot, including origin resolution.
+            # _read_ctx alone does not start a transaction on pooled readers.
+            snapshot = conn.execute(
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, observed, "
+                "effect_disposition, display_metadata, active, compacted, _compressed_summary "
+                "FROM messages WHERE session_id = ? ORDER BY id", (session_id,),
+            ).fetchall()
+        matches = []
+        for row in snapshot:
+            if row["role"] != "user" or row["observed"]:
+                continue
+            try:
+                metadata = json.loads(row["display_metadata"]) if row["display_metadata"] else {}
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError("malformed recovery display metadata") from exc
+            if not isinstance(metadata, dict):
+                raise ValueError("non-object recovery display metadata")
+            if metadata.get("gateway_input_owner") == origin_owner:
+                matches.append(int(row["id"]))
+        if len(matches) != 1:
+            raise ValueError("ambiguous or missing recovery origin row")
+        if origin_row_id is None:
+            origin_row_id = matches[0]
+        elif type(origin_row_id) is not int or origin_row_id <= 0 or matches != [origin_row_id]:
+            raise ValueError("recovery origin row does not match owner")
+        rows = [row for row in snapshot if row["id"] >= origin_row_id]
+
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            tool_calls = None
+            if row["tool_calls"] is not None:
+                try:
+                    tool_calls = json.loads(row["tool_calls"])
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise ValueError("malformed recovery tool_calls") from exc
+                if not isinstance(tool_calls, list):
+                    raise ValueError("recovery tool_calls must be a list")
+            metadata = None
+            if row["display_metadata"] is not None:
+                try:
+                    metadata = json.loads(row["display_metadata"])
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise ValueError("malformed recovery display metadata") from exc
+                if not isinstance(metadata, dict):
+                    raise ValueError("recovery display metadata must be an object")
+            result.append({
+                "id": int(row["id"]),
+                "session_id": row["session_id"],
+                "role": row["role"],
+                "content": self._decode_content(row["content"]),
+                "tool_calls": tool_calls,
+                "tool_call_id": row["tool_call_id"],
+                "effect_disposition": row["effect_disposition"],
+                "display_metadata": metadata,
+                "active": bool(row["active"]),
+                "compacted": bool(row["compacted"]),
+                "_compressed_summary": bool(row["_compressed_summary"]),
+            })
+        if not result or result[0]["id"] != origin_row_id:
+            raise ValueError("missing recovery origin row")
+        return result
+
     def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """True when *platform_message_id* exists (partial-index probe; the gateway's transient-failure dedupe).
 

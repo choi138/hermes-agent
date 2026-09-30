@@ -165,6 +165,59 @@ def _source():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_process_completion_queued_turn_keeps_execution_fence(monkeypatch, tmp_path, cancelled):
+    """Completion producer -> real adapter queue -> recursive turn -> durable fence."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.process_followups import reconcile
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    from tools import process_registry_followups as ledger
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _TwoTurnAgent.calls = []
+    _install_fake_agent(monkeypatch, tmp_path, _TwoTurnAgent)
+    adapter = HookRecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.session_store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    runner._boot_id = "queue-test"
+    entry = runner.session_store.get_or_create_session(_source())
+    key = entry.session_key
+    runner._classify_completion_target = AsyncMock(return_value="deliver")
+    adapter._message_handler = AsyncMock()
+    adapter._active_sessions[key] = asyncio.Event()
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_queued", command="true", remote_root=str(tmp_path),
+        session_key=key, parent_session_id=entry.session_id,
+        notify_on_complete=True, watcher_platform="telegram", watcher_chat_id="4242",
+    )
+    registry._running[session.id] = session
+    registry._finish_exited(session, 0)
+    assert ledger.get_state(session.id)["phase"] == "pending"
+    await reconcile(runner)
+    event = adapter._pending_messages[key]
+    assert event.metadata["process_followup"]["execution_id"] == session.id
+    adapter._message_handler.assert_not_called()
+    if cancelled:
+        ledger.cancel_for_session(key)
+
+    await runner._run_agent(message="first", context_prompt="", history=[], source=_source(),
+                            session_id=entry.session_id, session_key=key)
+    assert len(_TwoTurnAgent.calls) == (1 if cancelled else 2)
+    assert ledger.get_state(session.id)["phase"] == ("cancelled" if cancelled else "turn_finished")
+    if not cancelled:
+        assert event._gateway_active_turn_id
+    # Replay the exact accepted event through the same queue, not a direct TurnRunner call.
+    adapter._pending_messages[key] = event
+    await runner._run_agent(message="another human turn", context_prompt="", history=[],
+                            source=_source(), session_id=entry.session_id, session_key=key)
+    assert len(_TwoTurnAgent.calls) == (2 if cancelled else 3)
+
+
+@pytest.mark.asyncio
 async def test_queued_followup_fires_processing_hooks(monkeypatch, tmp_path):
     """The runner-drained follow-up gets the same start/complete hooks as a
     message that arrives while the session is idle."""

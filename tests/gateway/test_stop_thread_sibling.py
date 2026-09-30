@@ -95,6 +95,7 @@ def test_sibling_does_not_cross_profiles():
 class _StoreEntry:
     def __init__(self, session_key):
         self.session_key = session_key
+        self.session_id = "fixture-session"
 
 
 class _FakeStore:
@@ -103,6 +104,16 @@ class _FakeStore:
 
     def get_or_create_session(self, source):
         return _StoreEntry(self._key)
+
+    def _generate_session_key(self, source):
+        return self._key
+
+    def lookup_by_session_key(self, session_key):
+        return _StoreEntry(self._key) if session_key == self._key else None
+
+    def cancel_active_turn_recovery(self, session_key, *, expected_session_id, reason):
+        # This fixture has no active recovery record; real SessionStore returns False.
+        return False
 
 
 @pytest.mark.asyncio
@@ -144,7 +155,7 @@ class _FakeStatusAdapter:
 
 
 @pytest.mark.asyncio
-async def test_stop_no_active_agent_survives_status_clear_failure():
+async def test_stop_no_active_agent_survives_status_clear_failure(monkeypatch, tmp_path):
     """A failing adapter clear must not break the /stop reply."""
     runner = object.__new__(GatewayRunner)
     runner._running_agents = {}
@@ -165,6 +176,39 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
     event = MessageEvent(
         text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
     )
+    from tools.process_registry import ProcessSession
+    from tools import process_registry_followups as ledger
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_idle_stop', command='true', session_key=key)
+    ledger.reserve(session)
     result = await runner._handle_stop_command(event)
+    assert ledger.get_state(session.id)['phase'] == 'pending'
 
     assert "no active" in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_pending_own_cancellation_still_stops_authorized_sibling():
+    runner = object.__new__(GatewayRunner)
+    key_a, key_b = _per_user_key("userA"), _per_user_key("userB")
+    runner._running_agents = {key_b: _FakeAgent()}
+    runner.session_store = _FakeStore(key_a)
+    cancelled = []
+    interrupted = []
+
+    def cancel(session_key, *, expected_session_id, reason):
+        cancelled.append((session_key, expected_session_id))
+        return True
+
+    async def interrupt(session_key, source, *, interrupt_reason, invalidation_reason):
+        interrupted.append(session_key)
+
+    runner.session_store.cancel_active_turn_recovery = cancel
+    runner._interrupt_and_clear_session = interrupt
+    runner._is_user_authorized_for_source = lambda source: True
+    reply = await runner._handle_stop_command(MessageEvent(
+        text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA"),
+    ))
+    assert cancelled == [(key_a, "fixture-session")]
+    assert interrupted == [key_b]
+    assert "Stopped" in str(reply)

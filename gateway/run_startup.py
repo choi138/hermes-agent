@@ -41,10 +41,12 @@ _MAX_SAME_TURN_RESUMES = 2
 
 
 def _orphaned_active_turn(entry, boot_id: Optional[str]) -> Optional[dict]:
-    """Only a previous boot's running turn or an explicit drain interrupt is recoverable."""
+    """Return a turn eligible for bounded resume on this boot."""
     record = getattr(entry, "active_turn", None)
     if not isinstance(record, dict):
         return None
+    if record.get("status") == "retry_wait":
+        return record
     if record.get("status") == "interrupted":
         return record
     if record.get("status") in {"running", "resuming"} and record.get("boot_id") != boot_id:
@@ -145,7 +147,11 @@ class GatewayStartupMixin:
         finally:
             # Release the pre-claimed slot if handle_message raised before _handle_message took ownership.
             _pre_state = self._peek_session_state(session_key)
-            if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
+            if (
+                _pre_state is not None
+                and _pre_state.turn.agent is _AGENT_PENDING_SENTINEL
+                and _pre_state.turn.event is event
+            ):
                 self._release_running_agent_state(session_key)
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
@@ -370,11 +376,16 @@ class GatewayStartupMixin:
         sendable = []
         for row in claimed:
             session_key = row.get("session_key") or ""
-            if not session_key:
+            if not session_key or row.get("response_kind") in {"failure_notice", "interruption_notice"}:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                if row.get("turn_id"):
+                    await self.async_session_store.clear_resume_pending(
+                        session_key, expected_turn_id=row["turn_id"],
+                    )
+                else:
+                    await self.async_session_store.clear_resume_pending(session_key)
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:
@@ -436,7 +447,8 @@ class GatewayStartupMixin:
         try:
             await asyncio.to_thread(release_runtime_claim, obligation_id, error)
         except Exception:
-            logger.debug(log_fmt, obligation_id, exc_info=True)
+            from gateway.delivery_ledger import public_obligation_id
+            logger.debug(log_fmt, public_obligation_id(obligation_id), exc_info=True)
 
     def _schedule_flood_redelivery(self, platform, *, profile: Optional[str] = None) -> None:
         """Wake one deadline-driven ledger worker per bot identity, never sleep in a send."""
@@ -535,26 +547,47 @@ class GatewayStartupMixin:
                 except Exception:
                     logger.debug("lifecycle claim deferral failed", exc_info=True)
                 continue
+            from gateway.process_followups import AttentionSendPending
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                if row['obligation_id'].startswith('process-attention:'):
+                    from gateway.process_followups import _send_attention
+                    _, execution, token = row['obligation_id'].split(':')
+                    source = SessionSource(platform=Platform(row['platform']), chat_id=row['chat_id'], thread_id=row['thread_id'])
+                    result = await _send_attention(adapter, source, content, {**(metadata or {}), '_interim_send': True},
+                                                   execution, token, row['obligation_id'], runner=self)
+                    if result is None:
+                        continue  # Cancellation already abandoned this obligation.
+                else:
+                    result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+            except AttentionSendPending:
+                continue  # A live transport owns settlement; never launch a concurrent retry.
             except Exception as send_err:
-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+                from tools.environments.ssh_process import safe_error
+                from gateway.delivery_ledger import public_obligation_id
+                logger.warning("obligation %s: redelivery send raised: %s", public_obligation_id(row["obligation_id"]), safe_error(send_err))
+                if row['obligation_id'].startswith('process-attention:'):
+                    from gateway.delivery_ledger import mark_uncertain
+                    with _log_suppressed(logging.DEBUG, "attention outcome persistence failed", exc_info=True):
+                        await asyncio.to_thread(mark_uncertain, row['obligation_id'], safe_error(send_err))
+                    continue  # Keep attempting if persistence fails; never infer a rejected send.
                 result = None
+            from tools.environments.ssh_process import safe_error
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
+                    from gateway.delivery_ledger import public_obligation_id
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
+                        row["platform"], row["chat_id"], public_obligation_id(row["obligation_id"]), row["attempts"],
                     )
                 else:
                     await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        mark_failed, row["obligation_id"], safe_error(RuntimeError(str(getattr(result, "error", "") or "send failed")))
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
@@ -567,7 +600,8 @@ class GatewayStartupMixin:
         try:
             platform = Platform(row["platform"])
         except Exception:
-            logger.debug("obligation %s: unknown platform %r", row["obligation_id"], row.get("platform"))
+            from gateway.delivery_ledger import public_obligation_id
+            logger.debug("obligation %s: unknown platform %r", public_obligation_id(row["obligation_id"]), row.get("platform"))
             return None
         if "profile" in row:
             adapter = self._authorization_adapter(platform, row.get("profile"))
@@ -638,6 +672,7 @@ class GatewayStartupMixin:
                         _orphaned_active_turn(entry, getattr(self, "_boot_id", None)) is not None
                         or (
                             entry.resume_pending
+                            and not (entry.active_turn and entry.active_turn.get("status") == "blocked")
                             and entry.resume_reason in self._AUTO_RESUME_REASONS
                             and not (entry.active_turn and entry.active_turn.get("boot_id") == getattr(self, "_boot_id", None))
                         )
@@ -648,7 +683,14 @@ class GatewayStartupMixin:
             return None
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
         # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
-        if candidates:
+        restart_candidates = [
+            entry for entry in candidates
+            if not (
+                isinstance(getattr(entry, "active_turn", None), dict)
+                and entry.active_turn.get("status") == "retry_wait"
+            )
+        ]
+        if restart_candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
@@ -657,6 +699,58 @@ class GatewayStartupMixin:
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
+
+    def _schedule_retryable_turn_wakeup(self, session_key: str, turn_id: str) -> bool:
+        """Arm one delayed call into the existing resume scheduler for an exact attempt."""
+        try:
+            entry = self.session_store._entries.get(session_key)
+            record = getattr(entry, "active_turn", None)
+            if (
+                entry is None or entry.suspended or not isinstance(record, dict)
+                or record.get("turn_id") != turn_id or record.get("status") != "retry_wait"
+                or self.session_store.recovery_is_quarantined(session_key, record)
+            ):
+                return False
+            resume_count = record.get("resume_count")
+            if type(resume_count) is not int:
+                return False
+            not_before = datetime.fromisoformat(str(record.get("retry_not_before") or ""))
+            delay = max(0.0, (not_before - datetime.now()).total_seconds())
+        except (TypeError, ValueError):
+            delay = 0.0
+            resume_count = record.get("resume_count", 0) if isinstance(record, dict) else 0
+
+        wakeups = getattr(self, "_retryable_turn_wakeups", None)
+        if wakeups is None:
+            wakeups = self._retryable_turn_wakeups = {}
+        wait_identity = self.session_store._attempt_identity(record)
+        key = (session_key, *wait_identity)
+        current = wakeups.get(key)
+        if current is not None and not current.done():
+            return False
+
+        async def _wake() -> None:
+            try:
+                if delay:
+                    await asyncio.sleep(delay)
+                latest = self.session_store._entries.get(session_key)
+                latest_record = getattr(latest, "active_turn", None)
+                if (
+                    latest is None or latest.suspended or not isinstance(latest_record, dict)
+                    or latest_record.get("turn_id") != turn_id
+                    or latest_record.get("resume_count") != resume_count
+                    or latest_record.get("status") != "retry_wait"
+                    or self.session_store._attempt_identity(latest_record) != wait_identity
+                    or self.session_store.recovery_is_quarantined(session_key, latest_record)
+                ):
+                    return
+                platform = latest.origin.platform if latest.origin is not None else None
+                self._schedule_resume_pending_sessions(platform=platform)
+            finally:
+                wakeups.pop(key, None)
+
+        wakeups[key] = self._retain_background_task(asyncio.create_task(_wake()))
+        return True
 
     def _resume_owner_authorized(self, session_key: str, source) -> bool:
         """Validate the session owner against the CURRENT allowlist: a session created before the
@@ -685,7 +779,7 @@ class GatewayStartupMixin:
             with self.session_store._lock:
                 self.session_store._ensure_loaded_locked()
                 candidates = [
-                    (entry.session_key, entry.active_turn.get("turn_id"))
+                    (entry.session_key, entry.active_turn.get("turn_id"), entry.active_turn.get("resume_count"))
                     for entry in self.session_store._entries.values()
                     if isinstance(entry.active_turn, dict) and entry.active_turn.get("turn_id")
                 ]
@@ -693,12 +787,16 @@ class GatewayStartupMixin:
             logger.warning("Could not enumerate active turns for delivery reconciliation", exc_info=True)
             return 0
         retired = 0
-        for session_key, turn_id in candidates:
+        for session_key, turn_id, resume_count in candidates:
             try:
                 if not await asyncio.to_thread(has_turn_obligation, session_key, turn_id):
                     continue
-                if await self.async_session_store.finish_active_turn(session_key, turn_id):
-                    await self.async_session_store.clear_resume_pending(session_key)
+                if await self.async_session_store.finish_active_turn(
+                    session_key, turn_id, expected_resume_count=resume_count,
+                ):
+                    await self.async_session_store.clear_resume_pending(
+                        session_key, expected_turn_id=turn_id,
+                    )
                     retired += 1
             except Exception:
                 logger.warning("Could not reconcile answered turn for %s", session_key, exc_info=True)
@@ -724,24 +822,109 @@ class GatewayStartupMixin:
                 try:
                     from gateway.delivery_ledger import has_turn_obligation
                     if has_turn_obligation(entry.session_key, record.get("turn_id")):
-                        if self.session_store.finish_active_turn(entry.session_key, record.get("turn_id")):
+                        if self.session_store.finish_active_turn(
+                            entry.session_key, record.get("turn_id"),
+                            expected_resume_count=record.get("resume_count"),
+                        ):
                             self.session_store.clear_resume_pending(entry.session_key)
                         continue
                 except Exception:
                     logger.warning("Skipping auto-resume for %s: delivery ledger unavailable",
                                    entry.session_key, exc_info=True)
                     continue
-                stamp = record.get("interrupted_at") or record.get("started_at")
+                if record.get("process_followup"):
+                    from tools.process_registry_followups import require_reconciliation
+                    marker = record["process_followup"]
+                    require_reconciliation(marker["execution_id"], marker["token"])
+                    self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
+                    self.session_store.clear_resume_pending(entry.session_key)
+                    # No durable answer: effects are uncertain, so never replay the model turn.
+                    continue
+                stamp = record.get("failed_at") or record.get("interrupted_at") or record.get("started_at")
                 if not _is_fresh_gateway_interruption(stamp, window_secs=window):
                     self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
                     self.session_store.clear_resume_pending(entry.session_key)
                     continue
                 prior_resumes = record.get("resume_count", 0)
-                if prior_resumes >= _MAX_SAME_TURN_RESUMES:
-                    self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
+                replacing_queued = (record.get("status") == "resuming"
+                                    and record.get("dispatch_state") == "queued")
+                if prior_resumes > _MAX_SAME_TURN_RESUMES or (
+                    prior_resumes == _MAX_SAME_TURN_RESUMES and not replacing_queued
+                ):
+                    self.session_store.mark_active_turn_recovery(
+                        entry.session_key,
+                        record.get("turn_id"),
+                        expected_resume_count=prior_resumes,
+                        expected_identity=record,
+                        status="blocked",
+                        failure_reason=str(record.get("failure_reason") or "retry_exhausted"),
+                        blocked_reason="retry_cap",
+                    )
                     self.session_store.clear_resume_pending(entry.session_key)
                     logger.warning("Abandoning %s after %d same-turn resume attempts", entry.session_key, prior_resumes)
                     continue
+                failure_reason = str(record.get("failure_reason") or "interrupted_retry")
+
+                def _block(reason: str) -> None:
+                    self.session_store.mark_active_turn_recovery(
+                        entry.session_key,
+                        record.get("turn_id"),
+                        expected_resume_count=prior_resumes,
+                        expected_identity=record,
+                        status="blocked",
+                        failure_reason=failure_reason,
+                        blocked_reason=reason,
+                    )
+
+                if (type(record.get("recovery_version")) is not int or record.get("recovery_version") != 1):
+                    _block("legacy_missing_proof")
+                    continue
+                status = record.get("status")
+                dispatch_state = record.get("dispatch_state")
+                checkpoint = record.get("checkpoint")
+                if status in {"running", "interrupted"}:
+                    _block("unsealed_attempt")
+                    continue
+                if status == "resuming" and dispatch_state not in {"queued", "executing"}:
+                    _block("malformed_dispatch_state")
+                    continue
+                if status == "resuming" and dispatch_state == "executing" and (
+                    not isinstance(checkpoint, dict)
+                    or checkpoint.get("resume_count") != prior_resumes
+                ):
+                    _block("unsealed_attempt")
+                    continue
+                if status in {"retry_wait", "resuming"} and not isinstance(checkpoint, dict):
+                    _block("missing_evidence_checkpoint")
+                    continue
+                if status == "retry_wait" and checkpoint.get("resume_count") != prior_resumes:
+                    _block("checkpoint_attempt_mismatch")
+                    continue
+                try:
+                    from gateway.turn_recovery import failed_turn_recovery
+                    evidence = self.session_store.load_turn_recovery_evidence(record)
+                    safety = failed_turn_recovery({
+                        "failed": True,
+                        "failure_retryable": True,
+                        "failure_reason": failure_reason,
+                    }, evidence=evidence)
+                except Exception as exc:
+                    reason = getattr(exc, "reason", "evidence_store_unavailable")
+                    logger.warning("Cannot prove interrupted retry safety for %s", entry.session_key,
+                                   exc_info=True)
+                    _block(reason)
+                    continue
+                if safety is None or safety["status"] == "blocked":
+                    _block((safety or {}).get("blocked_reason", "missing_replay_history"))
+                    continue
+                if record.get("status") == "retry_wait":
+                    try:
+                        not_before = datetime.fromisoformat(str(record.get("retry_not_before") or ""))
+                    except (TypeError, ValueError):
+                        not_before = now
+                    if not_before > now:
+                        self._schedule_retryable_turn_wakeup(entry.session_key, record.get("turn_id"))
+                        continue
             else:
                 marker = entry.last_resume_marked_at or entry.updated_at
                 if marker is not None and (now - marker).total_seconds() > window:
@@ -757,16 +940,43 @@ class GatewayStartupMixin:
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
+            expected_session_id = entry.session_id
+            expected_turn_id = record.get("turn_id") if record is not None else None
+            expected_resume_count = record.get("resume_count") if record is not None else None
+            expected_status = record.get("status") if record is not None else None
             if not self._resume_owner_authorized(entry.session_key, source):
+                if record is not None and record.get("status") == "retry_wait":
+                    self.session_store.mark_active_turn_recovery(
+                        entry.session_key,
+                        record.get("turn_id"),
+                        expected_resume_count=record.get("resume_count", 0),
+                        expected_identity=record,
+                        status="blocked",
+                        failure_reason=str(record.get("failure_reason") or "authorization_changed"),
+                        blocked_reason="authorization_unavailable",
+                    )
                 continue
             turn_id = record["turn_id"] if record is not None else (
                 f"{entry.session_id}:{entry.session_id}:{uuid.uuid4().hex[:8]}"
             )
-            resume_count = (record["resume_count"] if record is not None else 0) + 1
+            replacing_queued = bool(
+                record is not None
+                and record.get("status") == "resuming"
+                and record.get("dispatch_state") == "queued"
+            )
+            resume_count = (
+                record["resume_count"] if replacing_queued
+                else (record["resume_count"] if record is not None else 0) + 1
+            )
             try:
-                recorded = self.session_store.begin_active_turn(
+                recorded = self.session_store.claim_resume_active_turn(
                     entry.session_key, turn_id, getattr(self, "_boot_id", "unknown-boot"),
                     resume_count=resume_count,
+                    expected_session_id=expected_session_id,
+                    expected_turn_id=expected_turn_id,
+                    expected_resume_count=expected_resume_count,
+                    expected_status=expected_status,
+                    expected_identity=record,
                 )
             except Exception:
                 logger.warning("Could not claim same-turn resume for %s", entry.session_key, exc_info=True)
@@ -775,16 +985,33 @@ class GatewayStartupMixin:
                 continue
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
+            # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
+            claimed_record = entry.active_turn
+            marker = {
+                key: claimed_record.get(key) for key in (
+                    "recovery_version", "turn_id", "origin_session_id",
+                    "execution_session_id", "origin_owner", "boot_id",
+                    "dispatch_token", "resume_count",
+                )
+            }
+            event = MessageEvent(
+                text="", message_type=MessageType.TEXT, source=source, internal=True,
+                metadata={
+                    "gateway_session_key": entry.session_key,
+                    "gateway_session_id": entry.session_id,
+                    "gateway_session_strict": True,
+                },
+            )
+            # Only the versioned M1 path is a fenced same-turn replay. A legacy
+            # ``resume_pending`` wake with no active-turn record retains its existing
+            # recovery-note behavior and must not be presented as a malformed marker.
+            if record is not None:
+                event._hermes_turn_resume = marker
             _resume_state = self._session_state(entry.session_key)
             _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _resume_state.turn.event = event
             _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
-            # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
-            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
-            event._hermes_turn_resume = {
-                "turn_id": turn_id, "resume_count": resume_count,
-                "record_backed": record is not None,
-            }
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )

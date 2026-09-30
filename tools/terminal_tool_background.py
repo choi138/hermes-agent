@@ -87,12 +87,14 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty):
+           session_key, effective_pty, notify_on_complete=False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
+    if env_type == "ssh":
+        common["notify_on_complete"] = notify_on_complete
     return process_registry.spawn_via_env(env=env, **common)
 
 
@@ -158,14 +160,19 @@ def spawn_background_process(
     effective_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
     )
+    proc_session = None
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty,
+            effective_pty=effective_pty, notify_on_complete=notify_on_complete,
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
+        if proc_session.remote_root and proc_session.pid is None:
+            result_data.update(
+                output="Background dispatch is unconfirmed. Do not rerun; poll this session_id to reconcile.",
+                dispatch_unconfirmed=True, exit_code=None, error="dispatch_unconfirmed")
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
@@ -199,8 +206,30 @@ def spawn_background_process(
         if watch_patterns:
             proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
+        if getattr(proc_session, "remote_root", ""):
+            from tools.process_registry_followups import enabled, reserve
+            # A fast remote job can finish before notification routing is attached.
+            with proc_session._finalize_lock:
+                if proc_session.exited and enabled(proc_session):
+                    reserve(proc_session)
+            process_registry._write_checkpoint(strict=True)
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
+        if proc_session is not None:
+            # Spawn already returned an execution identity. A later setup/storage
+            # failure must not invite retrying a command with external effects.
+            warning = _redact_terminal_error_text(f"Post-launch setup failed: {e}")
+            logger.warning("Background execution %s: %s", proc_session.id, warning)
+            return json.dumps({
+                "output": (
+                    "Background execution is already registered. Do not rerun the command; "
+                    "use process_manage with action=poll and this session_id to check it. "
+                    "Completion notifications or restart recovery may be incomplete."),
+                "session_id": proc_session.id, "pid": proc_session.pid,
+                "exit_code": None if proc_session.remote_root and proc_session.pid is None else 0,
+                "error": "dispatch_unconfirmed" if proc_session.remote_root and proc_session.pid is None else None,
+                "setup_incomplete": True, "warning": warning,
+            }, ensure_ascii=False)
         return json.dumps({
             "output": "", "exit_code": -1,
             "error": _redact_terminal_error_text(f"Failed to start background process: {e}"),

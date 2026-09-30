@@ -625,8 +625,12 @@ class TestGatewayRedeliverySweep:
         _record()
         _orphan("ob-1")
         hang = asyncio.Event()
+        send_started = asyncio.Event()
+        cleared_at_send = []
 
         async def hanging_send(**_kwargs):
+            cleared_at_send.append(runner._async_session_store.clear_resume_pending.await_count)
+            send_started.set()
             await hang.wait()
             return MagicMock(success=True, error="")
 
@@ -635,19 +639,17 @@ class TestGatewayRedeliverySweep:
         runner = self._runner(adapter)
         task = asyncio.create_task(runner._redeliver_pending_obligations())
 
-        deadline = asyncio.get_running_loop().time() + 2
-        while runner._async_session_store.clear_resume_pending.await_count == 0:
-            if asyncio.get_running_loop().time() >= deadline:
-                raise AssertionError("resume_pending was not cleared before send")
-            await asyncio.sleep(0)
-
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
-        )
-        assert not task.done()
-
-        hang.set()
-        assert await task == 1
+        try:
+            await asyncio.wait_for(send_started.wait(), 30)
+            assert cleared_at_send == [1], "resume_pending was not cleared before send"
+            runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+                "agent:main:slack:channel:C1"
+            )
+            assert not task.done()
+        finally:
+            hang.set()
+            delivered = await asyncio.wait_for(task, 30)
+        assert delivered == 1
 
 
 class TestAttemptsOnlySpentOnRealSends:

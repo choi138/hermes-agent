@@ -1909,6 +1909,82 @@ class GatewayTurnMixin:
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
 
+    async def _hmwa_settle_retryable_turn(
+        self, *, event, session_entry, session_key, agent_result,
+    ) -> None:
+        """Prove persisted raw evidence before publishing any automatic retry verdict."""
+        if not (
+            isinstance(agent_result, dict)
+            and agent_result.get("failed") is True
+            and agent_result.get("interrupted") is not True
+            and agent_result.get("failure_retryable") is True
+            and isinstance(agent_result.get("failure_reason"), str)
+            and agent_result["failure_reason"].strip()
+        ):
+            return
+
+        from gateway.session_transcript import RecoveryEvidenceError
+        from gateway.turn_recovery import BLOCKED, failed_turn_recovery, reconcile_result_evidence
+
+        failure_reason = agent_result["failure_reason"]
+        marker = getattr(event, "_hermes_turn_resume", None)
+        expected_count = marker.get("resume_count") if isinstance(marker, dict) else 0
+        dispatch_token = marker.get("dispatch_token") if isinstance(marker, dict) else None
+        try:
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            record = dict(entry.active_turn) if entry and isinstance(entry.active_turn, dict) else None
+            if not isinstance(record, dict) or (type(record.get("recovery_version")) is not int or record.get("recovery_version") != 1):
+                raise RecoveryEvidenceError("legacy_missing_proof")
+            if (
+                record.get("turn_id") != getattr(event, "_gateway_active_turn_id", None)
+                or record.get("resume_count") != expected_count
+            ):
+                raise RecoveryEvidenceError("attempt_identity_changed")
+            if record.get("execution_session_id") != session_entry.session_id:
+                raise RecoveryEvidenceError("rotated_origin")
+            if isinstance(marker, dict) and any(
+                record.get(key) != marker.get(key) for key in (
+                    "recovery_version", "origin_session_id", "execution_session_id", "origin_owner",
+                    "turn_id", "resume_count", "boot_id", "dispatch_token",
+                )
+            ):
+                event._gateway_response_kind = "unsettled_failure"
+                return
+            event._gateway_recovery_identity = dict(record)
+            evidence = await self.async_session_store.load_turn_recovery_evidence(record)
+            recovery = failed_turn_recovery(agent_result, evidence=evidence)
+            reconcile_result_evidence(agent_result, evidence)
+            checkpoint = dict(evidence["checkpoint"])
+            checkpoint["resume_count"] = expected_count
+            sealed = await self.async_session_store.seal_active_turn_evidence(
+                session_key,
+                record["turn_id"],
+                expected_resume_count=expected_count,
+                origin_row_id=evidence["origin_row_id"],
+                checkpoint=checkpoint,
+                expected_dispatch_token=dispatch_token,
+                expected_identity=record,
+            )
+            if not sealed:
+                event._gateway_response_kind = "unsettled_failure"
+                logger.warning("Could not seal retry evidence for %s", session_key)
+                return
+            evidence["checkpoint"] = checkpoint
+        except RecoveryEvidenceError as exc:
+            recovery = {
+                "status": BLOCKED,
+                "failure_reason": failure_reason,
+                "blocked_reason": exc.reason,
+            }
+        except Exception:
+            event._gateway_response_kind = "unsettled_failure"
+            logger.warning("Could not prove retry evidence for %s", session_key, exc_info=True)
+            return
+
+        if recovery is not None:
+            event._gateway_turn_recovery = recovery
+            event._gateway_response_kind = "failure_notice"
+
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -2152,6 +2228,11 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        marker = getattr(event, "_hermes_turn_resume", None)
+        if marker is not None and not await self.async_session_store.resume_owner_matches(
+            session_key, marker, phase="queued",
+        ):
+            return None
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2194,6 +2275,18 @@ class GatewayTurnMixin:
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
+            if marker is not None:
+                try:
+                    consumed = await self.async_session_store.consume_resume_dispatch(
+                        session_key, marker,
+                    )
+                except Exception:
+                    logger.warning("Could not consume recovery dispatch for %s", session_key,
+                                   exc_info=True)
+                    return None
+                if not consumed:
+                    return None
+                event._gateway_resume_dispatch_consumed = True
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
@@ -2217,9 +2310,35 @@ class GatewayTurnMixin:
                     mention_inbox_execution_observer=execution_observer,
                     event=event,
                 )
+                if getattr(event, "_gateway_resume_dispatch_stale", False):
+                    return None
+                if marker is not None:
+                    try:
+                        still_owned = await self.async_session_store.resume_owner_matches(
+                            session_key, marker, phase="executing",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not revalidate completed recovery dispatch for %s",
+                            session_key,
+                            exc_info=True,
+                        )
+                        still_owned = False
+                    if not still_owned:
+                        event._gateway_resume_dispatch_stale = True
+                        return None
                 if isinstance(agent_result, dict):
                     event._gateway_turn_result_seen = True
                     event._gateway_turn_result_interrupted = bool(agent_result.get("interrupted"))
+                    event._gateway_response_kind = (
+                        "interruption_notice" if agent_result.get("interrupted")
+                        else "terminal_failure" if agent_result.get("failed")
+                        or agent_result.get("completed") is False else "final"
+                    )
+                    _resume = getattr(event, "_hermes_turn_resume", None)
+                    event._gateway_active_turn_expected_resume_count = (
+                        _resume.get("resume_count", 0) if isinstance(_resume, dict) else 0
+                    )
             except BaseException:
                 if execution_observer is not None:
                     try:
@@ -2285,6 +2404,12 @@ class GatewayTurnMixin:
                 response=response, agent_failed_early=agent_failed_early,
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
+            )
+            await self._hmwa_settle_retryable_turn(
+                event=event,
+                session_entry=session_entry,
+                session_key=session_key,
+                agent_result=agent_result,
             )
             with self._profile_scope_for_source(source):
                 hard_masked = await self._handle_gateway_hard_refusal(
@@ -3725,6 +3850,26 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
+    def _promote_queued_event_preserving_followups(self, session_key, adapter, pending_event):
+        # Move the overflow into the adapter's drain chain. A stale recovery event can
+        # return before entering the runner, so it must not strand the remaining FIFO.
+        overflow = self._overflow_queue(session_key)
+        slot = getattr(adapter, "_pending_messages", None)
+        if not overflow or slot is None:
+            return pending_event
+        if pending_event is None:
+            pending_event = overflow.pop(0)
+        if overflow:
+            head = slot.get(session_key)
+            if head is None:
+                head = overflow.pop(0)
+                slot[session_key] = head
+            following = list(getattr(head, "_gateway_pending_followups", []))
+            following.extend(overflow)
+            head._gateway_pending_followups = following
+            overflow.clear()
+        return pending_event
+
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
     ) -> Tuple[Any, Optional[str]]:
@@ -3737,10 +3882,28 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            pending_event = _dequeue_pending_event(adapter, session_key)
-            # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
-            # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
-            pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            while True:
+                pending_event = _dequeue_pending_event(adapter, session_key)
+                pending_event = self._promote_queued_event_preserving_followups(
+                    session_key, adapter, pending_event,
+                )
+                if pending_event is None or not hasattr(pending_event, "_hermes_turn_resume"):
+                    break
+                if await self.async_session_store.resume_owner_matches(
+                    session_key, pending_event._hermes_turn_resume, phase="queued",
+                ):
+                    # A recovery ticket must enter through adapter/runner admission and
+                    # consume, never the ordinary recursive follow-up worker shortcut.
+                    successor = adapter._pending_messages.get(session_key)
+                    if successor is not None:
+                        pending_event._gateway_pending_followups = [successor, *getattr(
+                            successor, "_gateway_pending_followups", [],
+                        )]
+                        if hasattr(successor, "_gateway_pending_followups"):
+                            delattr(successor, "_gateway_pending_followups")
+                    adapter._pending_messages[session_key] = pending_event
+                    return None, None
+                # A stale ticket is silent; continue draining its human successor.
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -3989,6 +4152,7 @@ class GatewayTurnMixin:
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                event=pending_event,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
