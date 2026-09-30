@@ -121,7 +121,7 @@ def main():
                 override_source = "legacy_override"
                 if selection_mode == "pinned":
                     pinned_effort = legacy_selection.metadata()["effort"]
-                    if model_override is None:
+                    if model_override is None and pinned_model is None:
                         pinned_model = "gpt-6.1-sol"
                 else:
                     effort_override = legacy_selection.metadata()["effort"]

@@ -282,6 +282,7 @@ def test_public_closed_snapshot_frozen_pending_drain_restart(tmp_path, terminal)
     from agent.delegation_progress import Manifest, Progress, render
     from agent.delegation_progress_policy import stage
     p = lane(tmp_path)
+    p.manifest = replace(p.manifest, receipt_path=p.manifest.artifact_root / 'status.json')
     manifest = tmp_path / 'manifest.json'
     def save_manifest():
         _atomic(manifest, {k: str(v) if isinstance(v, Path) else v for k, v in vars(p.manifest).items()})
@@ -303,6 +304,7 @@ def test_public_closed_snapshot_frozen_pending_drain_restart(tmp_path, terminal)
         (p.manifest.artifact_root / 'gate.log').write_text(result.stdout + result.stderr)
         cli('record-validation', '--ticket', ticket['ticket'], '--evidence-ref', 'gate.log',
             '--exit-code', '0', '--gate', 'pytest')
+        p.manifest.receipt_path.write_text(json.dumps({'status': 'cli_completed', 'exit_code': 0}))
     else:
         cli('set-stage', '--stage', 'stopped')
     # Existing policy waits for the preceding card before queuing final output.

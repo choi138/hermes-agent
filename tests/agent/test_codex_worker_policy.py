@@ -119,6 +119,16 @@ def test_prerequisites_do_not_spawn(flag, action, next_action):
     assert decision.next_action == next_action
 
 
+@pytest.mark.parametrize("attempt,max_attempts", [(2, 2), (3, 3)])
+def test_last_permitted_attempt_can_escalate(attempt, max_attempts):
+    decision = decide_worker(PolicyInput(
+        failure_kind="shallow_reasoning", attempt=attempt, max_attempts=max_attempts,
+        prior_model="gpt-6.1-sol", prior_effort="medium",
+    ))
+    assert decision.action == "spawn"
+    assert (decision.model, decision.effort) == ("gpt-6.1-sol", "high")
+
+
 def test_retry_adaptation_is_bounded_and_carries_handoff_refs():
     shallow = decide_worker(PolicyInput(
         task_class="general", failure_kind="shallow_reasoning", attempt=2,

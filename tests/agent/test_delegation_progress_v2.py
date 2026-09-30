@@ -98,9 +98,11 @@ def validation(p):
 
 def test_parent_pass_worker_unknown_final_card_then_notice_and_drain(tmp_path):
     p = lane(tmp_path)
+    p.manifest = replace(p.manifest, receipt_path=p.manifest.artifact_root / 'status.json')
     p.tick(now=0)
     drain(p)
     validation(p)
+    p.manifest.receipt_path.write_text(json.dumps({'status': 'cli_completed', 'exit_code': 0}))
     result = p.tick(now=1)
     assert result['snapshot']['validation']['applicable']
     assert '레나 검증 3개 통과' in render(result['snapshot'])
@@ -112,6 +114,29 @@ def test_parent_pass_worker_unknown_final_card_then_notice_and_drain(tmp_path):
     drain(p)
     assert p.tick(now=10000)['stopped']
     assert not p.tick(now=20000)['queued']
+
+
+@pytest.mark.parametrize('next_status', ['running', 'cli_failed', 'cli_completed'])
+def test_parent_pass_does_not_close_while_worker_is_running(tmp_path, next_status):
+    from agent.delegation_progress_policy import stage
+    p = lane(tmp_path)
+    p.manifest = replace(p.manifest, receipt_path=p.manifest.artifact_root / 'status.json')
+    p.tick(now=0)
+    drain(p)
+    validation(p)
+    running = p.tick(now=1)
+    assert running['snapshot']['validation']['applicable']
+    assert stage(running['snapshot'])[0] != 'final_verified'
+    assert not p._load().get('closing')
+    drain(p)
+    if next_status != 'running':
+        p.manifest.receipt_path.write_text(json.dumps({
+            'status': next_status, 'exit_code': 0 if next_status == 'cli_completed' else 1}))
+    result = p.tick(now=2)
+    assert result['snapshot']['exit_status'] == next_status
+    assert stage(result['snapshot'])[0] == (
+        'final_verified' if next_status == 'cli_completed' else
+        'cli_failed' if next_status == 'cli_failed' else 'observing')
 
 
 @pytest.mark.parametrize('field', ['run_id', 'scope', 'code_fingerprint', 'evidence_digest'])

@@ -149,7 +149,7 @@ def test_cli_exit_immediate_continues_review_and_concurrent_bridge_fenced(lane, 
         duplicate = subprocess.run(args, capture_output=True, text=True, timeout=10)
         assert duplicate.returncode == 74
         (artifacts / 'status.json').write_text('{"status":"cli_completed","exit_code":0}')
-        wait_for(lambda: p._load()['delivered'] is not None)
+        wait_for(lambda: f'{p.manifest.run_id}:cli_completed' in p._load().get('reported_events', []))
         assert child.poll() is None
         set_stage(manifest, 'stopped')
         stdout, stderr = child.communicate(timeout=10)

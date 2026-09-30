@@ -30,6 +30,16 @@ def run_cli(args, *extra):
     )
 
 
+def test_legacy_pinned_effort_preserves_explicit_model_pin(cli_case):
+    _, _, args = cli_case
+    result = run_cli(args, "--dry-run", "--selection", "pinned",
+                     "--pinned-tier", "light", "--pinned-model", "gpt-6-luna")
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt['argv'][receipt['argv'].index('-m') + 1] == 'gpt-6-luna'
+    assert receipt['policy']['selected']['model'] == 'gpt-6-luna'
+
+
 def test_default_and_all_task_classes_reach_real_dry_run(cli_case):
     _, output, args = cli_case
     default = run_cli(args, "--dry-run")

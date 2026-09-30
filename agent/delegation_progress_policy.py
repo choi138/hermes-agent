@@ -30,7 +30,7 @@ def stage(snapshot):
         return status, '실행 중단'
     if status not in ('running', 'needs_user', 'cli_completed'):
         return status, '실행 실패'
-    if snapshot.get('validation', {}).get('applicable'):
+    if status == 'cli_completed' and snapshot.get('validation', {}).get('applicable'):
         return 'final_verified', '최종 검증 완료'
     if status == 'needs_user':
         return 'needs_user', '사용자 확인 대기'

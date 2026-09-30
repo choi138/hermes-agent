@@ -250,7 +250,9 @@ def decide_worker(values: PolicyInput) -> WorkerDecision:
             return _blocked(values, effective_class, model, effort,
                             "Retry cannot repair the environment", "repair_environment",
                             source=source)
-        if values.attempt >= values.max_attempts or (model == MODELS[-1] and effort == EFFORTS[-1]):
+        # `attempt` names the run being planned. Validation already rejects runs
+        # beyond max_attempts; the last permitted run still gets an adaptation.
+        if model == MODELS[-1] and effort == EFFORTS[-1]:
             return _decision(values, action="stop_replan", effective_class=effective_class,
                              model=model, effort=effort,
                              reason="The bounded attempt budget or hardest configuration is exhausted",
