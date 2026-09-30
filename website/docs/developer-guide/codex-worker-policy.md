@@ -11,19 +11,19 @@ metadata; the worker does not classify task prose and does not infer authority
 from the SPEC. The policy never changes the approved root, working directory,
 sandbox, timeout, or output bounds.
 
-Policy version `2026-09-21.1` starts with these pairs:
+Policy version `2026-09-30.1` starts with these pairs:
 
 | `--task-class` | Model | Effort | Intended use |
 | --- | --- | --- | --- |
-| `mechanical` | `gpt-5.6-luna` | `low` | Exact repeat changes |
-| `bounded` | `gpt-5.6-luna` | `medium` | Fixed narrow work or a known cause |
-| `general` | `gpt-5.6-terra` | `medium` | Ordinary development; the default |
-| `integration` | `gpt-5.6-terra` | `high` | Known direction with multi-layer verification |
-| `complex` | `gpt-5.6-sol` | `high` | Ambiguous design, judgment, or polish |
-| `frontier` | `gpt-6-astra` | `high` | Hardest multi-system end-to-end work |
+| `mechanical` | `gpt-6-luna` | `low` | Exact repeat changes |
+| `bounded` | `gpt-6-luna` | `medium` | Fixed narrow work or a known cause |
+| `general` | `gpt-6.1-sol` | `medium` | Ordinary development; the default |
+| `integration` | `gpt-6.1-sol` | `high` | Known direction with multi-layer verification |
+| `complex` | `gpt-6.1-sol` | `high` | Ambiguous design, judgment, or polish |
+| `frontier` | `gpt-6.1-sol` | `xhigh` | Hardest multi-system end-to-end work; requires `--deeper-analysis-evidence` |
 
 `--risk high` and `--ambiguity ambiguous` floor a selection at Sol/high.
-`--ambiguity unknown` floors cheap ordinary work at Terra/medium. These floors
+`--ambiguity unknown` floors cheap ordinary work at Sol/medium. These floors
 also apply after `--phase implementation --contract-resolved` downshifts a
 resolved `complex` or `frontier` implementation phase to `general`; select
 `--implementation-class bounded` only when the remaining scope is narrow. A short
@@ -52,17 +52,17 @@ Use `--model` and `--effort` for audited caller overrides. A caller-selected
 model is recorded as `caller_override`, never as a user pin. The approved
 Codex values are:
 
-- Models: `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-6-astra`
+- Models: `gpt-6-luna`, `gpt-6.1-sol` (`gpt-6-astra` and the `gpt-5.6-*` models were removed on 2026-09-30)
 - Efforts: `low`, `medium`, `high`, `xhigh`, `max`
 
-An Astra/xhigh selection requires `--deeper-analysis-evidence`. A direct max
+An xhigh selection (including the `frontier` class) requires `--deeper-analysis-evidence`. A direct max
 selection requires that evidence plus `--hard-judgment`,
 `--high-failure-cost`, and `--choice-reason`. Direct selection is allowed; no
 compulsory model ladder is imposed:
 
 ```bash
 python scripts/run_codex_task.py ... \
-  --model gpt-6-astra --effort max \
+  --model gpt-6.1-sol --effort max \
   --deeper-analysis-evidence "high effort missed a cross-system invariant" \
   --hard-judgment --high-failure-cost \
   --choice-reason "failure would corrupt tenant data" \
@@ -93,7 +93,7 @@ artifact. `--dry-run` returns the next decision without executing it:
 ```bash
 python scripts/run_codex_task.py ... --dry-run \
   --failure-kind approach_failure --attempt 2 --max-attempts 3 \
-  --prior-model gpt-5.6-terra --prior-effort medium \
+  --prior-model gpt-6-luna --prior-effort medium \
   --prior-action implement \
   --handoff-ref SPEC.md --handoff-ref tests/failing-output.txt
 ```
@@ -102,7 +102,7 @@ python scripts/run_codex_task.py ... --dry-run \
 `shallow_reasoning` increases effort. `misunderstanding` and
 `approach_failure` upgrade the model. `repeated_same_defect` stops unless
 `--correction-evidence` identifies an evidence-informed correction; it never
-blindly retries the same pair. The attempt bound or an exhausted Astra/max
+blindly retries the same pair. The attempt bound or an exhausted Sol/max
 pair returns `stop_replan`. The executor remains single-run, not a retry daemon.
 
 The coordinator is responsible for deciding whether a phase split is worth

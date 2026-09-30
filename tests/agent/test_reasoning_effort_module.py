@@ -173,6 +173,21 @@ class TestCodexVocabulary:
         assert clamp_effort("max", supported) == "max"
         assert clamp_effort("ultra", supported) == "max"
 
+    def test_gpt6_sol_and_luna_vocabularies(self):
+        """OpenAI model pages (2026-09-30): gpt-6.1-sol accepts low..max without
+        'none'; gpt-6-luna accepts none..max."""
+        from agent.reasoning_effort import (
+            CODEX_GPT61_SOL_EFFORTS,
+            CODEX_GPT6_LUNA_EFFORTS,
+            codex_supported_efforts,
+        )
+
+        assert codex_supported_efforts("gpt-6.1-sol") is CODEX_GPT61_SOL_EFFORTS
+        assert codex_supported_efforts("gpt-6.1-sol-2026-09-29") is CODEX_GPT61_SOL_EFFORTS
+        assert codex_supported_efforts("gpt-6-luna") is CODEX_GPT6_LUNA_EFFORTS
+        assert "max" in CODEX_GPT61_SOL_EFFORTS and "none" not in CODEX_GPT61_SOL_EFFORTS
+        assert "none" in CODEX_GPT6_LUNA_EFFORTS and "max" in CODEX_GPT6_LUNA_EFFORTS
+
 
 class TestRequestedEffort:
     def test_extracts_effort(self):

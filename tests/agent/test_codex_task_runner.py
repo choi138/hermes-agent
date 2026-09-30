@@ -78,7 +78,7 @@ def test_tiers_real_subprocess_serialization(inputs, tmp_path, tier, effort):
     observed = json.loads((run / "events.jsonl").read_text())
     assert observed["stdin"] == inputs["spec"].read_text()
     assert observed["cwd"] == str(tmp_path.resolve())
-    assert observed["argv"] == ["exec", "--ephemeral", "-m", "gpt-6-astra", "-c",
+    assert observed["argv"] == ["exec", "--ephemeral", "-m", "gpt-6.1-sol", "-c",
         f'model_reasoning_effort="{effort}"', "-s", "read-only", "-C", str(tmp_path.resolve()), "--json", "-"]
     assert json.dumps(parent) == before
     assert not (tmp_path / "INJECTED").exists()
@@ -251,7 +251,7 @@ def test_cli_help_dry_run_and_real_script_with_injected_process(inputs, tmp_path
     assert dry.returncode == 0
     dry_receipt = json.loads(dry.stdout)
     assert dry_receipt["argv"][0] == "codex"
-    assert dry_receipt["argv"][dry_receipt["argv"].index("-m") + 1] == "gpt-5.6-terra"
+    assert dry_receipt["argv"][dry_receipt["argv"].index("-m") + 1] == "gpt-6.1-sol"
     assert "Literal" not in dry.stdout
     assert list(inputs["output_dir"].iterdir()) == []
     # Python DI bootstrap executes the actual __main__ CLI and argparse, with

@@ -38,6 +38,10 @@ ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
 DAYBREAK_MODEL_IDS: frozenset[str] = frozenset(
     {"gpt-daybreak-blue-latest", "gpt-daybreak-blue-latest-900k"}
 )
+CODEX_GPT61_SOL_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+_GPT61_SOL_MODEL_RE = re.compile(r"gpt-6\.1-sol(?:-\d{4}-\d{2}-\d{2})?")
+CODEX_GPT6_LUNA_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+_GPT6_LUNA_MODEL_RE = re.compile(r"gpt-6-luna(?:-\d{4}-\d{2}-\d{2})?")
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
@@ -97,6 +101,10 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     if is_astra_model(model):
         return CODEX_ASTRA_EFFORTS
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if _GPT61_SOL_MODEL_RE.fullmatch(bare):
+        return CODEX_GPT61_SOL_EFFORTS
+    if _GPT6_LUNA_MODEL_RE.fullmatch(bare):
+        return CODEX_GPT6_LUNA_EFFORTS
     return (
         CODEX_GPT56_EFFORTS
         if "gpt-5.6" in bare or bare in DAYBREAK_MODEL_IDS

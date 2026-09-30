@@ -69,6 +69,12 @@ def _absolute_existing(value):
     return path.resolve(strict=True)
 
 
+CLAUDE_ADVISORS = ("opus",)
+# Per-run only: the advisor tool needs feature-flag fetching, which the user-level
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 turns off. Never edit settings.json.
+ADVISOR_SETTINGS = '{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":""}}'
+
+
 @dataclass(frozen=True)
 class TaskRequest:
     spec: Path
@@ -78,9 +84,10 @@ class TaskRequest:
     selection: WorkerSelection = field(default_factory=WorkerSelection)
     sandbox: str = "read-only"
     timeout: float = 600
-    model: str = "gpt-5.6-terra"
+    model: str = "gpt-6.1-sol"
     cli: str = "codex"
     policy_input: dict | None = None
+    advisor: str | None = None
 
     def __post_init__(self):
         if os.name != "posix":
@@ -91,6 +98,8 @@ class TaskRequest:
             raise ValueError("Unsupported sandbox")
         if self.cli not in ("codex", "claude"):
             raise ValueError("Unsupported CLI")
+        if self.advisor is not None and (self.cli != "claude" or self.advisor not in CLAUDE_ADVISORS):
+            raise ValueError("Advisor is supported only for the Claude CLI with an approved advisor model")
         if self.cli == "claude" and self.sandbox != "read-only":
             raise ValueError("Claude currently supports read-only tasks only")
         if (isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float))
@@ -121,7 +130,8 @@ class TaskRequest:
                     "--effort", self.selection.metadata()["effort"],
                     "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
                     "--allowedTools", "Read,Glob,Grep", "--strict-mcp-config",
-                    "--mcp-config", '{"mcpServers":{}}']
+                    "--mcp-config", '{"mcpServers":{}}',
+                    *(("--advisor", self.advisor, "--settings", ADVISOR_SETTINGS) if self.advisor else ())]
         return ["codex", "exec", "--ephemeral", "-m", self.model, "-c",
                 f'model_reasoning_effort="{self.selection.metadata()["effort"]}"',
                 "-s", self.sandbox, "-C", str(self.workdir), "--json", "-"]
