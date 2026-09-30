@@ -597,17 +597,82 @@ class SessionEntry:
         if not isinstance(token, str) or not token:
             # The pair is written atomically; a partial/malformed pair must not auto-resume.
             token = started_at = None
-        turn_record = data.get("active_turn")
-        if not (
+        raw_turn_record = data.get("active_turn")
+        turn_record = raw_turn_record
+        basic_turn_valid = (
             isinstance(turn_record, dict)
             and isinstance(turn_record.get("turn_id"), str) and turn_record["turn_id"]
             and isinstance(turn_record.get("boot_id"), str) and turn_record["boot_id"]
-            and turn_record.get("status") in {"running", "interrupted", "resuming"}
+            and turn_record.get("status") in {
+                "running", "interrupted", "resuming", "retry_wait", "blocked",
+            }
             and _parse_iso(turn_record.get("started_at")) is not None
             and type(turn_record.get("resume_count")) is int
             and turn_record["resume_count"] >= 0
-        ):
-            turn_record = None
+        )
+        if not basic_turn_valid:
+            if isinstance(raw_turn_record, dict) and "recovery_version" in raw_turn_record:
+                # A malformed versioned record is evidence that M1 recovery was in flight.
+                # Preserve a non-runnable tombstone so ``resume_pending`` cannot reinterpret it
+                # as a legacy wake and bypass the proof gate.
+                fallback_sid = str(data.get("session_id") or "invalid-session")
+                turn_record = {
+                    **raw_turn_record,
+                    "turn_id": (
+                        raw_turn_record.get("turn_id")
+                        if isinstance(raw_turn_record.get("turn_id"), str)
+                        and raw_turn_record["turn_id"]
+                        else f"{fallback_sid}:{fallback_sid}:invalid-recovery"
+                    ),
+                    "boot_id": (
+                        raw_turn_record.get("boot_id")
+                        if isinstance(raw_turn_record.get("boot_id"), str)
+                        and raw_turn_record["boot_id"]
+                        else "invalid-recovery-record"
+                    ),
+                    "status": "blocked",
+                    "started_at": (
+                        raw_turn_record.get("started_at")
+                        if _parse_iso(raw_turn_record.get("started_at")) is not None
+                        else data.get("updated_at")
+                    ),
+                    "resume_count": (
+                        raw_turn_record.get("resume_count")
+                        if type(raw_turn_record.get("resume_count")) is int
+                        and raw_turn_record["resume_count"] >= 0
+                        else 0
+                    ),
+                    "blocked_reason": "invalid_recovery_record",
+                }
+            else:
+                turn_record = None
+        elif "recovery_version" in turn_record:
+            versioned_valid = (
+                type(turn_record.get("recovery_version")) is int and turn_record.get("recovery_version") == 1
+                and all(
+                    isinstance(turn_record.get(name), str) and turn_record[name]
+                    for name in ("origin_session_id", "execution_session_id", "origin_owner")
+                )
+                and (
+                    turn_record.get("origin_row_id") is None
+                    or type(turn_record.get("origin_row_id")) is int
+                    and turn_record["origin_row_id"] > 0
+                )
+                and (
+                    turn_record.get("status") != "resuming"
+                    or (
+                        isinstance(turn_record.get("dispatch_token"), str)
+                        and bool(turn_record["dispatch_token"])
+                        and turn_record.get("dispatch_state") in {"queued", "executing"}
+                    )
+                )
+            )
+            if not versioned_valid:
+                turn_record = {
+                    **turn_record,
+                    "status": "blocked",
+                    "blocked_reason": "invalid_recovery_record",
+                }
 
         session_key, session_id = data["session_key"], data["session_id"]
         # CWE-22: session_id becomes a filename (strict); session_key allows interior ``/``.

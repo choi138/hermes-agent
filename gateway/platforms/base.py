@@ -1705,6 +1705,19 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def pop_pending_message_event(pending_messages, session_key):
+    """Take one event, promoting the separately queued control/human successor."""
+    event = pending_messages.pop(session_key, None)
+    if event is not None:
+        following = getattr(event, "_gateway_pending_followups", [])
+        if following:
+            successor, *remaining = following
+            successor._gateway_pending_followups = remaining
+            pending_messages[session_key] = successor
+            delattr(event, "_gateway_pending_followups")
+    return event
+
+
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
@@ -1712,6 +1725,17 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     replace."""
     existing = pending_messages.get(session_key)
     if existing:
+        if (hasattr(existing, "_hermes_turn_resume") or hasattr(event, "_hermes_turn_resume")
+                or getattr(existing, "_gateway_pending_followups", None)):
+            following = list(getattr(existing, "_gateway_pending_followups", []))
+            # Duplicate adapter delivery may reuse the very same event object.
+            from copy import copy
+            queued = copy(event)
+            if hasattr(queued, "_gateway_pending_followups"):
+                delattr(queued, "_gateway_pending_followups")
+            following.append(queued)
+            existing._gateway_pending_followups = following
+            return
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -3828,6 +3852,24 @@ class BasePlatformAdapter(ABC):
             return False
         return True
 
+    async def _resume_dispatch_is_current(self, event: MessageEvent, session_key: str) -> bool:
+        """Validate a recovery control without allowing it to become ordinary blank input."""
+        if not hasattr(event, "_hermes_turn_resume"):
+            return True
+        marker = getattr(event, "_hermes_turn_resume", None)
+        store = getattr(self, "_session_store", None)
+        validator = getattr(store, "resume_owner_matches", None) if store is not None else None
+        if not callable(validator):
+            return False
+        try:
+            return bool(await asyncio.to_thread(
+                validator, session_key, marker, phase="queued",
+            ))
+        except Exception:
+            logger.warning("[%s] Recovery dispatch validation failed for %s", self.name, session_key,
+                           exc_info=True)
+            return False
+
     def _track_session_task(self, session_key: str, task: Any) -> bool:
         """Record ``task`` as the session owner and track it for shutdown; False when
         ``create_task`` was stubbed with an unhashable sentinel (tests) — the owner entry is left
@@ -3874,7 +3916,7 @@ class BasePlatformAdapter(ABC):
         """Tail of /stop, /new, /reset: release the command-scoped guard, then
         spawn a fresh processing task for any follow-up queued meanwhile."""
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = pop_pending_message_event(self._pending_messages, session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is not None:
             self._start_session_processing(pending_event, session_key)
@@ -3934,6 +3976,8 @@ class BasePlatformAdapter(ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            return
+        if not await self._resume_dispatch_is_current(event, session_key):
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
@@ -3998,7 +4042,9 @@ class BasePlatformAdapter(ABC):
                 logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
         # Without a runner FIFO, do not merge a wake into an occupied human slot
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
-        if event.internal and session_key in self._pending_messages:
+        if (event.internal and session_key in self._pending_messages
+                and not hasattr(event, "_hermes_turn_resume")
+                and not hasattr(self._pending_messages[session_key], "_hermes_turn_resume")):
             return
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
@@ -4093,6 +4139,14 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
+            response_kind = getattr(event, "_gateway_response_kind", None)
+            if response_kind is not None:
+                # Resumed attempts have no inbound message id; keep their notices
+                # distinct from one another and from any completed answer.
+                _ledger_id = (
+                    f"{_ledger_id or ''}:{getattr(event, '_gateway_active_turn_id', '')}:"
+                    f"{getattr(event, '_gateway_active_turn_expected_resume_count', 0)}:{response_kind}"
+                )
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
             await asyncio.to_thread(
@@ -4101,7 +4155,8 @@ class BasePlatformAdapter(ABC):
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
-                turn_id=getattr(event, "_gateway_active_turn_id", None))
+                turn_id=getattr(event, "_gateway_active_turn_id", None),
+                response_kind=response_kind)
             event._gateway_delivery_obligation_id = obligation_id
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
@@ -4364,7 +4419,7 @@ class BasePlatformAdapter(ABC):
         drop: re-queue it if another task already owns the session (drain handoff), else spawn the
         drain task and leave it the guard. Nothing pending: release the guard only if we still own
         it."""
-        late_pending = self._pending_messages.pop(session_key, None)
+        late_pending = pop_pending_message_event(self._pending_messages, session_key)
         current_task = asyncio.current_task()
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
@@ -4374,6 +4429,13 @@ class BasePlatformAdapter(ABC):
                 # spawning two concurrent _process_message_background tasks for the same key (#17758
                 # follow-up: prevents the create_task path from racing with itself across the
                 # in-band/finally boundary).
+                successor = self._pending_messages.get(session_key)
+                if successor is not None:
+                    late_pending._gateway_pending_followups = [successor, *getattr(
+                        successor, "_gateway_pending_followups", [],
+                    )]
+                    if hasattr(successor, "_gateway_pending_followups"):
+                        delattr(successor, "_gateway_pending_followups")
                 self._pending_messages[session_key] = late_pending
             else:
                 logger.debug(
@@ -4403,6 +4465,8 @@ class BasePlatformAdapter(ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
+            if not await self._resume_dispatch_is_current(event, session_key):
+                return
             await self._run_processing_hook("on_processing_start", event)
             response = await self._message_handler(event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
@@ -4475,7 +4539,7 @@ class BasePlatformAdapter(ABC):
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
             if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+                pending_event = pop_pending_message_event(self._pending_messages, session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
@@ -4572,8 +4636,12 @@ class BasePlatformAdapter(ABC):
                                self.name, sum(not t.done() for t in tasks))
                 break
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
+            from gateway.shutdown_flush import flush_pending_to_file, flush_overflow_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            flush_overflow_to_file({
+                key: getattr(event, "_gateway_pending_followups", [])
+                for key, event in self._pending_messages.items()
+            }, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
@@ -4586,7 +4654,7 @@ class BasePlatformAdapter(ABC):
 
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        return pop_pending_message_event(self._pending_messages, session_key)
 
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",

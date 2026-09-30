@@ -205,6 +205,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
     if "turn_id" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "turn_id", "turn_id TEXT")
+    if "response_kind" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+        # NULL is deliberately ambiguous: old rows must still prevent unsafe replay.
+        add_column_if_missing(conn, "delivery_obligations", "response_kind", "response_kind TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_delivery_obligations_turn "
         "ON delivery_obligations(session_key, turn_id)"
@@ -272,20 +275,22 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
-                      preserve_existing: bool = False, turn_id: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+                      preserve_existing: bool = False, turn_id: Optional[str] = None,
+                      response_kind: Optional[str] = None) -> None:
+    """Record an answer or typed notice as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     stored_profile = str(adapter_profile).strip() if adapter_profile else "default"
     with _DB_LOCK, _transaction() as conn:
         if preserve_existing:
             existing = conn.execute(
-                "SELECT session_key,platform,chat_id,thread_id,content,adapter_profile,turn_id "
+                "SELECT session_key,platform,chat_id,thread_id,content,adapter_profile,turn_id,response_kind "
                 "FROM delivery_obligations WHERE obligation_id=?", (obligation_id,),
             ).fetchone()
             expected = (session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
                         content, stored_profile)
             if existing is not None:
-                if tuple(existing[:6]) != expected or (turn_id and existing[6] not in (None, turn_id)):
+                if (tuple(existing[:6]) != expected or (turn_id and existing[6] not in (None, turn_id))
+                        or existing[7] != response_kind):
                     raise ValueError("Delivery obligation payload conflict")
                 if turn_id and existing[6] is None:
                     conn.execute(
@@ -297,20 +302,25 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile, turn_id)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, turn_id, response_kind)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, stored_profile, turn_id))
+             content, now, now, pid, started, stored_profile, turn_id, response_kind))
     _prune()
 
 
 def has_turn_obligation(session_key: str, turn_id: str) -> bool:
-    """Whether this exact agent turn already handed an answer to the delivery ledger."""
+    """Whether this turn has an answer (or legacy ambiguous output), never just a notice.
+
+    Successful answers remain conclusive across attempts; replaying a task that already
+    produced one risks duplicate effects. Only explicitly typed notices are excluded.
+    """
     if not session_key or not turn_id:
         return False
     with _DB_LOCK, _transaction() as conn:
         return conn.execute(
-            "SELECT 1 FROM delivery_obligations WHERE session_key=? AND turn_id=? LIMIT 1",
+            "SELECT 1 FROM delivery_obligations WHERE session_key=? AND turn_id=? "
+            "AND (response_kind IS NULL OR response_kind NOT IN ('failure_notice', 'interruption_notice')) LIMIT 1",
             (session_key, turn_id),
         ).fetchone() is not None
 
@@ -451,7 +461,8 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
-                 last_error: Optional[str] = None) -> Dict[str, Any]:
+                 last_error: Optional[str] = None, turn_id: Optional[str] = None,
+                 response_kind: Optional[str] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
@@ -460,6 +471,7 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
+            "turn_id": turn_id, "response_kind": response_kind,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
@@ -490,12 +502,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at, turn_id, response_kind
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+             owner_pid, owner_started_at, adapter_profile, last_error, updated_at, turn_id, response_kind) in rows:
             allowed = process_attention_authorized(oid)
             if allowed is not True:
                 if allowed is False:
@@ -530,7 +542,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
-                        "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
+                        "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        "turn_id": turn_id, "response_kind": response_kind})
                 continue
             # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
             # resend is seen as 'attempting' with no error by the next boot and gets the marker.
@@ -548,7 +561,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # the marker.
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default", needs_marker=state != "pending",
-                                            flood=flood_row))
+                                            flood=flood_row, turn_id=turn_id, response_kind=response_kind))
     return claimed
 
 
@@ -573,11 +586,11 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile, updated_at
+                      owner_started_at, last_error, adapter_profile, updated_at, turn_id, response_kind
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
+             owner_pid, owner_started_at, last_error, adapter_profile, updated_at, turn_id, response_kind) in rows:
             allowed = process_attention_authorized(oid)
             if allowed is not True:
                 if allowed is False:
@@ -612,7 +625,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # claim released unsent keeps its flood retry eligibility.
                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                                            flood=is_flood_error(last_error), last_error=last_error,
+                                            turn_id=turn_id, response_kind=response_kind))
     return claimed
 
 

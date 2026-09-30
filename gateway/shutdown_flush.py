@@ -71,7 +71,8 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         serialised = _serialise_value(value)
         if serialised is None:
             return False
-        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
+        _write_payload(flush_dir, {"session_key": session_key, **extra,
+                                   "flush_order_ns": time.time_ns(), "data": serialised})
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
@@ -223,13 +224,35 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
+    # Filenames are random UUIDs. Recover queue heads and followers in durable
+    # flush order, with timestamp/seq fallback for payloads from older gateways.
+    ordered = []
+    for path in flush_files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("pending payload is not an object")
+            stamp = payload.get("ts", 0)
+            stamp = stamp if type(stamp) in (int, float) else 0
+            order = payload.get("flush_order_ns", payload.get("seq", -1))
+            order = order if type(order) is int else -1
+            ordered.append((stamp, order, path.name, path, payload))
+        except Exception as exc:
+            logger.warning("Failed to read pending message from %s: %s", path, exc)
     recovered = 0
+    failed_sessions = set()
     try:
-        for path in flush_files:
-            # One unparseable payload or rejected append must only skip THIS file: the file is
-            # never unlinked, so aborting the pass would re-poison every later boot.
+        for _stamp, _order, _name, path, payload in sorted(ordered, key=lambda item: item[:3]):
+            session_key = payload.get("session_key")
+            session_key = session_key if isinstance(session_key, str) else None
+            data = payload.get("data")
+            session_id = data.get("session_id") if isinstance(data, dict) else None
+            session_id = session_id if isinstance(session_id, str) else None
+            failure_key = (session_key, session_id)
+            if failure_key in failed_sessions:
+                continue
+            # Preserve followers behind a failed append, while other sessions can recover.
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
@@ -239,6 +262,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
                     recovered += 1
                     path.unlink(missing_ok=True)
             except Exception as exc:
+                if session_key:
+                    failed_sessions.add(failure_key)
                 logger.warning("Failed to recover pending message from %s: %s", path, exc)
     finally:
         if own_db:  # shutdown cancellation/interrupt must not strand an owned DB

@@ -1666,13 +1666,66 @@ class TurnRunner:
             _select_cached_agent_history,
         )
         ctx = self._ctx
+        # In-place compaction can summarize the original user away. Its sole summary
+        # represents that owned turn only when the exact dispatch and raw archive prove it.
+        # Project the identity onto an existing row; never regrow archived tool history.
+        history = ctx.history
+        marker = getattr(ctx.event, "_hermes_turn_resume", None)
+        if isinstance(marker, dict) and history:
+            owner = marker.get("origin_owner")
+            owned = [row for row in history if row.get("role") == "user"
+                     and (row.get("display_metadata") or {}).get("gateway_input_owner") == owner]
+            summaries = [i for i, row in enumerate(history) if row.get("role") == "user"
+                         and row.get("_compressed_summary")
+                         and not (row.get("display_metadata") or {}).get("gateway_input_owner")]
+            if not owned and len(summaries) == 1 and self._runner.session_store.resume_owner_matches(
+                ctx.session_key, marker, phase="executing",
+            ):
+                entry = self._runner.session_store._entries.get(ctx.session_key)
+                try:
+                    evidence = self._runner.session_store.load_turn_recovery_evidence(entry.active_turn)
+                    raw_summaries = [row for row in evidence["rows"]
+                                     if row.get("active") and row.get("_compressed_summary")
+                                     and row.get("role") == "user"]
+                    idx = summaries[0]
+                    if (evidence["rows"][0].get("compacted")
+                            and len(raw_summaries) == 1
+                            and raw_summaries[0].get("content") == history[idx].get("content")):
+                        history = list(history)
+                        history[idx] = {**history[idx], "display_metadata": {
+                            **(history[idx].get("display_metadata") or {}), "gateway_input_owner": owner,
+                        }}
+                except Exception:
+                    logger.warning("Cannot prove compacted recovery owner for %s", ctx.session_key, exc_info=True)
         # Transcript rows ({role, content, timestamp}) lose timestamps; interrupt-path agent messages
         # (tool_calls/tool_call_id/reasoning) pass through intact so the API sees valid assistant→tool
         # sequences. Telegram observed=True rows are withheld from replayable history and attached to
         # the current addressed message as API-only context.
         agent_history, observed_group_context = _build_gateway_agent_history(
-            ctx.history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+            history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
+        # Project each source user independently to establish the ordered row mapping. The
+        # replay canonicalizer removes tool blocks but never reorders or merges user rows.
+        # Use the actual projection filter (observed/empty/recovery-note rows), not text matching.
+        projected_owners = []
+        for row in history or []:
+            if row.get("role") != "user":
+                continue
+            projected, _ = _build_gateway_agent_history(
+                [row], channel_prompt=ctx.channel_prompt,
+                inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+            )
+            users = [item for item in projected if item.get("role") == "user"]
+            if len(users) == 1:
+                projected_owners.append(row.get("display_metadata"))
+            elif users:
+                raise ValueError("Ambiguous recovery user projection")
+        replay_users = [row for row in agent_history if row.get("role") == "user"]
+        if len(replay_users) != len(projected_owners):
+            raise ValueError("Unverifiable recovery user projection")
+        for row, metadata in zip(replay_users, projected_owners):
+            if isinstance(metadata, dict) and metadata.get("gateway_input_owner"):
+                row["display_metadata"] = dict(metadata)
         # FTS write-corruption guard: if persistence failed silently the reloaded transcript is stale
         # while the SAME cached agent still holds the live conversation (same-session amnesia). Only
         # for a reused agent bound to this exact session_id.
@@ -1732,34 +1785,32 @@ class TurnRunner:
         persist_override: Optional[Any] = ctx.persist_user_message
         ctx.turn_resume_marker = None
         marker = getattr(ctx.event, "_hermes_turn_resume", None)
-        if isinstance(marker, dict) and isinstance(marker.get("turn_id"), str) and marker["turn_id"] and agent_history:
+        if ctx.event is not None and hasattr(ctx.event, "_hermes_turn_resume"):
             entry = self._runner.session_store._entries.get(ctx.session_key) if ctx.session_key else None
             record = getattr(entry, "active_turn", None)
-            record_matches = (
-                isinstance(record, dict)
-                and record.get("turn_id") == marker["turn_id"]
-                and record.get("resume_count") == marker.get("resume_count")
-                and record.get("status") == "resuming"
-            )
-            if marker.get("record_backed") is True:
-                accepted = record_matches
-            else:
-                from agent.turn_resume import is_interrupt_closer_message
-
-                tail = agent_history[-1]
-                accepted = bool(
-                    record_matches and getattr(entry, "resume_pending", False)
-                    and isinstance(tail, dict)
-                    and (
-                        tail.get("role") == "tool"
-                        or (tail.get("role") == "assistant" and tail.get("tool_calls"))
-                        or is_interrupt_closer_message(tail)
-                    )
+            accepted = bool(
+                isinstance(marker, dict)
+                and isinstance(marker.get("turn_id"), str)
+                and marker["turn_id"]
+                and agent_history
+                and sum(
+                    row.get("role") == "user"
+                    and isinstance(row.get("display_metadata"), dict)
+                    and row["display_metadata"].get("gateway_input_owner") == marker.get("origin_owner")
+                    for row in agent_history
+                ) == 1
+                and isinstance(record, dict)
+                and self._runner.session_store.resume_owner_matches(
+                    ctx.session_key, marker, phase="executing",
                 )
+            )
             if accepted:
                 ctx.turn_resume_marker = marker
                 ctx.message = ""
                 return None, None
+            if ctx.event is not None:
+                ctx.event._gateway_resume_dispatch_stale = True
+            return None, None
         self._prepend_pending_note("_pending_model_notes")
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
@@ -1838,6 +1889,17 @@ class TurnRunner:
                 if not begin(followup["execution_id"], followup["token"]):
                     return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
             resume_marker = ctx.turn_resume_marker
+            if ctx.event is not None and getattr(
+                ctx.event, "_gateway_resume_dispatch_stale", False,
+            ):
+                return {
+                    "final_response": "",
+                    "messages": agent_history,
+                    "api_calls": 0,
+                    "completed": False,
+                    "interrupted": True,
+                    "agent_persisted": True,
+                }
             api_message = "" if resume_marker else _wrap_current_message_with_observed_context(
                 self._native_image_run_message(), observed_group_context,
             )
@@ -1849,6 +1911,9 @@ class TurnRunner:
             if resume_marker:
                 kwargs["resume_turn"] = True
                 kwargs["turn_id"] = resume_marker["turn_id"]
+                kwargs["persist_user_display_metadata"] = {
+                    "gateway_input_owner": resume_marker["origin_owner"],
+                }
                 if ctx.event is not None:
                     ctx.event._gateway_active_turn_id = resume_marker["turn_id"]
             elif persist_user_message_override is not None:
@@ -1875,7 +1940,12 @@ class TurnRunner:
                 if callable(begin):
                     try:
                         extra = {"process_followup": followup} if followup else {}
-                        recorded = begin(ctx.session_key, turn_id, getattr(self._runner, "_boot_id", "unknown-boot"), **extra)
+                        owner = (ctx.persist_user_display_metadata or {}).get("gateway_input_owner")
+                        recorded = begin(
+                            ctx.session_key, turn_id,
+                            getattr(self._runner, "_boot_id", "unknown-boot"),
+                            origin_session_id=ctx.session_id, origin_owner=owner, **extra,
+                        )
                         if followup and not recorded:
                             raise RuntimeError("Follow-up turn marker was not persisted")
                         if recorded:
@@ -1909,6 +1979,22 @@ class TurnRunner:
                 lease = verification_lease(followup['execution_id'], followup['token']) if followup else nullcontext()
                 request_scope = task_request_scope(ctx.message or '') if not followup else nullcontext()
                 with lease, request_scope, notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+                    if resume_marker and not (
+                        self._runner.session_store.resume_owner_matches(
+                            session_key, resume_marker, phase="executing",
+                        )
+                        and self._runner._resume_owner_authorized(session_key, ctx.source)
+                    ):
+                        if ctx.event is not None:
+                            ctx.event._gateway_resume_dispatch_stale = True
+                        return {
+                            "final_response": "",
+                            "messages": agent_history,
+                            "api_calls": 0,
+                            "completed": False,
+                            "interrupted": True,
+                            "agent_persisted": True,
+                        }
                     result = agent.run_conversation(api_message, **kwargs)
             finally:
                 if followup:
@@ -2196,14 +2282,16 @@ class TurnRunner:
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
         }
         compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
-        # failure_reason must survive the empty-response path too (TUI billing, transient-failure
-        # persistence). compression_deferred (soft lock-contention defer) is distinct from
+        # The structured failure verdict must survive the empty-response path too (TUI billing,
+        # transient-failure recovery). compression_deferred (soft lock-contention defer) is distinct from
         # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
         # about to shrink.
         common = {
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "turn_id": result.get("turn_id"),
+            "current_turn_user_idx": result.get("current_turn_user_idx"),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
+            "failure_retryable": result.get("failure_retryable"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),

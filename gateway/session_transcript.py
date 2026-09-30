@@ -5,6 +5,8 @@ bound onto ``SessionStore`` via the MRO."""
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -24,6 +26,14 @@ class TranscriptReadError(RuntimeError):
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         super().__init__(f"transcript read failed for session {session_id}")
+
+
+class RecoveryEvidenceError(RuntimeError):
+    """Raised when raw turn evidence is unavailable, malformed, or no longer continuous."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 def _spool_dropped(session_id: str, message: Dict[str, Any]):
@@ -378,6 +388,7 @@ class SessionTranscriptMixin:
             tool_name=message.get("tool_name"),
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
+            effect_disposition=message.get("effect_disposition"),
             **{k: message.get(k) if is_assistant else None for k in _ASSISTANT_ONLY_KEYS},
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
             observed=bool(message.get("observed")),
@@ -536,10 +547,11 @@ class SessionTranscriptMixin:
         except Exception as e:
             raise TranscriptReadError(session_id) from e
 
-    def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
+    def load_transcript(self, session_id: str, *, repair_alternation: bool = True) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the
         same routing writes use — the in-memory reroute map, then the durable compression tip —
-        otherwise the transcript "vanishes" while every message sits under the child."""
+        otherwise the transcript "vanishes" while every message sits under the child.
+        Recovery safety checks disable repair so unmatched outcomes remain visible."""
         if not self._db_for_session_id(session_id):
             return []
         session_id = self._follow_reroutes(session_id)
@@ -548,9 +560,9 @@ class SessionTranscriptMixin:
             db = self._db_for_session_id(session_id)
             session_id = db.get_compression_tip(session_id) or session_id
         try:
-            # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
+            # Live replay normally heals alternation; safety inspection must retain evidence.
             return self._db_for_session_id(session_id).get_messages_as_conversation(
-                session_id, repair_alternation=True)
+                session_id, repair_alternation=repair_alternation)
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers
             # must fail closed, not start from [].
@@ -558,6 +570,67 @@ class SessionTranscriptMixin:
                 "Transcript read failed for session %s; refusing to treat the conversation as "
                 "empty: %s", session_id, e, exc_info=True)
             raise TranscriptReadError(session_id) from e
+
+    @staticmethod
+    def _turn_evidence_hash(rows: List[Dict[str, Any]]) -> str:
+        canonical = []
+        for row in rows:
+            metadata = row.get("display_metadata")
+            canonical.append({
+                "id": row.get("id"),
+                "role": row.get("role"),
+                "content": row.get("content"),
+                "tool_calls": row.get("tool_calls"),
+                "tool_call_id": row.get("tool_call_id"),
+                "effect_disposition": row.get("effect_disposition"),
+                "gateway_input_owner": (
+                    metadata.get("gateway_input_owner") if isinstance(metadata, dict) else None
+                ),
+            })
+        payload = json.dumps(
+            canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def load_turn_recovery_evidence(self, identity: Dict[str, Any]) -> Dict[str, Any]:
+        """Load and verify the immutable original-session audit slice for one active turn."""
+        if not isinstance(identity, dict) or (type(identity.get("recovery_version")) is not int or identity.get("recovery_version") != 1):
+            raise RecoveryEvidenceError("legacy_missing_proof")
+        origin_sid = identity.get("origin_session_id")
+        execution_sid = identity.get("execution_session_id")
+        owner = identity.get("origin_owner")
+        if not all(isinstance(value, str) and value for value in (origin_sid, execution_sid, owner)):
+            raise RecoveryEvidenceError("missing_turn_boundary")
+        if origin_sid != execution_sid:
+            raise RecoveryEvidenceError("rotated_origin")
+        db = self._db_for_session_id(origin_sid)
+        if db is None:
+            raise RecoveryEvidenceError("evidence_store_unavailable")
+        try:
+            rows = db.get_turn_recovery_rows(
+                origin_sid, owner, identity.get("origin_row_id"),
+            )
+        except Exception as exc:
+            raise RecoveryEvidenceError("missing_turn_boundary") from exc
+        prior = identity.get("checkpoint")
+        if prior is not None:
+            if not isinstance(prior, dict):
+                raise RecoveryEvidenceError("invalid_checkpoint")
+            count = prior.get("evidence_row_count")
+            last_id = prior.get("last_row_id")
+            if type(count) is not int or count <= 0 or count > len(rows):
+                raise RecoveryEvidenceError("checkpoint_evidence_changed")
+            prefix = rows[:count]
+            if prefix[-1].get("id") != last_id or self._turn_evidence_hash(prefix) != prior.get("evidence_sha256"):
+                raise RecoveryEvidenceError("checkpoint_evidence_changed")
+        checkpoint = {
+            "resume_count": identity.get("resume_count"),
+            "origin_row_id": rows[0]["id"],
+            "last_row_id": rows[-1]["id"],
+            "evidence_row_count": len(rows),
+            "evidence_sha256": self._turn_evidence_hash(rows),
+        }
+        return {"rows": rows, "origin_row_id": rows[0]["id"], "checkpoint": checkpoint}
 
     def rewind_session(
         self, session_id: str, n: int = 1, *, require_retryable_composite: bool = False,

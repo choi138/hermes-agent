@@ -238,7 +238,7 @@ def test_answered_turn_is_not_scheduled_even_without_preflight(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_orphaned_turn_is_scheduled_with_its_original_id():
+async def test_legacy_orphaned_turn_is_blocked_without_proof():
     runner, adapter = make_restart_runner()
     runner._boot_id = "new-boot"
     source = make_restart_source(chat_id="orphaned")
@@ -252,19 +252,19 @@ async def test_orphaned_turn_is_scheduled_with_its_original_id():
         },
     )
     runner.session_store._entries = {entry.session_key: entry}
-    runner.session_store.begin_active_turn.return_value = True
+    runner.session_store.claim_resume_active_turn.return_value = True
     adapter.handle_message = AsyncMock()
 
-    assert runner._schedule_resume_pending_sessions() == 1
-    await asyncio.sleep(0)
-
-    event = adapter.handle_message.await_args.args[0]
-    assert event.text == ""
-    assert event._hermes_turn_resume == {
-        "turn_id": "sid:sid:deadbeef", "resume_count": 1, "record_backed": True,
-    }
-    runner.session_store.begin_active_turn.assert_called_once_with(
-        entry.session_key, "sid:sid:deadbeef", "new-boot", resume_count=1,
+    assert runner._schedule_resume_pending_sessions() == 0
+    adapter.handle_message.assert_not_called()
+    runner.session_store.mark_active_turn_recovery.assert_called_once_with(
+        entry.session_key,
+        "sid:sid:deadbeef",
+        expected_resume_count=0,
+        expected_identity=entry.active_turn,
+        status="blocked",
+        failure_reason="interrupted_retry",
+        blocked_reason="legacy_missing_proof",
     )
 
 
@@ -297,8 +297,21 @@ async def test_suspended_or_stale_or_exhausted_turn_never_auto_reenters():
 
 
 def _turn_runner(entry, marker, history):
+    def resume_owner_matches(session_key, candidate, *, phase):
+        record = entry.active_turn
+        return bool(
+            session_key == entry.session_key
+            and candidate == marker
+            and isinstance(record, dict)
+            and record.get("dispatch_state") == phase
+        )
+
     runner = SimpleNamespace(
-        session_store=SimpleNamespace(_entries={entry.session_key: entry}),
+        session_store=SimpleNamespace(
+            _entries={entry.session_key: entry},
+            resume_owner_matches=resume_owner_matches,
+        ),
+        _resume_owner_authorized=lambda _key, _source: True,
         _pending_model_notes={}, _pending_skills_reload_notes={},
         _delivery_adapter_for=lambda _source: SimpleNamespace(interactive_resume=True),
         _consume_pending_native_image_paths=lambda _key: [],
@@ -306,7 +319,7 @@ def _turn_runner(entry, marker, history):
     ctx = TurnContext(
         source=entry.origin, session_id=entry.session_id, session_key=entry.session_key,
         message="", history=history,
-        event=SimpleNamespace(_hermes_turn_resume=marker),
+        event=SimpleNamespace(**({"_hermes_turn_resume": marker} if marker is not None else {})),
     )
     return TurnRunner(runner, ctx), ctx
 
@@ -318,15 +331,33 @@ def test_record_backed_resume_calls_agent_without_new_user_message():
         created_at=datetime.now(), updated_at=datetime.now(), origin=source,
         resume_pending=True, resume_reason="restart_timeout",
         last_resume_marked_at=datetime.now(),
-        active_turn={"turn_id": "sid:sid:deadbeef", "boot_id": "new-boot",
-                     "status": "resuming", "resume_count": 1},
+        active_turn={
+            "recovery_version": 1,
+            "turn_id": "sid:sid:deadbeef",
+            "origin_session_id": "sid",
+            "execution_session_id": "sid",
+            "origin_owner": "owner-1",
+            "boot_id": "new-boot",
+            "status": "resuming",
+            "resume_count": 1,
+            "dispatch_token": "dispatch-1",
+            "dispatch_state": "queued",
+        },
     )
     history = [{"role": "user", "content": "make a report"},
                {"role": "tool", "content": "42", "tool_call_id": "call-1"}]
-    marker = {"turn_id": "sid:sid:deadbeef", "resume_count": 1, "record_backed": True}
+    marker = {
+        key: entry.active_turn[key] for key in (
+            "recovery_version", "turn_id", "origin_session_id", "execution_session_id",
+            "origin_owner", "boot_id", "dispatch_token", "resume_count",
+        )
+    }
     turn, ctx = _turn_runner(entry, marker, history)
     agent = SimpleNamespace(run_conversation=MagicMock(return_value={"final_response": "done"}))
 
+    # The gateway consumes before entering the executor's real preparation stage.
+    entry.active_turn["dispatch_state"] = "executing"
+    history[0]["display_metadata"] = {"gateway_input_owner": "owner-1"}
     persist_message, persist_timestamp = turn._prepare_turn_message(history)
     with patch("agent.notification_presentation.notification_turn", return_value=nullcontext()):
         turn._run_conversation_with_approval(
@@ -338,6 +369,7 @@ def test_record_backed_resume_calls_agent_without_new_user_message():
     assert args == ("",)
     assert kwargs["resume_turn"] is True
     assert kwargs["turn_id"] == "sid:sid:deadbeef"
+    assert kwargs["persist_user_display_metadata"] == {"gateway_input_owner": "owner-1"}
     assert "persist_user_message" not in kwargs
 
 
@@ -352,7 +384,7 @@ def test_legacy_clean_tail_falls_back_to_recovery_note():
     history = [{"role": "user", "content": "make a report"},
                {"role": "assistant", "content": "Report completed."}]
     turn, ctx = _turn_runner(
-        entry, {"turn_id": "sid:sid:newturn", "resume_count": 1, "record_backed": False}, history,
+        entry, None, history,
     )
 
     turn._prepare_turn_message(history)

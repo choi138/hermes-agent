@@ -492,6 +492,32 @@ class GatewayAgentCacheMixin:
             return
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
+        original_generation = self._current_session_run_generation(session_key)
+
+        def still_original_turn():
+            current = self._peek_session_state(session_key)
+            return (self._is_session_run_current(session_key, original_generation)
+                    and (current.turn.agent if current else None) is running_agent)
+
+        cancellation_error = None
+        try:
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if not still_original_turn():
+                return
+            record = getattr(entry, "active_turn", None)
+            if isinstance(record, dict):
+                await self.async_session_store.cancel_active_turn_recovery(
+                    session_key,
+                    expected_session_id=entry.session_id,
+                    expected_identity=dict(record),
+                    reason=invalidation_reason,
+                )
+        except Exception as exc:
+            cancellation_error = exc
+            logger.error("Could not persist active-turn cancellation for %s", session_key,
+                         exc_info=True)
+        if not still_original_turn():
+            return
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
@@ -561,6 +587,10 @@ class GatewayAgentCacheMixin:
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)
+        if cancellation_error is not None:
+            raise RuntimeError(
+                f"active-turn cancellation was not persisted for {session_key}"
+            ) from cancellation_error
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard

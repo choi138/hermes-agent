@@ -115,9 +115,19 @@ def _refund_api_call(agent: Any, api_call_count: int) -> int:
 def _reanchor(agent: Any, messages: List[Any], user_message: Any) -> int:
     """Compaction rebuilt ``messages``: re-anchor this turn's user index so the
     api_content stamp, injection site and persist-override row hit the same dict."""
-    from agent.turn_context import reanchor_current_turn_user_idx
+    from agent.turn_context import (
+        reanchor_current_turn_owner_idx, reanchor_current_turn_user_idx,
+        reanchor_compacted_turn_owner_idx,
+    )
 
-    idx = reanchor_current_turn_user_idx(messages, user_message)
+    owner = getattr(agent, "_current_turn_gateway_input_owner", None)
+    idx = (
+        reanchor_current_turn_owner_idx(messages, owner)
+        if owner is not None
+        else reanchor_current_turn_user_idx(messages, user_message)
+    )
+    if idx < 0 and owner is not None:
+        idx = reanchor_compacted_turn_owner_idx(agent, messages, owner)
     agent._persist_user_message_idx = idx
     return idx
 

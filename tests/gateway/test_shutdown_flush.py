@@ -342,3 +342,40 @@ def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monke
     replayed = []
     assert drain_transcript_spool("sess-1", replayed.append) == (1, 0)
     assert replayed == [{"role": "user", "content": "hi"}]
+
+
+def test_actual_recovery_keeps_head_before_fifo_tail(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    monkeypatch.setattr("gateway.shutdown_flush.time.time", lambda: 1000.0)
+    key = "queue-session"
+    flush_pending_to_file({key: "first"})
+    flush_overflow_to_file({key: ["second", "third"]})
+    # UUID filenames must not determine the transcript's user-message order.
+    for path in list(flush_dir.glob("*.json")):
+        text = json.loads(path.read_text())["data"]["text"]
+        path.rename(flush_dir / {"first": "z.json", "second": "m.json", "third": "a.json"}[text])
+    db = MagicMock()
+    assert recover_pending_to_db(db, session_resolver=lambda *a, **kw: ("sid", db)) == 3
+    assert [call.kwargs["content"] for call in db.append_message.call_args_list] == ["first", "second", "third"]
+    assert not list(flush_dir.glob("*.json"))
+
+
+def test_recovery_failure_keeps_followers_behind_failed_head(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    flush_pending_to_file({"same": "first"})
+    flush_overflow_to_file({"same": ["second"]})
+    flush_pending_to_file({"other": "unrelated"})
+    db = MagicMock()
+    def append(**kwargs):
+        if kwargs["content"] == "first":
+            raise OSError("injected head append failure")
+    db.append_message.side_effect = append
+    assert recover_pending_to_db(db, session_resolver=lambda *a, **kw: ("sid", db)) == 1
+    assert [call.kwargs["content"] for call in db.append_message.call_args_list] == ["first", "unrelated"]
+    assert sorted(json.loads(p.read_text())["data"]["text"] for p in flush_dir.glob("*.json")) == ["first", "second"]
+    db.append_message.side_effect = None
+    db.append_message.reset_mock()
+    assert recover_pending_to_db(db, session_resolver=lambda *a, **kw: ("sid", db)) == 2
+    assert [call.kwargs["content"] for call in db.append_message.call_args_list] == ["first", "second"]

@@ -419,8 +419,10 @@ class GatewaySlashCommandsMixin(
         all cases.  The session is preserved so the user can continue."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
         source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
-        session_key = session_entry.session_key
+        # Stop must reach cancellation even when the session index cannot be
+        # written. Resolving/touching a route first can fail before its fence is saved.
+        session_key = self._session_key_for_source(source)
+        session_entry = await self.async_session_store.lookup_by_session_key(session_key)
 
         async def _stop(key: str, invalidation_reason: str) -> None:
             await self._interrupt_and_clear_session(
@@ -434,6 +436,29 @@ class GatewaySlashCommandsMixin(
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
             await _stop(session_key, "stop_command_handler")
             return EphemeralReply(t("gateway.stop.stopped"))
+
+        try:
+            cancelled_recovery = await self.async_session_store.cancel_active_turn_recovery(
+                session_key,
+                expected_session_id=getattr(session_entry, "session_id", None),
+                reason="stop_command_pending_recovery",
+            )
+        except Exception:
+            logger.error("STOP could not persist recovery cancellation for %s", session_key,
+                         exc_info=True)
+            try:
+                self._interrupt_running_turn(
+                    session_key, interrupt_reason=_INTERRUPT_REASON_STOP,
+                    invalidation_reason="stop_cancel_write_failed",
+                )
+            except Exception:
+                logger.error("Local interrupt also failed for %s", session_key, exc_info=True)
+            return EphemeralReply(
+                "⚠️ Cancellation could not be saved. This pending attempt is quarantined "
+                "in this process; cancellation after restart is not guaranteed."
+            )
+        if cancelled_recovery:
+            logger.info("STOP cancelled pending recovery for session %s", session_key)
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
         # shaped key. One scan feeds both tiers; the chat tier is a superset of the thread-sibling
@@ -451,12 +476,12 @@ class GatewaySlashCommandsMixin(
             if fallback_keys == sibling_keys
             else "stop_command_chat_scope"
         )
-        if fallback_keys and self._is_user_authorized_for_source(source):
+        stopped_siblings = bool(fallback_keys and self._is_user_authorized_for_source(source))
+        if stopped_siblings:
             for fallback_key in fallback_keys:
                 await _stop(fallback_key, reason)
             logger.info("STOP (%s) by %s — interrupted %d run(s): %s",
                         reason, session_key, len(fallback_keys), ", ".join(fallback_keys))
-            return EphemeralReply(t("gateway.stop.stopped"))
 
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
         # earlier turn still count as "active": stop them; each returns as an interrupted completion.
@@ -464,9 +489,14 @@ class GatewaySlashCommandsMixin(
         # retain their completion/report obligation; /stop must not silently
         # suppress the result of a command it did not cancel.
         from tools.async_delegation import interrupt_for_session
-        if interrupt_for_session(session_key=session_key, reason="stop_command",
-                                 parent_session_id=str(getattr(session_entry, "session_id", "") or "")):
+        stopped_delegations = interrupt_for_session(
+            session_key=session_key, reason="stop_command",
+            parent_session_id=str(getattr(session_entry, "session_id", "") or ""),
+        )
+        if stopped_siblings or stopped_delegations:
             return EphemeralReply(t("gateway.stop.stopped"))
+        if cancelled_recovery:
+            return EphemeralReply(t("gateway.stop.stopped_pending"))
         # A platform status indicator can still be stuck —
         # e.g. Slack's persistent assistant.threads.setStatus survives a gateway restart or a turn
         # that died without a final send.

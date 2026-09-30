@@ -267,7 +267,53 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     return fallback
 
 
-def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> Any:
+def reanchor_current_turn_owner_idx(messages: List[Any], owner: Any) -> int:
+    """Resolve exactly one durable gateway-owned user row in a model projection."""
+    if not isinstance(owner, str) or not owner:
+        return -1
+    matches = []
+    for idx, message in enumerate(messages):
+        if not (isinstance(message, dict) and message.get("role") == "user"):
+            continue
+        metadata = message.get("display_metadata")
+        if isinstance(metadata, dict) and metadata.get("gateway_input_owner") == owner:
+            matches.append(idx)
+    return matches[0] if len(matches) == 1 else -1
+
+
+def reanchor_compacted_turn_owner_idx(agent: Any, messages: List[Any], owner: Any) -> int:
+    """Resolve a summary against the preserved audit without stamping a second durable owner."""
+    if not isinstance(owner, str) or not owner:
+        return -1
+    if any(isinstance(row, dict) and row.get("role") == "user"
+           and (row.get("display_metadata") or {}).get("gateway_input_owner") == owner
+           for row in messages):
+        return -1  # Multiple live owners must not be replaced by a summary guess.
+    summaries = [i for i, row in enumerate(messages) if isinstance(row, dict)
+                 and row.get("role") == "user" and row.get("_compressed_summary")
+                 and not (row.get("display_metadata") or {}).get("gateway_input_owner")]
+    db = getattr(agent, "_session_db", None)
+    sid = getattr(agent, "session_id", None)
+    if len(summaries) != 1 or db is None or not sid:
+        return -1
+    try:
+        rows = db.get_turn_recovery_rows(sid, owner)
+        raw_summaries = [row for row in rows if row.get("active")
+                         and row.get("role") == "user" and row.get("_compressed_summary")]
+        idx = summaries[0]
+        if (rows and rows[0].get("compacted")
+                and (rows[0].get("display_metadata") or {}).get("gateway_input_owner") == owner
+                and len(raw_summaries) == 1
+                and raw_summaries[0].get("content") == messages[idx].get("content")):
+            return idx
+    except Exception:
+        logger.debug("Cannot prove compacted turn boundary", exc_info=True)
+    return -1
+
+
+def export_current_turn_boundary(
+    agent: Any, result: Any, user_message: Any, *, gateway_input_owner: Any = None,
+) -> Any:
     """Stamp ``{turn_id, current_turn_user_idx}`` on a result envelope, proven against the
     exact ``result["messages"]`` projection it travels with.
 
@@ -287,7 +333,13 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
     turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     if not isinstance(messages, list) or not turn_id or user_message is None:
         return result
-    idx = reanchor_current_turn_user_idx(messages, user_message)
+    idx = (
+        reanchor_current_turn_owner_idx(messages, gateway_input_owner)
+        if gateway_input_owner is not None
+        else reanchor_current_turn_user_idx(messages, user_message)
+    )
+    if idx < 0 and gateway_input_owner is not None:
+        idx = reanchor_compacted_turn_owner_idx(agent, messages, gateway_input_owner)
     if idx < 0 or idx >= len(messages):
         return result
     row = messages[idx]
@@ -295,11 +347,12 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
         return result
     from agent.context_compressor import user_originated_turn_view
 
-    live_view = user_originated_turn_view(row)
-    if row.get("content") != user_message and not (
-        isinstance(live_view, dict) and live_view.get("content") == user_message
-    ):
-        return result  # rewritten (merge-into-tail) row: not a proven boundary
+    if gateway_input_owner is None:
+        live_view = user_originated_turn_view(row)
+        if row.get("content") != user_message and not (
+            isinstance(live_view, dict) and live_view.get("content") == user_message
+        ):
+            return result  # rewritten (merge-into-tail) row: not a proven boundary
     result["turn_id"] = turn_id
     result["current_turn_user_idx"] = idx
     return result
@@ -1010,13 +1063,21 @@ def build_turn_context(
     bind_image_token_cost(agent)
     # The resumed user row is already durable. Never fabricate a second user turn.
     if resume_turn:
-        current_turn_user_idx = next(
-            (i for i in range(len(messages) - 1, -1, -1)
-             if isinstance(messages[i], dict) and messages[i].get("role") == "user"), -1,
+        owner = (
+            persist_user_display_metadata.get("gateway_input_owner")
+            if isinstance(persist_user_display_metadata, dict) else None
         )
+        current_turn_user_idx = reanchor_current_turn_owner_idx(messages, owner)
+        if owner is not None and current_turn_user_idx < 0:
+            raise ValueError("Missing or ambiguous original recovery owner")
+        agent._current_turn_gateway_input_owner = owner
     else:
         append_message(messages, user_msg)
         current_turn_user_idx = len(messages) - 1
+        agent._current_turn_gateway_input_owner = (
+            persist_user_display_metadata.get("gateway_input_owner")
+            if isinstance(persist_user_display_metadata, dict) else None
+        )
     agent._persist_user_message_idx = current_turn_user_idx
 
     if not resume_turn:

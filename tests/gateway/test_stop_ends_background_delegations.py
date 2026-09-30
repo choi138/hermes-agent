@@ -55,7 +55,7 @@ def _seed_unit(session_key: str, parent_session_id: str = "") -> MagicMock:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("session_state", ["idle", "busy"])
+@pytest.mark.parametrize("session_state", ["idle", "busy", "pending_recovery"])
 async def test_stop_ends_background_delegations_of_the_session(monkeypatch, session_state):
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "u1")
     adapter = _Adapter()
@@ -63,6 +63,17 @@ async def test_stop_ends_background_delegations_of_the_session(monkeypatch, sess
     runner.adapters = {Platform.TELEGRAM: adapter}
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm", user_id="u1", user_name="tester")
     key = adapter._event_session_key(MessageEvent(text="", message_type=MessageType.TEXT, source=source))
+    if session_state == "pending_recovery":
+        entry = runner.session_store.get_or_create_session(source)
+        assert entry.session_key == key
+        runner.session_store.begin_active_turn(
+            key, "pending-turn", "boot", origin_session_id=entry.session_id,
+            origin_owner="pending-owner",
+        )
+        runner.session_store.mark_active_turn_recovery(
+            key, "pending-turn", expected_resume_count=0, status="retry_wait",
+            failure_reason="timeout", retry_delay=60,
+        )
     stop_fn = _seed_unit(key)
     other_fn = MagicMock()
     with ad._records_lock:
@@ -86,6 +97,8 @@ async def test_stop_ends_background_delegations_of_the_session(monkeypatch, sess
     assert ledger.get_state(late.id)['phase'] == 'pending'
     stop_fn.assert_called_once()
     other_fn.assert_not_called()  # another chat's background work is untouched
+    if session_state == "pending_recovery":
+        assert entry.active_turn["blocked_reason"] == "user_cancelled"
 
 
 @pytest.mark.asyncio
