@@ -8,9 +8,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-POLICY_VERSION = "2026-09-21.1"
+POLICY_VERSION = "2026-09-30.1"
 
-MODELS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra")
+MODELS = ("gpt-6-luna", "gpt-6.1-sol")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 TASK_CLASSES = ("mechanical", "bounded", "general", "integration", "complex", "frontier")
 FAILURE_KINDS = (
@@ -19,21 +19,19 @@ FAILURE_KINDS = (
 )
 
 CLASS_SELECTIONS = {
-    "mechanical": ("gpt-5.6-luna", "low"),
-    "bounded": ("gpt-5.6-luna", "medium"),
-    "general": ("gpt-5.6-terra", "medium"),
-    "integration": ("gpt-5.6-terra", "high"),
-    "complex": ("gpt-5.6-sol", "high"),
-    "frontier": ("gpt-6-astra", "high"),
+    "mechanical": ("gpt-6-luna", "low"),
+    "bounded": ("gpt-6-luna", "medium"),
+    "general": ("gpt-6.1-sol", "medium"),
+    "integration": ("gpt-6.1-sol", "high"),
+    "complex": ("gpt-6.1-sol", "high"),
+    "frontier": ("gpt-6.1-sol", "xhigh"),
 }
 
 _MODEL_RANK = {value: index for index, value in enumerate(MODELS)}
 _EFFORT_RANK = {value: index for index, value in enumerate(EFFORTS)}
 _MODEL_BASE_EFFORT = {
-    "gpt-5.6-luna": "medium",
-    "gpt-5.6-terra": "medium",
-    "gpt-5.6-sol": "high",
-    "gpt-6-astra": "high",
+    "gpt-6-luna": "medium",
+    "gpt-6.1-sol": "high",
 }
 
 
@@ -219,13 +217,13 @@ def decide_worker(values: PolicyInput) -> WorkerDecision:
     reasons = [f"{effective_class} task policy"]
 
     if values.ambiguity == "unknown":
-        model, effort = _at_least(model, effort, "gpt-5.6-terra", "medium")
-        reasons.append("unknown low-risk work floors at Terra/medium")
+        model, effort = _at_least(model, effort, "gpt-6.1-sol", "medium")
+        reasons.append("unknown low-risk work floors at Sol/medium")
     elif values.ambiguity == "ambiguous":
-        model, effort = _at_least(model, effort, "gpt-5.6-sol", "high")
+        model, effort = _at_least(model, effort, "gpt-6.1-sol", "high")
         reasons.append("ambiguous approach floors at Sol/high")
     if values.risk == "high":
-        model, effort = _at_least(model, effort, "gpt-5.6-sol", "high")
+        model, effort = _at_least(model, effort, "gpt-6.1-sol", "high")
         reasons.append("high-risk work floors at Sol/high")
 
     if values.missing_context:
@@ -309,9 +307,9 @@ def decide_worker(values: PolicyInput) -> WorkerDecision:
     # This keeps explicit, audited legacy overrides exact.
     floor_model, floor_effort = CLASS_SELECTIONS["mechanical"]
     if values.ambiguity == "unknown":
-        floor_model, floor_effort = _at_least(floor_model, floor_effort, "gpt-5.6-terra", "medium")
+        floor_model, floor_effort = _at_least(floor_model, floor_effort, "gpt-6.1-sol", "medium")
     if values.ambiguity == "ambiguous" or values.risk == "high":
-        floor_model, floor_effort = _at_least(floor_model, floor_effort, "gpt-5.6-sol", "high")
+        floor_model, floor_effort = _at_least(floor_model, floor_effort, "gpt-6.1-sol", "high")
     safe_model, safe_effort = _at_least(model, effort, floor_model, floor_effort)
     if (safe_model, safe_effort) != (model, effort) and (pinned or overridden):
         return _blocked(values, effective_class, model, effort,

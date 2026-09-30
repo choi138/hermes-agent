@@ -28,7 +28,7 @@ def main():
     parser.add_argument("--contract-resolved", action="store_true")
     parser.add_argument("--implementation-class", choices=("bounded", "general"), default="general")
     parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"))
-    parser.add_argument("--pinned-model", choices=("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"))
+    parser.add_argument("--pinned-model", choices=("gpt-6-luna", "gpt-6.1-sol"))
     parser.add_argument("--pinned-effort", choices=("low", "medium", "high", "xhigh", "max"))
     parser.add_argument("--choice-reason")
     parser.add_argument("--deeper-analysis-evidence")
@@ -39,7 +39,7 @@ def main():
     prerequisites.add_argument("--broken-environment", action="store_true")
     prerequisites.add_argument("--deterministic-tool-sufficient", action="store_true")
     parser.add_argument("--failure-kind", choices=("missing_information", "environment", "shallow_reasoning", "misunderstanding", "approach_failure", "repeated_same_defect"))
-    parser.add_argument("--prior-model", choices=("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"))
+    parser.add_argument("--prior-model", choices=("gpt-6-luna", "gpt-6.1-sol"))
     parser.add_argument("--prior-effort", choices=("low", "medium", "high", "xhigh", "max"))
     parser.add_argument("--prior-action")
     parser.add_argument("--correction-evidence")
@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--model")
     parser.add_argument("--cli", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--advisor", choices=("opus",), help="Claude only: consult this model as advisor for this run")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--progress-manifest", help="New absolute manifest path, published before spawn")
     parser.add_argument("--progress-state-dir", help="Private state root outside worktree")
@@ -60,6 +61,9 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from agent.codex_task_runner import TaskRequest, WorkerSelection, run_task
     from agent.codex_worker_policy import PolicyInput, decide_worker
+
+    if args.advisor is not None and args.cli != "claude":
+        parser.error("--advisor requires --cli claude")
 
     def cancelled(_signum, _frame):
         raise KeyboardInterrupt
@@ -118,11 +122,11 @@ def main():
                 if selection_mode == "pinned":
                     pinned_effort = legacy_selection.metadata()["effort"]
                     if model_override is None:
-                        pinned_model = "gpt-6-astra"
+                        pinned_model = "gpt-6.1-sol"
                 else:
                     effort_override = legacy_selection.metadata()["effort"]
                     if model_override is None:
-                        model_override = "gpt-6-astra"
+                        model_override = "gpt-6.1-sol"
             policy_input = PolicyInput(
                 task_class=args.task_class, risk=args.risk, ambiguity=args.ambiguity,
                 phase=args.phase, contract_resolved=args.contract_resolved,
@@ -149,7 +153,7 @@ def main():
         if action == "spawn":
             request = TaskRequest(spec=args.spec, workdir=args.workdir, allowed_root=args.allowed_root,
                                   output_dir=args.output_dir, sandbox=args.sandbox, timeout=args.timeout,
-                                  model=selected_model, cli=args.cli, selection=selection,
+                                  model=selected_model, cli=args.cli, selection=selection, advisor=args.advisor,
                                   policy_input=asdict(policy_input) if args.cli == "codex" else None)
         options = (args.progress_manifest, args.progress_state_dir, args.progress_thread, args.progress_label)
         if (any(options) or args.progress_code_scope) and not all(options):

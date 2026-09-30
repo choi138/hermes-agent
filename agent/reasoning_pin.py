@@ -59,7 +59,7 @@ def _responses_efforts(model, provider, base_url):
     if declared is not None:
         return declared
     slug = model.lower().split("/")[-1]
-    if slug.startswith(("gpt-5", "gpt-6-astra", "o1", "o3", "o4")):
+    if slug.startswith(("gpt-5", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "o1", "o3", "o4")):
         return codex_supported_efforts(model)
     return ()
 

@@ -73,6 +73,10 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
 )
 CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 _ASTRA_MODEL_RE = re.compile(r"gpt-6-astra(?:-\d{4}-\d{2}-\d{2})?")
+CODEX_GPT61_SOL_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+_GPT61_SOL_MODEL_RE = re.compile(r"gpt-6\.1-sol(?:-\d{4}-\d{2}-\d{2})?")
+CODEX_GPT6_LUNA_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+_GPT6_LUNA_MODEL_RE = re.compile(r"gpt-6-luna(?:-\d{4}-\d{2}-\d{2})?")
 
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
@@ -80,6 +84,10 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     slug = (model or "").lower().split("/")[-1]
     if _ASTRA_MODEL_RE.fullmatch(slug):
         return CODEX_ASTRA_EFFORTS
+    if _GPT61_SOL_MODEL_RE.fullmatch(slug):
+        return CODEX_GPT61_SOL_EFFORTS
+    if _GPT6_LUNA_MODEL_RE.fullmatch(slug):
+        return CODEX_GPT6_LUNA_EFFORTS
     if "gpt-5.6" in (model or "").lower():
         return CODEX_GPT56_EFFORTS
     return CODEX_LEGACY_EFFORTS
