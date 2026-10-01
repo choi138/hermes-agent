@@ -1591,6 +1591,8 @@ class GatewayTurnMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        if agent_result.get('response_kind') == 'process_verification_report':
+            return response  # the persisted report is the complete public response
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
@@ -1632,6 +1634,8 @@ class GatewayTurnMixin:
     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
         (display.runtime_footer.enabled=false)."""
+        if agent_result.get('response_kind') == 'process_verification_report':
+            return None
         from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
         try:
             from gateway.runtime_footer import build_footer_line as _bfl
@@ -1913,6 +1917,8 @@ class GatewayTurnMixin:
         self, *, event, session_entry, session_key, agent_result,
     ) -> None:
         """Prove persisted raw evidence before publishing any automatic retry verdict."""
+        if (getattr(event, 'metadata', None) or {}).get('process_followup'):
+            return  # Verification effects are reconciled, never automatically replayed.
         if not (
             isinstance(agent_result, dict)
             and agent_result.get("failed") is True
@@ -2330,7 +2336,7 @@ class GatewayTurnMixin:
                 if isinstance(agent_result, dict):
                     event._gateway_turn_result_seen = True
                     event._gateway_turn_result_interrupted = bool(agent_result.get("interrupted"))
-                    event._gateway_response_kind = (
+                    event._gateway_response_kind = agent_result.get('response_kind') or (
                         "interruption_notice" if agent_result.get("interrupted")
                         else "terminal_failure" if agent_result.get("failed")
                         or agent_result.get("completed") is False else "final"
@@ -2367,6 +2373,9 @@ class GatewayTurnMixin:
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                 if _terminal_inbound:
                     event.ledger_message_id = str(_terminal_inbound)
+                if 'queued_terminal_turn_id' in agent_result:
+                    event._gateway_active_turn_id = agent_result['queued_terminal_turn_id']
+                    event._gateway_response_kind = agent_result.get('queued_terminal_response_kind')
                 if "queued_terminal_notification_category" in agent_result:
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
@@ -2386,14 +2395,16 @@ class GatewayTurnMixin:
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (_footer_line and response and not agent_result.get("already_sent") and not _intentional_silence
+                    and agent_result.get('response_kind') != 'process_verification_report'):
                 response = f"{response}\n\n{_footer_line}"
             await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
 
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
-            if agent_failed_early and not is_context_overflow_failure:
+            if (agent_failed_early and not is_context_overflow_failure
+                    and agent_result.get('response_kind') != 'process_verification_report'):
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
@@ -4007,6 +4018,8 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    turn_id=_delivery_result.get('turn_id') or getattr(turn_ctx.event, '_gateway_active_turn_id', None),
+                    response_kind=_delivery_result.get('response_kind') or getattr(turn_ctx.event, '_gateway_response_kind', None),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -4179,6 +4192,8 @@ class GatewayTurnMixin:
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
+                "queued_terminal_turn_id": followup_result.get('turn_id') or getattr(pending_event, '_gateway_active_turn_id', None),
+                "queued_terminal_response_kind": followup_result.get('response_kind') or getattr(pending_event, '_gateway_response_kind', None),
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")

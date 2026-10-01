@@ -17,9 +17,35 @@ def attention_inflight(turn_id):
     return (str(get_hermes_home()), turn_id) in _attention_inflight
 
 
+def prepare_report(runner, ctx, result, turn_id):
+    """Persist a sanitized report obligation before any user-facing delivery."""
+    from tools.process_registry_followups import verification_report, reserve_report
+    from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_obligation
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.run import _sanitize_gateway_final_response, _strip_response_attachments_for_direct_send
+    if not turn_id or not ledger_enabled():
+        raise RuntimeError('Verification report requires a durable turn and delivery ledger')
+    resolve = getattr(runner, '_delivery_adapter_for', None)
+    adapter = resolve(ctx.source) if callable(resolve) else None
+    report = _sanitize_gateway_final_response(ctx.source.platform, verification_report(result, language_hint=ctx.message))
+    report = _strip_response_attachments_for_direct_send(report, adapter or BasePlatformAdapter)
+    followup = ctx.event.metadata['process_followup']
+    if not reserve_report(followup['execution_id'], followup['token'], turn_id):
+        return report, None  # Cancellation or reconciliation already owns this turn.
+    kind = 'process_verification_report'
+    obligation_id = 'process-report:' + compute_obligation_id(ctx.session_key, turn_id, kind)
+    record_obligation(obligation_id=obligation_id, session_key=ctx.session_key,
+        platform=str(getattr(ctx.source.platform, 'value', ctx.source.platform)),
+        chat_id=ctx.source.chat_id, thread_id=getattr(ctx.source, 'thread_id', None),
+        content=report, adapter_profile=getattr(adapter, '_owner_profile', None),
+        turn_id=turn_id, response_kind=kind, preserve_existing=True)
+    ctx.event._gateway_response_kind = kind
+    return report, obligation_id
+
+
 
 async def reconcile(runner):
-    from tools.process_registry_followups import pending, admission, defer, cancel
+    from tools.process_registry_followups import pending, admission, reject_admission, defer, cancel
     from tools.process_registry_notifications import format_process_notification
     from gateway.wake import adapter_supports_push
     for row in await asyncio.to_thread(pending):
@@ -81,9 +107,10 @@ async def reconcile(runner):
         try:
             accepted = await runner._inject_watch_notification(text, evt)
             if accepted is not True:
-                await asyncio.to_thread(defer, execution, token, 'gateway admission unavailable; retry scheduled')
+                await asyncio.to_thread(reject_admission, execution, token, 'gateway admission unavailable; retry scheduled')
         except Exception as exc:
-            await asyncio.to_thread(defer, execution, token, f'admission failed: {type(exc).__name__}')
+            await asyncio.to_thread(reject_admission, execution, token,
+                f'admission outcome unknown: {type(exc).__name__}; inspect the conversation before retrying', uncertain=True)
             from tools.environments.ssh_process import safe_error
             logger.warning('Process follow-up admission failed: %s: %s', execution, safe_error(exc))
 

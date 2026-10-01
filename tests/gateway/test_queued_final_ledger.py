@@ -300,13 +300,30 @@ async def test_a_deeper_chain_keeps_the_innermost_inbound_id():
     """Chained follow-ups nest, and the LAST message answered owns the ledger identity, so an id
     already set by a deeper recursion must not be overwritten on the way out."""
     GatewayRunner, runner, turn_ctx, pending_event = _chain_runner_and_ctx(
-        {"final_response": "done", "messages": [], "queued_terminal_inbound_id": "6003"})
+        {"final_response": "done", "messages": [], "queued_terminal_inbound_id": "6003",
+         "queued_terminal_turn_id": "turn-innermost", "queued_terminal_response_kind": "process_verification_report"})
 
     merged = await GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
         response="resp", result={"interrupted": True, "messages": []}, stream_task=None)
 
     assert merged["queued_terminal_inbound_id"] == "6003"
+    assert merged['queued_terminal_turn_id'] == 'turn-innermost'
+    assert merged['queued_terminal_response_kind'] == 'process_verification_report'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['stream', 'edit'])
+async def test_confirmed_queued_stream_or_edit_retains_exact_turn_receipt(path):
+    from gateway.delivery_ledger import turn_delivery_state
+    adapter = _telegram_adapter()
+    adapter.edit_message = AsyncMock(return_value=SendResult(success=True, message_id='900'))
+    assert await _runner()._deliver_queued_first_response(TEXT, _source(), adapter,
+        text_already_delivered=path == 'stream', deliver_media=False,
+        stream_consumer=SimpleNamespace(message_id='900', _turn_split_delivery=False),
+        session_key=SESSION_KEY, inbound_message_id=INBOUND_ID, turn_id='turn-receipt')
+    assert turn_delivery_state(SESSION_KEY, 'turn-receipt') == 'delivered'
+    adapter.send.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -369,8 +369,21 @@ def public_obligation_id(obligation_id):
     return obligation_id
 
 
-def process_attention_authorized(obligation_id):
-    """Cancellation in the state DB fences attention retries even if ledger cleanup failed."""
+def process_attention_authorized(obligation_id, *, connection=None):
+    """The state DB fences process-report retries even if ledger cleanup failed."""
+    if obligation_id.startswith('process-report:'):
+        try:
+            from tools.process_registry_followups import report_authorized
+            def read(conn):
+                row = conn.execute('SELECT session_key,turn_id FROM delivery_obligations WHERE obligation_id=?', (obligation_id,)).fetchone()
+                return report_authorized(*row, connection=conn) if row else False
+            if connection is not None:
+                return read(connection)
+            with _DB_LOCK, _transaction() as conn:
+                return read(conn)
+        except (sqlite3.Error, OSError):
+            logger.warning('Process report authorization unavailable: %s', obligation_id, exc_info=True)
+            return None
     if not obligation_id.startswith('process-attention:'):
         return True
     parts = obligation_id.split(':')
@@ -381,6 +394,9 @@ def process_attention_authorized(obligation_id):
     if attention_inflight(obligation_id):
         return None
     try:
+        if connection is not None:
+            return connection.execute("SELECT 1 FROM process_followups WHERE execution_id=? AND token=? AND phase='needs_reconciliation'",
+                                      (parts[1], parts[2])).fetchone() is not None
         return attention_authorized(parts[1], parts[2])
     except (sqlite3.Error, OSError) as exc:
         from tools.environments.ssh_process import safe_error
@@ -397,9 +413,9 @@ def mark_delivered(obligation_id: str) -> None:
 
 
 def mark_uncertain(obligation_id: str, error: str = '') -> None:
-    """Attention transport may have accepted the send; require manual reconciliation."""
-    if not obligation_id.startswith('process-attention:'):
-        raise ValueError('uncertain state is reserved for process attention')
+    """Process-report transport may have accepted the send; require reconciliation."""
+    if not obligation_id.startswith(('process-attention:', 'process-report:')):
+        raise ValueError('uncertain state is reserved for process reports')
     with _DB_LOCK, _transaction() as conn:
         conn.execute("UPDATE delivery_obligations SET state='uncertain',updated_at=?,last_error=? WHERE obligation_id=? AND state NOT IN ('delivered','abandoned')",
                      (time.time(), error[:500] if error else None, obligation_id))
@@ -455,7 +471,7 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=? AND (state!='abandoned' OR obligation_id NOT LIKE 'process-attention:%')""",
+               WHERE obligation_id=? AND (state!='abandoned' OR (obligation_id NOT LIKE 'process-attention:%' AND obligation_id NOT LIKE 'process-report:%'))""",
             (state, time.time(), error[:500] if error else None, obligation_id))
 
 
@@ -508,16 +524,16 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at, turn_id, response_kind) in rows:
-            allowed = process_attention_authorized(oid)
+            allowed = process_attention_authorized(oid, connection=conn)
             if allowed is not True:
                 if allowed is False:
                     conn.execute("UPDATE delivery_obligations SET state='abandoned',updated_at=? WHERE obligation_id=?", (now, oid))
                 continue
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if oid.startswith('process-attention:') and state == 'attempting':
+            if oid.startswith(('process-attention:', 'process-report:')) and state == 'attempting':
                 conn.execute("UPDATE delivery_obligations SET state='uncertain',updated_at=?,last_error=? WHERE obligation_id=? AND state='attempting'",
-                             (now, 'Previous owner exited during attention send; inspect conversation before any manual resend', oid))
+                             (now, 'Previous owner exited during process report send; inspect conversation before any manual resend', oid))
                 continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
@@ -591,7 +607,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at, turn_id, response_kind) in rows:
-            allowed = process_attention_authorized(oid)
+            allowed = process_attention_authorized(oid, connection=conn)
             if allowed is not True:
                 if allowed is False:
                     conn.execute("UPDATE delivery_obligations SET state='abandoned',updated_at=? WHERE obligation_id=?", (now, oid))

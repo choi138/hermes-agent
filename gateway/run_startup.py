@@ -553,6 +553,15 @@ class GatewayStartupMixin:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
+                if row['obligation_id'].startswith('process-report:'):
+                    from gateway.delivery_ledger import process_attention_authorized, abandon_obligation
+                    allowed = await asyncio.to_thread(process_attention_authorized, row['obligation_id'])
+                    if allowed is not True:
+                        if allowed is False:
+                            await asyncio.to_thread(abandon_obligation, row['obligation_id'])
+                        else:
+                            await asyncio.to_thread(mark_failed, row['obligation_id'], 'Report authorization unavailable; no send admitted')
+                        continue
                 if row['obligation_id'].startswith('process-attention:'):
                     from gateway.process_followups import _send_attention
                     _, execution, token = row['obligation_id'].split(':')
@@ -563,13 +572,18 @@ class GatewayStartupMixin:
                         continue  # Cancellation already abandoned this obligation.
                 else:
                     result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                    if (row['obligation_id'].startswith('process-report:') and not result.success
+                            and (adapter._is_timeout_error(result.error) or adapter._is_partial_delivery(result))):
+                        from gateway.delivery_ledger import mark_uncertain
+                        await asyncio.to_thread(mark_uncertain, row['obligation_id'], 'Report transport may have accepted content; inspect conversation before resend')
+                        continue
             except AttentionSendPending:
                 continue  # A live transport owns settlement; never launch a concurrent retry.
             except Exception as send_err:
                 from tools.environments.ssh_process import safe_error
                 from gateway.delivery_ledger import public_obligation_id
                 logger.warning("obligation %s: redelivery send raised: %s", public_obligation_id(row["obligation_id"]), safe_error(send_err))
-                if row['obligation_id'].startswith('process-attention:'):
+                if row['obligation_id'].startswith(('process-attention:', 'process-report:')):
                     from gateway.delivery_ledger import mark_uncertain
                     with _log_suppressed(logging.DEBUG, "attention outcome persistence failed", exc_info=True):
                         await asyncio.to_thread(mark_uncertain, row['obligation_id'], safe_error(send_err))

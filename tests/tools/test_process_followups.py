@@ -192,6 +192,27 @@ def test_return_without_verification_cannot_close_followup(monkeypatch, tmp_path
     assert followups.get_state(session.id)['verification']['outcome'] == 'unverified'
 
 
+def test_report_obligation_cannot_escape_before_assessment_commit_or_after_cancel(monkeypatch, tmp_path):
+    from gateway import delivery_ledger as delivery
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_uncommitted_report', command='true', session_key='report-session')
+    followups.reserve(session)
+    row = followups.pending()[0]
+    assert followups.admission(session.id, row['token']) and followups.begin(session.id, row['token'])
+    assert followups.authorized(session.id, row['token'])
+    assert followups.reserve_report(session.id, row['token'], 'report-turn')
+    oid = 'process-report:' + delivery.compute_obligation_id(session.session_key, 'report-turn', 'process_verification_report')
+    delivery.record_obligation(obligation_id=oid, session_key=session.session_key, platform='telegram',
+        chat_id='4242', thread_id=None, content='Assessment not committed yet', turn_id='report-turn',
+        response_kind='process_verification_report')
+    assert delivery.process_attention_authorized(oid) is None
+    assert not delivery.claim_pending_obligation(oid)
+    followups.cancel_for_session(session.session_key)
+    assert delivery.process_attention_authorized(oid) is False
+    assert not delivery.claim_pending_obligation(oid)
+    assert delivery.turn_delivery_state(session.session_key, 'report-turn') == 'abandoned'
+
+
 def test_verified_failure_and_approval_are_distinct_durable_outcomes(monkeypatch, tmp_path):
     import json
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -330,6 +351,28 @@ def test_failed_verification_report_retains_original_cause(monkeypatch, tmp_path
     assert state['phase'] == 'needs_reconciliation'
     assert 'model connection refused' in state['reason']
     assert 'sk-testSensitiveReasonKey' not in state['reason']
+
+
+@pytest.mark.parametrize('prefix', ['', '{"outcome":"verified","evidence":["artifact"],"next_action":"none"}',
+    '```json\n{"outcome":"verified","evidence":["artifact"],"next_action":"none"}\n```',
+    '검증 결과야.\n{"outcome":"verified","evidence":["artifact"],"next_action":"none"}',
+    '검증 결과야.\n```json\n{"outcome":"verified","evidence":["artifact"],"next_action":"none"}\n```',
+    '검증 결과야.\n{"outcome":"verified","evidence":'])
+def test_json_only_report_uses_assessment_evidence_without_exposing_json(prefix):
+    block = '\n```process_verification\n{"outcome":"verification_failed","evidence":["pytest was missing"],"next_action":"Install test dependencies"}\n```'
+    report = followups.verification_report({'final_response': prefix + block}, language_hint='검증')
+    assert '검증에 실패' in report
+    assert 'pytest was missing' in report and 'Install test dependencies' in report
+    assert 'outcome' not in report and 'process_verification' not in report
+
+
+@pytest.mark.parametrize('text', ['{"outcome":"verified"}', '```process_verification\ninvalid\n```',
+    '보고서\n```process_verification\n{"outcome":"verified","evidence":[],"next_action":"none"}\n```'])
+def test_malformed_assessment_is_private_and_cannot_claim_success(text):
+    report = followups.verification_report({'final_response': text}, language_hint='검증')
+    assert '확정하지 못했어' in report
+    assert 'outcome' not in report and 'process_verification' not in report
+    assert followups.verification_outcome({'final_response': text})['outcome'] == 'unverified'
 
 
 def test_verification_assessment_must_be_terminal_and_unquoted():

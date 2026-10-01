@@ -115,28 +115,79 @@ def reserve(session):
 def pending():
     # Never run host probes while holding SQLite's writer lock.
     with _db() as db:
-        running = [dict(row) for row in db.execute(
-            "SELECT execution_id,token,owner,updated_at FROM process_followups WHERE phase IN ('running','dispatching','cancel_requested')")]
-    dead = {row['owner'] for row in running if row['owner']}
-    dead = {owner for owner in dead if _owner_alive(owner) is not True}
+        active = [dict(row) for row in db.execute(
+            "SELECT execution_id,token,owner,updated_at,phase FROM process_followups WHERE phase IN ('queued','running','dispatching','cancel_requested')")]
+    owners = {owner: _owner_alive(owner) for owner in {row['owner'] for row in active if row['owner']}}
     with _db() as db:
-        for row in running:
-            if row['owner'] in dead or time.time() - row['updated_at'] > 900:
+        for row in active:
+            if row['phase'] == 'queued':
+                # Queue acceptance belongs to one process instance, not a 30-second
+                # retry timer. Only an undispatched event whose owner exited may
+                # be restored. Empty owners are legacy queued rows.
+                if not row['owner'] or owners.get(row['owner']) is False:
+                    db.execute("UPDATE process_followups SET phase='pending',owner='',next_attempt=0,updated_at=? WHERE execution_id=? AND token=? AND owner=? AND updated_at=? AND phase='queued'",
+                               (time.time(), row['execution_id'], row['token'], row['owner'], row['updated_at']))
+                continue
+            if owners.get(row['owner']) is not True or time.time() - row['updated_at'] > 900:
                 db.execute("UPDATE process_followups SET phase=CASE WHEN phase='cancel_requested' THEN 'cancelled' ELSE 'needs_reconciliation' END,reason=?,updated_at=?,next_attempt=0 WHERE execution_id=? AND token=? AND owner=? AND updated_at=? AND phase IN ('running','dispatching','cancel_requested')",
                            ('Verification owner unavailable or 15-minute progress deadline exceeded; inspect effects before retrying',
                             time.time(), row['execution_id'], row['token'], row['owner'], row['updated_at']))
-        rows = db.execute("SELECT * FROM process_followups WHERE phase IN ('pending','queued','needs_reconciliation','turn_finished','failed') AND next_attempt<=? ORDER BY next_attempt,updated_at LIMIT 32",
+        rows = db.execute("SELECT * FROM process_followups WHERE phase IN ('pending','needs_reconciliation','turn_finished','failed') AND next_attempt<=? ORDER BY next_attempt,updated_at LIMIT 32",
                           (time.time(),)).fetchall()
     return [dict(row) for row in rows]
 
 
 def admission(execution, token):
-    """Reserve a bounded retry window, with a token that also fences actual model execution."""
+    """Claim queue ownership once; actual model execution has a separate token fence."""
     now = time.time()
     with _db() as db:
-        return db.execute('''UPDATE process_followups SET phase='queued',next_attempt=?,updated_at=?
-            WHERE execution_id=? AND token=? AND phase IN ('pending','queued') AND next_attempt<=?''',
-            (now + 30, now, execution, token, now)).rowcount == 1
+        if not db.execute("SELECT 1 FROM process_followups WHERE execution_id=? AND token=? AND phase='pending' AND next_attempt<=?",
+                          (execution, token, now)).fetchone():
+            return False
+    try:
+        owner = _owner_for_pid(os.getpid())
+    except (psutil.Error, OSError, ValueError) as exc:
+        from tools.environments.ssh_process import safe_error
+        with _db() as db:
+            db.execute("UPDATE process_followups SET phase='needs_reconciliation',reason=?,updated_at=?,next_attempt=0 WHERE execution_id=? AND token=? AND phase='pending'",
+                       ('Cannot establish queue owner identity; no model dispatched: ' + safe_error(exc), now, execution, token))
+        return False
+    with _db() as db:
+        return db.execute('''UPDATE process_followups SET phase='queued',owner=?,next_attempt=?,updated_at=?
+            WHERE execution_id=? AND token=? AND phase='pending' AND next_attempt<=?''',
+            (owner, now + 30, now, execution, token, now)).rowcount == 1
+
+
+def reject_admission(execution, token, reason, *, uncertain=False):
+    """Only a refused queue admission releases the claim for a bounded retry."""
+    with _db() as db:
+        db.execute("UPDATE process_followups SET phase=?,owner='',reason=?,updated_at=?,next_attempt=? WHERE execution_id=? AND token=? AND phase='queued'",
+                   ('needs_reconciliation' if uncertain else 'pending', scrub_payload(reason), time.time(),
+                    0 if uncertain else time.time() + 30, execution, token))
+
+
+def reserve_report(execution, token, turn_id):
+    """Bind the report's turn before recording its obligation; dispatch stays fenced."""
+    with _db() as db:
+        return db.execute("UPDATE process_followups SET payload=json_set(payload,'$.followup_turn_id',?) WHERE execution_id=? AND token=? AND phase='dispatching' AND COALESCE(json_extract(payload,'$.followup_cancelled'),0)=0",
+                          (turn_id, execution, token)).rowcount == 1
+
+
+def report_authorized(session_key, turn_id, *, connection=None):
+    """Only a committed, uncancelled assessment permits public report delivery."""
+    def read(db):
+        return db.execute("SELECT phase,payload FROM process_followups WHERE json_extract(payload,'$.session_key')=? AND json_extract(payload,'$.followup_turn_id')=?",
+                          (session_key, turn_id)).fetchone()
+    if connection is None:
+        with _db() as db:
+            row = read(db)
+    else:
+        row = read(connection)
+    if not row or json.loads(row[1]).get('followup_cancelled'):
+        return False
+    if row[0] in {'running', 'dispatching'}:
+        return None  # The assessment has not committed; recovery must wait.
+    return row[0] in {'turn_finished', 'failed', 'reported', 'verification_failed', 'approval_wait'}
 
 
 def begin(execution, token):
@@ -155,7 +206,7 @@ def begin(execution, token):
             (owner, time.time(), execution, token)).rowcount == 1
 
 
-def finish(execution, token, result, turn_id=None):
+def finish(execution, token, result, turn_id=None, *, report_text=None):
     phase = 'failed' if result.get('failed') or result.get('interrupted') else 'turn_finished'
     reason = scrub_payload(str(result.get('failure_reason') or result.get('interrupt_message') or ''))
     with _db() as db:
@@ -167,6 +218,8 @@ def finish(execution, token, result, turn_id=None):
         payload['followup_turn_id'] = turn_id
         payload['verification_failure_reason'] = reason
         payload['verification'] = scrub_payload(verification_outcome(result))
+        payload['verification_raw_response'] = scrub_payload(result.get('final_response') or '')
+        payload['report_text'] = scrub_payload(verification_report(result) if report_text is None else report_text)
         if row['phase'] == 'cancel_requested':
             phase = 'cancelled'
             reason = 'Cancelled verification result retained for inspection; no follow-up will be dispatched'
@@ -229,6 +282,10 @@ def cancel_for_session(session_key):
     for row in rows:
         if json.loads(row['payload']).get('session_key') == session_key:
             abandon_obligation('process-attention:' + row['execution_id'] + ':' + row['token'])
+            payload = json.loads(row['payload'])
+            if payload.get('followup_turn_id'):
+                from gateway.delivery_ledger import compute_obligation_id
+                abandon_obligation('process-report:' + compute_obligation_id(session_key, payload['followup_turn_id'], 'process_verification_report'))
 
 
 def get_state(execution):
@@ -238,7 +295,7 @@ def get_state(execution):
         return None
     state = dict(row)
     payload = json.loads(state.pop('payload'))
-    state.update({key: payload[key] for key in ('verification', 'timings', 'report_delivered') if key in payload})
+    state.update({key: payload[key] for key in ('verification', 'timings', 'report_delivered', 'report_text') if key in payload})
     return state
 
 
@@ -296,12 +353,15 @@ Do not rerun the completed command or start an automatic repair in this follow-u
 Allowed checks are read_file, search_files, and process/process_manage poll or log for this execution only.
 Terminal commands and all other tools are blocked. If required evidence needs another tool or command, return approval_wait with the exact check that needs approval.
 On failed verification, report the reason and concrete remaining work. Never loop repairs or bypass approval.
+First write a natural-language report in the user's language, including the outcome, evidence,
+and concrete remaining work. This is the only text shown to the user.
 End the response with a single ```process_verification JSON block containing:
 {"outcome":"verified","evidence":["specific checks and observed results"], "next_action":"none"}
 Choose exactly one outcome: verified, verification_failed, or approval_wait.
 For either non-verified outcome, replace next_action with the concrete remaining or approval action.
 The automatic repair budget is zero and is recorded by the system. Only use verified with actual successful checks.
 This is your recorded assessment, not an independent automated certificate.
+The JSON block is internal bookkeeping and is removed before delivery; never replace the natural-language report with it.
 """
 
 
@@ -344,6 +404,35 @@ def verification_outcome(result):
         return json.loads(redact_sensitive_text(json.dumps(value), code_file=True, force=True))
     except (ValueError, TypeError):
         return fallback
+
+
+def verification_report(result, *, language_hint=''):
+    """Render only the public report; never expose malformed or bare assessment JSON."""
+    assessment = verification_outcome(result)
+    korean = bool(re.search(r'[가-힣]', language_hint + str(result.get('final_response') or '')))
+    if assessment['outcome'] == 'unverified':
+        return ('검증 결과를 확정하지 못했어. 기록된 결과를 확인해야 해. 명령을 자동으로 다시 실행하지 않았어.'
+            if korean else 'Verification result could not be confirmed. '
+            'Inspect the recorded evidence before retrying; no command was automatically repeated.')
+    text = result.get('final_response') or ''
+    start = re.search(r'^```process_verification[^\S\n]*\n', text, re.M).start()
+    prose = text[:start].strip()
+    # A model can repeat its assessment inside prose, including truncated JSON.
+    # Render the validated assessment instead of exposing any repeated schema.
+    if re.search(r'"(?:outcome|evidence|next_action)"\s*:', prose):
+        prose = ''
+    from gateway.response_filters import is_intentional_silence_response
+    if prose and not is_intentional_silence_response(prose):
+        return scrub_payload(prose)
+    headings = ({'verified': '검증을 완료했어.', 'verification_failed': '검증에 실패했어.',
+                 'approval_wait': '검증에 필요한 승인을 기다리고 있어.'} if korean else
+                {'verified': 'Verification completed.', 'verification_failed': 'Verification failed.',
+                 'approval_wait': 'Verification is waiting for approval.'})
+    heading = headings[assessment['outcome']]
+    report = heading + '\n' + '\n'.join(assessment['evidence'])
+    if assessment['outcome'] != 'verified':
+        report += ('\n남은 작업: ' if korean else '\nNext action: ') + assessment['next_action']
+    return scrub_payload(report)
 
 
 def record_timings(execution, token, **values):

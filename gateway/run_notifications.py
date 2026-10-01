@@ -400,6 +400,7 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        turn_id: Optional[str] = None, response_kind: Optional[str] = None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -414,8 +415,11 @@ class GatewayNotificationsMixin:
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        text_content = _strip_response_attachments_for_direct_send(response, adapter)
+        if text_already_delivered and text_content:
+            await self._record_queued_final_receipt(adapter, source, text_content, session_key,
+                inbound_message_id, turn_id=turn_id, response_kind=response_kind)
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
@@ -431,6 +435,8 @@ class GatewayNotificationsMixin:
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
                         if getattr(_edit_res, "success", False):
+                            await self._record_queued_final_receipt(adapter, source, text_content, session_key,
+                                inbound_message_id, turn_id=turn_id, response_kind=response_kind)
                             _reconciled = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
@@ -454,7 +460,7 @@ class GatewayNotificationsMixin:
                 if not _reconciled:
                     _sent = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
-                        inbound_message_id)
+                        inbound_message_id, turn_id=turn_id, response_kind=response_kind)
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -470,10 +476,30 @@ class GatewayNotificationsMixin:
         )
         return True
 
+    async def _record_queued_final_receipt(
+        self, adapter, source, content, session_key, inbound_message_id, *, turn_id, response_kind,
+    ):
+        """Retain exact-turn evidence for an already confirmed stream or final edit."""
+        if not session_key or not isinstance(adapter, BasePlatformAdapter):
+            return
+        event = MessageEvent(text='', source=source, ledger_message_id=inbound_message_id)
+        event._gateway_active_turn_id = turn_id
+        event._gateway_response_kind = response_kind
+        try:
+            obligation_id = await adapter._record_delivery_obligation(event, session_key, content, adapter, False)
+            if obligation_id:
+                from gateway.delivery_ledger import mark_delivered
+                await asyncio.to_thread(mark_delivered, obligation_id)
+        except Exception:
+            logger.warning('Confirmed queued delivery receipt could not be retained', exc_info=True)
+            # The platform already acknowledged delivery. Never duplicate it
+            # merely because recording its receipt failed.
+
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],
         event_message_id: Optional[str], session_key: Optional[str],
         inbound_message_id: Optional[str] = None,
+        *, turn_id: Optional[str] = None, response_kind: Optional[str] = None,
     ):
         """Send a queued-lane final through the same ledger bracket as the normal final
         (``send_final_ledgered``). This lane used to call ``adapter.send`` bare and discard the
@@ -484,8 +510,11 @@ class GatewayNotificationsMixin:
         inbound id the ledger falls back to the event's own (empty) message id. Adapters without
         the base contract and sends without a session key keep the plain send."""
         if session_key and isinstance(adapter, BasePlatformAdapter):
+            event = MessageEvent(text="", source=source, ledger_message_id=inbound_message_id)
+            event._gateway_active_turn_id = turn_id
+            event._gateway_response_kind = response_kind
             result, _ = await adapter.send_final_ledgered(
-                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                event,
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)

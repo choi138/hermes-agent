@@ -25,9 +25,9 @@ class Transport:
 
 
 class Runner(GatewayNotificationsMixin):
-    def __init__(self, home):
+    def __init__(self, home, platform=Platform.TELEGRAM):
         self.session_store = SessionStore(home / 'sessions', GatewayConfig())
-        self.source = SessionSource(platform=Platform.TELEGRAM, chat_id='4242', chat_type='dm')
+        self.source = SessionSource(platform=platform, chat_id='4242', chat_type='dm')
         self.entry = self.session_store.get_or_create_session(self.source)
         self.transport = Transport()
         self._boot_id = 'test-boot'
@@ -43,6 +43,218 @@ class Runner(GatewayNotificationsMixin):
 
     async def _classify_completion_target(self, parent):
         return 'deliver'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('state', ['pending', 'failed', 'attempting', 'cancelled'])
+async def test_report_restart_recovers_saved_text_only_and_isolates_profiles(monkeypatch, tmp_path, state):
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    from unittest.mock import AsyncMock
+    from gateway import delivery_ledger as delivery
+    from gateway.run import GatewayRunner
+    from gateway.platforms.base import SendResult
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    # A real exiting process creates the marker, assessment and obligation through
+    # the actual turn boundary. There is no simulated owner or shared module cache.
+    child = '''
+import json, os
+from pathlib import Path
+from types import SimpleNamespace
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionStore, SessionSource
+from gateway.platforms.base import MessageEvent
+from gateway.turn_context import TurnContext
+from gateway.run_turn_runner import TurnRunner
+from tools.process_registry import ProcessSession
+from tools import process_registry_followups as f
+from gateway import delivery_ledger as d
+home = Path(os.environ['HERMES_HOME'])
+store = SessionStore(home / 'sessions', GatewayConfig())
+source = SessionSource(platform=Platform.TELEGRAM, chat_id='4242', chat_type='dm')
+entry = store.get_or_create_session(source)
+session = ProcessSession(id='proc_restart_report', command='true', session_key=entry.session_key, parent_session_id=entry.session_id)
+f.reserve(session)
+row = f.pending()[0]
+assert f.admission(session.id, row['token'])
+event = MessageEvent(text='검증', source=source, internal=True, metadata={'process_followup': {'execution_id':session.id, 'token':row['token']}})
+ctx = TurnContext(event=event, source=source, session_key=entry.session_key, session_id=entry.session_id, message=event.text)
+def run(message, **kwargs):
+    (home / 'model-calls').write_text('1')
+    return {'final_response': '검증 결과를 확인했어.\\n```process_verification\\n{"outcome":"verified","evidence":["artifact checked"],"next_action":"none"}\\n```', 'messages':[], 'turn_id':kwargs['turn_id']}
+runner = SimpleNamespace(session_store=store, _boot_id='child-boot', _consume_pending_native_image_paths=lambda _: [])
+result = TurnRunner(runner, ctx)._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
+state = os.environ['REPORT_TEST_STATE']
+if state == 'failed': d.mark_failed(result['process_report_obligation_id'], 'transport explicitly refused')
+if state == 'attempting': d.mark_attempting(result['process_report_obligation_id'])
+print(json.dumps({'turn_id':result['turn_id'], 'session_key':entry.session_key}))
+'''
+    homes = [tmp_path / 'a', tmp_path / 'b']
+    identities = []
+    for home in homes:
+        env = {**os.environ, 'HERMES_HOME': str(home), 'REPORT_TEST_STATE': state}
+        completed = subprocess.run([sys.executable, '-c', child], cwd=Path(__file__).resolve().parents[2],
+            env=env, text=True, capture_output=True, timeout=45)
+        assert completed.returncode == 0, completed.stderr
+        identities.append(json.loads(completed.stdout.splitlines()[-1]))
+    for index in [0, 1, 0]:
+        home, identity = homes[index], identities[index]
+        monkeypatch.setenv('HERMES_HOME', str(home))
+        runner = Runner(home)
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token='isolated-test-token', extra={}))
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id='ack'))
+        runner._obligation_adapter = AsyncMock(return_value=adapter)
+        runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+        if state == 'cancelled':
+            ledger.cancel_for_session(identity['session_key'])
+        claimed = delivery.sweep_recoverable()
+        count = await GatewayRunner._redeliver_claimed_obligations(runner, claimed)
+        expected = state in {'pending', 'failed'}
+        if index == 0 and ledger.get_state('proc_restart_report').get('report_delivered'):
+            expected = False
+        assert count == int(expected)
+        if expected:
+            assert '검증 결과를 확인했어.' in adapter.send.call_args.kwargs['content']
+            assert 'process_verification' not in adapter.send.call_args.kwargs['content']
+            assert '"outcome"' not in adapter.send.call_args.kwargs['content']
+            with ledger._db() as db:
+                db.execute('UPDATE process_followups SET next_attempt=0')
+            await reconcile(runner)
+            assert ledger.get_state('proc_restart_report')['phase'] == 'reported'
+        else:
+            adapter.send.assert_not_awaited()
+        assert (home / 'model-calls').read_text() == '1'
+        assert not runner.transport.events  # No model verification is re-injected.
+        assert delivery.turn_delivery_state(identity['session_key'], identity['turn_id']) == (
+            'delivered' if state in {'pending', 'failed'} else 'uncertain' if state == 'attempting' else 'abandoned')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel', [False, True])
+@pytest.mark.parametrize('failure', ['exception', 'timeout'])
+async def test_report_transport_uncertainty_and_cancellation_never_trigger_parallel_send(monkeypatch, tmp_path, cancel, failure):
+    from unittest.mock import AsyncMock, MagicMock
+    from gateway import delivery_ledger as delivery
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from gateway.platforms.base import SendResult
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = Runner(tmp_path)
+    session = ProcessSession(id='proc_report_race', command='true', session_key=runner.entry.session_key,
+        parent_session_id=runner.entry.session_id)
+    ledger.reserve(session)
+    await reconcile(runner)
+    event = runner.transport.events[0]
+    ctx = TurnContext(event=event, source=runner.source, session_key=session.session_key,
+        session_id=session.parent_session_id, message=event.text)
+    def run(message, **kwargs):
+        return {'final_response': '확인했어.\n```process_verification\n{"outcome":"verified","evidence":["artifact checked"],"next_action":"none"}\n```',
+            'messages': [], 'turn_id': kwargs['turn_id']}
+    result = TurnRunner(runner, ctx)._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='isolated-test-token', extra={}))
+    adapter.gateway_runner = MagicMock()
+    adapter._send_with_retry = (AsyncMock(side_effect=OSError('ack lost')) if failure == 'exception'
+        else AsyncMock(return_value=SendResult(success=False, error='ReadTimeout: request timed out')))
+    if cancel:
+        ledger.cancel_for_session(session.session_key)
+    elif failure == 'exception':
+        with pytest.raises(OSError):
+            await adapter.send_final_ledgered(event, session.session_key, result['final_response'], {}, reply_to=None)
+    else:
+        failed, _ = await adapter.send_final_ledgered(event, session.session_key, result['final_response'], {}, reply_to=None)
+        assert not failed.success
+    again, _ = await adapter.send_final_ledgered(event, session.session_key, result['final_response'], {}, reply_to=None)
+    assert not again.success
+    assert adapter._send_with_retry.await_count == (0 if cancel else 1)
+    assert delivery.turn_delivery_state(session.session_key, result['turn_id']) == ('abandoned' if cancel else 'uncertain')
+
+
+@pytest.mark.asyncio
+async def test_busy_completion_is_queued_once_and_restored_only_after_owner_exit(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = Runner(tmp_path)
+    session = ProcessSession(id='proc_busy_report', command='true',
+        session_key=runner.entry.session_key, parent_session_id=runner.entry.session_id)
+    ledger.reserve(session)
+    await reconcile(runner)
+    for _ in range(3):
+        with ledger._db() as db:
+            db.execute('UPDATE process_followups SET next_attempt=0')
+        await reconcile(runner)
+    assert len(runner.transport.events) == 1
+    assert ledger.get_state(session.id)['phase'] == 'queued'
+    # The in-memory queue disappeared with its owner. Restore this undispatched
+    # event once, without restoring a running verification or a completed command.
+    original_alive = ledger._owner_alive
+    monkeypatch.setattr(ledger, '_owner_alive', lambda _: False)
+    restored = Runner(tmp_path)
+    await reconcile(restored)
+    monkeypatch.setattr(ledger, '_owner_alive', original_alive)
+    await reconcile(restored)
+    assert len(restored.transport.events) == 1
+    assert restored.transport.events[0].metadata['process_followup'] == runner.transport.events[0].metadata['process_followup']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['verified', 'verification_failed', 'approval_wait'])
+@pytest.mark.parametrize('platform', [Platform.TELEGRAM, Platform.DISCORD])
+async def test_private_verification_reaches_queued_delivery_with_its_exact_turn(monkeypatch, tmp_path, outcome, platform):
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from gateway.delivery_ledger import turn_delivery_state
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from gateway.config import PlatformConfig
+    from gateway.run import _normalize_empty_agent_response
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = Runner(tmp_path, platform)
+    session = ProcessSession(id='proc_private_report', command='true',
+        session_key=runner.entry.session_key, parent_session_id=runner.entry.session_id)
+    ledger.reserve(session)
+    await reconcile(runner)
+    event = runner.transport.events[0]
+    prose = '검증 결과와 남은 작업을 확인했어.'
+    assessment = dict(outcome=outcome, evidence=['observed artifact'],
+        next_action='none' if outcome == 'verified' else 'Inspect remaining work')
+    raw = prose + '\n```process_verification\n' + json.dumps(assessment) + '\n```'
+    calls = []
+    def run(message, **kwargs):
+        calls.append(message)
+        return dict(final_response=raw, messages=[], turn_id=kwargs['turn_id'])
+    ctx = TurnContext(event=event, source=runner.source, session_key=session.session_key,
+        session_id=session.parent_session_id, message=event.text)
+    ctx.resolve_display_setting = lambda *_: True
+    ctx.interim_assistant_messages_enabled = True
+    turn = TurnRunner(runner, ctx)
+    assert turn._setup_stream_consumer(platform.value) == (None, None, None, False)
+    result = turn._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
+    assert result['final_response'] == prose
+    assert ledger.get_state(session.id)['verification'] == {**assessment, 'repair_attempts': 0}
+    assert ledger.get_state(session.id)['report_text'] == prose
+    duplicate = turn._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
+    assert duplicate['process_followup_disposition'] == 'skipped'
+    assert _normalize_empty_agent_response(duplicate, duplicate['final_response']) == 'NO_REPLY'
+    assert len(calls) == 1
+    adapter_type = TelegramAdapter if platform == Platform.TELEGRAM else DiscordAdapter
+    adapter = adapter_type(PlatformConfig(enabled=True, token='isolated-test-token', extra={}))
+    adapter.gateway_runner = MagicMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id='report-ack'))
+    assert await runner._deliver_queued_first_response(result['final_response'], runner.source, adapter,
+        session_key=session.session_key, inbound_message_id=event.message_id, deliver_media=False,
+        turn_id=result['turn_id'], response_kind=result['response_kind'])
+    assert turn_delivery_state(session.session_key, result['turn_id']) == 'delivered'
+    adapter.send.assert_awaited_once()
+    assert adapter.send.call_args.kwargs['content'] == prose
+    with ledger._db() as db:
+        db.execute('UPDATE process_followups SET next_attempt=0')
+    await reconcile(runner)
+    assert ledger.get_state(session.id)['phase'] == ('reported' if outcome == 'verified' else outcome)
+    assert len(runner.transport.events) == 1
 
 
 @pytest.mark.asyncio

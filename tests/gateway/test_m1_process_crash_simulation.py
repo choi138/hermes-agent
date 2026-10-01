@@ -17,6 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+# Real HTTP faults, cold imports and state writes share the loaded host.
+# Keep progress bounded without asserting interpreter or filesystem speed.
+_CHILD_PROGRESS_TIMEOUT = 60
+_CHILD_PROCESS_TIMEOUT = 180
+
 
 async def _child(root: Path, scenario: str, stage: str):
     import logging
@@ -91,7 +96,7 @@ async def _child(root: Path, scenario: str, stage: str):
 
     if stage == "prepare":
         await adapter.handle_message(_m1_replan_event("inspect original request", source, "original"))
-        await _m1_replan_await_session_task(adapter, key)
+        await _m1_replan_await_session_task(adapter, key, timeout=_CHILD_PROGRESS_TIMEOUT)
         entry = runner.session_store._entries[key]
         assert entry.active_turn is not None, {"requests": len(state["requests"]), "sent": adapter.sent}
         assert entry.active_turn["status"] == "retry_wait", entry.active_turn
@@ -119,7 +124,7 @@ async def _child(root: Path, scenario: str, stage: str):
         elif scenario == "executing":
             state["action"] = "hang"
             assert runner._schedule_resume_pending_sessions() == 1
-            async with asyncio.timeout(20):
+            async with asyncio.timeout(_CHILD_PROGRESS_TIMEOUT):
                 while len(state["requests"]) == initial_count:
                     await asyncio.sleep(0.01)
             assert entry.active_turn["dispatch_state"] == "executing"
@@ -128,10 +133,10 @@ async def _child(root: Path, scenario: str, stage: str):
                 raise OSError("injected session-index write failure")
             patch.setattr(runner.session_store, "_save_entry", cannot_save)
             await adapter.handle_message(_m1_replan_event("/stop", source, "stop"))
-            await _m1_replan_await_session_task(adapter, key)
+            await _m1_replan_await_session_task(adapter, key, timeout=_CHILD_PROGRESS_TIMEOUT)
             tasks = [task for task in adapter._background_tasks if not task.done()]
             if tasks:
-                await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=_CHILD_PROGRESS_TIMEOUT)
             assert runner.session_store.recovery_is_quarantined(key, old), {
                 "record": entry.active_turn, "sent": adapter.sent,
             }
@@ -145,7 +150,7 @@ async def _child(root: Path, scenario: str, stage: str):
         await asyncio.Event().wait()
     else:
         scheduled = runner._schedule_resume_pending_sessions()
-        await _m1_replan_await_background_tasks(runner, timeout=20)
+        await _m1_replan_await_background_tasks(runner, timeout=_CHILD_PROGRESS_TIMEOUT)
         entry = runner.session_store._entries[key]
         transcript = runner.session_store.load_transcript(entry.session_id, repair_alternation=False)
         receipt = {
@@ -177,7 +182,7 @@ def test_http_outage_kill_and_restart(tmp_path, scenario, record_property):
     with (root / "prepare.log").open("w") as log:
         process = subprocess.Popen(argv + ["prepare"], cwd=repo, env=env, stdout=log, stderr=log)
         try:
-            deadline = time.monotonic() + 35
+            deadline = time.monotonic() + _CHILD_PROCESS_TIMEOUT
             while not (root / "ready.json").exists():
                 assert process.poll() is None, (root / "prepare.log").read_text()
                 assert time.monotonic() < deadline, (root / "prepare.log").read_text()
@@ -196,7 +201,7 @@ def test_http_outage_kill_and_restart(tmp_path, scenario, record_property):
     for stage in ("restart", "restart_again"):
         with (root / f"{stage}.log").open("w") as log:
             completed = subprocess.run(argv + [stage], cwd=repo, env=env,
-                stdout=log, stderr=log, timeout=30)
+                stdout=log, stderr=log, timeout=_CHILD_PROCESS_TIMEOUT)
         assert completed.returncode == 0, (root / f"{stage}.log").read_text()
         receipt = json.loads((root / f"{stage}-receipt.json").read_text())
         record_property(stage, json.dumps(receipt))

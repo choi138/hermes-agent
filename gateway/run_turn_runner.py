@@ -910,7 +910,9 @@ class TurnRunner:
 
     def _setup_stream_consumer(self, platform_key):
         ctx = self._ctx
-        if ctx.mute_notification_reply:
+        if ctx.mute_notification_reply or (getattr(ctx.event, 'metadata', None) or {}).get('process_followup'):
+            # The assessment must be parsed and persisted before any draft,
+            # commentary, or speech can expose its internal JSON.
             return None, None, None, False
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
@@ -1887,7 +1889,8 @@ class TurnRunner:
             if followup:
                 from tools.process_registry_followups import begin, finish
                 if not begin(followup["execution_id"], followup["token"]):
-                    return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
+                    return {"final_response": "NO_REPLY", "process_followup_disposition": "skipped",
+                            "messages": [], "api_calls": 0, "tools": []}
             resume_marker = ctx.turn_resume_marker
             if ctx.event is not None and getattr(
                 ctx.event, "_gateway_resume_dispatch_stale", False,
@@ -1962,7 +1965,8 @@ class TurnRunner:
             if followup:
                 from tools.process_registry_followups import authorized
                 if not authorized(followup["execution_id"], followup["token"]):
-                    return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
+                    return {"final_response": "NO_REPLY", "process_followup_disposition": "skipped",
+                            "messages": [], "api_calls": 0, "tools": []}
             if followup:
                 from tools.process_registry_followups import VERIFICATION_INSTRUCTION
                 api_message += "\n" + VERIFICATION_INSTRUCTION
@@ -2003,7 +2007,18 @@ class TurnRunner:
                         approval_wait_seconds=max(0, human_wait_seconds(session_key) - approval_baseline),
                         model_response_seconds=max(0, getattr(agent, 'session_model_response_seconds', 0.0) - model_baseline))
             if followup:
-                finish(followup["execution_id"], followup["token"], result, kwargs.get("turn_id"))
+                from gateway.process_followups import prepare_report
+                turn_id = kwargs.get('turn_id')
+                report_text, obligation_id = prepare_report(self._runner, ctx, result, turn_id)
+                if obligation_id is None:
+                    finish(followup['execution_id'], followup['token'], result, turn_id, report_text=report_text)
+                    return {'final_response': 'NO_REPLY', 'process_followup_disposition': 'skipped',
+                            'messages': result.get('messages', []), 'api_calls': result.get('api_calls', 0), 'tools': []}
+                if not finish(followup["execution_id"], followup["token"], result, turn_id, report_text=report_text):
+                    raise RuntimeError('Verification assessment was not persisted')
+                result = {**result, 'final_response': report_text, 'turn_id': turn_id,
+                          'process_report_obligation_id': obligation_id,
+                          'response_kind': 'process_verification_report'}
             return result
         except Exception as exc:
             if followup:
@@ -2289,6 +2304,9 @@ class TurnRunner:
         common = {
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "turn_id": result.get("turn_id"),
+            "process_followup_disposition": result.get("process_followup_disposition"),
+            "process_report_obligation_id": result.get("process_report_obligation_id"),
+            "response_kind": result.get("response_kind"),
             "current_turn_user_idx": result.get("current_turn_user_idx"),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "failure_retryable": result.get("failure_retryable"),
@@ -2309,7 +2327,8 @@ class TurnRunner:
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
             return {"final_response": final_response, **common}
-        final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
+        if result.get('response_kind') != 'process_verification_report':
+            final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.
         return {

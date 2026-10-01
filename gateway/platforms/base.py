@@ -4147,8 +4147,10 @@ class BasePlatformAdapter(ABC):
                     f"{_ledger_id or ''}:{getattr(event, '_gateway_active_turn_id', '')}:"
                     f"{getattr(event, '_gateway_active_turn_expected_resume_count', 0)}:{response_kind}"
                 )
-            obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
+            process_report = response_kind == 'process_verification_report'
+            obligation_id = (
+                'process-report:' + compute_obligation_id(session_key, event._gateway_active_turn_id, response_kind)
+                if process_report else compute_obligation_id(session_key, str(_ledger_id or ""), text_content))
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
@@ -4156,11 +4158,14 @@ class BasePlatformAdapter(ABC):
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 turn_id=getattr(event, "_gateway_active_turn_id", None),
-                response_kind=response_kind)
+                response_kind=response_kind, preserve_existing=process_report)
             event._gateway_delivery_obligation_id = obligation_id
-            await asyncio.to_thread(mark_attempting, obligation_id)
+            if not process_report:
+                await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
+            if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
+                raise  # never send a verification report without its durable obligation
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
@@ -4279,8 +4284,37 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
+            from gateway.delivery_ledger import claim_pending_obligation, turn_delivery_state
+            if obligation_id is None:
+                raise RuntimeError('Verification report has no durable delivery obligation')
+            if not await asyncio.to_thread(claim_pending_obligation, obligation_id):
+                delivered = await asyncio.to_thread(turn_delivery_state, session_key, event._gateway_active_turn_id)
+                return SendResult(success=delivered == 'delivered', error=None if delivered == 'delivered'
+                    else 'Existing delivery ledger owns verification report recovery'), delivery_adapter
+        try:
+            if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
+                from gateway.delivery_ledger import process_attention_authorized, abandon_obligation
+                allowed = await asyncio.to_thread(process_attention_authorized, obligation_id)
+                if allowed is not True:
+                    if allowed is False:
+                        await asyncio.to_thread(abandon_obligation, obligation_id)
+                    else:
+                        from gateway.delivery_ledger import mark_failed
+                        await asyncio.to_thread(mark_failed, obligation_id, 'Report authorization unavailable; no send admitted')
+                    return SendResult(success=False, error='Verification report delivery is fenced'), delivery_adapter
+            result = await delivery_adapter._send_with_retry(
+                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        except BaseException:
+            if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
+                from gateway.delivery_ledger import mark_uncertain
+                await asyncio.to_thread(mark_uncertain, obligation_id, 'Report transport outcome unknown; inspect conversation before resend')
+            raise
+        if (getattr(event, '_gateway_response_kind', None) == 'process_verification_report'
+                and not result.success and (self._is_timeout_error(result.error) or self._is_partial_delivery(result))):
+            from gateway.delivery_ledger import mark_uncertain
+            await asyncio.to_thread(mark_uncertain, obligation_id, 'Report transport may have accepted content; inspect conversation before resend')
+            return result, delivery_adapter
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
