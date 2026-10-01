@@ -11,7 +11,8 @@ import subprocess
 import time
 
 from agent.delegation_progress import _atomic, _lock, _read
-from scripts.delegation_progress_discord_send import decode, identifier, validate, validate_receipt
+from scripts.delegation_progress_discord_send import (decode, identifier, validate, validate_receipt,
+    validate_profile, profile_fields, validate_failure, failure)
 
 
 def ssh_transport(argv, data, timeout, *, popen=subprocess.Popen):
@@ -49,8 +50,8 @@ def ssh_transport(argv, data, timeout, *, popen=subprocess.Popen):
             # SSH exit codes are ambiguous, irrespective of stdout.
             if code not in (0, 75):
                 raise ValueError('transport_failed')
-            if code == 75 and decode(bytes(output)) not in ({'status': 'rejected'}, {'status': 'uncertain'}):
-                raise ValueError('nonzero_success_receipt')
+            if code == 75:
+                validate_failure(decode(bytes(output)))
         return bytes(output)
     finally:
         if process.poll() is None:
@@ -61,7 +62,10 @@ def ssh_transport(argv, data, timeout, *, popen=subprocess.Popen):
 
 
 class SSHSender:
-    def __init__(self, host, remote_python, runtime_root, helper, allow_threads, *, timeout=40, transport=ssh_transport, server_state_dir=None):
+    def __init__(self, host, remote_python, runtime_root, helper, allow_threads, *, timeout=40, transport=ssh_transport,
+                 server_state_dir=None, sender_profile=None, expected_bot_id=None):
+        validate_profile(sender_profile, expected_bot_id)
+        self.sender_profile, self.expected_bot_id = sender_profile, expected_bot_id
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,200}', host):
             raise ValueError('ssh_host')
         for path in (remote_python, runtime_root, helper):
@@ -77,7 +81,7 @@ class SSHSender:
         self.server_state_dir = server_state_dir
         self.allow_threads, self.timeout, self.transport = tuple(allow_threads), timeout, transport
 
-    def argv(self, reconcile_message=None, *, recover_journal=False):
+    def argv(self, reconcile_message=None, *, recover_journal=False, preflight=False):
         remote = [self.remote_python, self.helper, '--runtime-root', self.runtime_root]
         if self.server_state_dir:
             remote.extend(['--delivery-state-dir', self.server_state_dir])
@@ -89,19 +93,37 @@ class SSHSender:
             remote.extend(['--reconcile-message', reconcile_message])
         if recover_journal:
             remote.append('--recover-journal')
+        if preflight:
+            if self.sender_profile is None or reconcile_message or recover_journal:
+                raise ValueError('profile_mismatch')
+            remote.append('--preflight')
+        if self.sender_profile is not None:
+            remote.extend(['--sender-profile', self.sender_profile])
+            if self.expected_bot_id is not None:
+                remote.extend(['--expected-bot-id', self.expected_bot_id])
         return ['/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                 '-o', 'StrictHostKeyChecking=yes', '--', self.host, shlex.join(remote)]
 
-    def send(self, value, *, reconcile_message=None, recover_journal=False):
+    def send(self, value, *, reconcile_message=None, recover_journal=False, preflight=False):
         validate(value, self.allow_threads)
+        if (value.get('sender_profile') != self.sender_profile or value.get('expected_bot_id') != self.expected_bot_id):
+            return failure(value, 'rejected', 'profile_mismatch')
         try:
-            raw = self.transport(self.argv(reconcile_message, recover_journal=recover_journal), json.dumps(value, ensure_ascii=True).encode(), self.timeout)
+            raw = self.transport(self.argv(reconcile_message, recover_journal=recover_journal, preflight=preflight),
+                                 json.dumps(value, ensure_ascii=True).encode(), self.timeout)
             result = decode(raw)
-            if result in ({'status': 'rejected'}, {'status': 'uncertain'}):
+            if isinstance(result, dict) and result.get('status') in ('rejected', 'uncertain'):
+                return validate_failure(result)
+            if preflight:
+                expected = dict(status='ready', run_id=value['run_id'], thread_id=value['thread_id'],
+                                **profile_fields(value), bot_id=result.get('bot_id'))
+                if (result != expected or not identifier(result.get('bot_id'))
+                        or self.expected_bot_id is not None and result['bot_id'] != self.expected_bot_id):
+                    raise ValueError('preflight_identity')
                 return result
             return validate_receipt(result, value)
         except Exception:
-            return {'status': 'uncertain'}
+            return failure(value, 'uncertain', 'transport_error')
 
 
 class Delivery:
@@ -129,8 +151,11 @@ class Delivery:
             manifest = self.progress.manifest
             if message['run_id'] != manifest.run_id or message['thread_id'] != manifest.thread_id:
                 raise ValueError('outbox_identity')
+            if profile_fields(message) != manifest.sender_identity():
+                raise ValueError('outbox_identity')
             value = {k: message[k] for k in ('run_id', 'sequence', 'thread_id', 'content', 'operation', 'event_id')}
             value.update(content_digest=hashlib.sha256(value['content'].encode()).hexdigest(), card_receipt=None)
+            value.update(manifest.sender_identity())
             validate(value, {manifest.thread_id})
             state = self._load()
             key = str(message['sequence'])
@@ -151,10 +176,12 @@ class Delivery:
                 return {'status': 'empty'}
             manifest = self.progress.manifest
             if (message['run_id'] != manifest.run_id or message['thread_id'] != manifest.thread_id
-                    or message['id'] != f"{manifest.run_id}:{message['sequence']}"):
+                    or message['id'] != f"{manifest.run_id}:{message['sequence']}"
+                    or profile_fields(message) != manifest.sender_identity()):
                 raise ValueError('outbox_identity')
             value = {k: message[k] for k in ('run_id', 'sequence', 'thread_id', 'content')}
             value['content_digest'] = hashlib.sha256(value['content'].encode()).hexdigest()
+            value.update(manifest.sender_identity())
             state = self._load()
             if 'operation' in message:
                 value.update(operation=message['operation'], event_id=message['event_id'], card_receipt=None)
@@ -186,16 +213,18 @@ class Delivery:
                     if recover_journal and record and record.get('status') == 'uncertain':
                         kwargs['recover_journal'] = True
                     result = self.sender.send(value, **kwargs)
-                    if result not in ({'status': 'rejected'}, {'status': 'uncertain'}):
+                    if isinstance(result, dict) and result.get('status') in ('rejected', 'uncertain'):
+                        validate_failure(result)
+                    else:
                         validate_receipt(result, value)
                         if value.get('operation') != 'CARD_PATCH' and any(r.get('message_id') == result['message_id'] for k, r in state['records'].items() if k != key):
                             raise ValueError('duplicate_discord_message')
                 except Exception:
-                    result = {'status': 'uncertain'}
-                if (reconcile_message is not None or kwargs.get('recover_journal')) and result == {'status': 'rejected'}:
+                    result = failure(value, 'uncertain', 'transport_error')
+                if (reconcile_message is not None or kwargs.get('recover_journal')) and result['status'] == 'rejected':
                     # GET rejection says nothing about whether the earlier POST
                     # succeeded. Never turn failed reconciliation into POST retry.
-                    result = {'status': 'uncertain'}
+                    result = dict(result, status='uncertain')
                 state['records'][key] = result
                 if result['status'] == 'verified' and value.get('operation') == 'CARD_CREATE':
                     state['card'] = result

@@ -1,0 +1,12 @@
+{
+  "hermes-agent": {
+    "path": "hermes-agent-original-SKILL.md",
+    "sha256": "f81fb4fb47f7a62ef50e5e7a330ef4644efe82202c60d3ea15deb3cd40581a7d",
+    "bytes": 53664
+  },
+  "agent-performance-engineering": {
+    "path": "agent-performance-engineering-original-SKILL.md",
+    "sha256": "6d87e25973d941cc16dbe6ddd8579aeb3113d25608efa1ab60a8203b00cc4f89",
+    "bytes": 35190
+  }
+}

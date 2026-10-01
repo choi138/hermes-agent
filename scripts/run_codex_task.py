@@ -57,6 +57,8 @@ def main():
     parser.add_argument("--progress-thread", help="Exact Discord channel/thread ID")
     parser.add_argument("--progress-label", help="Operator task label (local metadata only)")
     parser.add_argument("--progress-code-scope", action="append", default=[], help="Approved relative source file for bounded progress evidence; repeat for the complete task scope")
+    parser.add_argument('--progress-sender-profile', choices=('default', 'koharu'), help='Trusted operator sender identity; omission preserves legacy default')
+    parser.add_argument('--progress-expected-bot-id', help='Audited public bot ID; required for koharu')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from agent.codex_task_runner import TaskRequest, WorkerSelection, run_task
@@ -156,7 +158,10 @@ def main():
                                   model=selected_model, cli=args.cli, selection=selection, advisor=args.advisor,
                                   policy_input=asdict(policy_input) if args.cli == "codex" else None)
         options = (args.progress_manifest, args.progress_state_dir, args.progress_thread, args.progress_label)
-        if (any(options) or args.progress_code_scope) and not all(options):
+        identity = dict(sender_profile=args.progress_sender_profile, expected_bot_id=args.progress_expected_bot_id)
+        from scripts.delegation_progress_discord_send import validate_profile
+        validate_profile(**identity)
+        if (any(options) or args.progress_code_scope or any(identity.values())) and not all(options):
             raise ValueError("All progress options are required")
         if action != "spawn":
             result = {"status": action, "exit_code": 0 if action == "skipped" else 74,
@@ -167,12 +172,12 @@ def main():
                       "acceptance": {"status": "unknown", "independent_validation": False}}
         elif any(options):
             from agent.delegation_progress import Progress, register_run, validate_registration
-            validate_registration(request, *options, code_scope=args.progress_code_scope)
+            validate_registration(request, *options, code_scope=args.progress_code_scope, **identity)
             def register(checked, run_dir):
-                manifest = register_run(checked, run_dir, *options, code_scope=args.progress_code_scope)
+                manifest = register_run(checked, run_dir, *options, code_scope=args.progress_code_scope, **identity)
                 baseline = Progress(manifest, args.progress_state_dir)._load()
                 print(json.dumps({"status": "progress_registered", "run_id": manifest.run_id,
-                                  "manifest": args.progress_manifest,
+                                  "manifest": args.progress_manifest, **manifest.sender_identity(),
                                   "baseline_complete": not baseline.get('observation_errors'),
                                   "baseline_errors": baseline.get('observation_errors', [])}), flush=True)
             result = (request.inspect(policy_receipt) if args.dry_run

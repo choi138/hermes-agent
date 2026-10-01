@@ -78,16 +78,18 @@ def _agent_browser_candidate_present(path: str | None) -> bool:
     return os.path.exists(path) and (os.name == "nt" or os.access(path, os.X_OK))
 
 
-def _resolve_npx_bin() -> Optional[str]:
-    """Resolve a runnable npx, extended (Hermes-managed/Homebrew) PATH first.
+def _resolve_npx_bin(*, validate: bool = True) -> Optional[str]:
+    """Resolve npx, extended (Hermes-managed/Homebrew) PATH first.
 
     Bare PATH first would let a broken system npx shadow a healthy managed one,
-    so every candidate is validated with ``node_tool_runnable`` before use.
+    so execution validates every candidate with ``node_tool_runnable``. Schema
+    discovery checks presence only, without spawning or caching a version probe.
     """
     extended_path = _merge_browser_path("")
     for path in ([extended_path] if extended_path else []) + [None]:
         npx = shutil.which("npx", path=path)
-        if npx and node_tool_runnable(npx):
+        # shutil.which already requires an executable file; only execution needs a version probe.
+        if npx and (not validate or node_tool_runnable(npx)):
             return npx
     return None
 
@@ -139,7 +141,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         if candidate and ok(candidate):
             return _accept(candidate)
     # npx fallback (also searches the extended PATH)
-    if _resolve_npx_bin():
+    if _resolve_npx_bin(validate=validate):
         return _accept(_bt.NPX_AGENT_BROWSER_SENTINEL)
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")

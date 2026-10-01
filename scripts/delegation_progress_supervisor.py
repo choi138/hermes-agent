@@ -122,6 +122,11 @@ def supervise(config_path, *, run_bridge=bridge_main, sleep=time.sleep):
                 _atomic(path, state)
                 emit(state)
                 return 0
+            if code == 78:
+                state.update(status='attention', reason='profile_delivery_rejected_pending_preserved')
+                _atomic(path, state)
+                emit(state)
+                return 0
             if code == 76:
                 state['renewals'] += 1
                 # Clear failures only after a full healthy lifetime, never a retry.
@@ -135,7 +140,7 @@ def supervise(config_path, *, run_bridge=bridge_main, sleep=time.sleep):
 
 
 def launch(argv, *, dry_run=False, wait=True):
-    forbidden = {'--once', '--dry-run', '--reconcile-message', '--record-reported-message'}
+    forbidden = {'--once', '--dry-run', '--preflight', '--reconcile-message', '--record-reported-message'}
     if any(arg.split('=', 1)[0] in forbidden for arg in argv):
         raise ValueError('supervisor_requires_continuous_bridge')
     if '--recover-journal' not in argv:
@@ -149,6 +154,10 @@ def launch(argv, *, dry_run=False, wait=True):
     if dry_run:
         emit(dict(status='supervisor_validated', run_id=progress.manifest.run_id, owner='launchd'))
         return 0
+    if progress.manifest.sender_profile is not None:
+        preflight_args = [arg for arg in argv if arg != '--recover-journal']
+        if bridge_main([*preflight_args, '--preflight']) != 0:
+            raise ValueError('profile_preflight_failed_no_supervisor_started')
     if sys.platform != 'darwin':
         raise ValueError('macos_launchd_required')
     # macOS agent jobs belong to the logged-in GUI bootstrap domain. The user

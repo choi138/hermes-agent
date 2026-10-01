@@ -390,7 +390,7 @@ def _browser_cdp_check() -> bool:
     except ImportError as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp check: browser_tool import failed: %s", exc)
         return False
-    return bool(check_browser_requirements() and _get_cdp_override_raw())
+    return bool(_get_cdp_override_raw() and check_browser_requirements())
 
 
 registry.register(

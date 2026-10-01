@@ -5,6 +5,7 @@ Exit 75 retains pending delivery for operator action; exit 0 requires final ack.
 No daemon, autostart, worker control or credentials on this machine.
 """
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -29,6 +30,9 @@ def main(argv=None):
     parser.add_argument('--reconcile-message', help='GET-only verification of exact pending Discord message ID')
     parser.add_argument('--recover-journal', action='store_true', help='Recover uncertain delivery through GET-only server journal lookup')
     parser.add_argument('--server-state-dir', help='Private durable server journal directory')
+    parser.add_argument('--sender-profile', choices=('default', 'koharu'))
+    parser.add_argument('--expected-bot-id')
+    parser.add_argument('--preflight', action='store_true', help='Read-only server credential/identity/target check before supervisor start')
     parser.add_argument('--record-reported-message', help='GET-verify and acknowledge the exact NOTICE head sent by coordinator')
     parser.add_argument('--once', action='store_true', help='Drain at most one item, then exit')
     parser.add_argument('--dry-run', action='store_true', help='Validate and preview; no writes or SSH')
@@ -36,6 +40,7 @@ def main(argv=None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from agent.delegation_progress import Manifest, Progress
     from agent.delegation_progress_delivery import Delivery, SSHSender
+    from scripts.delegation_progress_discord_send import validate_profile
 
     def emit(value):
         print(json.dumps(value, ensure_ascii=True), flush=True)
@@ -48,17 +53,33 @@ def main(argv=None):
                 or not math.isfinite(args.max_runtime) or not 0 < args.max_runtime <= 86400):
             raise ValueError('interval')
         manifest = Manifest.load(args.manifest)
+        validate_profile(args.sender_profile, args.expected_bot_id)
+        if (args.sender_profile != manifest.sender_profile or args.expected_bot_id != manifest.expected_bot_id
+                or args.preflight and (manifest.sender_profile is None or args.reconcile_message
+                    or args.record_reported_message or args.recover_journal)):
+            emit({'status': 'rejected', 'reason': 'profile_mismatch'})
+            return 78
         if manifest.thread_id not in args.allow_thread:
             raise ValueError('thread_not_allowed')
         progress = Progress(manifest, args.state_dir, interval=args.interval, light_poll=True)
         sender = SSHSender(args.ssh_host, args.remote_python, args.runtime_root, args.helper_path,
                            args.allow_thread, timeout=args.sender_timeout,
+                           sender_profile=args.sender_profile, expected_bot_id=args.expected_bot_id,
                            server_state_dir=args.server_state_dir or str(Path(args.runtime_root) / '.delegation-progress-delivery'))
         sender.argv(args.reconcile_message)  # Validate even in dry-run.
         if args.dry_run:
             progress.tick(dry_run=True)
             emit({'status': 'validated', 'run_id': manifest.run_id})
             return 0
+        if args.preflight:
+            content = '작업: 진행 중이에요.'
+            value = dict(run_id=manifest.run_id, sequence=1, thread_id=manifest.thread_id,
+                         content=content, content_digest=hashlib.sha256(content.encode()).hexdigest(),
+                         operation='CARD_CREATE', event_id=manifest.run_id + ':preflight',
+                         card_receipt=None, **manifest.sender_identity())
+            result = sender.send(value, preflight=True)
+            emit(result)
+            return 0 if result['status'] == 'ready' else 78
         if progress._load()['previous'] is None:
             raise ValueError('registration_baseline_required')
         delivery = Delivery(progress, sender)
@@ -80,6 +101,8 @@ def main(argv=None):
                     reported = None
                     emit(receipt)
                     if receipt['status'] != 'verified':
+                        if manifest.sender_profile is not None and receipt['status'] == 'rejected':
+                            return 78  # Operator must repair; supervisor must not blindly retry.
                         return 75
                     if args.once:
                         return 0

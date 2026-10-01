@@ -70,8 +70,12 @@ class Manifest:
     schema_version: int = SCHEMA_VERSION
     code_scope: tuple[str, ...] = ()
     worker_cli: str = 'codex'
+    sender_profile: str | None = None
+    expected_bot_id: str | None = None
 
     def __post_init__(self):
+        from scripts.delegation_progress_discord_send import validate_profile
+        validate_profile(self.sender_profile, self.expected_bot_id)
         if self.worker_cli not in ('codex', 'claude'):
             raise ValueError('worker_cli')
         if (not isinstance(self.code_scope, (tuple, list)) or len(self.code_scope) > 1024 or
@@ -137,7 +141,13 @@ class Manifest:
         # Preserve existing Codex bindings, bind the additional adapter explicitly.
         if self.worker_cli != 'codex':
             values['worker_cli'] = self.worker_cli
+        values.update(self.sender_identity())
         return _digest(_json(values))
+
+    def sender_identity(self):
+        # Omitted fields preserve the exact historical default binding digest.
+        return ({} if self.sender_profile is None else
+                dict(sender_profile=self.sender_profile, expected_bot_id=self.expected_bot_id))
 
 
 @contextmanager
@@ -735,7 +745,8 @@ def _atomic(path, data):
             os.unlink(name)
 
 
-def validate_registration(request, manifest_path, state_dir, thread_id, task_label, *, code_scope=()):
+def validate_registration(request, manifest_path, state_dir, thread_id, task_label, *, code_scope=(),
+                          sender_profile=None, expected_bot_id=None):
     path = _path(manifest_path, exists=False)
     root = _path(state_dir, exists=False)
     if path.exists() or path.is_relative_to(request.workdir) or root.is_relative_to(request.workdir):
@@ -744,15 +755,19 @@ def validate_registration(request, manifest_path, state_dir, thread_id, task_lab
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("private_manifest_parent_required")
     Manifest("registration-check", request.workdir, request.allowed_root, request.output_dir,
-             thread_id, task_label, code_scope=code_scope)
+             thread_id, task_label, code_scope=code_scope,
+             sender_profile=sender_profile, expected_bot_id=expected_bot_id)
 
 
-def register_run(request, run_dir, manifest_path, state_dir, thread_id, task_label, *, code_scope=()):
+def register_run(request, run_dir, manifest_path, state_dir, thread_id, task_label, *, code_scope=(),
+                 sender_profile=None, expected_bot_id=None):
     """Opt-in callback. Durable baseline precedes exclusive manifest publication."""
-    validate_registration(request, manifest_path, state_dir, thread_id, task_label, code_scope=code_scope)
+    validate_registration(request, manifest_path, state_dir, thread_id, task_label, code_scope=code_scope,
+                          sender_profile=sender_profile, expected_bot_id=expected_bot_id)
     manifest = Manifest(uuid.uuid4().hex, request.workdir, request.allowed_root, run_dir,
                         thread_id, task_label, run_dir / "events.jsonl", run_dir / "status.json",
-                        code_scope=code_scope, worker_cli=request.cli)
+                        code_scope=code_scope, worker_cli=request.cli,
+                        sender_profile=sender_profile, expected_bot_id=expected_bot_id)
     progress = Progress(manifest, state_dir)
     snapshot = progress.tick()["snapshot"]
     # A bounded inventory is a valid, explicitly partial baseline. A failed
@@ -1003,6 +1018,7 @@ class Progress:
                            'thread_id': self.manifest.thread_id, 'observed_at': now,
                            'operation': operation, 'event_id': event_id, 'event': event,
                            'content': content, 'allowed_mentions': {'parse': [], 'replied_user': False}}
+                message.update(self.manifest.sender_identity())
                 state['pending'].append(message)
                 queued.append(message)
         if state.get('closing') and not state['pending']:
