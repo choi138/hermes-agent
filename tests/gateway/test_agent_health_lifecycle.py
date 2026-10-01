@@ -238,7 +238,7 @@ async def test_stop_stops_sink_before_adapter_teardown():
     runner._profile_adapters = {}
     runner._restart_requested = False
     runner._finalize_shutdown_agents = AsyncMock()
-    runner._stop_mention_inbox_services = AsyncMock()
+
     runner._stop_agent_health_sink = AsyncMock()
 
     async def check_adapter_teardown(candidate, _platform):

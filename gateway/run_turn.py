@@ -22,14 +22,9 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.run_mention_inbox import (
-    _constrain_mention_inbox_toolsets,
-    _has_mention_inbox_execution_marker,
-    _mention_inbox_session_source,
-    _validated_mention_inbox_execution,
-)
+
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, has_unsupported_execution_envelope
 from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -390,6 +385,8 @@ class GatewayTurnMixin:
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
         the event."""
+        if has_unsupported_execution_envelope(event):
+            raise ValueError("unsupported execution envelope")
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
@@ -405,9 +402,9 @@ class GatewayTurnMixin:
             with suppress(Exception):
                 event.source = source
 
-        session_source = _mention_inbox_session_source(event, source)
+
         if expected_session_key:
-            derived_session_key = self._session_key_for_source(session_source)
+            derived_session_key = self._session_key_for_source(source)
             if derived_session_key != expected_session_key:
                 logger.warning(
                     "Dropping internally routed event after route recovery: expected session=%s derived=%s",
@@ -429,7 +426,7 @@ class GatewayTurnMixin:
             # Internal wakes observe reset policy without counting as user activity, or periodic
             # notifications keep the routing key alive across every daily/idle boundary.
             session_entry = await self.async_session_store.get_or_create_session(
-                session_source, touch_activity=not bool(getattr(event, "internal", False)),
+                source, touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
         if not strict_session and pinned_session_id:
@@ -2216,10 +2213,8 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
-        execution_id, execution_observer = _validated_mention_inbox_execution(
-            event,
-            self._delivery_adapter_for(source) if _has_mention_inbox_execution_marker(event) else None,
-        )
+        if has_unsupported_execution_envelope(event):
+            raise ValueError("unsupported execution envelope")
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2298,71 +2293,50 @@ class GatewayTurnMixin:
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
-            try:
-                agent_result = await self._run_agent(
-                    message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
-                    session_id=_run_start_session_id, session_key=session_key,
-                    run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
-                    inbound_message_id=str(event.message_id) if event.message_id else None,
-                    channel_prompt=event.channel_prompt, moa_config=getattr(event, "_moa_config", None),
-                    persist_user_message=prepared.persist_user_message,
-                    persist_user_timestamp=prepared.persist_user_timestamp,
-                    persist_user_display_kind=prepared.persist_user_display_kind,
-                    persist_user_display_metadata={
-                        "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
-                    message_type=event.message_type,
-                    scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
-                    mention_inbox_execution_id=execution_id,
-                    mention_inbox_execution_observer=execution_observer,
-                    event=event,
-                )
-                if getattr(event, "_gateway_resume_dispatch_stale", False):
-                    return None
-                if marker is not None:
-                    try:
-                        still_owned = await self.async_session_store.resume_owner_matches(
-                            session_key, marker, phase="executing",
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Could not revalidate completed recovery dispatch for %s",
-                            session_key,
-                            exc_info=True,
-                        )
-                        still_owned = False
-                    if not still_owned:
-                        event._gateway_resume_dispatch_stale = True
-                        return None
-                if isinstance(agent_result, dict):
-                    event._gateway_turn_result_seen = True
-                    event._gateway_turn_result_interrupted = bool(agent_result.get("interrupted"))
-                    event._gateway_response_kind = agent_result.get('response_kind') or (
-                        "interruption_notice" if agent_result.get("interrupted")
-                        else "terminal_failure" if agent_result.get("failed")
-                        or agent_result.get("completed") is False else "final"
-                    )
-                    _resume = getattr(event, "_hermes_turn_resume", None)
-                    event._gateway_active_turn_expected_resume_count = (
-                        _resume.get("resume_count", 0) if isinstance(_resume, dict) else 0
-                    )
-            except BaseException:
-                if execution_observer is not None:
-                    try:
-                        await execution_observer.run_failed(execution_id)
-                    except Exception:
-                        logger.exception("mention-inbox execution failure receipt failed")
-                raise
-            if execution_observer is not None:
+            agent_result = await self._run_agent(
+                message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
+                session_id=_run_start_session_id, session_key=session_key,
+                run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
+                inbound_message_id=str(event.message_id) if event.message_id else None,
+                channel_prompt=event.channel_prompt, moa_config=getattr(event, "_moa_config", None),
+                persist_user_message=prepared.persist_user_message,
+                persist_user_timestamp=prepared.persist_user_timestamp,
+                persist_user_display_kind=prepared.persist_user_display_kind,
+                persist_user_display_metadata={
+                    "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
+                message_type=event.message_type,
+                scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                event=event,
+            )
+            if getattr(event, "_gateway_resume_dispatch_stale", False):
+                return None
+            if marker is not None:
                 try:
-                    await execution_observer.run_completed(execution_id, agent_result)
+                    still_owned = await self.async_session_store.resume_owner_matches(
+                        session_key, marker, phase="executing",
+                    )
                 except Exception:
-                    logger.exception("mention-inbox execution finalization failed")
-                    try:
-                        await execution_observer.run_failed(execution_id)
-                    except Exception:
-                        logger.exception("mention-inbox fallback failure receipt failed")
-                if isinstance(agent_result, dict):
-                    agent_result["final_response"] = "NO_REPLY"
+                    logger.warning(
+                        "Could not revalidate completed recovery dispatch for %s",
+                        session_key,
+                        exc_info=True,
+                    )
+                    still_owned = False
+                if not still_owned:
+                    event._gateway_resume_dispatch_stale = True
+                    return None
+            if isinstance(agent_result, dict):
+                event._gateway_turn_result_seen = True
+                event._gateway_turn_result_interrupted = bool(agent_result.get("interrupted"))
+                event._gateway_response_kind = agent_result.get('response_kind') or (
+                    "interruption_notice" if agent_result.get("interrupted")
+                    else "terminal_failure" if agent_result.get("failed")
+                    or agent_result.get("completed") is False else "final"
+                )
+                _resume = getattr(event, "_hermes_turn_resume", None)
+                event._gateway_active_turn_expected_resume_count = (
+                    _resume.get("resume_count", 0) if isinstance(_resume, dict) else 0
+                )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -2973,14 +2947,14 @@ class GatewayTurnMixin:
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
         scheduled_heartbeat: bool = False,
-        mention_inbox_execution_id: Optional[str] = None,
-        mention_inbox_execution_observer: Any = None,
         event: Any = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
         Lets a Docker container handle Matrix E2EE while the agent runs on the host with full
         access to local files, memory, skills, and a unified session store."""
+        if has_unsupported_execution_envelope(event):
+            raise ValueError("unsupported execution envelope")
         from gateway.run import _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS
         try:
             from aiohttp import ClientSession as _AioClientSession, ClientTimeout
@@ -4495,16 +4469,15 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
-        mention_inbox_execution_id: Optional[str] = None,
-        mention_inbox_execution_observer: Any = None,
         event: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        if has_unsupported_execution_envelope(event):
+            raise ValueError("unsupported execution envelope")
         if self._get_proxy_url():
-            if mention_inbox_execution_id is not None:
-                raise RuntimeError("approved mention-inbox execution requires local tool receipts")
+
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -4514,22 +4487,7 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
-        if mention_inbox_execution_id is not None:
-            if mention_inbox_execution_observer is None:
-                raise RuntimeError("approved mention-inbox execution observer is unavailable")
-            approved_toolsets = mention_inbox_execution_observer.enabled_toolsets(
-                mention_inbox_execution_id
-            )
-            enabled_toolsets = _constrain_mention_inbox_toolsets(
-                configured=disp.enabled_toolsets,
-                disabled=disp.disabled_toolsets,
-                approved=approved_toolsets,
-            )
-            disp = dataclasses.replace(
-                disp,
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=sorted(set(disp.disabled_toolsets or ()) - set(enabled_toolsets)) or None,
-            )
+
         tool_policy = self._tool_policy_for_source(
             disp.user_config, source, disp.enabled_toolsets, disp.disabled_toolsets,
         )
@@ -4557,8 +4515,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
-            mention_inbox_execution_id=mention_inbox_execution_id,
-            mention_inbox_execution_observer=mention_inbox_execution_observer,
+
             tool_policy=tool_policy,
             event=event,
         )

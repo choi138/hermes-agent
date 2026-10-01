@@ -998,10 +998,10 @@ def _read_discord_prompt_timeout() -> int:
 
 
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
-from plugins.platforms.discord.mention_inbox_adapter import DiscordMentionInboxMixin
 
 
-class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAdapter):
+
+class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1123,10 +1123,7 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
-        self._mention_inbox_parent_channels: Dict[str, str] = {}
-        self._mention_inbox_thread_locks: Dict[str, asyncio.Lock] = {}
-        self._mention_inbox_router: Any = None
-        self._mention_inbox_execution_observer: Any = None
+
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -3034,10 +3031,7 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 send_kwargs: Dict[str, Any] = {"content": chunk, "reference": chunk_reference}
-                if metadata and metadata.get("mention_inbox_no_mentions"):
-                    send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
-                if metadata and i == 0 and metadata.get("mention_inbox_nonce") is not None:
-                    send_kwargs["nonce"] = metadata["mention_inbox_nonce"]
+
                 try:
                     msg = await channel.send(**send_kwargs)
                 except Exception as e:
@@ -6040,25 +6034,10 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
                     and not self._is_bot_tag_debounce_continuation(message)
                 ):
                     return False
-        mention_inbox_agent_passthrough = False
-        route_channel_id = str(getattr(message.channel, "id", ""))
-        if route_channel_id:
-            route_result = await self._route_mention_inbox_message_result(
-                message,
-                thread_id=route_channel_id,
-                parent_channel_id=parent_channel_id,
-                raw_content=raw_content,
-                check_registered_thread=is_thread,
-            )
-            if route_result is not None and bool(route_result.handled):
-                return True
-            agent_text = None if route_result is None else getattr(route_result, "agent_text", None)
-            if isinstance(agent_text, str) and agent_text.strip():
-                normalized_content = agent_text
-                mention_inbox_agent_passthrough = True
+
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
-        if not mention_inbox_agent_passthrough and not is_thread and not isinstance(message.channel, discord.DMChannel):
+        if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
             skip_thread = bool(channel_keys & no_thread_channels) or (
@@ -6099,9 +6078,9 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
         referenced_attachments = []
         reference = getattr(message, "reference", None)
         resolved_reference = getattr(reference, "resolved", None) if reference else None
-        if resolved_reference is not None and not mention_inbox_agent_passthrough:
+        if resolved_reference is not None:
             referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
-        inherited_attachments = [] if mention_inbox_agent_passthrough else snapshot_attachments + referenced_attachments
+        inherited_attachments = snapshot_attachments + referenced_attachments
         all_attachments = list(message.attachments) + inherited_attachments
         if normalized_content.startswith("/"):
             msg_type = MessageType.COMMAND
@@ -6121,8 +6100,7 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"
-        if mention_inbox_agent_passthrough:
-            chat_name = "Work Inbox"
+
         # Channel topic (TextChannels only); forum-parented threads inherit the parent topic.
         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
         guild = getattr(message, "guild", None)
@@ -6156,7 +6134,7 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
         # and prepend it. DMs skipped (every DM triggers the bot); in-flight arrivals not captured.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and not mention_inbox_agent_passthrough and self._discord_history_backfill():
+        if not _is_dm and self._discord_history_backfill():
             # Backfill on a gap: mention-gated channels, any thread (processing/restart gaps), any
             # reply (hydrate context around the referenced message). DMs/fresh auto-threads: nothing.
             _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
@@ -6186,7 +6164,7 @@ class DiscordAdapter(DiscordMentionInboxMixin, DiscordMediaMixin, BasePlatformAd
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
         reply_to_id = None
         reply_to_text = None
-        if message.reference and not mention_inbox_agent_passthrough:
+        if message.reference:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None

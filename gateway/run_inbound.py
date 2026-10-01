@@ -1259,6 +1259,10 @@ class GatewayInboundMixin:
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
+        from gateway.platforms.event import has_unsupported_execution_envelope
+        if has_unsupported_execution_envelope(event):
+            logger.warning("Dropping unsupported execution envelope before gateway admission")
+            return None
         from gateway.run import _AGENT_PENDING_SENTINEL
         if hasattr(event, "_hermes_turn_resume"):
             routed_key = str((getattr(event, "metadata", None) or {}).get(

@@ -12,6 +12,19 @@ from typing import Any, Dict, List, Optional
 from gateway.session import SessionSource
 
 
+def has_unsupported_execution_envelope(event: Any) -> bool:
+    """Opaque execution metadata is not ordinary chat authority.
+
+    No execution-envelope consumer is installed. Reject even malformed payloads
+    before admission rather than silently granting the normal session toolset.
+    Ordinary routing, notification and heartbeat metadata remains unaffected.
+    """
+    metadata = getattr(event, "metadata", None)
+    return isinstance(metadata, dict) and any(
+        isinstance(key, str) and key.endswith("_execution") for key in metadata
+    )
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"

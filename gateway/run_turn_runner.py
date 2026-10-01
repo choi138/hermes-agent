@@ -1321,19 +1321,7 @@ class TurnRunner:
         baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
-        # Cached agents keep their guardrail object. Remove the previous approved
-        # execution's receipt guard before installing this turn's policy.
-        base_guardrails = getattr(agent, "_mention_inbox_base_tool_guardrails", None)
-        if base_guardrails is not None:
-            agent._tool_guardrails = base_guardrails
-        if ctx.mention_inbox_execution_id is not None:
-            from gateway.run_mention_inbox import _install_mention_inbox_pretool_guard
 
-            if ctx.mention_inbox_execution_observer is None:
-                raise RuntimeError("approved mention-inbox execution observer is unavailable")
-            _install_mention_inbox_pretool_guard(
-                agent, ctx.mention_inbox_execution_id, ctx.mention_inbox_execution_observer,
-            )
         agent._notification_config = ctx.user_config
         agent._notification_platform = ctx.source.platform
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
@@ -1346,24 +1334,7 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
-        if ctx.mention_inbox_execution_id is not None:
-            from gateway.run_mention_inbox import _compose_mention_inbox_execution_callbacks
 
-            base_complete = agent.tool_complete_callback
-            execution_start, execution_complete = _compose_mention_inbox_execution_callbacks(
-                execution_id=ctx.mention_inbox_execution_id,
-                observer=ctx.mention_inbox_execution_observer,
-                voice_callback=agent.tool_start_callback,
-            )
-            agent.tool_start_callback = execution_start
-            if base_complete is None:
-                agent.tool_complete_callback = execution_complete
-            else:
-                def combined_complete(call_id, tool_name, args, result):
-                    base_complete(call_id, tool_name, args, result)
-                    execution_complete(call_id, tool_name, args, result)
-
-                agent.tool_complete_callback = combined_complete
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None

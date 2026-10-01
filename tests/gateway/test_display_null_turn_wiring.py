@@ -40,8 +40,7 @@ def _wire(user_config):
         process_task_id=None,
         process_baseline=None,
         run_generation=0,
-        mention_inbox_execution_id=None,
-        mention_inbox_execution_observer=None,
+
     )
     holder = types.SimpleNamespace(
         _ctx=ctx,

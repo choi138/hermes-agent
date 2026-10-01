@@ -73,47 +73,6 @@ class GatewayStartupMixin:
             self._agent_health_sink = None
             logger.debug("Agent health sink unavailable", exc_info=True)
 
-    async def _start_mention_inbox_services(self) -> None:
-        """Attach Work Inbox routers before startup-replayed inbound reaches Discord."""
-        from gateway.run import _async_profile_runtime_scope, _load_gateway_config
-        from hermes_constants import get_process_hermes_home
-        from plugins.mention_inbox.operational import MentionInboxGatewayService, parse_mention_inbox_config
-
-        async def start_one(profile: str, home: Path, adapter: Any) -> None:
-            try:
-                async with _async_profile_runtime_scope(home):
-                    config = parse_mention_inbox_config(_load_gateway_config())
-                    service = MentionInboxGatewayService(
-                        config, adapter, db_path=home / "mention_inbox" / "inbox.db",
-                    )
-                    await service.start()
-                    self._mention_inbox_services.append(service)
-                    health = service.health()
-                    logger.info(
-                        "Mention inbox profile=%s status=%s category=%s",
-                        profile, health.get("status"), health.get("error_category"),
-                    )
-            except Exception:
-                logger.warning("Mention inbox profile=%s entered degraded startup state", profile, exc_info=True)
-
-        launch_home = Path(get_process_hermes_home()).resolve()
-        await start_one("active", launch_home, self.adapters.get(Platform.DISCORD))
-        if not getattr(self.config, "multiplex_profiles", False):
-            return
-        from hermes_cli.profiles import profiles_to_serve
-
-        for profile, home in profiles_to_serve(multiplex=True):
-            if Path(home).resolve() == launch_home:
-                continue
-            adapter = getattr(self, "_profile_adapters", {}).get(profile, {}).get(Platform.DISCORD)
-            await start_one(profile, Path(home), adapter)
-
-    async def _stop_mention_inbox_services(self) -> None:
-        services = getattr(self, "_mention_inbox_services", [])
-        self._mention_inbox_services = []
-        if services:
-            await asyncio.gather(*(service.stop() for service in services), return_exceptions=True)
-
     @staticmethod
     def _log_agent_budget() -> None:
         """Report the ENFORCED per-turn budget: ``agent.max_turns`` is bridged into
@@ -1812,7 +1771,7 @@ class GatewayStartupMixin:
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
-        await self._start_mention_inbox_services()
+
         await self._finish_startup_restore()
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.

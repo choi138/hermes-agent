@@ -3558,7 +3558,7 @@ class GatewayRunner(
 
         self._boot_id = uuid.uuid4().hex
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
-        self._mention_inbox_services: list[Any] = []
+
         self._agent_health_sink = None
         self._turn_started_at: Dict[str, float] = {}
         self._last_content_sent_at: Dict[str, float] = {}

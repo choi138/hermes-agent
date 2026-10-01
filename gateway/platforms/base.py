@@ -3948,6 +3948,10 @@ class BasePlatformAdapter(ABC):
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
+        from gateway.platforms.event import has_unsupported_execution_envelope
+        if has_unsupported_execution_envelope(event):
+            logger.warning("Dropping unsupported execution envelope before adapter admission")
+            return
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
             # say so once per adapter (#102260).
