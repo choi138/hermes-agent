@@ -38,6 +38,7 @@ def _consume_codex(stream, *, model, on_event):
     del model
     for event in stream:
         on_event(event)
+    on_event(SimpleNamespace(type="response.completed"))
     return SimpleNamespace(
         output=[SimpleNamespace(
             type="message",
@@ -53,7 +54,9 @@ def _make_codex_adapter(event_iter):
         responses=SimpleNamespace(create=lambda **_kwargs: event_iter),
         close=lambda: None,
     )
-    return aux._CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
+    adapter = aux._CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
+    adapter._attempt_client = lambda: real_client
+    return adapter
 
 
 def test_codex_stream_stops_at_the_host_deadline_not_its_own_ceiling():

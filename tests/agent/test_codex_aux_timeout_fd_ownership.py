@@ -54,15 +54,18 @@ def _adapter_with_recording_client(stream):
             )
 
     class _LeafClient:
-        def __init__(self):
+        def __init__(self, role):
+            self.role = role
             self._client = _Client()
             self.base_url = "https://chatgpt.com/backend-api/codex"
             self.responses = SimpleNamespace(create=lambda **kw: stream)
 
         def close(self):
-            events.append(("client.close", threading.get_ident()))
+            events.append((f"{self.role}.close", threading.get_ident()))
 
-    return _CodexCompletionsAdapter(_LeafClient(), "gpt-5.5"), events
+    adapter = _CodexCompletionsAdapter(_LeafClient("cached"), "gpt-5.5")
+    adapter._attempt_client = lambda: _LeafClient("attempt")
+    return adapter, events
 
 
 class TestCodexAuxiliaryTimeoutFdOwnership:
@@ -109,11 +112,12 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
         # close() from a stranger thread is the corruption vector — banned.
         stranger_closes = [
             (a, tid) for a, tid in events
-            if a in {"client.close", "sock.close"} and tid != owner_tid
+            if a in {"attempt.close", "cached.close", "sock.close"} and tid != owner_tid
         ]
         assert not stranger_closes, f"stranger-thread FD release: {stranger_closes}"
         # The owning thread released the FDs on unwind.
-        assert ("client.close", owner_tid) in events, events
+        assert ("attempt.close", owner_tid) in events, events
+        assert not any(a == "cached.close" for a, _ in events)
 
     def test_owner_thread_deadline_hit_closes_directly(self):
         """When the OWNING thread detects the deadline in _check_cancelled,
@@ -159,4 +163,5 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
 
         stranger = [(a, t) for a, t in events if t != owner_tid]
         assert not stranger, f"non-owner activity: {stranger}"
-        assert ("client.close", owner_tid) in events, events
+        assert ("attempt.close", owner_tid) in events, events
+        assert not any(a == "cached.close" for a, _ in events)

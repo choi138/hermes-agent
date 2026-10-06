@@ -32,6 +32,30 @@ class _BlockingStream:
         raise RuntimeError("transport closed")
 
 
+def _install_socket_shutdown_path(client: Any, stream: _BlockingStream) -> None:
+    """Give a synthetic OpenAI copy the same pool/socket shape as real httpx."""
+    class _Socket:
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def shutdown(self, _how: int) -> None:
+            stream.close()
+
+    class _Connection:
+        def __init__(self) -> None:
+            self._connection = self
+            self._network_stream = self
+
+        def get_extra_info(self, name: str) -> Any:
+            return _Socket() if name == "socket" else None
+
+    client._client = SimpleNamespace(
+        _transport=SimpleNamespace(
+            _pool=SimpleNamespace(_connections=[_Connection()]),
+        ),
+    )
+
+
 class _GenericCompletions:
     def __init__(self, stream: _BlockingStream) -> None:
         self.stream = stream
@@ -66,6 +90,10 @@ class _CodexRealClient:
         self.base_url = "https://example.test/codex"
         self.stream = stream
         self.closed = threading.Event()
+        _install_socket_shutdown_path(self, stream)
+
+    def copy(self, **_kwargs: Any) -> "_CodexRealClient":
+        return _CodexRealClient(self.stream)
 
     def close(self) -> None:
         self.closed.set()
@@ -247,6 +275,10 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
             self.api_key = "test"
             self.base_url = "https://example.test/codex"
             self.responses = _SharedResponses(self)
+            _install_socket_shutdown_path(self, owner_stream)
+
+        def copy(self, **_kwargs: Any) -> "_SharedRealClient":
+            return _SharedRealClient()
 
         def close(self) -> None:
             self.closed.set()
@@ -354,12 +386,22 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
             self.base_url = "https://example.test/codex"
             self.responses = SimpleNamespace(create=lambda **_kwargs: stream)
             self.closed = threading.Event()
+            _install_socket_shutdown_path(self, stream)
+
+        def copy(self, **_kwargs: Any) -> "_RealClient":
+            copied = _RealClient()
+            attempts.append(copied)
+            return copied
 
         def close(self) -> None:
             self.closed.set()
             stream.close()
 
+    attempts: list[_RealClient] = []
     real_client: Any = _RealClient()
+    # Hermes-built client: attempts run on private copies (the caller-owned path is covered
+    # by test_codex_aux_caller_owned_http_client.py).
+    real_client._hermes_attempt_http_client_factory = lambda: SimpleNamespace(close=lambda: None)
     wrapper = aux.CodexAuxiliaryClient(real_client, "gpt-test")
     owner_outcome: dict[str, BaseException] = {}
 
@@ -386,7 +428,8 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
 
     assert not owner.is_alive()
     if winner == "timeout":
-        assert real_client.closed.is_set()
+        assert attempts and attempts[0].closed.is_set()
+        assert not real_client.closed.is_set()
         assert isinstance(owner_outcome["exc"], TimeoutError)
         assert not isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
     else:

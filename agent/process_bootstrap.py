@@ -33,6 +33,7 @@ _SHARED_TRANSPORTS_MAX = 32
 # the socket-abort walker in agent_runtime_helpers uses it to find only the
 # owning client's in-flight connections on a shared pool.
 HERMES_TRANSPORT_OWNER_EXT = "hermes_transport_owner"
+_PROXY_UNSET = object()
 
 
 class _HappyEyeballsSyncBackend:
@@ -265,7 +266,9 @@ def close_shared_transports() -> int:
     return len(transports)
 
 
-def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False, verify: Any = True) -> Optional[Any]:
+def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False, verify: Any = True,
+                                private_transport: bool = False,
+                                _resolved_proxy: Any = _PROXY_UNSET) -> Optional[Any]:
     """httpx client for OpenAI SDK calls with env-only proxy policy (None on failure).
 
     Explicit no-proxy mounts disable httpx's ``trust_env`` path so macOS system
@@ -274,18 +277,26 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
     socket_options transport broke streaming and stripped TCP_NODELAY). ``verify``
     goes on the client AND the mounts, since a mounted transport owns its SSL context.
 
-    Every call returns a NEW ``httpx.Client`` (per-client close semantics), but sync clients
-    with the same (verify, proxy, happy-eyeballs) identity mount the SAME underlying
-    ``HTTPTransport`` through a ``_SharedTransport`` view, so N delegated children share one
-    connection pool + SSL context. Async clients are never shared: an httpcore async pool is
-    bound to the event loop that first used it. Proxy-backed clients keep httpx's own transport.
+    Every call returns a NEW ``httpx.Client``. Normal sync clients with the same
+    (verify, proxy, happy-eyeballs) identity share the underlying ``HTTPTransport``;
+    ``private_transport`` gives one request its own pool for safe timeout shutdown.
+    Async and proxy-backed clients also have private transports.
 
     See #12952, #54049.
     See #10933.
     """
     try:
         import httpx
-        proxy = _get_proxy_for_base_url(base_url)
+        proxy = (_get_proxy_for_base_url(base_url) if _resolved_proxy is _PROXY_UNSET
+                 else _resolved_proxy)
+
+        def _configured(client):
+            # Capture the resolved proxy and verify object while the parent is built.
+            # Attempts recreate transport from this source, never from httpx internals.
+            if not async_mode:
+                client._hermes_private_factory = lambda: build_keepalive_http_client(
+                    base_url, verify=verify, private_transport=True, _resolved_proxy=proxy)
+            return client
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=20.0)
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)  # read=None for SSE streaming
         transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
@@ -307,7 +318,7 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
                     _enable_happy_eyeballs(transport)
                 return transport
 
-            if async_mode:
+            if async_mode or private_transport:
                 mounts = {"http://": _build_direct(), "https://": _build_direct()}
             else:
                 key = _shared_transport_key(base_url, verify, proxy)
@@ -318,8 +329,10 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
                 }
                 # Default transport = the https view; otherwise httpx builds a third, never-used
                 # direct transport (pool + SSL context) per client.
-                return client_cls(limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts)
-        return client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify)
+                return _configured(client_cls(
+                    limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts))
+        return _configured(client_cls(
+            limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify))
     except Exception:
         return None
 

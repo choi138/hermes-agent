@@ -430,6 +430,7 @@ class TestContentBearingProgress:
             responses=SimpleNamespace(create=lambda **_kwargs: iter(events)),
         )
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
+        adapter._attempt_client = lambda: real_client
         fence = CompressionCommitFence()
         touches = []
 
@@ -441,6 +442,7 @@ class TestContentBearingProgress:
             del model
             for event in stream:
                 on_event(event)
+            on_event(SimpleNamespace(type="response.completed"))
             return SimpleNamespace(output=[], usage=None)
 
         with (

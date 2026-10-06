@@ -63,6 +63,17 @@ class _FakeAnthropicStream:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Strip provider env vars so each test starts clean."""
+    from openai import OpenAI as SDKOpenAI
+    original_attempt_client = _CodexCompletionsAdapter._attempt_client
+
+    def attempt_client(adapter):
+        # These request-shaping tests use SDK stand-ins with no copy()/transport.
+        # Real SDK clients still exercise the production private-pool factory.
+        if isinstance(adapter._client, SDKOpenAI):
+            return original_attempt_client(adapter)
+        return adapter._client
+
+    monkeypatch.setattr(_CodexCompletionsAdapter, "_attempt_client", attempt_client)
     for key in (
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
@@ -4068,6 +4079,7 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
         original_consume = codex_runtime._consume_codex_event_stream
 
         def _consume_returning_none_output(*args, **kwargs):
+            kwargs["on_event"](empty_events[0])
             return SimpleNamespace(
                 output=None,  # the defensive guard target
                 output_text="",

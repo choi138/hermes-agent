@@ -44,13 +44,18 @@ def _make_adapter(event_iter):
         responses=SimpleNamespace(create=lambda **_kwargs: event_iter),
         close=lambda: None,
     )
-    return _CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
+    adapter = _CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
+    adapter._attempt_client = lambda: SimpleNamespace(
+        base_url=real_client.base_url, responses=real_client.responses, close=lambda: None,
+    )
+    return adapter
 
 
 def _consume(stream, *, model, on_event):
     del model
     for event in stream:
         on_event(event)
+    on_event(SimpleNamespace(type="response.completed"))
     return SimpleNamespace(
         output=[SimpleNamespace(
             type="message",
@@ -168,6 +173,10 @@ class TestNoProgressFailFast:
             close=lambda: closed_by.append(threading.get_ident()),
         )
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
+        adapter._attempt_client = lambda: SimpleNamespace(
+            base_url=real_client.base_url, responses=real_client.responses,
+            close=lambda: closed_by.append(threading.get_ident()),
+        )
         owner_result: dict = {}
         try:
             with (

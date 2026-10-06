@@ -179,10 +179,27 @@ def _openai_http_client_kwargs(base_url: Optional[str], *, async_mode: bool = Fa
 
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    http_client_factory = kwargs.pop("http_client_factory", None)
     if _aux_probe_active():
         # Availability probe: resolved credentials/base_url are the answer.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
-    kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
+    if "http_client" in kwargs and kwargs["http_client"] is not None:
+        # A caller-supplied transport carries the caller's auth/proxy/CA policy: attempts must
+        # reuse it as-is, so an explicit factory never replaces it (only a Hermes-built
+        # transport may name its own private factory below).
+        http_client_factory = None
+    if http_client_factory is not None and "http_client" not in kwargs:
+        kwargs["http_client"] = http_client_factory()
+    seam_owned_client = "http_client" not in kwargs
+    kwargs = {**(_openai_http_client_kwargs(base_url) if "http_client" not in kwargs else {}), **kwargs}
+    if http_client_factory is None:
+        http_client_factory = getattr(kwargs.get("http_client"), "_hermes_private_factory", None)
+    if http_client_factory is None and seam_owned_client and kwargs.get("http_client") is not None:
+        # The Hermes HTTP seam built this client but gave no private-transport factory
+        # (version skew or an injected seam). Each attempt re-enters the SAME seam so it
+        # keeps the seam's routing/proxy/CA policy instead of a hand-built default transport.
+        def http_client_factory(_base_url=base_url):
+            return _openai_http_client_kwargs(_base_url).get("http_client")
     _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
     # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
     # wall time on a hung endpoint before Hermes sees one failure.
@@ -193,7 +210,10 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
     # via kwargs.
     kwargs.setdefault("max_retries", 0)
-    return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    client = OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    if http_client_factory is not None:
+        client._hermes_attempt_http_client_factory = http_client_factory
+    return client
 
 
 # Interrupt protection for atomic aux tasks: a compression summary killed by an ordinary
@@ -1169,6 +1189,15 @@ def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
                 logger.debug("Codex auxiliary: %s", failure_note, exc_info=True)
 
 
+def _sdk_default_http_client(client: Any) -> bool:
+    """True only when the OpenAI SDK built the pool itself (no caller-supplied ``http_client``)."""
+    try:
+        from openai._base_client import SyncHttpxClientWrapper
+    except Exception:  # SDK layout changed: treat as caller-owned (never drop caller policy)
+        return False
+    return isinstance(getattr(client, "_client", None), SyncHttpxClientWrapper)
+
+
 class _CodexStreamGuard:
     """Progress-aware deadline + FD-safe timeout watchdog for one Codex aux stream attempt.
 
@@ -1181,9 +1210,15 @@ class _CodexStreamGuard:
 
     def __init__(
         self, client: Any, total_timeout: Optional[float],
-        no_progress_timeout: Optional[float] = None,
+        no_progress_timeout: Optional[float] = None, *, owns_client: bool = True,
     ):
         self._client = client
+        # False when the attempt runs on a caller-owned/shared client (no Hermes private-transport
+        # factory). Then neither the watchdog nor the owner may shut down or close that client —
+        # other requests share its pool — and a timeout retires only this attempt's stream.
+        self._owns_client = owns_client
+        self._attempt_stream_lock = threading.Lock()
+        self._attempt_stream: Any = None
         self.total_timeout = total_timeout
         self._start = time.monotonic()
         # Task-scoped override (auxiliary.<task>.no_progress_timeout, #108104); falls back to the
@@ -1217,19 +1252,13 @@ class _CodexStreamGuard:
         self._progress_deadline = self._start + self.no_progress_timeout
         self.saw_content = threading.Event()
         self.timed_out = threading.Event()
-        # Set only when the timeout WON (not when the owner hard-cancelled first): tells the
-        # owner's ``finally`` the shared client's FDs still need a real close.
-        self.timeout_release_pending = threading.Event()
         self.stream_finished = threading.Event()
+        self._finish_lock = threading.Lock()
         self._timer = None
         # The owner may return on hard cancel while this attempt is still blocked in the SDK
         # stream. Timer threads don't inherit the worker's thread-local protection state, so
         # freeze the hard-cancel source before creating the timer.
         self._protected_cancel_check = _capture_aux_cancel_check() if _aux_interrupt_protected() else None
-        self._attempt_stream_lock = threading.Lock()
-        self._attempt_stream: Any = None
-        # The request-driving thread owns the transport FDs — see _close_client_on_timeout.
-        self._owner_tid = threading.get_ident()
 
     def effective_deadline(self) -> float:
         with self._deadline_lock:
@@ -1240,21 +1269,22 @@ class _CodexStreamGuard:
         check = self._protected_cancel_check
         return callable(check) and _captured_aux_cancel_requested(check)
 
-    def adopt_stream(self, stream: Any) -> None:
-        with self._attempt_stream_lock:
-            self._attempt_stream = stream
+    def attach_stream(self, stream: Any) -> None:
+        """Owner-side: register this attempt's stream so a shared-client timeout can retire it."""
+        with self._finish_lock:
+            with self._attempt_stream_lock:
+                self._attempt_stream = stream
+            late = self.timed_out.is_set()
+        if late and not self._owns_client:
+            # The watchdog already fired before the stream existed; it had nothing to close.
+            _close_quietly(stream, "late attempt stream close after timeout failed")
 
     def release_stream(self, stream: Any) -> None:
-        """Owner-side: close the attempt stream silently and forget it."""
+        """Owner-side: close the attempt stream before its private client."""
+        with self._attempt_stream_lock:
+            if self._attempt_stream is stream:
+                self._attempt_stream = None
         _close_quietly(stream, None)
-        with self._attempt_stream_lock:
-            self._attempt_stream = None
-
-    def close_attempt_stream(self, failure_note: str) -> None:
-        """Closes only this attempt's stream — never the process-shared client."""
-        with self._attempt_stream_lock:
-            stream = self._attempt_stream
-        _close_quietly(stream, failure_note)
 
     def record_progress(self) -> None:
         """Substantive payload re-arms the no-progress window; the hard ceiling never moves."""
@@ -1274,53 +1304,32 @@ class _CodexStreamGuard:
             f"for {float(self.no_progress_timeout):.1f}s ({elapsed:.1f}s elapsed)")
 
     def _close_client_on_timeout(self) -> None:
-        begin_timeout_cleanup = getattr(self._protected_cancel_check, "begin_timeout_cleanup", None)
-        if callable(begin_timeout_cleanup):
-            timeout_won = bool(begin_timeout_cleanup())
-        else:
-            timeout_won = not self.cancel_requested()
-        # Publish transport timeout only after the attempt-local decision is fixed, so owner
-        # polling cannot observe completion in between.
-        self.timed_out.set()
-        if not timeout_won:
-            # Owner already hard-cancelled. The OpenAI client is process-shared, so never
-            # close/evict it here; wake only this attempt's stream if responses.create()
-            # returned one, else rely on the bounded SDK timeout.
-            self.close_attempt_stream("cancelled attempt stream close during timeout failed")
-            return
-        # FD-ownership contract: only the thread driving the request may ``close()`` this
-        # client's FDs. From a stranger thread (the watchdog Timer) only ``shutdown()`` is
-        # FD-safe — ``close()`` releases the raw TLS fd while the owner's OpenSSL BIO still
-        # caches it, the kernel recycles it (e.g. into a SQLite handle), and the owner's TLS
-        # flush corrupts that file. The owner does the real close in its ``finally``.
-        # This callback has two callers — ``_check_cancelled`` on the owning thread, and the daemon watchdog
-        # ``threading.Timer``, which is a stranger thread. The owning thread performs the real close in the
-        # ``finally`` below, which is where the FD release belongs. See #70773.
-        self.timeout_release_pending.set()
-        if threading.get_ident() == self._owner_tid:
-            _close_quietly(self._client, "client close during timeout failed")
-        else:
+        with self._finish_lock:
+            if self.stream_finished.is_set() or self.timed_out.is_set():
+                return
+            begin_timeout_cleanup = getattr(self._protected_cancel_check, "begin_timeout_cleanup", None)
+            if callable(begin_timeout_cleanup):
+                timeout_won = bool(begin_timeout_cleanup())
+            else:
+                timeout_won = not self.cancel_requested()
+            self.timed_out.set()
+            if not self._owns_client:
+                # Shared pool: shutting its sockets down would kill sibling requests.
+                # Retire only this attempt's stream; the SDK timeout bounds a pre-stream wait.
+                with self._attempt_stream_lock:
+                    stream = self._attempt_stream
+                _close_quietly(stream, "shared-client attempt stream close during timeout failed")
+                logger.info("Codex auxiliary attempt aborted on shared client (timeout=%s)", timeout_won)
+                return
             try:
+                # Hold finish arbitration through shutdown: the owner cannot close and
+                # recycle an FD while this timer is still about to touch its socket.
                 from agent.agent_runtime_helpers import force_close_tcp_sockets
                 shutdown_count = force_close_tcp_sockets(self._client)
-                logger.info(
-                    "Codex auxiliary client aborted (timeout, tcp_force_closed=%d, "
-                    "deferred_close=stranger_thread)", shutdown_count)
+                logger.info("Codex auxiliary attempt aborted (timeout=%s, tcp_shutdown=%d)",
+                            timeout_won, shutdown_count)
             except Exception:
-                logger.debug("Codex auxiliary: client abort during timeout failed", exc_info=True)
-            # Socket shutdown only wakes a reader on a REAL transport; the owner may be blocked
-            # inside the SDK's event stream (or a socketless test double). Closing the
-            # attempt-owned stream releases it without touching shared FDs.
-            self.close_attempt_stream("attempt stream close during stranger-thread timeout failed")
-        # The aux client cache wraps this same client; drop the entry so the next aux call
-        # doesn't reuse the dead transport and fail fast.
-        try:
-            # After we close the httpx transport above, the cache must drop that entry — otherwise the next
-            # auxiliary call (compression retry, memory flush, etc.) reuses the dead client and fails fast
-            # with a connection error. See issue #23432.
-            _evict_cached_client_instance(self._client)
-        except Exception:
-            logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+                logger.debug("Codex auxiliary: attempt socket shutdown failed", exc_info=True)
 
     def check_cancelled(self) -> None:
         if self.total_timeout is not None and time.monotonic() >= self.effective_deadline():
@@ -1348,8 +1357,9 @@ class _CodexStreamGuard:
         # live stream.
         remaining = self.effective_deadline() - time.monotonic()
         if remaining > 0:
-            if not (self.timed_out.is_set() or self.stream_finished.is_set()):
-                self._arm_timer(remaining)
+            with self._finish_lock:
+                if not (self.timed_out.is_set() or self.stream_finished.is_set()):
+                    self._arm_timer(remaining)
             return
         self._close_client_on_timeout()
 
@@ -1380,13 +1390,12 @@ class _CodexStreamGuard:
 
     def finish(self) -> None:
         """Owner ``finally``: stop the watchdog and release FDs a stranger-thread timeout only shut down."""
-        self.stream_finished.set()
+        with self._finish_lock:
+            self.stream_finished.set()
         if self._timer is not None:
             self._timer.cancel()
-        # Gated on timeout_release_pending, NOT timed_out: after a hard-cancel the shared
-        # client must stay usable for other sessions.
-        if self.timeout_release_pending.is_set():
-            _close_quietly(self._client, "owner-thread close after timeout failed")
+        if self._owns_client:
+            _close_quietly(self._client, "owner-thread attempt client close failed")
 
 
 class _CodexCompletionsAdapter:
@@ -1395,6 +1404,40 @@ class _CodexCompletionsAdapter:
     def __init__(self, real_client: OpenAI, model: str):
         self._client = real_client
         self._model = model
+
+    def _attempt_client(self) -> OpenAI:
+        """Return the client one attempt runs on; the attempt owns it iff it is not ``self._client``.
+
+        Hermes-built clients carry a private-transport factory: copy SDK auth, route, headers and
+        retry policy onto a fresh physical pool the attempt owns. A caller-supplied ``http_client``
+        (custom auth such as Bedrock SigV4, proxy, CA bundle, transport) is reused as-is: rebuilding
+        it would silently drop the caller's policy, so that attempt shares the caller's client and
+        must never close it."""
+        factory = getattr(self._client, "_hermes_attempt_http_client_factory", None)
+        http_client = None
+        try:
+            if factory is not None:
+                http_client = factory()
+            elif _sdk_default_http_client(self._client):
+                # SDK-default pool carries no caller policy, so an equivalent private pool is safe.
+                from agent.process_bootstrap import build_keepalive_http_client
+                base_url = str(self._client.base_url)
+                http_client = build_keepalive_http_client(
+                    base_url, verify=_resolve_aux_verify(base_url), private_transport=True)
+        except (ImportError, AttributeError, TypeError) as exc:
+            # Version-skewed install (#64333): degrade like _openai_http_client_kwargs does.
+            logger.debug("Codex auxiliary private transport unavailable: %s", exc)
+            http_client = None
+        if http_client is None:
+            # No private transport could be built (seam returned None, bad CA/proxy, skew):
+            # base behavior is to keep serving on the existing client, so do that and let the
+            # guard treat it as shared (stream-only close) rather than fail every request.
+            return self._client
+        try:
+            return self._client.copy(http_client=http_client)
+        except BaseException:
+            http_client.close()
+            raise
 
     def _build_responses_kwargs(self, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Any]:
         """chat.completions kwargs → Responses API kwargs, ``(resp_kwargs, model, timeout)``; mirrors codex.py::build_kwargs."""
@@ -1565,20 +1608,21 @@ class _CodexCompletionsAdapter:
         resp_kwargs, model, timeout = self._build_responses_kwargs(kwargs)
         wire_aliases = resp_kwargs.pop("_wire_aliases", None) or {}
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        guard = _CodexStreamGuard(self._client, total_timeout, no_progress_timeout=kwargs.get("no_progress_timeout"))
+        attempt_client = self._attempt_client()
+        guard = _CodexStreamGuard(attempt_client, total_timeout, no_progress_timeout=kwargs.get("no_progress_timeout"),
+                                  owns_client=attempt_client is not self._client)
         try:
             guard.start()
             from agent.codex_runtime import _consume_codex_event_stream
             from agent.sdk_transform_bypass import bypass_sdk_request_transform
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
             stream_kwargs = bypass_sdk_request_transform({**resp_kwargs, "stream": True})
-            event_stream = self._client.responses.create(**stream_kwargs)
-            guard.adopt_stream(event_stream)
-            # The timer may fire while responses.create() is blocked; if the cancelled attempt
-            # had no stream to close then, close it now that it is attempt-owned — never the shared client.
-            if guard.timed_out.is_set() and guard.cancel_requested():
-                guard.close_attempt_stream("late cancelled attempt stream close failed")
+            event_stream = attempt_client.responses.create(**stream_kwargs)
+            guard.attach_stream(event_stream)
             try:
+                # A watchdog may have expired while responses.create() was blocked. The
+                # owner still closes a stream returned after that timeout.
+                guard.check_cancelled()
                 # Some Codex-compatible hosts accept ``stream=True`` but return a completed
                 # Responses object (not iterable) — don't hand it to the consumer.
                 if hasattr(event_stream, "output"):
@@ -1591,6 +1635,7 @@ class _CodexCompletionsAdapter:
                 guard.release_stream(event_stream)
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
+            guard.check_cancelled()
             text_parts, tool_calls_raw, usage = _parse_codex_final_response(final)
             # Undo only the aliases THIS request emitted, before the call reaches Hermes dispatch.
             for tc in tool_calls_raw or ():
@@ -1603,6 +1648,10 @@ class _CodexCompletionsAdapter:
             raise
         finally:
             guard.finish()
+        # finish() linearizes against the timer. Once it returns, no later watchdog can
+        # retire this attempt; if the timer already won, a parsed payload is not success.
+        if guard.timed_out.is_set():
+            raise TimeoutError(guard.timeout_message())
         # Shape the result like chat.completions.
         message = SimpleNamespace(
             role="assistant", content="".join(text_parts).strip() or None,
