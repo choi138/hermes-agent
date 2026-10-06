@@ -81,6 +81,19 @@ class TestSyncExternalMemoryForTurn:
 
         agent._memory_manager.sync_all.assert_called_once()
         assert "turn_author" not in agent._memory_manager.sync_all.call_args.kwargs
+        assert "author_name" not in agent._memory_manager.queue_prefetch_all.call_args.kwargs
+
+    def test_queued_prefetch_carries_author_name_for_sender_prefix_strip(self):
+        agent = _bare_agent()
+        agent._turn_author = {"id": "42", "name": "Alice", "is_bot": False}
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="[Alice] status?", final_response="All green.", interrupted=False,
+        )
+
+        agent._memory_manager.queue_prefetch_all.assert_called_once_with(
+            "[Alice] status?", session_id="test_session_001", author_name="Alice",
+        )
 
     # --- Normal completed turn still syncs ------------------------------
 

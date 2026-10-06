@@ -973,7 +973,11 @@ class AIAgent(
             self._memory_manager.sync_all(user_text, response_text, **sync_kwargs)
             # Sibling of the build_turn_context() prefetch gate: don't key recall on zero-signal prompts.
             if not is_trivial_prompt(user_text):
-                self._memory_manager.queue_prefetch_all(user_text, session_id=self.session_id or "")
+                prefetch_kwargs = {"session_id": self.session_id or ""}
+                author_name = turn_author.get("name") if isinstance(turn_author, dict) else None
+                if isinstance(author_name, str) and author_name:
+                    prefetch_kwargs["author_name"] = author_name
+                self._memory_manager.queue_prefetch_all(user_text, **prefetch_kwargs)
         except Exception:
             pass
 

@@ -882,6 +882,12 @@ def _bind_interrupt_scope(agent: Any, ra) -> None:
     agent._interrupt_thread_signal_pending = False
 
 
+def _author_name_kwargs(author: Dict[str, Any]) -> Dict[str, Any]:
+    """``author_name`` for the recall call, only when known (keeps the plain call shape otherwise)."""
+    name = author.get("name") if isinstance(author, dict) else None
+    return {"author_name": name} if isinstance(name, str) and name else {}
+
+
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -902,7 +908,9 @@ def _memory_turn_start_and_prefetch(
     ext_prefetch_cache = ""
     with suppress(Exception):
         if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query, session_id=agent.session_id, **_author_name_kwargs(_author),
+            ) or ""
     if ext_prefetch_cache:
         ext_prefetch_cache = strip_graphiti_lookup_status_blocks(ext_prefetch_cache)
     # Deterministic recall indicator via _emit_status so the model can't silently

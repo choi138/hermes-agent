@@ -292,6 +292,14 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def test_prefetch_carries_turn_author_name_for_sender_prefix_strip():
+    """The shared-session ``[Name]`` prefix is stripped by the manager; it needs the author's name."""
+    agent, mm = _agent_with_memory_manager()
+    query = "[Alice] what did we decide about the deploy pipeline?"
+    _build(agent, user_message=query, turn_author={"id": "42", "name": "Alice", "is_bot": False})
+    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id, author_name="Alice")
+
+
 @pytest.mark.parametrize("recall", ["", "# Graphiti Recall\n- remembered fact"])
 def test_graphiti_lookup_status_stays_out_of_prefetch_sidecar(recall):
     agent, mm = _agent_with_memory_manager()

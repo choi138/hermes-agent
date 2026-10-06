@@ -13,12 +13,15 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_journal import L0Mirror, PendingTurnWAL, run_pending_startup_scan_once
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_provider import (
+    MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, is_trivial_prompt, spawn_context_thread,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
@@ -43,6 +46,79 @@ _GATEWAY_INJECTED_PREFIX_LINE_RE = re.compile(
     r"by the model router[^\r\n]*\]"
     r")"
 )
+_SLACK_SENDER_SUFFIX_RE = re.compile(r" \| Slack user <@[^>\s]+>$")
+_UNVERIFIED_TAG = "[unverified] "  # history backfill marks senders outside the allowlist
+_TURN_AUTHOR_NAME_CAP = 200  # agent/turn_author.py caps the author name; the prefix allows longer
+# gateway/session.py `neutralize_untrusted_inline_text` cuts a display name to exactly this many
+# characters ending in "..."; no real prefix label is longer (plus Slack's id suffix).
+_PREFIX_NAME_CAP = 240
+_MAX_SENDER_LABEL = _PREFIX_NAME_CAP + len(" | Slack user <@>") + 64
+
+
+def _sender_key(value: str) -> str:
+    """Comparison key for a display name: the gateway's ``[Name]`` prefix collapses whitespace and
+    control characters (``neutralize_untrusted_inline_text``) while the turn author drops them."""
+    return "".join(ch for ch in value if not ch.isspace() and unicodedata.category(ch)[0] != "C")
+
+
+def _is_sender_label(label: str, author_key: str, author_capped: bool) -> bool:
+    name = _SLACK_SENDER_SUFFIX_RE.sub("", label)
+    label_key = _sender_key(name)
+    if label_key == author_key:
+        return True
+    if author_capped:
+        # The turn author keeps 200 chars, the prefix up to 240: the label extends the author.
+        if len(name) == _PREFIX_NAME_CAP and name.endswith("..."):
+            label_key = label_key[:-3]
+        return label_key.startswith(author_key)
+    # Only the gateway's exact truncation shape counts; an authored "[Al...] " never matches.
+    return (len(name) == _PREFIX_NAME_CAP and name.endswith("...")
+            and author_key.startswith(label_key[:-3]))
+
+
+def strip_sender_attribution(text: Any, author_name: Optional[str]) -> Any:
+    """Remove the gateway's ``[<author>] `` attribution tokens; every other character is kept.
+
+    Shared multi-user gateway sessions prefix each message with the speaker's display name. That is
+    attribution, not authored text: as a recall query the name outweighs what was asked, so recall
+    surfaces memories that merely mention the user. Only a token that opens a line (optionally after
+    ``[unverified] ``) and matches THIS turn's author is removed, wherever the gateway put it: after
+    a reply pointer, a media/voice note, a history backfill, or a platform wrapper header. Nothing
+    ahead of or around it is dropped, so transcripts and captions survive. With no known author the
+    text is returned unchanged, so authored brackets (``[WIP] ...``) are never guessed at.
+    """
+    if not isinstance(text, str) or not isinstance(author_name, str):
+        return text
+    author_key = _sender_key(author_name)
+    if not author_key:
+        return text
+    # Capped by the original length: whitespace removed from the key must not hide the cap.
+    author_capped = len(author_name) >= _TURN_AUTHOR_NAME_CAP
+    lines = text.splitlines(keepends=True)
+    changed = False
+    for index, line in enumerate(lines):
+        stripped = _drop_line_sender(line, author_key, author_capped)
+        if stripped is not None:
+            lines[index] = stripped
+            changed = True
+    return "".join(lines).strip() if changed else text
+
+
+def _drop_line_sender(line: str, author_key: str, author_capped: bool) -> Optional[str]:
+    """``line`` without its leading ``[<author>] `` token, else None."""
+    pos = 0
+    while line.startswith("[", pos):
+        close = line.find("] ", pos)
+        # A display name may itself contain "] "; no real label is longer than the gateway cap,
+        # which also keeps a long "[1] [2] [3] ..." line linear.
+        while close != -1 and close - pos <= _MAX_SENDER_LABEL:
+            if _is_sender_label(line[pos + 1:close], author_key, author_capped):
+                return line[:pos] + line[close + 2:]
+            close = line.find("] ", close + 1)
+        if not line.startswith(_UNVERIFIED_TAG, pos):
+            return None
+        pos += len(_UNVERIFIED_TAG)
+    return None
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -499,9 +575,21 @@ class MemoryManager:
                 index += 1
         return "".join(lines[index:]) or None
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+    def _recall_query(self, query: str, author_name: Optional[str]) -> Optional[str]:
+        """The authored text to recall against: no skill scaffolding, no gateway sender prefix.
+        None when nothing substantive is left (a prefix-only or trivial message)."""
         clean_query = self._strip_skill_scaffolding(query)
+        if not clean_query:
+            return None
+        stripped = strip_sender_attribution(clean_query, author_name)
+        if stripped != clean_query and is_trivial_prompt(stripped):
+            return None
+        return stripped
+
+    def prefetch_all(self, query: str, *, session_id: str = "", author_name: Optional[str] = None) -> str:
+        """Merge non-empty prefetch context from all providers (failures are non-fatal).
+        ``author_name`` lets the gateway's ``[author]`` attribution be stripped from the query."""
+        clean_query = self._recall_query(query, author_name)
         if not clean_query:
             return ""
         parts = self._each_provider(
@@ -568,10 +656,10 @@ class MemoryManager:
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
-    def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch_all(self, query: str, *, session_id: str = "", author_name: Optional[str] = None) -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
         providers = list(self._providers)
-        clean_query = self._strip_skill_scaffolding(query) if providers else None
+        clean_query = self._recall_query(query, author_name) if providers else None
         if not clean_query:
             return
         self._submit_background(lambda: self._each_provider(
