@@ -51,21 +51,31 @@ from hermes_constants import get_hermes_home
 
 
 @contextmanager
-def _db():
+def _db(*, read_only=False):
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
     from hermes_cli.sqlite_util import open_db
     conn = open_db(home / 'state.db', db_label="state.db (process_followups)", busy_timeout_ms=5000)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute('''CREATE TABLE IF NOT EXISTS process_followups (
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('process_followups','process_followup_cancellations')")}
+        # Avoid DDL on the hot read path. A new profile still initializes lazily;
+        # no process-global schema cache can outlive a replaced database.
+        if 'process_followups' not in tables:
+            conn.execute('''CREATE TABLE IF NOT EXISTS process_followups (
             execution_id TEXT PRIMARY KEY, parent_session_id TEXT NOT NULL,
             payload TEXT NOT NULL, phase TEXT NOT NULL, token TEXT NOT NULL,
             version INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL,
             next_attempt REAL NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '')''')
-        conn.execute('CREATE TABLE IF NOT EXISTS process_followup_cancellations (session_key TEXT PRIMARY KEY, cancelled_at REAL NOT NULL)')
+        if 'process_followup_cancellations' not in tables:
+            conn.execute('CREATE TABLE IF NOT EXISTS process_followup_cancellations (session_key TEXT PRIMARY KEY, cancelled_at REAL NOT NULL)')
         with conn:
-            conn.execute('BEGIN IMMEDIATE')
+            if read_only:
+                conn.execute('PRAGMA query_only=ON')
+            else:
+                conn.execute('BEGIN IMMEDIATE')
             yield conn
     finally:
         conn.close()
@@ -114,12 +124,18 @@ def reserve(session):
 
 def pending():
     # Never run host probes while holding SQLite's writer lock.
-    with _db() as db:
+    with _db(read_only=True) as db:
         active = [dict(row) for row in db.execute(
             "SELECT execution_id,token,owner,updated_at,phase FROM process_followups WHERE phase IN ('queued','running','dispatching','cancel_requested')")]
     owners = {owner: _owner_alive(owner) for owner in {row['owner'] for row in active if row['owner']}}
-    with _db() as db:
-        for row in active:
+    changes = [row for row in active if (
+        (row['phase'] == 'queued' and (not row['owner'] or owners.get(row['owner']) is False))
+        or (row['phase'] != 'queued' and
+            (owners.get(row['owner']) is not True or time.time() - row['updated_at'] > 900)))]
+    # A healthy reconciliation tick is entirely read-only. Recoveries retain
+    # one atomic write transaction and the snapshot predicates below.
+    with _db(read_only=not changes) as db:
+        for row in changes:
             if row['phase'] == 'queued':
                 # Queue acceptance belongs to one process instance, not a 30-second
                 # retry timer. Only an undispatched event whose owner exited may
@@ -140,7 +156,7 @@ def pending():
 def admission(execution, token):
     """Claim queue ownership once; actual model execution has a separate token fence."""
     now = time.time()
-    with _db() as db:
+    with _db(read_only=True) as db:
         if not db.execute("SELECT 1 FROM process_followups WHERE execution_id=? AND token=? AND phase='pending' AND next_attempt<=?",
                           (execution, token, now)).fetchone():
             return False
@@ -179,7 +195,7 @@ def report_authorized(session_key, turn_id, *, connection=None):
         return db.execute("SELECT phase,payload FROM process_followups WHERE json_extract(payload,'$.session_key')=? AND json_extract(payload,'$.followup_turn_id')=?",
                           (session_key, turn_id)).fetchone()
     if connection is None:
-        with _db() as db:
+        with _db(read_only=True) as db:
             row = read(db)
     else:
         row = read(connection)
@@ -289,7 +305,7 @@ def cancel_for_session(session_key):
 
 
 def get_state(execution):
-    with _db() as db:
+    with _db(read_only=True) as db:
         row = db.execute('SELECT phase,reason,updated_at,payload FROM process_followups WHERE execution_id=?', (execution,)).fetchone()
     if not row:
         return None
@@ -336,7 +352,7 @@ def _owner_alive(owner):
 
 
 def attention_authorized(execution, token):
-    with _db() as db:
+    with _db(read_only=True) as db:
         return db.execute("SELECT 1 FROM process_followups WHERE execution_id=? AND token=? AND phase='needs_reconciliation'",
                           (execution, token)).fetchone() is not None
 

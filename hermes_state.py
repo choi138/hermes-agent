@@ -1023,11 +1023,9 @@ class SessionDB(
                         # a holder's argv (a worktree named fix-corrupt-db) would flip the bucket.
                         log_write_lock_holders(self.db_path, patience_s)
                         raise sqlite3.OperationalError(
-                            f"database is locked (another Hermes process held the "
-                            f"state.db write lock for over {patience_s:.0f}s — "
-                            "likely a long maintenance operation such as VACUUM, "
-                            "a large WAL checkpoint, or an older pre-update "
-                            "process; the database itself is healthy)"
+                            f"database is locked (write retry budget of {patience_s:.0f}s "
+                            "exhausted; see sqlite_diagnostic logs "
+                            "for connection, caller, SQL and transaction timings)"
                         ) from exc
                     if (
                         _DISK_IO_ERROR_MARKER in err_msg and not fn_started and not ioerr_begin_retried

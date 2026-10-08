@@ -577,6 +577,8 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     EXCLUSIVE).  The ONLY tolerated fallback is the helper being absent (scaffold/embed installs
     without hermes_cli); a real connection failure must propagate — a silent untracked retry
     would disable the guard for that connection."""
+    from hermes_state_diagnostics import diagnostic_factory
+    kwargs['factory'] = diagnostic_factory(kwargs.get('factory', sqlite3.Connection))
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:

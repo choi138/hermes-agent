@@ -41,7 +41,7 @@ def _hold_write_lock(db_path, hold_s, started_evt):
 
 @pytest.fixture
 def db(tmp_path):
-    d = SessionDB(db_path=tmp_path / "state.db")
+    d = SessionDB(db_path=tmp_path / "malformed-state.db")
     yield d
     d.close()
 
@@ -82,8 +82,8 @@ class TestTranscriptWritePatience:
         assert db._TRANSCRIPT_WRITE_PATIENCE_S >= 30.0
 
     def test_exhausted_patience_names_the_real_cause(self, db, monkeypatch):
-        """When patience genuinely runs out, the error must say the lock was
-        held by another process — not read like disk/permission damage."""
+        """Exhaustion must retain lock classification regardless of the DB name."""
+        from hermes_state_errors import classify_persistence_error
         monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
 
         started = threading.Event()
@@ -99,8 +99,11 @@ class TestTranscriptWritePatience:
             holder.join(timeout=10.0)
         assert not holder.is_alive()
         text = str(excinfo.value)
-        assert "another Hermes process" in text
-        assert "healthy" in text
+        assert "write retry budget" in text
+        assert str(db.db_path) not in text
+        assert classify_persistence_error(excinfo.value) == 'locked'
+        assert "sqlite_diagnostic" in text
+        assert "healthy" not in text  # contention alone does not establish database integrity
 
     def test_write_succeeds_immediately_when_uncontended(self, db):
         """Patience must cost nothing when there is no contention."""

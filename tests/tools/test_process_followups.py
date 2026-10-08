@@ -7,6 +7,25 @@ from tools.process_registry import ProcessSession
 from tools import process_registry_followups as followups
 
 
+def test_followup_reads_work_while_another_connection_holds_the_writer(monkeypatch, tmp_path):
+    import sqlite3
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_locked_read', command='true')
+    followups.reserve(session)
+    token = followups.pending()[0]['token']
+    blocker = sqlite3.connect(tmp_path / 'state.db', timeout=0.01)
+    try:
+        blocker.execute('BEGIN IMMEDIATE')
+        assert followups.get_state(session.id)['phase'] == 'pending'
+        assert followups.pending()[0]['token'] == token
+        assert not followups.admission('missing', token)
+        assert not followups.report_authorized('missing', 'missing')
+        assert not followups.attention_authorized(session.id, token)
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
 def test_durable_cancel_completion_preserves_direct_group_scope(monkeypatch, tmp_path):
     import json
     from tools.process_registry import ProcessRegistry
