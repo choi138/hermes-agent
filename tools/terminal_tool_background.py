@@ -173,6 +173,15 @@ def spawn_background_process(
             result_data.update(
                 output="Background dispatch is unconfirmed. Do not rerun; poll this session_id to reconcile.",
                 dispatch_unconfirmed=True, exit_code=None, error="dispatch_unconfirmed")
+        if proc_session.delegation_progress:
+            result_data['delegation_tracking'] = {
+                'status': 'observer_armed_registration_pending',
+                'execution_id': proc_session.id,
+                'note': 'The gateway observer confirms actual worker spawn before sending a start notice. Do not claim worker start from shell PID alone.'}
+        elif env_type == 'ssh' and notify_on_complete:
+            result_data['delegation_tracking'] = {
+                'status': 'completion_only',
+                'note': 'Automatic CLI progress requires a simple absolute scripts/run_codex_task.py invocation. cmux/file monitors are not workers and have no automatic progress coverage.'}
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:

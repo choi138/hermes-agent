@@ -279,7 +279,7 @@ def _stop_group(process):
 
 
 def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
-             output_limit=MAX_OUTPUT_BYTES, before_spawn=None, prompt_bytes=None,
+             output_limit=MAX_OUTPUT_BYTES, before_spawn=None, after_spawn=None, prompt_bytes=None,
              policy_receipt=None):
     """Run using real binary pipes; ``popen`` is a Python-only testing seam.
 
@@ -354,6 +354,8 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
                     process._hermes_started_at = psutil.Process(process.pid).create_time()
                 except psutil.NoSuchProcess:
                     pass
+                if after_spawn is not None:
+                    after_spawn(request, run_dir, process)
                 result.update(status="running", exit_code=1)
                 with selectors.DefaultSelector() as selector:
                     for stream, event, data in ((process.stdin, selectors.EVENT_WRITE, None),

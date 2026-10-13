@@ -143,6 +143,8 @@ class Delivery:
 
     def claim_notice(self, *, dry_run=False):
         """Fence the automatic path BEFORE a coordinator sends this exact event."""
+        if self.progress.manifest.delivery_owner != "manual":
+            raise ValueError("manual_owner_required")
         from contextlib import nullcontext
         with nullcontext() if dry_run else _lock(self.progress.directory / 'delivery.lock'):
             message = self.progress.peek()
@@ -169,6 +171,8 @@ class Delivery:
             return {'event_id': message['event_id'], 'payload': value}
 
     def drain_one(self, *, reconcile_message=None, reported_message=None, recover_journal=False):
+        if self.progress.manifest.delivery_owner != "manual":
+            raise ValueError("manual_owner_required")
         # Also fences Python consumers that aren't inside the lifetime watcher.
         with _lock(self.progress.directory / 'delivery.lock'):
             message = self.progress.peek()

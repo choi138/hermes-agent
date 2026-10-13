@@ -538,6 +538,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                      _reason, self.chat_id)
         return False
 
+    def defer_publication_sync(self):
+        """Stop future preview/final publication before a tool result grants completion scope."""
+        self._process_report_deferred = True
+        if not self.flush_pending_sync():
+            raise RuntimeError('Process report publication barrier timed out')
+
     def on_delta(self, text: str) -> None:
         """Thread-safe callback from the agent's worker thread.  ``None`` signals a tool
         boundary: the current message is finalized and subsequent text goes out as a new
@@ -566,6 +572,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._abandon_native_stream()
                     return
                 tick = self._drain_queue()
+
+                if getattr(self, '_process_report_deferred', False):
+                    if tick.got_flush:
+                        self._signal_flush(tick.flush_event)
+                    if tick.got_done:
+                        self._final_response_sent = False
+                        self._final_content_delivered = False
+                        self._already_sent = False
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
 
                 # Boundary produces its own finalize and resets state, so it must
                 # run before got_done/segment_break processing.

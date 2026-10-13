@@ -975,12 +975,12 @@ class TurnRunner:
         stream_delta_cb = None
         if delta_sinks:
             def stream_delta_cb(text: Optional[str]) -> None:
-                if ctx._run_still_current():
+                if ctx._run_still_current() and not getattr(ctx, 'process_publication_deferred', False):
                     for sink in delta_sinks:
                         sink.on_delta(text)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if not ctx._run_still_current() or getattr(ctx, 'process_publication_deferred', False):
                 return
             if stts is not None:
                 # Flush accepted deltas; completed commentary is a separate speech segment.
@@ -1952,7 +1952,16 @@ class TurnRunner:
                 from contextlib import nullcontext
                 from tools.process_registry_followups import verification_lease, task_request_scope
                 lease = verification_lease(followup['execution_id'], followup['token']) if followup else nullcontext()
-                request_scope = task_request_scope(ctx.message or '') if not followup else nullcontext()
+                observed_results = {}
+                stream = ctx.stream_consumer_holder[0]
+                def barrier():
+                    ctx.process_publication_deferred = True
+                    speech = ctx.streaming_tts_consumer_holder[0]
+                    if speech is not None:
+                        speech.abort('process report requires verification before publication')
+                    if stream is not None:
+                        stream.defer_publication_sync()
+                request_scope = task_request_scope(ctx.message or '', observed=observed_results, publication_barrier=barrier) if not followup else nullcontext()
                 with lease, request_scope, notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                     if resume_marker and not (
                         self._runner.session_store.resume_owner_matches(
@@ -1990,6 +1999,9 @@ class TurnRunner:
                 result = {**result, 'final_response': report_text, 'turn_id': turn_id,
                           'process_report_obligation_id': obligation_id,
                           'response_kind': 'process_verification_report'}
+            elif observed_results:
+                from gateway.process_followups import prepare_foreground_report
+                result = prepare_foreground_report(self._runner, ctx, result, kwargs.get('turn_id'), observed_results)
             return result
         except Exception as exc:
             if followup:
@@ -2276,6 +2288,7 @@ class TurnRunner:
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "turn_id": result.get("turn_id"),
             "process_followup_disposition": result.get("process_followup_disposition"),
+            "process_report_disposition": result.get("process_report_disposition"),
             "process_report_obligation_id": result.get("process_report_obligation_id"),
             "response_kind": result.get("response_kind"),
             "current_turn_user_idx": result.get("current_turn_user_idx"),
@@ -2298,7 +2311,8 @@ class TurnRunner:
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
             return {"final_response": final_response, **common}
-        if result.get('response_kind') != 'process_verification_report':
+        if (result.get('response_kind') != 'process_verification_report'
+                and result.get('process_report_disposition') != 'report_only'):
             final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.

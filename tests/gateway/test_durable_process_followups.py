@@ -795,6 +795,44 @@ def test_normal_turn_captures_task_request_without_leaking_context(monkeypatch, 
     assert ledger.task_request() == ''
 
 
+@pytest.mark.parametrize('failure', ['refused', 'storage_error'])
+def test_foreground_assessment_survives_normal_turn_marker_failure(monkeypatch, tmp_path, failure):
+    import json
+    from gateway.platforms.base import MessageEvent
+    from gateway import delivery_ledger as delivery
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = Runner(tmp_path)
+    runner._delivery_adapter_for = lambda source: None
+    session = ProcessSession(id='proc_marker_missing', command='true', session_key=runner.entry.session_key,
+        parent_session_id=runner.entry.session_id, remote_root='/private', notify_on_complete=True,
+        watcher_platform='telegram', exited=True, exit_code=0)
+    ledger.reserve(session)
+    registry = ProcessRegistry()
+    registry._finished[session.id] = session
+    def marker(*args, **kwargs):
+        if failure == 'storage_error':
+            raise OSError('active turn storage unavailable')
+        return False
+    monkeypatch.setattr(runner.session_store, 'begin_active_turn', marker)
+    event = MessageEvent(text='verify prior execution', source=runner.source)
+    ctx = TurnContext(event=event, source=runner.source, session_key=runner.entry.session_key,
+                      session_id=runner.entry.session_id, message=event.text)
+    def run(message, **kwargs):
+        assert 'turn_id' not in kwargs
+        registry.wait(session.id, timeout=1)
+        report = {'execution_id': session.id, 'outcome': 'verified', 'evidence': ['artifact checked'],
+                  'next_action': 'none', 'report': '검증 완료.'}
+        return {'final_response': '```process_reports\n' + json.dumps({'reports': [report]}) + '\n```'}
+    result = TurnRunner(runner, ctx)._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
+    assert result['process_report_disposition'] == 'report_only' and result['final_response'] == 'NO_REPLY'
+    state = ledger.get_state(session.id)
+    assert state['phase'] == 'turn_finished' and state['verification']['outcome'] == 'verified'
+    with ledger._db(read_only=True) as db:
+        payload = json.loads(db.execute('SELECT payload FROM process_followups WHERE execution_id=?', (session.id,)).fetchone()[0])
+    assert payload['followup_turn_id'].startswith('foreground-report:')
+    assert delivery.turn_delivery_state(session.session_key, payload['followup_turn_id']) == 'pending'
+
+
 def test_attention_authority_outage_preserves_retry_and_other_messages(monkeypatch, tmp_path, caplog):
     import sqlite3,time
     from gateway import delivery_ledger as delivery
@@ -1171,3 +1209,88 @@ async def test_followup_error_logs_redact_exception_credentials(monkeypatch, tmp
         assert 'Process follow-up reconciliation failed' in caplog.text
     assert sentinel not in caplog.text
     assert not any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['delivered', 'failed_send', 'automatic_first', 'mixed', 'cancelled', 'missing_obligation', 'missing_marker', 'adapter_unavailable', 'report_only'])
+async def test_foreground_wait_report_uses_one_receipt_without_losing_parent(monkeypatch, tmp_path, mode):
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from gateway.process_followups import prepare_foreground_report
+    from gateway import delivery_ledger as delivery
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageEvent, SendResult
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = Runner(tmp_path)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token='fixture-token', extra={}))
+    adapter.gateway_runner = MagicMock()
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(success=mode != 'failed_send',
+        message_id='receipt-1', error='ReadTimeout' if mode == 'failed_send' else None))
+    runner._delivery_adapter_for = lambda source: adapter
+    session = ProcessSession(id='proc_normal', command='true', session_key=runner.entry.session_key,
+        parent_session_id=runner.entry.session_id, remote_root='/private', notify_on_complete=True,
+        watcher_platform='telegram', watcher_chat_id=runner.source.chat_id, exited=True, exit_code=0)
+    registry = ProcessRegistry()
+    registry._finished[session.id] = session
+    ledger.reserve(session)
+    row = ledger.pending()[0]
+    assert ledger.admission(session.id, row['token'])
+    observed = {}
+    with ledger.task_request_scope('verify', observed=observed):
+        registry.wait(session.id, timeout=1)
+    if mode == 'automatic_first':
+        assert ledger.begin(session.id, row['token'])
+    if mode == 'cancelled':
+        ledger.cancel(session.id)
+    report = {'execution_id': session.id, 'outcome': 'verified', 'evidence': ['artifact checked'],
+              'next_action': 'none', 'report': '위임 검증 완료.'}
+    reports = [report]
+    if mode == 'mixed':
+        unread = ProcessSession(id='proc_not_read', command='true', session_key=session.session_key,
+            parent_session_id=session.parent_session_id, remote_root='/private', notify_on_complete=True,
+            watcher_platform='telegram', exited=True, exit_code=0)
+        ledger.reserve(unread)
+        # Still claimable by a foreground report, but avoid dispatching its unrelated
+        # automatic verification during this report's delivery assertion below.
+        with ledger._db() as db:
+            db.execute('UPDATE process_followups SET next_attempt=? WHERE execution_id=?',
+                       (__import__('time').time() + 300, unread.id))
+        reports += [{**report, 'execution_id': 'proc_not_read', 'report': 'not scoped'}]
+    event = MessageEvent(text='verify', source=runner.source)
+    ctx = TurnContext(event=event, source=runner.source, session_key=session.session_key, message='검증')
+    parent = '' if mode == 'report_only' else '부모 PR 작업 설명.\n'
+    result = {'final_response': parent + '```process_reports\n' + json.dumps({'reports': reports}) + '\n```'}
+    final = prepare_foreground_report(runner, ctx, result, None if mode == 'missing_marker' else 'normal-turn', observed)
+    assert final['final_response'] == ('NO_REPLY' if mode == 'report_only' else '부모 PR 작업 설명.')
+    if mode == 'report_only':
+        assert final['process_report_disposition'] == 'report_only'
+    if mode == 'mixed':
+        assert ledger.get_state(unread.id)['phase'] == 'pending'
+        assert not delivery.has_turn_obligation(session.session_key, 'normal-turn:process:' + unread.id)
+    if mode in {'automatic_first', 'cancelled'}:
+        assert not delivery.has_turn_obligation(session.session_key, 'normal-turn:process:' + session.id)
+        return
+    if mode == 'missing_obligation':
+        # Simulate exit after the foreground report CAS, before ledger insertion.
+        # The persisted report text is sufficient to recover without a model call.
+        with ledger._db() as db:
+            db.execute("DELETE FROM delivery_obligations WHERE turn_id=?", ('normal-turn:process:' + session.id,))
+    if mode == 'adapter_unavailable':
+        with ledger._db() as db:
+            db.execute("DELETE FROM delivery_obligations WHERE turn_id=?", ('normal-turn:process:' + session.id,))
+        runner._delivery_adapter_for = lambda source: None
+        await reconcile(runner)
+        assert ledger.get_state(session.id)['phase'] == 'turn_finished'
+        assert adapter._send_with_retry.await_count == 0
+        runner._delivery_adapter_for = lambda source: adapter
+        with ledger._db() as db:
+            db.execute('UPDATE process_followups SET next_attempt=0 WHERE execution_id=?', (session.id,))
+    await reconcile(runner)
+    assert adapter._send_with_retry.await_count == 1 and not runner.transport.events
+    assert ledger.get_state(session.id)['phase'] == ('needs_reconciliation' if mode == 'failed_send' else 'reported')
+    if mode != 'failed_send':
+        await reconcile(runner)
+        assert adapter._send_with_retry.await_count == 1 and not ledger.begin(session.id, row['token'])
+        with ledger._db(read_only=True) as db:
+            assert db.execute('SELECT message_id FROM delivery_obligation_receipts').fetchone()[0] == 'receipt-1'

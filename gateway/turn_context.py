@@ -77,6 +77,7 @@ class TurnContext:
     tools_holder: list = field(default_factory=lambda: [None])
     stream_consumer_holder: list = field(default_factory=lambda: [None])
     streaming_tts_consumer_holder: list = field(default_factory=lambda: [None])
+    process_publication_deferred: bool = False
     # voice-ack wiring
     _voice_ack_fired: list = field(default_factory=lambda: [False])
     _voice_ack_guild: list = field(default_factory=lambda: [None])

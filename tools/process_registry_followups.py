@@ -16,15 +16,146 @@ from contextvars import ContextVar
 
 _verification_execution = ContextVar("verification_execution", default=None)
 _task_request = ContextVar("process_task_request", default='')
+_observed_results = ContextVar('process_observed_results', default=None)
 
 
 @contextmanager
-def task_request_scope(request):
+def task_request_scope(request, *, observed=None, publication_barrier=None):
     token = _task_request.set(scrub_payload(request))
+    observation_token = _observed_results.set((observed, publication_barrier) if observed is not None else None)
     try:
         yield
     finally:
         _task_request.reset(token)
+        _observed_results.reset(observation_token)
+
+
+FOREGROUND_REPORT_INSTRUCTION = """This result read is not a delivered completion report.
+Keep unrelated parent-task prose separate. To report this execution's verified result, end your
+response with one internal ```process_reports JSON block containing
+{"reports":[{"execution_id":"EXACT_SESSION_ID","outcome":"verified","evidence":["actual checks"],
+"next_action":"none","report":"public completion report in the user's language"}]}.
+Use verification_failed or approval_wait with concrete remaining work when appropriate.
+Put this execution's completion ONLY in its report segment, not also in parent prose.
+Only report IDs whose completed results you read in this turn. Exit zero alone is not verification.
+The gateway removes this block and publishes only segments it owns; never claim an automatic retry.
+"""
+
+
+def observe_result(session, result):
+    scope = _observed_results.get()
+    if scope is None or not enabled(session) or not session.exited:
+        return
+    state = get_state(session.id)
+    if state is not None and state['phase'] not in {'pending', 'queued'}:
+        # Re-reading a retained result is an ordinary answer, not a new report claim.
+        return
+    observed, barrier = scope
+    if barrier:
+        barrier()
+    observed[session.id] = session.session_key
+    result['completion_reporting'] = FOREGROUND_REPORT_INSTRUCTION.replace('EXACT_SESSION_ID', session.id)
+
+
+def fence_publication():
+    scope = _observed_results.get()
+    if scope and scope[1]:
+        scope[1]()
+
+
+def foreground_reports(result):
+    """Parse a single terminal, unquoted block; reuse the strict assessment validator."""
+    text = result.get('final_response') or ''
+    # Recognize outer fences before removing internal blocks: a report example
+    # quoted inside a larger Markdown fence is public prose, not bookkeeping.
+    spans, fence, report_start, offset = [], None, None, 0
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line.rstrip('\r\n'))
+        if marker:
+            run, suffix = marker.groups()
+            if fence is None and (run[0] != '`' or '`' not in suffix):
+                fence = run
+                if run == '```' and suffix.strip() == 'process_reports' and line.startswith('```'):
+                    report_start = offset
+            elif fence and run[0] == fence[0] and len(run) >= len(fence) and not suffix.strip():
+                if report_start is not None:
+                    spans.append((report_start, offset + len(line)))
+                    report_start = None
+                fence = None
+        offset += len(line)
+    if report_start is not None:
+        spans.append((report_start, len(text)))
+    public = text
+    for start, end in reversed(spans):
+        public = public[:start] + public[end:]
+    public = public.strip()
+    if len(spans) != 1:
+        return public, []
+    start, end = spans[0]
+    match = re.fullmatch(r'```process_reports[^\S\n]*\n(.*?)\n```[^\S\n]*\n?', text[start:end], re.S)
+    if match is None or text[end:].strip():
+        return public, []
+    try:
+        value = json.loads(match[1])
+        reports = value['reports']
+        if not isinstance(reports, list) or len(reports) > 32:
+            raise ValueError('reports')
+        valid, ids = [], set()
+        for report in reports:
+            if not isinstance(report, dict):
+                raise ValueError('report')
+            execution = report.get('execution_id')
+            prose = report.get('report')
+            if not isinstance(execution, str) or execution in ids or not isinstance(prose, str) or not prose.strip():
+                raise ValueError('report identity')
+            assessment_result = {**result, 'final_response': text[:start] +
+                '```process_verification\n' + json.dumps(report) + '\n```'}
+            assessment = verification_outcome(assessment_result)
+            if assessment['outcome'] == 'unverified':
+                raise ValueError('assessment')
+            valid.append((execution, assessment, scrub_payload(prose.strip())))
+            ids.add(execution)
+        return public, valid
+    except (ValueError, TypeError, KeyError):
+        return public, []
+
+
+def claim_foreground_report(execution, session_key, turn_id, assessment, report):
+    """A completed read grants scope, never delivery. Claim the existing obligation atomically."""
+    owner = _owner_for_pid(os.getpid())
+    with _db() as db:
+        if progress_inflight(db, execution):
+            return False
+        row = db.execute("SELECT token,payload FROM process_followups WHERE execution_id=? AND phase IN ('pending','queued')", (execution,)).fetchone()
+        if not row:
+            return False
+        payload = json.loads(row['payload'])
+        if payload.get('session_key') != session_key or payload.get('followup_cancelled'):
+            return False
+        payload.update(followup_turn_id=turn_id, verification=assessment, report_text=report,
+                       report_owner='foreground', report_delivered=False)
+        return db.execute("UPDATE process_followups SET phase='turn_finished',payload=?,owner=?,version=version+1,updated_at=?,next_attempt=? WHERE execution_id=? AND token=? AND phase IN ('pending','queued')",
+            (json.dumps(scrub_payload(payload)), owner, time.time(), time.time(), execution, row['token'])).rowcount == 1
+
+
+def request_report_revision(execution, session_key, expected_version, reason):
+    """Operator API, deliberately absent from model tools. Preserve every prior receipt."""
+    if type(expected_version) is not int or not isinstance(reason, str) or not reason.strip():
+        raise ValueError('explicit revision and reason required')
+    with _db() as db:
+        row = db.execute("SELECT payload,version FROM process_followups WHERE execution_id=? AND version=? AND phase IN ('reported','verification_failed','approval_wait')", (execution, expected_version)).fetchone()
+        if not row:
+            return False
+        payload = json.loads(row['payload'])
+        if payload.get('session_key') != session_key or payload.get('followup_cancelled'):
+            return False
+        history = payload.setdefault('report_revisions', [])
+        history.append({k: payload[k] for k in ('verification', 'followup_turn_id', 'report_text', 'report_delivered') if k in payload})
+        for key in ('verification', 'followup_turn_id', 'report_text', 'report_delivered', 'verification_raw_response', 'verification_failure_reason', 'report_owner'):
+            payload.pop(key, None)
+        payload['revision_reason'] = scrub_payload(reason)
+        return db.execute("UPDATE process_followups SET phase='pending',payload=?,version=version+1,token=?,owner='',reason=?,next_attempt=0,updated_at=? WHERE execution_id=? AND version=?",
+                          (json.dumps(payload), uuid.uuid4().hex, scrub_payload(reason), time.time(), execution, expected_version)).rowcount == 1
 
 
 def task_request():
@@ -169,6 +300,8 @@ def admission(execution, token):
                        ('Cannot establish queue owner identity; no model dispatched: ' + safe_error(exc), now, execution, token))
         return False
     with _db() as db:
+        if progress_inflight(db, execution):
+            return False
         return db.execute('''UPDATE process_followups SET phase='queued',owner=?,next_attempt=?,updated_at=?
             WHERE execution_id=? AND token=? AND phase='pending' AND next_attempt<=?''',
             (owner, now + 30, now, execution, token, now)).rowcount == 1
@@ -206,6 +339,13 @@ def report_authorized(session_key, turn_id, *, connection=None):
     return row[0] in {'turn_finished', 'failed', 'reported', 'verification_failed', 'approval_wait'}
 
 
+def progress_inflight(db, execution):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_obligations'").fetchone():
+        return False
+    return db.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id LIKE ? AND state='attempting' LIMIT 1",
+                      ('delegation-progress:' + execution + ':%',)).fetchone() is not None
+
+
 def begin(execution, token):
     """Final cancellation/duplicate guard immediately before entering the model turn."""
     try:
@@ -217,6 +357,9 @@ def begin(execution, token):
                        ('Cannot establish verification owner identity; no model dispatched: ' + safe_error(exc), time.time(), execution, token))
         return False
     with _db() as db:
+        if progress_inflight(db, execution):
+            db.execute("UPDATE process_followups SET phase='pending',owner='',next_attempt=?,updated_at=? WHERE execution_id=? AND token=? AND phase='queued'", (time.time()+5, time.time(), execution, token))
+            return False
         return db.execute('''UPDATE process_followups SET phase='running',version=version+1,reason='Verification turn started; reconcile uncertain outcomes before retry',owner=?,updated_at=?
             WHERE execution_id=? AND token=? AND phase='queued' ''',
             (owner, time.time(), execution, token)).rowcount == 1

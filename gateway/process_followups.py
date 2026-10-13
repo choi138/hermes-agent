@@ -44,6 +44,59 @@ def prepare_report(runner, ctx, result, turn_id):
 
 
 
+def prepare_foreground_report(runner, ctx, result, turn_id, observed):
+    """Separate parent prose from independently cancellable, receipt-owned report segments."""
+    from tools.process_registry_followups import foreground_reports, claim_foreground_report
+    from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_obligation
+    parent, reports = foreground_reports(result)
+    if not reports or not ledger_enabled():
+        return {**result, 'final_response': parent}
+    if not turn_id:
+        # The ordinary active-turn marker is best effort. Report ownership is
+        # independently durable in the execution CAS and exact saved report ID.
+        import uuid
+        turn_id = 'foreground-report:' + uuid.uuid4().hex
+    from gateway.run import _sanitize_gateway_final_response, _strip_response_attachments_for_direct_send
+    from gateway.platforms.base import BasePlatformAdapter
+    adapter = runner._delivery_adapter_for(ctx.source)
+    for execution, assessment, text in reports:
+        if observed.get(execution) != ctx.session_key:
+            continue
+        report_turn = turn_id + ':process:' + execution
+        text = _strip_response_attachments_for_direct_send(
+            _sanitize_gateway_final_response(ctx.source.platform, text), adapter or BasePlatformAdapter)
+        if not text or not claim_foreground_report(execution, ctx.session_key, report_turn, assessment, text):
+            continue
+        kind = 'process_verification_report'
+        oid = 'process-report:' + compute_obligation_id(ctx.session_key, report_turn, kind)
+        record_obligation(obligation_id=oid, session_key=ctx.session_key,
+            platform=str(getattr(ctx.source.platform, 'value', ctx.source.platform)),
+            chat_id=ctx.source.chat_id, thread_id=getattr(ctx.source, 'thread_id', None),
+            content=text, adapter_profile=getattr(adapter, '_owner_profile', None),
+            turn_id=report_turn, response_kind=kind, preserve_existing=True)
+    # The ordinary final remains independently deliverable even when a subtask loses ownership.
+    # Reconciliation publishes saved report text directly; it never invokes another model.
+    return {**result, 'final_response': parent or 'NO_REPLY',
+            'process_report_disposition': 'report_only' if not parent else 'parent_and_report'}
+
+
+async def deliver_foreground_report(runner, evt):
+    from gateway.platforms.base import MessageEvent
+    source = runner._build_process_event_source(evt)
+    if source is None:
+        return False
+    adapter = runner._delivery_adapter_for(source)
+    if adapter is None:
+        return False
+    event = MessageEvent(text='', source=source, internal=True)
+    event._gateway_active_turn_id = evt['followup_turn_id']
+    event._gateway_response_kind = 'process_verification_report'
+    event._gateway_session_key = evt['session_key']
+    await adapter.send_final_ledgered(event, evt['session_key'], evt['report_text'],
+        {'thread_id': source.thread_id, 'non_conversational': True}, reply_to=None)
+    return True
+
+
 async def reconcile(runner):
     from tools.process_registry_followups import pending, admission, reject_admission, defer, cancel
     from tools.process_registry_notifications import format_process_notification
@@ -56,6 +109,14 @@ async def reconcile(runner):
             from gateway.delivery_ledger import turn_delivery_state
             from tools.process_registry_followups import report_state
             delivery = await asyncio.to_thread(turn_delivery_state, evt.get('session_key'), evt.get('followup_turn_id'))
+            # The foreground CAS persists the exact report before ledger creation.
+            # A restart in that gap can safely rebuild the obligation from saved
+            # text through send_final_ledgered; it must not rerun the model.
+            if delivery in {None, 'pending'} and evt.get('report_owner') == 'foreground' and evt.get('report_text'):
+                if not await deliver_foreground_report(runner, evt):
+                    await asyncio.to_thread(defer, execution, token, 'foreground report adapter or route unavailable; retry scheduled')
+                    continue
+                delivery = await asyncio.to_thread(turn_delivery_state, evt.get('session_key'), evt.get('followup_turn_id'))
             if delivery == 'delivered':
                 await asyncio.to_thread(report_state, execution, token, delivered=True)
             elif delivery == 'pending':
@@ -127,6 +188,8 @@ async def reconcile_all(runner):
             async with _async_profile_runtime_scope(Path(home)):
                 from tools.process_registry import process_registry
                 await asyncio.to_thread(process_registry.retry_checkpoint_recovery)
+                from tools.delegation_notifications import reconcile_progress
+                await reconcile_progress(runner, process_registry)
                 await reconcile(runner)
         except Exception as exc:
             from tools.environments.ssh_process import safe_error
