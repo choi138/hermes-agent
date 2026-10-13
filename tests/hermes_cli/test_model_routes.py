@@ -917,14 +917,14 @@ def test_fresh_unhealthy_verdict_suppresses_within_fail_ttl(monkeypatch, tmp_pat
     monkeypatch.setattr(mr, "_now", clock)
     _seed_verdict(health, "p1", healthy=False, ts=clock.t)
 
-    healthy, reason = mr.provider_health(
+    healthy, _reason = mr.provider_health(
         "p1", health=health, allow_recovery_probe=True,
     )
     assert healthy is False
     assert counts == {}  # fresh unhealthy verdict → cached, no probe
 
     clock.t += health.fail_ttl_seconds + 1
-    healthy, reason = mr.provider_health(
+    healthy, _reason = mr.provider_health(
         "p1", health=health, allow_recovery_probe=True,
     )
     assert healthy is False  # recovery probe ran and still failed

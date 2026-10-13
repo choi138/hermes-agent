@@ -6,8 +6,9 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, UTC
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from hermes_state_ids import new_session_id
@@ -59,28 +60,36 @@ def auto_continue_freshness_window() -> float:
 class SessionLifecycleMixin:
     """SessionStore explicit boundaries and crash-recovery markers."""
 
-    def _is_session_ended_in_db(self, session_id: str) -> bool:
-        """True iff state.db has this session with a non-null end_reason (same staleness test as
-        ``_prune_stale_sessions_locked``; no DB/row or DB error -> False). Lets routing self-heal a
-        session ended while the gateway stays alive. Store resolved from the owning profile.
+    def _is_session_ended_in_db(self, session_id: str, session_key: Optional[str] = None) -> bool:
+        """True iff state.db says the session is gone: ended (non-null end_reason) or hard-deleted
+        (no row in a readable owning DB). No DB or a DB error -> False (same failure mode as
+        ``_prune_stale_sessions_locked``). Lets routing self-heal a session finalized or deleted
+        while the gateway stays alive. Store resolved from the owning profile.
 
         Used by ``get_or_create_session`` to self-heal at routing time: ``_prune_stale_sessions_locked``
         only runs at startup, so a session ended in the DB while the gateway stays alive (any path that
         finalizes the row without clearing sessions.json) would otherwise be reused as a live routing key
         and silently swallow every subsequent message until the next restart (#54878 — the live-gateway
-        variant of #52804/FM9). DB errors are non-fatal — never block routing on a failed lookup.
+        variant of #52804/FM9). A hard delete is the same shape one step further: the row is GONE, not
+        merely ended, and reusing the route makes run_agent's INSERT OR IGNORE resurrect the deleted
+        session with its old id (#42422) — so a missing row is treated exactly like an ended one. DB
+        errors are non-fatal — never block routing on a failed lookup.
         The store is resolved from the row's owning profile rather than the ambient scope: an unscoped
         background writer keeps its own copy of the same session, and comparing against that copy reports a
         live session as ended (#66887).
+
+        Pass *session_key* when the owning key is known but the id may have left the routing index:
+        after the self-heal re-homes the key, the id has no owner and would resolve to the launch
+        store, which never holds a routed profile's rows (#118862).
         """
-        db = self._db_for_session_id(session_id)
+        db = self._db_for_key(session_key) if session_key else self._db_for_session_id(session_id)
         if not db or not session_id:
             return False
         try:
             row = db.get_session(session_id)
         except Exception:
             return False
-        return bool(row is not None and row.get("end_reason") is not None)
+        return row is None or row.get("end_reason") is not None
 
     def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
         """Only explicit suspension replaces a routed conversation; time never does."""
@@ -119,15 +128,16 @@ class SessionLifecycleMixin:
         candidate = entry.to_dict()
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
-        if started_at is not None:
+        touched = _now() if started_at is not None else None
+        if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
             # downgrade/upgrade window.
-            candidate["updated_at"] = started_at.isoformat()
+            candidate["updated_at"] = touched.isoformat()
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at
-        if started_at is not None:
-            entry.updated_at = started_at
+        if touched is not None:
+            entry.updated_at = touched
 
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
@@ -138,7 +148,9 @@ class SessionLifecycleMixin:
             entry = self._entry_locked(session_key)
             if entry is None:
                 return None
-            self._set_turn_marker_locked(session_key, entry, token, _now())
+            # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
+            # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
+            self._set_turn_marker_locked(session_key, entry, token, datetime.now(UTC))
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -222,7 +234,7 @@ class SessionLifecycleMixin:
         expected_turn_id: Optional[str],
         expected_resume_count: Optional[int],
         expected_status: Optional[str],
-        expected_identity: Optional[Dict[str, Any]] = None,
+        expected_identity: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Atomically claim an unchanged, unsuspended restart-resume candidate.
 
@@ -281,13 +293,13 @@ class SessionLifecycleMixin:
             "turn_id", "resume_count", "boot_id", "dispatch_token",
         ))
 
-    def _recovery_fence_path(self, session_key: str, record: Dict[str, Any]):
+    def _recovery_fence_path(self, session_key: str, record: dict[str, Any]):
         # Keep the fence scoped to the exact attempt and the owning SessionStore.
         payload = json.dumps([session_key, self._attempt_identity(record)], separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return self.sessions_dir / "recovery_cancellations" / f"{digest}.json"
 
-    def recovery_is_quarantined(self, session_key: str, record: Dict[str, Any]) -> bool:
+    def recovery_is_quarantined(self, session_key: str, record: dict[str, Any]) -> bool:
         if (session_key, self._attempt_identity(record)) in getattr(self, "_recovery_quarantine", set()):
             return True
         try:
@@ -377,7 +389,7 @@ class SessionLifecycleMixin:
 
     def cancel_active_turn_recovery(
         self, session_key: str, *, expected_session_id: Optional[str], reason: str,
-        expected_identity: Optional[Dict[str, Any]] = None,
+        expected_identity: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Persist sticky cancellation for pending or executing same-turn recovery."""
         with self._lock:
@@ -432,9 +444,9 @@ class SessionLifecycleMixin:
 
     def seal_active_turn_evidence(
         self, session_key: str, turn_id: str, *, expected_resume_count: int,
-        origin_row_id: int, checkpoint: Dict[str, Any],
+        origin_row_id: int, checkpoint: dict[str, Any],
         expected_dispatch_token: Optional[str] = None,
-        expected_identity: Optional[Dict[str, Any]] = None,
+        expected_identity: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Publish a raw-evidence checkpoint only while the exact attempt still owns the turn."""
         with self._lock:
@@ -484,7 +496,7 @@ class SessionLifecycleMixin:
         status: str, failure_reason: str, retry_delay: float = 0.0,
         blocked_reason: Optional[str] = None,
         expected_dispatch_token: Optional[str] = None,
-        expected_identity: Optional[Dict[str, Any]] = None,
+        expected_identity: Optional[dict[str, Any]] = None,
     ) -> bool:
         """CAS a structured failed attempt into ``retry_wait`` or ``blocked`` state."""
         if status not in {"retry_wait", "blocked"}:
@@ -567,8 +579,7 @@ class SessionLifecycleMixin:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.
         Returns the number of newly promoted sessions."""
-        now = _now()
-        max_age = timedelta(seconds=max(0, max_age_seconds))
+        now, epoch_now = _now(), time.time()
         promoted = 0
 
         def _promote(entry: SessionEntry) -> bool:
@@ -576,13 +587,10 @@ class SessionLifecycleMixin:
             if not entry.active_turn_token:
                 return False
             started_at = entry.active_turn_started_at
-            try:
-                marker_is_stale = started_at is None or (
-                    max_age_seconds > 0 and now - started_at > max_age
-                )
-            except TypeError:
-                # Mixed aware/naive timestamps: clear rather than risk an unsafe old resume.
-                marker_is_stale = True
+            # Epoch arithmetic: a pre-upgrade naive marker reads as local time, an aware one exactly.
+            marker_is_stale = started_at is None or (
+                max_age_seconds > 0 and epoch_now - started_at.timestamp() > max_age_seconds
+            )
             if not marker_is_stale and not entry.suspended:
                 if entry.resume_pending:
                     # A drain-timeout marker is more specific; keep it.
@@ -658,23 +666,3 @@ class SessionLifecycleMixin:
             logger.info("SessionStore pruned %d entries older than %d days",
                         len(removed_keys), max_age_days)
         return len(removed_keys)
-
-    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-        """Mark sessions active within *max_age_seconds* as ``resume_pending`` after a crash/fast
-        restart (already-pending and suspended entries are skipped). Returns the number marked.
-
-        Called on gateway startup after a crash or fast restart to preserve in-flight sessions instead of
-        destroying their conversation history (#7536). Only marks sessions updated within *max_age_seconds*
-        to avoid touching long-idle sessions. Sets ``resume_pending=True`` so the next incoming message on
-        the same session_key auto-resumes from the existing transcript.
-        """
-        cutoff = _now() - timedelta(seconds=max_age_seconds)
-
-        def _mark(entry: SessionEntry) -> bool:
-            if entry.resume_pending or entry.suspended or entry.updated_at < cutoff:
-                return False
-            entry.resume_pending = True
-            entry.resume_reason = "restart_interrupted"
-            entry.last_resume_marked_at = _now()
-            return True
-        return self._update_all_entries_locked(_mark)

@@ -18,7 +18,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Deque, Iterable, Optional
 
 
@@ -299,7 +299,7 @@ def classify_log_record(logger_name: str, message: str) -> Optional[HealthEvent]
 
 def _format_timestamp(timestamp: float) -> str:
     try:
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(
+        return datetime.fromtimestamp(timestamp, tz=UTC).isoformat(
             timespec="seconds"
         )
     except (OverflowError, OSError, ValueError):
@@ -341,7 +341,7 @@ def _mask_url_credentials(text: str) -> str:
     if "://" not in text:
         return text
 
-    def _mask(match: "re.Match[str]") -> str:
+    def _mask(match: re.Match[str]) -> str:
         userinfo = match.group("userinfo")
         masked = "***:***" if ":" in userinfo else "***"
         return f"{match.group('scheme')}{masked}@"
@@ -354,7 +354,7 @@ def _neutralize_markup(text: str) -> str:
     if not text:
         return ""
 
-    def _mention(match: "re.Match[str]") -> str:
+    def _mention(match: re.Match[str]) -> str:
         label = "channel" if match.group("sigil") == "#" else "mention"
         return f"[{label}:{match.group('target')}]"
 
@@ -533,7 +533,7 @@ class AlertBudget:
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self.hourly_cap = max(0, int(hourly_cap))
         self._last_by_rule_session: dict[tuple[str, str], float] = {}
-        self._hourly_emissions: Deque[float] = deque()
+        self._hourly_emissions: deque[float] = deque()
         self._suppressed = 0
 
     @property
@@ -577,7 +577,7 @@ class UpstreamFailureTracker:
     def __init__(self, threshold: int = 3, window_seconds: float = 600):
         self.threshold = max(1, int(threshold))
         self.window_seconds = max(1.0, float(window_seconds))
-        self._events: Deque[tuple[float, HealthEvent]] = deque()
+        self._events: deque[tuple[float, HealthEvent]] = deque()
 
     def record(
         self, event: HealthEvent, *, now: Optional[float] = None

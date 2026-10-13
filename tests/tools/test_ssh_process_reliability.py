@@ -14,7 +14,7 @@ class ShellTransport:
     host, user, port = 'isolated', 'test', 22
 
     def _run_ssh(self, command, timeout, *, stdin_data=None):
-        return subprocess.run(['bash', '-c', command], capture_output=True, text=True, timeout=timeout, input=stdin_data)
+        return subprocess.run(['bash', '-c', command], capture_output=True, text=True, timeout=timeout, input=stdin_data, check=False)
 
 
 def test_private_protocol_preserves_user_artifact_umask(tmp_path):
@@ -41,7 +41,7 @@ def test_remote_protocol_runs_on_real_python38(tmp_path):
     class Python38Transport(ShellTransport):
         def _run_ssh(self, command, timeout, *, stdin_data=None):
             return subprocess.run(['bash', '-c', command], capture_output=True, text=True,
-                timeout=timeout, input=stdin_data, env=dict(os.environ, PATH=str(binary) + ':' + os.environ['PATH']))
+                timeout=timeout, input=stdin_data, env=dict(os.environ, PATH=str(binary) + ':' + os.environ['PATH']), check=False)
     env = Python38Transport()
     result = env._run_ssh(launch_command(str(tmp_path), 'proc_python38'), 5, stdin_data='printf compatible')
     assert result.returncode == 0, result.stderr
@@ -264,7 +264,7 @@ def test_log_replacement_identity_and_utf8_terminal_backlog(monkeypatch, tmp_pat
     env = ShellTransport()
     env._run_ssh(launch_command(str(tmp_path), 'proc_tail'), 5,
                  stdin_data="python3 -c " + shlex.quote("print('한'*100000)"))
-    state = wait_exit(env, tmp_path, 'proc_tail')
+    wait_exit(env, tmp_path, 'proc_tail')
     log = tmp_path / 'hermes_bg_proc_tail.claim/process.log'
     count = []
     def observation(root, execution, offset):
@@ -549,7 +549,8 @@ def test_detached_wrapper_and_shell_do_not_retain_command_in_argv(tmp_path):
         wait_exit(env, tmp_path, 'proc_argv')
 
 
-def test_unconfirmed_launch_is_pollable_and_cancel_request_is_counted(monkeypatch, tmp_path):
+@pytest.mark.parametrize('persist_on_release', [False, True])
+def test_unconfirmed_launch_is_pollable_and_cancel_request_is_counted(monkeypatch, tmp_path, persist_on_release):
     from types import SimpleNamespace
     from tools import process_registry as pr
     from tools.terminal_tool_background import spawn_background_process
@@ -564,14 +565,21 @@ def test_unconfirmed_launch_is_pollable_and_cancel_request_is_counted(monkeypatc
     result = json.loads(spawn_background_process(
         env=env, env_type='ssh', command='true', effective_task_id='t', task_id='t', session_key='',
         workdir=None, cwd='/tmp', effective_pty=False, notify_on_complete=False,
-        watch_patterns=None, approval_note=None, pty_disabled_reason=None))
+        watch_patterns=None, approval_note=None, pty_disabled_reason=None,
+        persist_on_release=persist_on_release))
     assert result['dispatch_unconfirmed'] is True and 'Do not rerun' in result['output']
     assert result['session_id'] in registry._running
     assert registry.poll(result['session_id'])['status'] == 'unknown'
     monkeypatch.setattr(env, '_run_ssh', lambda *a, **kw: SimpleNamespace(returncode=0))
     pending_session = registry.get(result['session_id'])
+    assert pending_session.persist_on_release is persist_on_release
+    assert result.get('persist_on_release', False) is persist_on_release
     assert not pending_session._observation_wake.is_set()
-    assert registry.kill_all() == 1
+    if persist_on_release:
+        assert registry.kill_all() == 0
+        assert not pending_session.cancel_requested
+        assert not pending_session._observation_wake.is_set()
+    assert registry.kill_all(source='process.kill') == 1
     assert pending_session._observation_wake.is_set()
     assert not pending_session._completion_event.is_set()
     assert registry.get(result['session_id']).cancel_requested
@@ -769,7 +777,7 @@ def test_child_start_failure_publishes_terminal_receipt(tmp_path):
     from tools.environments.ssh_process import _RUN
     harness = "import subprocess\ndef refuse(*args, **kwargs): raise OSError(11, 'process capacity exhausted')\nsubprocess.Popen=refuse\n"
     result = subprocess.run(['python3', '-c', harness + _RUN, str(tmp_path), 'proc_startfail', ''],
-                            input='true', text=True, capture_output=True)
+                            input='true', text=True, capture_output=True, check=False)
     state = observe(ShellTransport(), str(tmp_path), 'proc_startfail', 0)
     assert state['state'] == 'exited', result.stderr
     assert state['exit_code'] != 0
@@ -1055,7 +1063,7 @@ subprocess.Popen = startup_action
 """
     harness = 'STARTUP = ' + repr(startup) + '\n' + harness
     result = subprocess.run([sys.executable, '-c', harness + _RUN, str(tmp_path), 'proc_loginfd', ''],
-        input='printf once > ' + shlex.quote(str(effect)), text=True, capture_output=True, timeout=10)
+        input='printf once > ' + shlex.quote(str(effect)), text=True, capture_output=True, timeout=10, check=False)
     state = observe(ShellTransport(), str(tmp_path), 'proc_loginfd', 0)
     assert state['state'] == 'exited', result.stderr
     if startup == 'close_descriptors':
@@ -1086,7 +1094,7 @@ subprocess.Popen = startup_action
 """
     harness = 'STARTUP = ' + repr(startup) + '\nOTHER = ' + repr(str(other)) + '\nTARGET = ' + repr(str(target)) + '\n' + harness
     result = subprocess.run([sys.executable, '-c', harness + _RUN, str(tmp_path), 'proc_logincwd', str(target)],
-        input='printf result > artifact.txt; pwd', text=True, capture_output=True, timeout=10)
+        input='printf result > artifact.txt; pwd', text=True, capture_output=True, timeout=10, check=False)
     state = observe(ShellTransport(), str(tmp_path), 'proc_logincwd', 0)
     assert state['state'] == 'exited', result.stderr
     assert not (other / 'artifact.txt').exists(), 'login initialization redirected the requested effect'
@@ -1123,7 +1131,7 @@ subprocess.Popen = startup_action
 """
     harness = 'STARTUP = ' + repr(startup) + '\nOTHER = ' + repr(str(other)) + '\n' + harness
     result = subprocess.run([sys.executable, '-c', harness + _RUN, str(tmp_path), 'proc_relativecwd', requested],
-        cwd=origin, input='printf result > artifact.txt; pwd', text=True, capture_output=True, timeout=10)
+        cwd=origin, input='printf result > artifact.txt; pwd', text=True, capture_output=True, timeout=10, check=False)
     state = observe(ShellTransport(), str(tmp_path), 'proc_relativecwd', 0)
     assert state['state'] == 'exited', result.stderr
     assert state['exit_code'] == 0

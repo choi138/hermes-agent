@@ -16,7 +16,7 @@ NAMES = ("hermes-agent", "agent-performance-engineering")
 
 
 def fenced_json(path):
-    return json.loads(re.search(r"```json\n(.*?)\n```", path.read_text(), re.S)[1])
+    return json.loads(re.search(r"```json\n(.*?)\n```", path.read_text(), re.DOTALL)[1])
 
 
 def frontmatter(raw):
@@ -73,7 +73,7 @@ def test_skill_local_links_and_targeted_load_are_bounded(name):
             destination = folder / relative
             assert destination.is_file(), (path, target)
             if anchor:
-                headings = re.findall(r"^#{1,6}\s+(.+)$", destination.read_text(), re.M)
+                headings = re.findall(r"^#{1,6}\s+(.+)$", destination.read_text(), re.MULTILINE)
                 slugs = {re.sub(r"[^\w\s-]", "", heading.lower()).replace(" ", "-")
                          for heading in headings}
                 assert anchor in slugs, (path, target)

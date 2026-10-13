@@ -5,6 +5,8 @@ import socket
 import subprocess
 import time
 
+import asyncio
+
 import pytest
 
 from tools.environments.ssh import SSHEnvironment
@@ -63,7 +65,7 @@ def test_sibling_cleanup_outage_reconnect_and_locked_status(ssh_server, monkeypa
             fcntl.flock(lock, fcntl.LOCK_EX)
             locked_at = time.monotonic()
             # Close only this test's master, simulating disconnect. The observer must reconnect.
-            subprocess.run(first._build_ssh_command(['-O', 'exit']), capture_output=True, timeout=5)
+            subprocess.run(first._build_ssh_command(['-O', 'exit']), capture_output=True, timeout=5, check=False)
             observer = SSHEnvironment('127.0.0.1', getpass.getuser(), port=port, key_path=str(key), _status_only=True)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
@@ -87,7 +89,7 @@ def test_sibling_cleanup_outage_reconnect_and_locked_status(ssh_server, monkeypa
             time.sleep(max(0, 60 - (time.monotonic() - locked_at)))
             assert time.monotonic() - locked_at >= 60
     finally:
-        subprocess.run(first._build_ssh_command(['-O', 'exit']), capture_output=True, timeout=5)
+        subprocess.run(first._build_ssh_command(['-O', 'exit']), capture_output=True, timeout=5, check=False)
 
 
 @pytest.mark.asyncio
@@ -159,10 +161,10 @@ async def test_real_ssh_completion_reaches_gateway_report_and_survives_restart(s
             session = registry.spawn_via_env(env, command, session_key=entry.session_key, notify_on_complete=True)
         else:
             import sys
-            child = subprocess.run([sys.executable, '-c', _CRASH_WORKER], input=json.dumps(dict(
+            child = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', _CRASH_WORKER], input=json.dumps(dict(
                 home=str(tmp_path / 'home'), root=str(tmp_path), user=getpass.getuser(), port=port,
                 key=str(key), session_key=entry.session_key, session_id=entry.session_id,
-                command=command, boundary='after_dispatch' if crash_boundary in {'missing_receipt','corrupt_receipt','pid_reuse'} else crash_boundary)), text=True, capture_output=True, timeout=20)
+                command=command, boundary='after_dispatch' if crash_boundary in {'missing_receipt','corrupt_receipt','pid_reuse'} else crash_boundary)), text=True, capture_output=True, timeout=20, check=False)
             assert child.returncode == 42, child.stderr
             saved_receipt = None
             if crash_boundary in {'missing_receipt','corrupt_receipt','pid_reuse'}:
@@ -234,7 +236,7 @@ async def test_real_ssh_completion_reaches_gateway_report_and_survives_restart(s
         assert len(calls) == 1 and marker.read_text() == 'once'
     finally:
         clear_session_vars(tokens)
-        subprocess.run(env._build_ssh_command(['-O', 'exit']), capture_output=True, timeout=5)
+        await asyncio.to_thread(subprocess.run, env._build_ssh_command(['-O', 'exit']), capture_output=True, timeout=5, check=False)
 
 
 _CRASH_WORKER = r'''

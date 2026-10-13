@@ -18,7 +18,7 @@ from gateway.agent_health import (
 
 
 _SEND_TIMEOUT_SECONDS = 15.0
-_ACTIVE_SINK: Optional["AgentHealthSink"] = None
+_ACTIVE_SINK: Optional[AgentHealthSink] = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -47,12 +47,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def set_active_agent_health_sink(sink: Optional["AgentHealthSink"]) -> None:
+def set_active_agent_health_sink(sink: Optional[AgentHealthSink]) -> None:
     global _ACTIVE_SINK
     _ACTIVE_SINK = sink
 
 
-def get_active_agent_health_sink() -> Optional["AgentHealthSink"]:
+def get_active_agent_health_sink() -> Optional[AgentHealthSink]:
     return _ACTIVE_SINK
 
 
@@ -129,7 +129,7 @@ class AgentHealthSink:
         self._dropped = 0
 
     @classmethod
-    def from_environment(cls, gateway: Any) -> "AgentHealthSink":
+    def from_environment(cls, gateway: Any) -> AgentHealthSink:
         return cls(
             gateway,
             enabled=_env_bool("HERMES_HEALTH_ENABLED", False),
@@ -286,7 +286,7 @@ class AgentHealthSink:
                 return
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         except Exception:
             return

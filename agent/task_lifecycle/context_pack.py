@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import hashlib
 import json
 from types import MappingProxyType
@@ -124,7 +124,7 @@ def build_pack(items: Iterable[MemoryItem], *, task_digest: str,
             latest[item.item_id] = item
     ordered = sorted(latest.values(), key=lambda i: _PRIORITY[i.kind])
     return ContextPack(tuple(ordered[:limit]), task_digest,
-                       datetime.now(timezone.utc), max(0, len(ordered) - limit))
+                       datetime.now(UTC), max(0, len(ordered) - limit))
 
 
 def render_for_executor(pack: ContextPack) -> str:

@@ -61,6 +61,30 @@ def test_failed_turn_record_write_never_leaks_into_memory(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_token_only_turn_remains_owned_until_adapter_handoff():
+    """Legacy turns without structured evidence still retain release crash protection."""
+    runner, adapter = make_restart_runner()
+    event = MessageEvent(text="report", source=make_restart_source(chat_id="legacy-handoff"))
+    key = runner._session_key_for_source(event.source)
+    event._gateway_active_turn_session_key = key
+    event._gateway_active_turn_token = "legacy-token"
+    event._turn_marker_handoff = True
+    clear = AsyncMock(return_value=True)
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, clear_turn_active=clear,
+    )
+    adapter.gateway_runner = runner
+
+    await runner._clear_durable_active_turn(event, defer_delivery=True)
+    clear.assert_not_awaited()
+    assert event._gateway_active_turn_token == "legacy-token"
+
+    await adapter._release_turn_marker(event)
+    clear.assert_awaited_once_with(key, "legacy-token")
+    assert not hasattr(event, "_gateway_active_turn_token")
+
+
+@pytest.mark.asyncio
 async def test_completed_reply_keeps_turn_record_until_adapter_delivery(tmp_path, monkeypatch):
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="handoff")

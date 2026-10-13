@@ -285,7 +285,7 @@ class TestNeighborSearch:
             evidence=["episode:" + "d" * 32], origin="user",
         )
         results = store.neighbor_search(["nas"], topic_key="nas.nfs.mount")
-        assert [r["topic_key"] for r in results][0] == "nas.nfs.access"
+        assert results[0]["topic_key"] == "nas.nfs.access"
         assert results[0]["match_score"] > results[-1]["match_score"] or len(results) == 1
 
     def test_tombstoned_notes_never_match(self, store):

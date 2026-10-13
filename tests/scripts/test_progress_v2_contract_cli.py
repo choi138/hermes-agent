@@ -121,7 +121,7 @@ def sender_for(boot, root):
 
 
 def test_producer_consumer_stable_card_dedup_and_get_only_parent_claim(tmp_path, discord):
-    boot, traces, messages = discord
+    boot, traces, _messages = discord
     p = lane(tmp_path)
     p.tick(now=0)
     sender = sender_for(boot, tmp_path / 'server-state')
@@ -149,7 +149,7 @@ def test_producer_consumer_stable_card_dedup_and_get_only_parent_claim(tmp_path,
     _atomic(manifest, {k: str(v) if isinstance(v, Path) else v for k, v in vars(p.manifest).items()})
     claimed = subprocess.run([sys.executable, str(ROOT / 'scripts/delegation_progress.py'),
         'claim-report', '--manifest', str(manifest), '--state-dir', str(p.root)],
-        capture_output=True, text=True, timeout=10)
+        capture_output=True, text=True, timeout=10, check=False)
     assert claimed.returncode == 0, claimed.stderr
     claim = json.loads(claimed.stdout)
     assert claim['event_id'] == head['event_id'] and discord_body(claim['payload'])['nonce'] == nonce
@@ -178,7 +178,7 @@ raise SystemExit(main())
         '--state-dir', str(p.root), '--ssh-host', 'fixture-host', '--remote-python', '/usr/bin/python3',
         '--runtime-root', '/srv/fixture', '--helper-path', '/srv/helper.py', '--allow-thread', '123',
         '--server-state-dir', str(tmp_path / 'server-state'), '--record-reported-message', manual['message_id'], '--once'],
-        text=True, capture_output=True, timeout=15)
+        text=True, capture_output=True, timeout=15, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert [t['method'] for t in traces[before:]] == ['GET']
     assert not p.peek()
@@ -255,7 +255,7 @@ def test_validation_cli_with_real_canonical_gate_log(tmp_path):
     _atomic(manifest, {k: str(v) if isinstance(v, Path) else v for k, v in vars(p.manifest).items()})
     def cli(command, *args, check=True):
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/delegation_progress.py'), command,
-            '--manifest', str(manifest), '--state-dir', str(p.root), *args], capture_output=True, text=True, timeout=15)
+            '--manifest', str(manifest), '--state-dir', str(p.root), *args], capture_output=True, text=True, timeout=15, check=False)
         if check:
             assert result.returncode == 0, result.stderr
             return json.loads(result.stdout)
@@ -264,7 +264,7 @@ def test_validation_cli_with_real_canonical_gate_log(tmp_path):
     ticket = cli('begin-validation')
     env = dict(os.environ, HERMES_PYTHON=sys.executable, HERMES_TEST_FILE_RETRIES='0')
     result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '3', '--file-timeout', '180', 'tests/test_gate.py'],
-        cwd=repo, env=env, capture_output=True, text=True, timeout=60)
+        cwd=repo, env=env, capture_output=True, text=True, timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     (p.manifest.artifact_root / 'gate.log').write_text(result.stdout + result.stderr)
     receipt = cli('record-validation', '--ticket', ticket['ticket'], '--evidence-ref', 'gate.log',
@@ -289,7 +289,7 @@ def test_public_closed_snapshot_frozen_pending_drain_restart(tmp_path, terminal)
     save_manifest()
     def cli(command, *args, check=True):
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/delegation_progress.py'), command,
-            '--manifest', str(manifest), '--state-dir', str(p.root), *args], capture_output=True, text=True, timeout=15)
+            '--manifest', str(manifest), '--state-dir', str(p.root), *args], capture_output=True, text=True, timeout=15, check=False)
         if check:
             assert result.returncode == 0, result.stderr
         return result
@@ -299,7 +299,7 @@ def test_public_closed_snapshot_frozen_pending_drain_restart(tmp_path, terminal)
         gate = tmp_path / 'test_acceptance.py'
         gate.write_text('def test_acceptance():\n    assert 2 + 2 == 4\n')
         result = subprocess.run([sys.executable, '-m', 'pytest', '-q', str(gate)],
-            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+            cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
         assert result.returncode == 0, result.stdout + result.stderr
         (p.manifest.artifact_root / 'gate.log').write_text(result.stdout + result.stderr)
         cli('record-validation', '--ticket', ticket['ticket'], '--evidence-ref', 'gate.log',
@@ -348,7 +348,7 @@ def test_public_closed_snapshot_frozen_pending_drain_restart(tmp_path, terminal)
     ('GET', {'id': '999'}), ('GET', {'channel_id': '999'}), ('GET', {'content': 'different'}),
 ])
 def test_http_response_correlation_and_bound_recovery(tmp_path, discord, method, wrong):
-    boot, traces, messages = discord
+    boot, traces, _messages = discord
     controls = boot.with_name('http-controls.json')
     controls.write_text(json.dumps({method: wrong}))
     p = lane(tmp_path)
@@ -407,7 +407,7 @@ def test_unbound_claim_and_wrong_run_channel_do_not_ack(tmp_path, discord):
 
 
 def test_patch_unknown_response_cannot_use_create_binding(tmp_path, discord):
-    boot, traces, messages = discord
+    boot, traces, _messages = discord
     p = lane(tmp_path)
     p.tick(now=0)
     sender = sender_for(boot, tmp_path / 'server-state')
@@ -425,7 +425,7 @@ def test_patch_unknown_response_cannot_use_create_binding(tmp_path, discord):
 
 
 def test_automatic_journal_recovery_is_get_only(tmp_path, discord):
-    boot, traces, messages = discord
+    boot, traces, _messages = discord
     p = lane(tmp_path)
     p.tick(now=0)
     sender = sender_for(boot, tmp_path / 'server-state')
@@ -442,7 +442,7 @@ def test_automatic_journal_recovery_is_get_only(tmp_path, discord):
 
 
 def test_journal_recovery_without_response_binding_never_posts(tmp_path, discord):
-    boot, traces, messages = discord
+    boot, traces, _messages = discord
     p = lane(tmp_path)
     p.tick(now=0)
     sender = sender_for(boot, tmp_path / 'server-state')

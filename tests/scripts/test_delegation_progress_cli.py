@@ -13,7 +13,7 @@ CLI = Path(__file__).resolve().parents[2] / "scripts" / "delegation_progress.py"
 
 
 def test_help_standalone():
-    result = subprocess.run([sys.executable, str(CLI), "--help"], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(CLI), "--help"], capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     for command in ("snapshot", "tick", "peek", "ack", "watch"):
         assert command in result.stdout
@@ -45,7 +45,7 @@ def fixture_lane(tmp_path):
 def invoke(lane, command, *args, check=True):
     _, _, _, manifest, state = lane
     result = subprocess.run([sys.executable, str(CLI), command, "--manifest", str(manifest),
-                             "--state-dir", str(state), *args], capture_output=True, text=True, timeout=15)
+                             "--state-dir", str(state), *args], capture_output=True, text=True, timeout=15, check=False)
     if check:
         assert result.returncode == 0, result.stderr
     return result
@@ -92,7 +92,7 @@ def test_watch_fast_exit_duplicate_fencing_and_final_reload(fixture_lane):
     state_file = state / 'cli-fixture/state.json'
     try:
         wait_until(state_file.exists)
-        assert subprocess.run(argv, capture_output=True, text=True, timeout=10).returncode == 74
+        assert subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False).returncode == 74
         first = json.loads(invoke(fixture_lane, 'peek').stdout)
         assert first['operation'] == 'CARD_CREATE'
         invoke(fixture_lane, 'ack', '--id', first['id'])
@@ -113,7 +113,7 @@ def test_watch_fast_exit_duplicate_fencing_and_final_reload(fixture_lane):
         assert [m['operation'] for m in pending] == ['CARD_PATCH', 'NOTICE']
         for message in pending:
             invoke(fixture_lane, 'ack', '--id', message['id'])
-        stdout, stderr = process.communicate(timeout=10)
+        _stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
         assert json.loads(state_file.read_text())['stopped']
     finally:

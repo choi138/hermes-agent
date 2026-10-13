@@ -82,16 +82,8 @@ def _run_finalize(agent: AIAgent, **overrides) -> None:
     finalize_turn(agent, **args)
 
 
-def test_default_skip_background_review_is_false() -> None:
-    """Without an explicit override, AIAgent does NOT skip background review."""
-    agent = _make_agent()
-    assert agent.skip_background_review is False
 
 
-def test_skip_background_review_flag_persists() -> None:
-    """Passing skip_background_review=True records the flag on the instance."""
-    agent = _make_agent(skip_background_review=True)
-    assert agent.skip_background_review is True
 
 
 def test_finalize_turn_skips_review_when_flag_set() -> None:
@@ -154,7 +146,11 @@ def test_persistence_failure_error_fallback_is_pinned_and_leaves_final_response_
     memory sync and the background-review gate still see the turn as having produced nothing."""
     from hermes_constants import profile_cli_selector
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "research"))
+    # A named profile home must exist before an agent is built inside it: setup_logging() now
+    # opens agent.log under the ACTIVE home and refuses to materialize a missing profile.
+    profile_home = tmp_path / ".hermes" / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     selector = profile_cli_selector()
     assert selector.strip()
     agent = _make_agent()

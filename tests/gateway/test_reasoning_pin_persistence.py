@@ -1,6 +1,6 @@
 """Explicit reasoning selections survive restart and fail without changing live state."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -64,7 +64,7 @@ def test_failed_pin_and_release_leave_memory_and_disk_unchanged(tmp_path, monkey
 
 
 def test_previous_production_row_restores_pin_without_secret_fields():
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     entry = SessionEntry.from_dict({
         "session_key": "agent:main:local:reasoning-pin", "session_id": "session-1",
         "created_at": now, "updated_at": now,

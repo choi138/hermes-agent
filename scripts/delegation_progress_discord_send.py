@@ -143,7 +143,7 @@ def validate(value, allow_threads):
             or not re.fullmatch(r'[가-힣A-Za-z0-9\n •·.,:/_\\()%\-]+', content)
             or re.search(r'\\(?!_)', content)):
         raise ValueError('unsafe_content')
-    if (re.search(r'MEDIA|https?\s*:|www\.|(?:sk|ghp|github_pat|xox[baprs])[-_]|[A-Za-z0-9]{24,}', content, re.I)
+    if (re.search(r'MEDIA|https?\s*:|www\.|(?:sk|ghp|github_pat|xox[baprs])[-_]|[A-Za-z0-9]{24,}', content, re.IGNORECASE)
             or value['content_digest'] != hashlib.sha256(content.encode()).hexdigest()):
         raise ValueError('unsafe_content')
     return value

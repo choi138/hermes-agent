@@ -162,8 +162,8 @@ class TaskContract:
         """
         if not isinstance(text, str) or not text.strip() or "\0" in text:
             raise LifecycleError("Request must be nonempty text without NUL")
-        action = re.search(r"\b(fix|implement|create|change|delete|run|build|update|install)\b|수정|구현|삭제|실행|만들|추가", text, re.I)
-        informational = re.search(r"^(what|why|how|explain|describe|show|list)\b|설명|알려|조회|상태|무엇", text.strip(), re.I)
+        action = re.search(r"\b(fix|implement|create|change|delete|run|build|update|install)\b|수정|구현|삭제|실행|만들|추가", text, re.IGNORECASE)
+        informational = re.search(r"^(what|why|how|explain|describe|show|list)\b|설명|알려|조회|상태|무엇", text.strip(), re.IGNORECASE)
         if len(text) <= 160 and informational and not action:
             return None
         return cls(text, text if objective is None else objective, allowed_paths,

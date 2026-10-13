@@ -33,7 +33,7 @@ def _frame(kind: str, data: str) -> bytes:
 
 
 class _Events(httpx.SyncByteStream):
-    def __init__(self, role: str, transport: "_Transport", sibling_started: threading.Event,
+    def __init__(self, role: str, transport: _Transport, sibling_started: threading.Event,
                  sibling_release: threading.Event):
         self.role = role
         self.transport = transport
@@ -341,7 +341,7 @@ def test_stream_without_content_or_terminal_still_fails(monkeypatch):
 
 
 def test_watchdog_winning_during_finalization_cannot_return_success(monkeypatch):
-    from agent import auxiliary_client as aux
+    from agent import auxiliary_codex_response as codex_response
 
     completed = _frame("response.output_text.delta",
                        '{"type":"response.output_text.delta","delta":"complete"}') + _frame(
@@ -351,13 +351,13 @@ def test_watchdog_winning_during_finalization_cannot_return_success(monkeypatch)
                         lambda *_args, **_kwargs: httpx.Client(transport=httpx.MockTransport(
                             lambda _request: httpx.Response(200, headers={"content-type": "text/event-stream"},
                                                             content=completed))))
-    original_parse = aux._parse_codex_final_response
+    original_parse = codex_response._parse_codex_final_response
 
-    def slow_finalization(final):
+    def slow_finalization(final, **kwargs):
         time.sleep(0.22)
-        return original_parse(final)
+        return original_parse(final, **kwargs)
 
-    monkeypatch.setattr(aux, "_parse_codex_final_response", slow_finalization)
+    monkeypatch.setattr(codex_response, "_parse_codex_final_response", slow_finalization)
     cached = _hermes_cached(api_key="synthetic-key", base_url="https://example.test/codex",
                     http_client=httpx.Client(transport=httpx.MockTransport(
                         lambda _request: pytest.fail("cached transport was used"))), max_retries=0)

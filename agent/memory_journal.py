@@ -94,7 +94,7 @@ def _safe_session_filename(session_id: str) -> str:
     return (name or "_no_session") + ".jsonl"
 
 
-def _scrub_evidence_refs(refs: Any) -> List[Dict[str, Any]]:
+def _scrub_evidence_refs(refs: Any) -> list[dict[str, Any]]:
     """Recursively scrub every string value in a list of evidence-ref dicts.
 
     The WAL must never hold secrets (ADR-004 §4.2 triple-scrub rule (a) —
@@ -115,7 +115,7 @@ def _scrub_evidence_refs(refs: Any) -> List[Dict[str, Any]]:
             return [_scrub_value(v) for v in value]
         return value
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for ref in refs or []:
         if isinstance(ref, dict):
             out.append(_scrub_value(ref))
@@ -130,7 +130,7 @@ def _scrub_evidence_refs(refs: Any) -> List[Dict[str, Any]]:
 # instance holding its own lock would serialize nothing. Keyed by str(path);
 # journal paths are a small bounded set (one per session + one per month), so
 # the map never needs eviction.
-_path_locks: Dict[str, threading.Lock] = {}
+_path_locks: dict[str, threading.Lock] = {}
 _path_locks_guard = threading.Lock()
 
 
@@ -144,7 +144,7 @@ def _lock_for(path: Path) -> threading.Lock:
         return lock
 
 
-def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     """Append one JSON line atomically with respect to concurrent appenders.
 
     The complete line is built first and written with a single ``os.write``
@@ -226,7 +226,7 @@ class PendingTurnWAL:
         self._lock = threading.Lock()
         # Per-session turn sequence, lazily seeded from the existing file so
         # restarts continue the sequence instead of restarting at 0.
-        self._seq: Dict[str, int] = {}
+        self._seq: dict[str, int] = {}
 
     def _dir(self) -> Path:
         return self._base_dir
@@ -314,7 +314,7 @@ class PendingTurnWAL:
         content: str,
         *,
         kind_hint: str = "",
-        evidence_refs: Optional[List[Dict[str, Any]]] = None,
+        evidence_refs: Optional[list[dict[str, Any]]] = None,
         origin: str = "user",
     ) -> Optional[str]:
         """Durably queue a ``memory_propose`` record (ADR-004 §③ writer list,
@@ -374,7 +374,7 @@ class PendingTurnWAL:
 
     # -- startup scan / GC ------------------------------------------------------
 
-    def scan_and_gc(self) -> Optional[Dict[str, int]]:
+    def scan_and_gc(self) -> Optional[dict[str, int]]:
         """Count unconsumed entries and GC old fully-consumed files.
 
         Returns ``{"files", "unconsumed_entries", "gc_deleted_files"}`` (or
@@ -402,7 +402,7 @@ class PendingTurnWAL:
             now = time.time()
             for path in sorted(wal_dir.glob("*.jsonl")):
                 try:
-                    entry_ts: Dict[str, float] = {}
+                    entry_ts: dict[str, float] = {}
                     acked_ids: set = set()
                     for rec in _iter_jsonl_records(path):
                         rec_type = rec.get("type")
@@ -505,7 +505,7 @@ def _unlink_quiet(path: Path) -> None:
         pass
 
 
-def _iter_jsonl_records(path: Path) -> Iterable[Dict[str, Any]]:
+def _iter_jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
     """Yield parsed dict records, skipping blank/truncated/corrupt lines.
 
     A crash mid-append leaves a truncated final line — that must degrade to
@@ -593,7 +593,7 @@ class L0Mirror:
                 ts = float(ts) if ts else time.time()
             except (TypeError, ValueError):
                 ts = time.time()
-            record: Dict[str, Any] = {
+            record: dict[str, Any] = {
                 "ts": round(ts, 3),
                 "kind": "sync_turn",
                 "session_id": session_id or "",
@@ -630,11 +630,11 @@ class L0Mirror:
     def build_boundary_record(
         self,
         kind: str,
-        messages: Optional[List[Dict[str, Any]]],
+        messages: Optional[list[dict[str, Any]]],
         *,
         session_id: str = "",
         provider_names: Iterable[str] = (),
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Derive a compact boundary MARKER record for a ``session_end`` /
         ``pre_compress`` extraction payload: the role sequence, tool-call
         names, and per-message content sizes — but no message content.
@@ -657,7 +657,7 @@ class L0Mirror:
             for msg in messages or []:
                 if not isinstance(msg, dict):
                     continue
-                entry: Dict[str, Any] = {
+                entry: dict[str, Any] = {
                     "role": msg.get("role") or "",
                     "chars": len(_flatten_message_text(msg.get("content"))),
                 }
@@ -684,7 +684,7 @@ class L0Mirror:
             )
             return None
 
-    def append_record(self, record: Optional[Dict[str, Any]]) -> None:
+    def append_record(self, record: Optional[dict[str, Any]]) -> None:
         """Append a pre-built record (None is a no-op). Fail-open."""
         if record is None or journals_disabled():
             return
@@ -697,7 +697,7 @@ class L0Mirror:
     def append_messages(
         self,
         kind: str,
-        messages: Optional[List[Dict[str, Any]]],
+        messages: Optional[list[dict[str, Any]]],
         *,
         session_id: str = "",
         provider_names: Iterable[str] = (),

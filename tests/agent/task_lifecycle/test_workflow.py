@@ -90,7 +90,7 @@ def test_detached_duplicate_receipts_and_restart_verification(case):
     assert verify(submitted['run_id'])['accepted']
     # Independent CLI process recovers state, not the former caller's cache.
     command = [sys.executable, str(ROOT/'scripts/run_codex_task.py'), 'lifecycle', 'verify', submitted['run_id']]
-    readback = subprocess.run(command, capture_output=True, text=True, timeout=20, env=os.environ)
+    readback = subprocess.run(command, capture_output=True, text=True, timeout=20, env=os.environ, check=False)
     assert readback.returncode == 0, readback.stderr
     assert json.loads(readback.stdout)['accepted']
     (case['repo']/'answer.json').write_text('{"status":"완료"}')
@@ -343,7 +343,7 @@ print(json.dumps(result))
 '''
     def invoke(stage):
         return subprocess.run([sys.executable, '-c', bootstrap, str(payload), stage], cwd=ROOT,
-            env={**os.environ, 'HERMES_HOME':str(home)}, capture_output=True, text=True, timeout=20)
+            env={**os.environ, 'HERMES_HOME':str(home)}, capture_output=True, text=True, timeout=20, check=False)
     assert invoke(crash_stage).returncode == 91
     resumed = invoke('resume')
     assert resumed.returncode == 0, resumed.stderr

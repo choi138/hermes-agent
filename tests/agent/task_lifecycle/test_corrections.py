@@ -1,6 +1,6 @@
 """Delivery is not behavioral evidence; one environment is not all."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 import pytest
 
@@ -13,7 +13,7 @@ from agent.task_lifecycle.types import LifecycleError
 def ledger():
     result = CorrectionLedger()
     result.record(Correction("c1", "Do not announce success early", "Verify first",
-                             ("cli", "desktop"), datetime.now(timezone.utc)))
+                             ("cli", "desktop"), datetime.now(UTC)))
     return result
 
 
@@ -89,12 +89,12 @@ def test_duplicate_record_cannot_reset_history(ledger):
     observe(ledger, "cli", "violated")
     with pytest.raises(LifecycleError):
         ledger.record(Correction("c1", "Changed", "Changed", ("cli",),
-                                 datetime.now(timezone.utc)))
+                                 datetime.now(UTC)))
     assert len(ledger.regressions()) == 1
 
 
 def test_no_environments_is_not_vacuous_success():
     ledger = CorrectionLedger()
     ledger.record(Correction("c1", "Style", "Use plain words", (),
-                             datetime.now(timezone.utc)))
+                             datetime.now(UTC)))
     assert ledger.status("c1")["followed_everywhere"] is False

@@ -46,7 +46,7 @@ def _propose(pipeline, content="jun prefers rg over grep", **kw):
     return pipeline.propose(content, **defaults)
 
 
-def _ledger_events(tmp_path) -> List[Dict[str, Any]]:
+def _ledger_events(tmp_path) -> list[dict[str, Any]]:
     path = tmp_path / "state" / "memory-notes-ledger.jsonl"
     if not path.exists():
         return []
@@ -941,7 +941,7 @@ class TestWriteApprovalGate:
 
 class _BackfillRecorder(MemoryProvider):
     def __init__(self):
-        self.writes: List[Dict[str, Any]] = []
+        self.writes: list[dict[str, Any]] = []
 
     @property
     def name(self) -> str:
@@ -953,7 +953,7 @@ class _BackfillRecorder(MemoryProvider):
     def initialize(self, session_id: str = "", **kwargs) -> None:
         pass
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return []
 
     def sync_turn(self, user_content, assistant_content, *, session_id="", **kw):
@@ -966,7 +966,7 @@ class _BackfillRecorder(MemoryProvider):
         )
 
 
-def _note_dict(tmp_path) -> Dict[str, Any]:
+def _note_dict(tmp_path) -> dict[str, Any]:
     return {
         "kind": "fact", "topic_key": "a.b", "body": "gist",
         "path": str(tmp_path / "notes" / "fact" / "a.b.md"),

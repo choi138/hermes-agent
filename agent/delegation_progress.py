@@ -31,7 +31,7 @@ SOURCE = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".c", ".h",
           ".cpp", ".hpp", ".java", ".kt", ".swift", ".sh", ".css", ".scss", ".html"}
 DOCS = {".md", ".rst"}
 CONFIG_NAMES = {"pyproject.toml", "package.json", "tsconfig.json", "Cargo.toml", "Makefile"}
-SECRET = re.compile(r"(?:secret|credential|auth|token|password|private.?key|^id_rsa|^id_ed25519)", re.I)
+SECRET = re.compile(r"(?:secret|credential|auth|token|password|private.?key|^id_rsa|^id_ed25519)", re.IGNORECASE)
 EXCLUDED = {".git", ".codex", ".hermes", ".ssh", ".aws", ".venv", "venv",
             "node_modules", "__pycache__", ".pytest_cache", ".delegation-progress"}
 
@@ -479,7 +479,7 @@ def _test_summary(output, code, *, canonical=False):
     if code != 0:
         return {"status": "failed", "exit_code": code}
     if canonical:
-        matches = re.findall(r"^=== Summary: ([0-9]{1,8}) files, ([0-9]{1,8}) tests passed, ([0-9]{1,8}) failed(?:, ([0-9]{1,8}) skipped)? \(100% complete\) in [0-9]+\.[0-9]+s \([0-9]+ workers\) ===$", output, re.M)
+        matches = re.findall(r"^=== Summary: ([0-9]{1,8}) files, ([0-9]{1,8}) tests passed, ([0-9]{1,8}) failed(?:, ([0-9]{1,8}) skipped)? \(100% complete\) in [0-9]+\.[0-9]+s \([0-9]+ workers\) ===$", output, re.MULTILINE)
         if len(matches) != 1 or int(matches[0][0]) <= 0 or int(matches[0][1]) <= 0 or int(matches[0][2]):
             return {"status": "unknown"}
         return {"status": "passed", "passed": int(matches[0][1]), "skipped": int(matches[0][3] or 0),
@@ -684,7 +684,7 @@ def safe_source_name(path):
     if (not isinstance(path, str) or not 1 <= len(path) <= 110
             or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
             or path.startswith(('/', '.')) or any(p in ('', '.', '..') for p in path.split('/'))
-            or not file_class(path) or re.search(r"MEDIA|https?|www\.|[A-Za-z0-9]{24,}|(?:sk|ghp|github_pat|xox[baprs])[-_]", path, re.I)):
+            or not file_class(path) or re.search(r"MEDIA|https?|www\.|[A-Za-z0-9]{24,}|(?:sk|ghp|github_pat|xox[baprs])[-_]", path, re.IGNORECASE)):
         return "안전한 이름 표시 불가"
     return path.replace('_', r'\_')
 

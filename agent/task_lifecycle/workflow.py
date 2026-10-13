@@ -138,7 +138,7 @@ def load_grant(path):
 
 
 def submit(path, *, popen=subprocess.Popen):
-    grant, contract, request, _ = load_grant(path)
+    grant, contract, _request, _ = load_grant(path)
     registry = Registry()
     try:
         submission = registry.submit(contract)

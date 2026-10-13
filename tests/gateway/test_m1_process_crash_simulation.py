@@ -201,7 +201,7 @@ def test_http_outage_kill_and_restart(tmp_path, scenario, record_property):
     for stage in ("restart", "restart_again"):
         with (root / f"{stage}.log").open("w") as log:
             completed = subprocess.run(argv + [stage], cwd=repo, env=env,
-                stdout=log, stderr=log, timeout=_CHILD_PROCESS_TIMEOUT)
+                stdout=log, stderr=log, timeout=_CHILD_PROCESS_TIMEOUT, check=False)
         assert completed.returncode == 0, (root / f"{stage}.log").read_text()
         receipt = json.loads((root / f"{stage}-receipt.json").read_text())
         record_property(stage, json.dumps(receipt))

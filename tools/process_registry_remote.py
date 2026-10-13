@@ -47,9 +47,7 @@ def poll_remote(registry, session, env):
             state = observation['state']
             identity = observation.get('identity')
             if identity:
-                if session.remote_identity and session.remote_identity != identity:
-                    state = 'identity_mismatch'
-                elif session.pid is not None and session.pid != identity['pid']:
+                if session.remote_identity and session.remote_identity != identity or session.pid is not None and session.pid != identity['pid']:
                     state = 'identity_mismatch'
                 elif not session.remote_identity:
                     session.remote_identity = identity

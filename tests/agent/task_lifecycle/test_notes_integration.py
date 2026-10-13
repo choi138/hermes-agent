@@ -20,7 +20,7 @@ def notes(tmp_path, monkeypatch):
 
 def test_scoped_canonical_successor_and_required_policy(notes):
     scope=dict(owner='user',project='repo',profile='default')
-    first=notes.create('preference','json.output','이전: 마크다운을 써도 됨',evidence=['fixture:user:1'],origin='user')
+    notes.create('preference','json.output','이전: 마크다운을 써도 됨',evidence=['fixture:user:1'],origin='user')
     notes.supersede('preference','json.output',body='최신 정정: JSON 코드 블록 금지',evidence=['fixture:user:2'],origin='user')
     current=notes.read('preference','json.output')
     digest=_digest({k:v for k,v in current.items() if k not in {'path','usage'}})

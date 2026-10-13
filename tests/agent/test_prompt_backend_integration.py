@@ -35,7 +35,7 @@ class ShellSSHEnvironment:
             ["bash", "-c", mapped_command], cwd=remote_cwd,
             capture_output=True, text=True, timeout=timeout,
             env={**os.environ, "HOME": str(self.root / "home")},
-        )
+        check=False)
         return {
             "returncode": result.returncode,
             "output": result.stdout.replace(str(remote_root), "/workspace"),

@@ -47,7 +47,7 @@ def _sanitize_base_url(raw_url: Any) -> str:
     return urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
-def _reasoning_state(agent: Any) -> Dict[str, Any]:
+def _reasoning_state(agent: Any) -> dict[str, Any]:
     cfg = getattr(agent, "reasoning_config", None)
     source = getattr(agent, "_runtime_reasoning_source", None) or "agent"
     if reasoning_is_pinned(cfg):
@@ -92,7 +92,7 @@ def _reasoning_state(agent: Any) -> Dict[str, Any]:
     return {"enabled": None, "effort": None, "source": "default"}
 
 
-def get_runtime_state(agent: Any) -> Dict[str, Any]:
+def get_runtime_state(agent: Any) -> dict[str, Any]:
     """Return a secret-free snapshot of the agent's current effective runtime."""
     return {
         "model": _safe_str(getattr(agent, "model", "")),
@@ -157,14 +157,14 @@ def _route_catalog_pairs() -> list[tuple[str, str]]:
         return []
 
 
-def _agent_route_runtime(agent: Any) -> Dict[str, Any]:
+def _agent_route_runtime(agent: Any) -> dict[str, Any]:
     """Non-secret runtime snapshot in ``runtime_satisfies_route``'s shape.
 
     Mirrors the gateway router's snapshot semantics
     (``GatewayRunner._model_router_runtime_snapshot``): disabled reasoning
     maps to effort ``"none"``; an unset effort stays absent.
     """
-    snapshot: Dict[str, Any] = {}
+    snapshot: dict[str, Any] = {}
     model = _safe_str(getattr(agent, "model", "")).strip()
     provider = _safe_str(getattr(agent, "provider", "")).strip()
     if model:
@@ -179,7 +179,7 @@ def _agent_route_runtime(agent: Any) -> Dict[str, Any]:
     return snapshot
 
 
-def _route_status_info(agent: Any) -> Optional[Dict[str, Any]]:
+def _route_status_info(agent: Any) -> Optional[dict[str, Any]]:
     """Route block for :func:`model_status`; None when routes are absent/dormant."""
     try:
         from hermes_cli.config import load_config
@@ -217,7 +217,7 @@ def _route_status_info(agent: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _resolve_route_switch_target(agent: Any, route_name: str) -> tuple[str, Dict[str, Any]]:
+def _resolve_route_switch_target(agent: Any, route_name: str) -> tuple[str, dict[str, Any]]:
     """Resolve a ``model_switch`` route request against the declared catalog.
 
     Returns ``(status, payload)``:
@@ -276,7 +276,7 @@ def _resolve_route_switch_target(agent: Any, route_name: str) -> tuple[str, Dict
     return "resolved", resolved
 
 
-def _emit_runtime_state_event(agent: Any, *, event: str, state: Optional[Dict[str, Any]] = None) -> None:
+def _emit_runtime_state_event(agent: Any, *, event: str, state: Optional[dict[str, Any]] = None) -> None:
     """Best-effort plugin notification for effective runtime state.
 
     Runtime-control tools are intercepted by the agent loop and do not always
@@ -299,7 +299,7 @@ def _emit_runtime_state_event(agent: Any, *, event: str, state: Optional[Dict[st
         logger.debug("runtime_state hook failed: %s", exc)
 
 
-def snapshot_runtime(agent: Any) -> Dict[str, Any]:
+def snapshot_runtime(agent: Any) -> dict[str, Any]:
     """Capture enough live state to restore a turn-scoped runtime switch."""
     return {
         "model": getattr(agent, "model", ""),
@@ -318,7 +318,7 @@ def snapshot_runtime(agent: Any) -> Dict[str, Any]:
     }
 
 
-def restore_runtime(agent: Any, snapshot: Dict[str, Any]) -> None:
+def restore_runtime(agent: Any, snapshot: dict[str, Any]) -> None:
     """Restore a runtime snapshot captured by :func:`snapshot_runtime`."""
     if not isinstance(snapshot, dict):
         return
@@ -422,9 +422,9 @@ def _configured_model_names(entry: Any) -> set[str]:
     return models
 
 
-def _configured_model_targets(cfg: Any) -> Dict[str, set[str]]:
+def _configured_model_targets(cfg: Any) -> dict[str, set[str]]:
     """Return provider -> configured model IDs using config.yaml as the SoT."""
-    targets: Dict[str, set[str]] = {}
+    targets: dict[str, set[str]] = {}
     if not isinstance(cfg, dict):
         return targets
 
@@ -460,7 +460,7 @@ def _configured_model_targets(cfg: Any) -> Dict[str, set[str]]:
     return targets
 
 
-def _match_configured_value(value: str, candidates: set[str] | Dict[str, set[str]]) -> str | None:
+def _match_configured_value(value: str, candidates: set[str] | dict[str, set[str]]) -> str | None:
     if value in candidates:
         return value
     lowered = value.lower()
@@ -501,8 +501,8 @@ def _configured_default_model(cfg: Any, provider: str) -> str | None:
     return None
 
 
-def _format_configured_targets(targets: Dict[str, set[str]], *, limit: int = 8) -> Dict[str, list[str]]:
-    formatted: Dict[str, list[str]] = {}
+def _format_configured_targets(targets: dict[str, set[str]], *, limit: int = 8) -> dict[str, list[str]]:
+    formatted: dict[str, list[str]] = {}
     for provider in sorted(targets)[:limit]:
         formatted[provider] = sorted(targets[provider])[:limit]
     return formatted
@@ -514,7 +514,7 @@ def resolve_agent_model_target_strict(
     requested_model: str,
     current_provider: str,
     current_model: str,
-) -> tuple[bool, str, str, Dict[str, Any] | None]:
+) -> tuple[bool, str, str, dict[str, Any] | None]:
     """Resolve agent-callable model switches only through configured targets.
 
     Human ``/model`` commands intentionally support fuzzy catalog discovery.  The
@@ -531,8 +531,8 @@ def resolve_agent_model_target_strict(
     current_provider = current_provider.strip()
     current_model = current_model.strip()
 
-    def error(message: str, **extra: Any) -> tuple[bool, str, str, Dict[str, Any]]:
-        payload: Dict[str, Any] = {
+    def error(message: str, **extra: Any) -> tuple[bool, str, str, dict[str, Any]]:
+        payload: dict[str, Any] = {
             "success": False,
             "error": message,
             "configured_targets": _format_configured_targets(targets),
@@ -635,8 +635,8 @@ def _notify_runtime_update(
     agent: Any,
     *,
     scope: str,
-    model_override: Optional[Dict[str, Any]],
-    reasoning_config: Optional[Dict[str, Any]],
+    model_override: Optional[dict[str, Any]],
+    reasoning_config: Optional[dict[str, Any]],
     require_persistence: bool = False,
 ) -> Optional[str]:
     callback = getattr(agent, "runtime_update_callback", None)
@@ -847,7 +847,7 @@ def model_switch(
     model_override = None
     changed = []
     persistence_error = None
-    route_info: Optional[Dict[str, Any]] = None
+    route_info: Optional[dict[str, Any]] = None
 
     # Resolve the switch target: a declared route (health-checked walk) or the
     # strict config-declared free-form model/provider.  Both feed the SAME
@@ -1038,8 +1038,8 @@ __all__ = [
     "get_runtime_state",
     "model_status",
     "model_switch",
-    "snapshot_runtime",
-    "restore_runtime",
-    "restore_pending_turn_runtime",
     "resolve_model_switch",
+    "restore_pending_turn_runtime",
+    "restore_runtime",
+    "snapshot_runtime",
 ]

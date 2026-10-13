@@ -421,7 +421,7 @@ def test_deleted_commit_and_rename_keep_state_evidence(lane):
 
 
 def test_snapshot_errors_and_process_identity_unknown(lane):
-    repo, artifacts, data, state = lane
+    _repo, _artifacts, data, state = lane
     p = Progress(Manifest.from_dict(dict(data, pid=123, process_start="fixture")), state,
                  process_probe=lambda *_: (_ for _ in ()).throw(OSError("SSH secret")))
     snapshot = p.snapshot(now=0)

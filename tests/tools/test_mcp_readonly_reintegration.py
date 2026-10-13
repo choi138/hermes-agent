@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tools import mcp_tool
@@ -98,7 +98,7 @@ def test_binding_hidden_and_profile_scoped(tmp_path, monkeypatch):
 def test_binding_detects_session_and_registry_swap(tmp_path, monkeypatch):
     home = tmp_path / "profile-a"
     home.mkdir()
-    bound, server, config, token, scope = _bind(home, monkeypatch)
+    bound, server, _config, token, scope = _bind(home, monkeypatch)
     try:
         old_session = server.session
         server.session = object()
@@ -117,7 +117,7 @@ def test_binding_detects_session_and_registry_swap(tmp_path, monkeypatch):
 def test_bound_call_on_real_mcp_loop_is_deadline_bounded(tmp_path, monkeypatch):
     home = tmp_path / "profile-a"
     home.mkdir()
-    bound, server, config, token, scope = _bind(home, monkeypatch)
+    bound, server, _config, token, scope = _bind(home, monkeypatch)
     loop = asyncio.new_event_loop()
     ready = threading.Event()
 
@@ -193,7 +193,7 @@ def test_hidden_cached_and_adopted_registrations(tmp_path, monkeypatch):
 def test_call_discards_result_when_tool_changes_during_rpc(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
-    bound, server, config, token, scope = _bind(home, monkeypatch)
+    bound, server, _config, token, scope = _bind(home, monkeypatch)
     loop = asyncio.new_event_loop()
     ready = threading.Event()
 

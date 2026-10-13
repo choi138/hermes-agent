@@ -79,7 +79,7 @@ def test_actual_bridge_final_pending_ack_then_exit(lane, tmp_path):
     p.tick(now=300)
     set_stage(manifest, 'stopped')
     result = subprocess.run([sys.executable, str(bootstrap(tmp_path, GOOD)), *bridge_args(p, manifest)],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.splitlines()[-1])['status'] == 'stopped_and_delivered'
     assert p.peek() is None
@@ -92,14 +92,14 @@ def test_actual_bridge_final_pending_ack_then_exit(lane, tmp_path):
 def test_actual_ssh_empty_malformed_exit0_stays_pending(lane, tmp_path, body):
     p, manifest, _ = lane
     result = subprocess.run([sys.executable, str(bootstrap(tmp_path, body)), *bridge_args(p, manifest)],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15, check=False)
     assert result.returncode == 75
     assert p.peek() is not None
     # Restart uses persisted uncertainty and must not launch even this fixture again.
     fake = tmp_path / 'fake_ssh.py'
     fake.write_text('raise RuntimeError("FIXTURE_SHOULD_NOT_RUN")')
     retry = subprocess.run([sys.executable, str(tmp_path / 'bootstrap.py'), *bridge_args(p, manifest)],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=15, check=False)
     assert retry.returncode == 75 and 'FIXTURE_SHOULD_NOT_RUN' not in retry.stderr
 
 
@@ -108,7 +108,7 @@ def test_actual_sender_timeout_is_bounded_safe_and_pending(lane, tmp_path):
     body = 'import sys,time; sys.stdin.read(); print("PRIVATE_REMOTE_ERROR",file=sys.stderr,flush=True); time.sleep(3)'
     start = time.monotonic()
     result = subprocess.run([sys.executable, str(bootstrap(tmp_path, body, timeout=.1)), *bridge_args(p, manifest)],
-                            capture_output=True, text=True, timeout=10)
+                            capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 75 and time.monotonic() - start < 5
     assert 'PRIVATE_REMOTE_ERROR' not in result.stdout + result.stderr
     assert p.peek()
@@ -146,7 +146,7 @@ def test_cli_exit_immediate_continues_review_and_concurrent_bridge_fenced(lane, 
         # Baseline collection already created the lock file. Its existence
         # cannot establish that this child won the lifetime fence.
         wait_for(child_owns_watch_lock)
-        duplicate = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        duplicate = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
         assert duplicate.returncode == 74
         (artifacts / 'status.json').write_text('{"status":"cli_completed","exit_code":0}')
         wait_for(lambda: f'{p.manifest.run_id}:cli_completed' in p._load().get('reported_events', []))
@@ -169,21 +169,21 @@ def test_cli_exit_immediate_continues_review_and_concurrent_bridge_fenced(lane, 
 def test_all_help_and_dry_run_surfaces_do_not_mutate(lane, tmp_path):
     p, manifest, _ = lane
     for script in [BRIDGE, SERVER, ROOT / 'scripts/run_codex_task.py', ROOT / 'scripts/delegation_progress.py']:
-        result = subprocess.run([sys.executable, str(script), '--help'], capture_output=True, text=True, timeout=10)
+        result = subprocess.run([sys.executable, str(script), '--help'], capture_output=True, text=True, timeout=10, check=False)
         assert result.returncode == 0 and '--dry-run' in result.stdout
     before = {f: f.read_bytes() for f in tmp_path.rglob('*') if f.is_file()}
     result = subprocess.run([sys.executable, str(BRIDGE), *bridge_args(p, manifest), '--dry-run'],
-                            capture_output=True, text=True, timeout=10)
+                            capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0
     content = '작업 진행 상황을 전해드려요.\n• runner.py: 파일 내용 변경.'
     value = dict(run_id='fixture', sequence=1, thread_id='123456789', content=content,
                  content_digest=hashlib.sha256(content.encode()).hexdigest())
     result = subprocess.run([sys.executable, str(SERVER), '--runtime-root', '/does/not/exist',
-        '--allow-thread', '123456789', '--dry-run'], input=json.dumps(value), capture_output=True, text=True, timeout=10)
+        '--allow-thread', '123456789', '--dry-run'], input=json.dumps(value), capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0 and json.loads(result.stdout)['status'] == 'validated'
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/delegation_progress.py'), 'set-stage',
         '--manifest', str(manifest), '--state-dir', str(p.root), '--stage', 'stopped', '--dry-run'],
-        capture_output=True, text=True, timeout=10)
+        capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0
     assert before == {f: f.read_bytes() for f in tmp_path.rglob('*') if f.is_file()}
 
@@ -191,5 +191,5 @@ def test_all_help_and_dry_run_surfaces_do_not_mutate(lane, tmp_path):
 def test_server_cli_dry_run_rejects_cross_thread_and_duplicate_keys(tmp_path):
     for value in ['{"run_id":"x","run_id":"y"}', '[]', 'x' * 17000]:
         result = subprocess.run([sys.executable, str(SERVER), '--runtime-root', '/does/not/exist',
-            '--allow-thread', '123456789', '--dry-run'], input=value, capture_output=True, text=True, timeout=10)
+            '--allow-thread', '123456789', '--dry-run'], input=value, capture_output=True, text=True, timeout=10, check=False)
         assert result.returncode != 0 and 'Traceback' not in result.stderr

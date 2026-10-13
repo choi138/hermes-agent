@@ -117,12 +117,14 @@ def test_observation_outage_is_diagnostic_not_completion():
     assert not diagnostic_process_event({'type': 'completion', 'exit_code': 0})
 
 
-def test_local_completion_is_published_after_receipt_write(monkeypatch, tmp_path):
+@pytest.mark.parametrize('remote_root', ['', '/tmp/isolated'])
+def test_local_completion_is_published_after_receipt_write(monkeypatch, tmp_path, remote_root):
     import threading
     from tools import process_registry as module
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     registry = ProcessRegistry()
-    session = ProcessSession(id='proc_local_publish', command='true', profile_home=str(tmp_path))
+    session = ProcessSession(id='proc_local_publish', command='true', profile_home=str(tmp_path),
+                             remote_root=remote_root, observation_state='running')
     session.append_output('retained output')
     registry._running[session.id] = session
     entered, release = threading.Event(), threading.Event()

@@ -49,7 +49,7 @@ def git(repo, *args):
 
 def run(repo, command):
     return subprocess.run(["/bin/sh", "-c", command], cwd=repo,
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=30, check=False)
 
 
 def event(art, item_id, command, result=None):
@@ -129,7 +129,7 @@ def test_f1_wrappers_and_compound_commands_cannot_keep_old_pass(lane, template):
 ])
 def test_f1_text_is_not_test_execution(lane, template):
     repo, art, progress = lane
-    command, result = passed(lane)
+    _command, _result = passed(lane)
     before = progress.tick()["snapshot"]["tests"]
     text = "python -m pytest test_fixture.py; 1 passed in 0.01s"
     spoof = template.format(quoted=shlex.quote(text), python=sys.executable,
@@ -207,7 +207,7 @@ def test_f2_incomplete_running_observation_does_not_rearm_wait(lane):
     while progress.peek():
         progress.ack(progress.peek()['id'])
     progress.manifest = replace(progress.manifest, cli_status="needs_user")
-    first = [m for m in progress.tick()['queued'] if m['operation'] == 'NOTICE'][0]
+    first = next(m for m in progress.tick()['queued'] if m['operation'] == 'NOTICE')
     while progress.peek():
         progress.ack(progress.peek()['id'])
     progress.manifest = replace(progress.manifest, cli_status="running")
@@ -225,7 +225,7 @@ def test_f2_incomplete_running_observation_does_not_rearm_wait(lane):
 def test_f2_legacy_wait_state_requires_observed_resume(lane):
     _, _, progress = lane
     progress.manifest = replace(progress.manifest, cli_status="needs_user")
-    first = [m for m in progress.tick()['queued'] if m['operation'] == 'NOTICE'][0]
+    next(m for m in progress.tick()['queued'] if m['operation'] == 'NOTICE')
     while progress.peek():
         progress.ack(progress.peek()['id'])
     legacy = json.loads(progress.path.read_text())

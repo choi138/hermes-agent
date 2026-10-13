@@ -20,7 +20,7 @@ def _tool_name(call: Any) -> str:
     return str(function.get("name") or "") if isinstance(function, dict) else ""
 
 
-def reconcile_result_evidence(agent_result: Dict[str, Any], evidence: Dict[str, Any]) -> list:
+def reconcile_result_evidence(agent_result: dict[str, Any], evidence: dict[str, Any]) -> list:
     """Prove coverage of every current original-turn call/result before sealing.
 
     Replay presentation fields are not persistence receipts. Compare the actual call payloads,
@@ -55,8 +55,8 @@ def reconcile_result_evidence(agent_result: Dict[str, Any], evidence: Dict[str, 
 
 
 def failed_turn_recovery(
-    agent_result: Any, *, evidence: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, str]]:
+    agent_result: Any, *, evidence: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, str]]:
     """Return a durable recovery decision only for an explicit retryable failure verdict.
 
     A failed turn containing a possibly effectful tool call is retained as ``blocked``.  Hermes

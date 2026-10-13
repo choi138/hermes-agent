@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # One pipeline per HERMES_HOME: the propose→confirm token map lives on the
 # pipeline instance, so it must be process-stable across tool calls (a
 # fresh pipeline per call would forget every issued token).
-_pipelines: Dict[str, Any] = {}
+_pipelines: dict[str, Any] = {}
 _pipelines_lock = threading.Lock()
 
 
@@ -55,12 +55,12 @@ def notes_write_tool(
     step: Optional[str] = None,
     content: Optional[str] = None,
     kind: Optional[str] = None,
-    evidence: Optional[List[Dict[str, Any]]] = None,
+    evidence: Optional[list[dict[str, Any]]] = None,
     topic_key: Optional[str] = None,
     token: Optional[str] = None,
     verdict: Optional[str] = None,
     target: Optional[str] = None,
-    evidence_overrides: Optional[Dict[Any, str]] = None,
+    evidence_overrides: Optional[dict[Any, str]] = None,
     session_id: str = "",
     memory_manager: Any = None,
 ) -> str:
@@ -195,7 +195,7 @@ def notes_read_tool(
 def memory_propose_tool(
     content: Optional[str] = None,
     kind_hint: Optional[str] = None,
-    evidence: Optional[List[Dict[str, Any]]] = None,
+    evidence: Optional[list[dict[str, Any]]] = None,
     session_id: str = "",
 ) -> str:
     """Queue a proposal record into the pending WAL (0 LLM calls)."""
@@ -239,7 +239,7 @@ def memory_propose_tool(
 
 def handle_notes_tool(
     function_name: str,
-    args: Dict[str, Any],
+    args: dict[str, Any],
     *,
     session_id: str = "",
     memory_manager: Any = None,
@@ -278,7 +278,7 @@ def handle_notes_tool(
 
 
 def dispatch_notes_tool_for_agent(
-    agent: Any, function_name: str, args: Dict[str, Any]
+    agent: Any, function_name: str, args: dict[str, Any]
 ) -> str:
     """Dispatch with agent-level state resolved (both executor paths use
     this): the session id, and the MemoryManager for the flag-gated

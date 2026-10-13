@@ -50,7 +50,7 @@ def argv(lane, command, *args):
 
 def cli(lane, command, *args, check=True):
     result = subprocess.run(argv(lane, command, *args), env=lane["env"],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15, check=False)
     if not check:
         return result
     assert result.returncode == 0, result.stderr
@@ -112,7 +112,7 @@ def test_f2_real_tick_wait_reentry_restart_fifo(lane, ack_first):
     cli(lane, 'tick')
     drain_all(lane)
     update(lane, cli_status='needs_user')
-    first = [m for m in cli(lane, 'tick')['queued'] if m['operation'] == 'NOTICE'][0]
+    first = next(m for m in cli(lane, 'tick')['queued'] if m['operation'] == 'NOTICE')
     while cli(lane, 'peek')['operation'] != 'NOTICE':
         cli(lane, 'ack', '--id', cli(lane, 'peek')['id'])
     assert not cli(lane, 'tick')['queued']
@@ -121,7 +121,7 @@ def test_f2_real_tick_wait_reentry_restart_fifo(lane, ack_first):
     update(lane, cli_status='running')
     cli(lane, 'tick')
     update(lane, cli_status='needs_user')
-    second = [m for m in cli(lane, 'tick')['queued'] if m['operation'] == 'NOTICE'][0]
+    second = next(m for m in cli(lane, 'tick')['queued'] if m['operation'] == 'NOTICE')
     assert second['event_id'] != first['event_id'] and second['sequence'] > first['sequence']
     assert second['observed_at'] - first['observed_at'] < 1200
     if not ack_first:
@@ -159,7 +159,7 @@ def test_f2_actual_watcher_repeat_wait_unknown_gap_and_final_pending(lane, ack_f
             update(lane, cli_status='needs_user')
             wait_for(lambda: wait_count(lane) == 2)
             drain_all(lane)
-            actual = subprocess.run([sys.executable, '-c', 'pass'], env=lane['env'], timeout=5)
+            actual = subprocess.run([sys.executable, '-c', 'pass'], env=lane['env'], timeout=5, check=False)
             (lane['art'] / 'status.json').write_text(json.dumps(dict(status='cli_completed', exit_code=actual.returncode)))
             wait_for(lambda: state(lane).get('receipt'))
             # The execution-ended transition is immediate in v3; acknowledge it
@@ -191,7 +191,7 @@ def test_f1_real_pytest_jsonl_persistence_and_watcher_render(lane):
     good = [sys.executable, '-m', 'pytest', 'test_fixture.py::test_good', '-q']
     append_event(lane, 'good', shlex.join(good))
     cli(lane, 'tick')
-    success = subprocess.run(good, cwd=lane['repo'], env=lane['env'], capture_output=True, text=True)
+    success = subprocess.run(good, cwd=lane['repo'], env=lane['env'], capture_output=True, text=True, check=False)
     assert success.returncode == 0 and '1 passed' in success.stdout
     append_event(lane, 'good', shlex.join(good), success)
     tests = cli(lane, 'tick')['snapshot']['tests']
@@ -199,7 +199,7 @@ def test_f1_real_pytest_jsonl_persistence_and_watcher_render(lane):
     bad = [sys.executable, '-m', 'pytest', 'test_fixture.py', '-k', 'test_bad', '-q']
     append_event(lane, 'bad', shlex.join(bad))
     assert cli(lane, 'tick')['snapshot']['tests']['status'] != 'passed'
-    failure = subprocess.run(bad, cwd=lane['repo'], env=lane['env'], capture_output=True, text=True)
+    failure = subprocess.run(bad, cwd=lane['repo'], env=lane['env'], capture_output=True, text=True, check=False)
     assert failure.returncode == 1 and '1 failed, 1 deselected' in failure.stdout
     append_event(lane, 'bad', shlex.join(bad), failure)
     snapshot = cli(lane, 'tick')['snapshot']

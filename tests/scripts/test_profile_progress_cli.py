@@ -71,7 +71,7 @@ def test_helper_cli_identity_mismatch_no_auth(monkeypatch, capsys, args):
 def test_actual_subprocess_help_does_not_load_runtime(script):
     path = Path(__file__).resolve().parents[2] / 'scripts' / script
     completed = subprocess.run([sys.executable, '-I', str(path), '--help'],
-                                capture_output=True, text=True, timeout=10)
+                                capture_output=True, text=True, timeout=10, check=False)
     assert completed.returncode == 0, completed.stderr
     assert 'usage:' in completed.stdout
 

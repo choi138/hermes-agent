@@ -6,6 +6,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncio
+
 import pytest
 
 from tests.agent.task_lifecycle.test_workflow import ROOT, case, detached_popen, await_exit
@@ -164,8 +166,8 @@ delivery_ledger.record_obligation(obligation_id='ordinary', session_key='ordinar
     platform='discord', chat_id='123', thread_id='123', content='ordinary result')
 print(oid)
 '''
-    child = subprocess.run([sys.executable, '-c', bootstrap, run_id, initial_state], cwd=ROOT,
-                           env=os.environ, capture_output=True, text=True, timeout=20)
+    child = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', bootstrap, run_id, initial_state], cwd=ROOT,
+                           env=os.environ, capture_output=True, text=True, timeout=20, check=False)
     assert child.returncode == 0, child.stderr
     oid = child.stdout.strip()
     channel = Channel()
@@ -205,7 +207,7 @@ from gateway.delivery_ledger import defer_lifecycle_claim
 assert not defer_lifecycle_claim(sys.argv[1], attempts=0)
 '''
     child = subprocess.run([sys.executable, '-c', bootstrap, oid], cwd=ROOT,
-                           env=os.environ, capture_output=True, text=True, timeout=20)
+                           env=os.environ, capture_output=True, text=True, timeout=20, check=False)
     assert child.returncode == 0, child.stderr
     row = obligation_state(oid)
     assert row['state'] == 'pending' and row['attempts'] == 0
@@ -305,7 +307,7 @@ assert registry.claim_job(sys.argv[1], 'owned-before-crash', process_identity(os
 os._exit(91)
 '''
     child = subprocess.run([sys.executable, '-c', bootstrap, run_id], cwd=ROOT,
-                           env=os.environ, capture_output=True, text=True, timeout=20)
+                           env=os.environ, capture_output=True, text=True, timeout=20, check=False)
     assert child.returncode == 91, child.stderr
     state = workflow.status(run_id)
     assert state['phase'] == 'unknown'

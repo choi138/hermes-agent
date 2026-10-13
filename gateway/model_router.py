@@ -428,7 +428,7 @@ def _call_gemini(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with _urlopen(req, timeout=timeout) as resp:  # noqa: S310 trusted endpoint
+    with _urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode("utf-8"))
     # Raw text; label normalization happens in the parsers (uppercasing here
     # would corrupt structured-JSON responses).
@@ -606,7 +606,7 @@ def _session_key(session_store: Any, event: Any) -> str:
     if source is None or session_store is None:
         return ""
     try:
-        return str(session_store._generate_session_key(source))  # noqa: SLF001 gateway-internal integration
+        return str(session_store._generate_session_key(source))
     except Exception:
         return ""
 
@@ -634,7 +634,7 @@ def _message_content_text(content: Any) -> str:
 def _recent_turns(session_store: Any, session_id: str, limit: int) -> list[Turn]:
     if not session_store or not session_id or limit <= 0:
         return []
-    db = getattr(session_store, "_db", None)  # noqa: SLF001 gateway-internal integration
+    db = getattr(session_store, "_db", None)
     if db is None:
         return []
     try:
@@ -1931,7 +1931,7 @@ def log_decision(record: dict[str, Any], *, decision_log: str = "") -> None:
         _ensure_private_log_parent(path.parent)
         encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
         _append_decision_line(path, encoded)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug(
             "model router: decision log write failed (%s)",
             type(exc).__name__,

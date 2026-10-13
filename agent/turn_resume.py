@@ -44,8 +44,8 @@ def _is_empty_assistant_message(msg: Any) -> bool:
 
 
 def prepare_resume_history(
-    history: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    history: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Return ``(normalized_history, already_composed_final)`` without mutating input."""
     normalized = list(history or [])
     while normalized and (
@@ -73,7 +73,7 @@ def prepare_resume_history(
     return normalized, None
 
 
-def resume_entry_reason(history: List[Dict[str, Any]]) -> str:
+def resume_entry_reason(history: list[dict[str, Any]]) -> str:
     if not history:
         return "empty"
     tail = history[-1]

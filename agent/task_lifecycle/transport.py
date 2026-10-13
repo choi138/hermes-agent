@@ -45,7 +45,7 @@ class SSHExecutor:
         completed = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                                     self.host, shlex.join(argv)],
             input=json.dumps(payload,ensure_ascii=False) if payload is not None else None,
-            capture_output=True, text=True, timeout=45)
+            capture_output=True, text=True, timeout=45, check=False)
         if completed.returncode != 0:
             # Lost response is ambiguous. Caller reconciles by original key;
             # the same envelope is safe to resubmit, never a new revision.

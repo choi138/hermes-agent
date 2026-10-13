@@ -42,7 +42,7 @@ def executable(home, name="npx", code=0):
 
 
 def test_schema_npx_fallback_never_validates(isolated_browser, monkeypatch):
-    path, marker = executable(isolated_browser)
+    _path, marker = executable(isolated_browser)
     probe = Mock(side_effect=AssertionError("schema discovery spawned npx validation"))
     monkeypatch.setattr(install, "node_tool_runnable", probe)
     assert install._find_agent_browser(validate=False) == browser.NPX_AGENT_BROWSER_SENTINEL
@@ -54,7 +54,7 @@ def test_schema_npx_fallback_never_validates(isolated_browser, monkeypatch):
 
 @pytest.mark.parametrize("code", [0, 127])
 def test_npx_execution_really_probes_after_discovery(isolated_browser, code):
-    path, marker = executable(isolated_browser, code=code)
+    _path, marker = executable(isolated_browser, code=code)
     assert install._find_agent_browser(validate=False) == browser.NPX_AGENT_BROWSER_SENTINEL
     assert not marker.exists()
     if code:
@@ -117,7 +117,7 @@ def test_repeated_cold_readiness_tracks_profile_switches(isolated_browser, monke
     from agent import secret_scope
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     a, b = isolated_browser / "a", isolated_browser / "b"
-    path, marker = executable(a)
+    _path, marker = executable(a)
     b.mkdir()
     monkeypatch.setattr(browser, "_is_browser_use_cli_mode", lambda: False)
     monkeypatch.setattr(browser, "_is_camofox_mode", lambda: False)
@@ -159,7 +159,7 @@ def test_cold_production_schema_assembly_is_spawn_free_across_profiles(isolated_
     from tools import vision_tools
 
     a, b = isolated_browser / "a", isolated_browser / "b"
-    path, marker = executable(a)
+    _path, marker = executable(a)
     b.mkdir()
     monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
     monkeypatch.setattr(browser, "_is_browser_use_cli_mode", lambda: False)

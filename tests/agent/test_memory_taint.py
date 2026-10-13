@@ -59,7 +59,7 @@ def _wal(tmp_path) -> PendingTurnWAL:
     return PendingTurnWAL(base_dir=tmp_path / "state" / "memory-pending")
 
 
-def _records(path) -> List[Dict[str, Any]]:
+def _records(path) -> list[dict[str, Any]]:
     return [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -282,7 +282,7 @@ class TestThresholdBoundary:
 # ---------------------------------------------------------------------------
 
 class TestPipelineEnforcement:
-    def _grounded_confirm(self, tmp_path, quote: str) -> Dict[str, Any]:
+    def _grounded_confirm(self, tmp_path, quote: str) -> dict[str, Any]:
         """propose→confirm an ADD citing a WAL quote; return confirm result."""
         pipeline = MemoryWritePipeline(hermes_home=tmp_path)
         wal = _wal(tmp_path)

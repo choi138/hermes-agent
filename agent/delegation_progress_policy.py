@@ -7,7 +7,7 @@ import re
 def safe_label(value):
     # Reject entire labels, never repair an injection into plausible authority.
     if (not isinstance(value, str) or not re.fullmatch(r'[가-힣A-Za-z0-9 -]{1,64}', value)
-            or re.search(r'MEDIA|https?|www|(?:sk|ghp|github)[-_]|[A-Za-z0-9]{24,}', value, re.I)
+            or re.search(r'MEDIA|https?|www|(?:sk|ghp|github)[-_]|[A-Za-z0-9]{24,}', value, re.IGNORECASE)
             or not value.strip()):
         return '작업'
     return value.strip()
@@ -42,7 +42,7 @@ def stage(snapshot):
 
 
 def render(snapshot, *, limit=900):
-    key, title = stage(snapshot)
+    key, _title = stage(snapshot)
     worker = 'Claude' if snapshot.get('worker_cli') == 'claude' else 'Codex'
     changes = snapshot.get('display_changes', snapshot.get('changes', []))
     content = [c for c in changes if set(c['kinds']) & {'content', 'added', 'deleted', 'reverted'}]

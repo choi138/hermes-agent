@@ -165,7 +165,7 @@ _FENCE_TAG_RE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)
 _SEGMENT_BREAK_RE = re.compile(r"\n+|(?<=[.!?…。])\s+")
 
 
-def _config_memory() -> Dict[str, Any]:
+def _config_memory() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config
 
@@ -224,9 +224,9 @@ def _shingles(text: str) -> set:
     return {norm[i : i + SHINGLE_SIZE] for i in range(len(norm) - SHINGLE_SIZE + 1)}
 
 
-def _segments(content: str) -> List[Tuple[int, int]]:
+def _segments(content: str) -> list[tuple[int, int]]:
     """Split content into (start, end) segment offsets in ORIGINAL coords."""
-    spans: List[Tuple[int, int]] = []
+    spans: list[tuple[int, int]] = []
     pos = 0
     for m in _SEGMENT_BREAK_RE.finditer(content):
         if m.start() > pos:
@@ -260,7 +260,7 @@ def _containment(
     return hits / len(candidate)
 
 
-def _merge_shingles(dst: Dict[str, float], shingles: set, ts: float) -> None:
+def _merge_shingles(dst: dict[str, float], shingles: set, ts: float) -> None:
     """Merge ``shingles`` into the earliest-ts map (keeps the earliest ts)."""
     for s in shingles:
         prev = dst.get(s)
@@ -268,7 +268,7 @@ def _merge_shingles(dst: Dict[str, float], shingles: set, ts: float) -> None:
             dst[s] = ts
 
 
-def _flatten_json_strings(value: Any, out: List[str]) -> None:
+def _flatten_json_strings(value: Any, out: list[str]) -> None:
     if isinstance(value, str):
         out.append(value)
     elif isinstance(value, dict):
@@ -284,7 +284,7 @@ def _flatten_json_strings(value: Any, out: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 class _SessionTaint:
-    __slots__ = ("shingles", "entries", "shas", "corrupt", "truncated")
+    __slots__ = ("corrupt", "entries", "shas", "shingles", "truncated")
 
     def __init__(self) -> None:
         # Union of every injected span's shingles for the session, mapped to
@@ -293,8 +293,8 @@ class _SessionTaint:
         # may stitch material from several injections. The per-shingle ts
         # lets recompute paths bound the corpus at a record's own ts
         # (``as_of``) so later injections cannot retroactively taint.
-        self.shingles: Dict[str, float] = {}
-        self.entries: List[Dict[str, Any]] = []
+        self.shingles: dict[str, float] = {}
+        self.entries: list[dict[str, Any]] = []
         # Shas already registered this session — dedup guard so the same
         # prefetch block re-injected every turn lands once in memory and
         # once in the sidecar (unbounded growth otherwise).
@@ -324,7 +324,7 @@ class TaintRegistry:
                 get_hermes_home() / "state" / "memory-pending" / "taint"
             )
         self._lock = threading.Lock()
-        self._sessions: "OrderedDict[str, _SessionTaint]" = OrderedDict()
+        self._sessions: OrderedDict[str, _SessionTaint] = OrderedDict()
         self._io_executor = None
         self._io_lock = threading.Lock()
 
@@ -500,7 +500,7 @@ class TaintRegistry:
         session_id: str,
         content: str,
         as_of: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Compute the taint block for an assistant-authored span.
 
         Returns a dict (never raises)::
@@ -559,7 +559,7 @@ class TaintRegistry:
                     "reason": "no injections registered this session",
                     "registry": "empty",
                 }
-            spans: List[List[int]] = []
+            spans: list[list[int]] = []
             max_score = 0.0
             for start, end in _segments(content):
                 seg_shingles = _shingles(content[start:end])
@@ -609,7 +609,7 @@ class TaintRegistry:
         session_id: str,
         quote: str,
         as_of: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Taint verdict for a QUOTE string itself (ADR-004 §① admission).
 
         Segment-level tainting can be diluted: a verbatim injected fact
@@ -676,7 +676,7 @@ class TaintRegistry:
 
     # -- digest / lifecycle -----------------------------------------------------------
 
-    def session_injected_digest(self, session_id: str) -> Dict[str, Any]:
+    def session_injected_digest(self, session_id: str) -> dict[str, Any]:
         """Summary of everything injected into a session (Phase-3 API, §⑤).
 
         Dream promotion calls this to exclude tainted re-occurrences from
@@ -689,7 +689,7 @@ class TaintRegistry:
         try:
             with self._lock:
                 state = self._session_locked(session_id or "")
-                sources: Dict[str, int] = {}
+                sources: dict[str, int] = {}
                 for e in state.entries:
                     src = str(e.get("source") or "?")
                     sources[src] = sources.get(src, 0) + 1
@@ -832,7 +832,7 @@ def record_injected_tool_result(
         except Exception:
             parsed = None
         if isinstance(parsed, (dict, list)):
-            flat: List[str] = []
+            flat: list[str] = []
             _flatten_json_strings(parsed, flat)
             text = "\n".join(flat)
         record_injected_text(session_id, text, source=source)
@@ -847,7 +847,7 @@ def record_injected_tool_result(
 
 def tag_wal_turn_records(
     session_id: str,
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     as_of: Optional[float] = None,
 ) -> None:
     """Stamp taint metadata onto a WAL turn's role records, in place.
@@ -888,7 +888,7 @@ def tag_wal_turn_records(
 
 def tag_wal_proposal_record(
     session_id: str,
-    record: Dict[str, Any],
+    record: dict[str, Any],
     as_of: Optional[float] = None,
 ) -> None:
     """Stamp taint metadata onto a WAL proposal record, in place.
@@ -915,7 +915,7 @@ def tag_wal_proposal_record(
 # ---------------------------------------------------------------------------
 
 def _occurrences_all_tainted(
-    content: str, quote: str, spans: List[List[int]]
+    content: str, quote: str, spans: list[list[int]]
 ) -> bool:
     """True when every occurrence of ``quote`` in ``content`` overlaps a
     tainted span. A single occurrence fully outside the tainted spans means
@@ -943,7 +943,7 @@ def _span_quote_tainted(
     role: str,
     content: str,
     quote: str,
-    stored_taint: Optional[Dict[str, Any]],
+    stored_taint: Optional[dict[str, Any]],
     as_of: Optional[float] = None,
 ) -> bool:
     """Taint verdict for one quote occurrence-set within one journal span."""
@@ -960,7 +960,7 @@ def _span_quote_tainted(
         taint = get_registry().assistant_taint(session_id, content, as_of=as_of)
     if not taint.get("tainted"):
         return False
-    spans: List[List[int]] = []
+    spans: list[list[int]] = []
     for pair in taint.get("spans") or []:
         try:
             s, e = pair
@@ -976,7 +976,7 @@ def _span_quote_tainted(
 
 def matched_quote_taint(
     session_id: str,
-    matched: List[Tuple[str, str, Optional[Dict[str, Any]], Optional[float]]],
+    matched: list[tuple[str, str, Optional[dict[str, Any]], Optional[float]]],
     quote: str,
 ) -> Optional[str]:
     """Admission check for a quote that already substring-matched journal
@@ -1049,7 +1049,7 @@ def curator_taint_label(
     session_id: str,
     role: str,
     content: str,
-    stored_taint: Optional[Dict[str, Any]] = None,
+    stored_taint: Optional[dict[str, Any]] = None,
 ) -> str:
     """``"[tainted]"`` marker for the curator's input rendering, else ``""``.
 
@@ -1070,8 +1070,8 @@ def curator_taint_label(
 
 
 def annotate_wal_records_for_curator(
-    session_id: str, records: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
+    session_id: str, records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Shallow-copied WAL role records with ``curator_label`` set per §4.6.
 
     Convenience wrapper for the curator context assembly (lane A): each
@@ -1079,7 +1079,7 @@ def annotate_wal_records_for_curator(
     records are not mutated. Fail-open: on error records come back with
     empty labels for user spans and ``[tainted]`` for the rest.
     """
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for rec in records or []:
         if not isinstance(rec, dict):
             continue
@@ -1098,7 +1098,7 @@ def annotate_wal_records_for_curator(
 # Phase-3 corroboration API (§⑤ dream promotion)
 # ---------------------------------------------------------------------------
 
-def span_taint(span: Dict[str, Any]) -> bool:
+def span_taint(span: dict[str, Any]) -> bool:
     """Is this journal span memory-tainted? (Phase-3 corroboration API.)
 
     ``span`` is a WAL-shaped role record — ``{"role": ..., "content": ...,
@@ -1138,7 +1138,7 @@ def span_taint(span: Dict[str, Any]) -> bool:
         return True
 
 
-def session_injected_digest(session_id: str) -> Dict[str, Any]:
+def session_injected_digest(session_id: str) -> dict[str, Any]:
     """Digest of a session's injected memory content (Phase-3 API, §⑤).
 
     See :meth:`TaintRegistry.session_injected_digest` — exposed at module
@@ -1167,21 +1167,21 @@ def end_session(session_id: str) -> None:
 
 
 __all__ = [
-    "SHINGLE_SIZE",
     "DEFAULT_CONTAINMENT_THRESHOLD",
+    "SHINGLE_SIZE",
     "TaintRegistry",
-    "get_registry",
-    "set_registry",
-    "taint_enforce_enabled",
+    "annotate_wal_records_for_curator",
     "containment_threshold",
+    "curator_taint_label",
+    "end_session",
+    "get_registry",
+    "matched_quote_taint",
     "record_injected_text",
     "record_injected_tool_result",
-    "tag_wal_turn_records",
-    "tag_wal_proposal_record",
-    "matched_quote_taint",
-    "curator_taint_label",
-    "annotate_wal_records_for_curator",
-    "span_taint",
     "session_injected_digest",
-    "end_session",
+    "set_registry",
+    "span_taint",
+    "tag_wal_proposal_record",
+    "tag_wal_turn_records",
+    "taint_enforce_enabled",
 ]

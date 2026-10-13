@@ -155,8 +155,8 @@ class RouteSpec:
     provider: str
     model: str
     reasoning_effort: str = ""  # "" = unspecified
-    accepted: Tuple[str, ...] = ()  # model ids; empty → legacy membership
-    fallbacks: Tuple["FallbackSpec", ...] = ()
+    accepted: tuple[str, ...] = ()  # model ids; empty → legacy membership
+    fallbacks: tuple["FallbackSpec", ...] = ()
     # None = inherit router.repromote_after_turns; <= 0 disables for this route.
     repromote_after_turns: Optional[int] = None
 
@@ -206,9 +206,9 @@ class MoodsConfig:
     dir: str = ""  # "" → get_hermes_home()/"moods"
     confidence_threshold: float = 0.7
     apply_model_routing: bool = False
-    routes: Tuple[Tuple[str, str], ...] = ()  # (mood-name, route-name) pairs
+    routes: tuple[tuple[str, str], ...] = ()  # (mood-name, route-name) pairs
 
-    def route_map(self) -> Dict[str, str]:
+    def route_map(self) -> dict[str, str]:
         return dict(self.routes)
 
     def resolved_dir(self) -> Path:
@@ -230,30 +230,30 @@ class RouterConfig:
     normal_downgrade_streak: int = 3
     repromote_after_turns: int = 3  # accepted-member noops before primary re-promotion
     chat_route: str = ""  # NORMAL downgrade target; "" = downgrades disabled
-    label_routes: Tuple[Tuple[str, str], ...] = ()  # (label, route-name) pairs
+    label_routes: tuple[tuple[str, str], ...] = ()  # (label, route-name) pairs
     decision_log: str = ""  # "" → get_hermes_home()/logs/model_router_decisions.jsonl
     refusal: RefusalConfig = field(default_factory=RefusalConfig)
 
-    def label_route_map(self) -> Dict[str, str]:
+    def label_route_map(self) -> dict[str, str]:
         return dict(self.label_routes)
 
 
 @dataclass
 class RouteCatalog:
     # Only VALID routes; declaration order preserved (dict insertion order).
-    routes: Dict[str, RouteSpec] = field(default_factory=dict)
+    routes: dict[str, RouteSpec] = field(default_factory=dict)
     health: HealthConfig = field(default_factory=HealthConfig)
-    static_rules: List[Dict[str, Any]] = field(default_factory=list)  # matched in gateway/model_router.py
+    static_rules: list[dict[str, Any]] = field(default_factory=list)  # matched in gateway/model_router.py
     router: RouterConfig = field(default_factory=RouterConfig)
     moods: MoodsConfig = field(default_factory=MoodsConfig)
-    issues: List[ConfigIssue] = field(default_factory=list)
+    issues: list[ConfigIssue] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class RouteResolution:
     """A route directive plus a secret-free explanation of the resolution."""
 
-    directive: Optional[Dict[str, str]]
+    directive: Optional[dict[str, str]]
     reason: str
 
 
@@ -266,7 +266,7 @@ def _norm(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
-def _model_alias_candidates(model: str) -> List[str]:
+def _model_alias_candidates(model: str) -> list[str]:
     candidates = [model]
     dotted_version = re.sub(r"(?<=\d)\.(?=\d)", "-", model)  # dots between digits only
     if dotted_version != model:
@@ -295,7 +295,7 @@ def _model_matches(current: Any, expected: Any) -> bool:
 # =============================================================================
 
 
-def _known_provider_names(cfg: Dict[str, Any]) -> set:
+def _known_provider_names(cfg: dict[str, Any]) -> set:
     """Names a route/fallback ``provider`` may legally reference.
 
     Union of the ``providers:`` dict keys/names (plus legacy
@@ -338,7 +338,7 @@ def _known_provider_names(cfg: Dict[str, Any]) -> set:
     return names
 
 
-def _declared_provider_models(cfg: Dict[str, Any], provider_norm: str) -> Optional[Dict[str, Any]]:
+def _declared_provider_models(cfg: dict[str, Any], provider_norm: str) -> Optional[dict[str, Any]]:
     """Return the matched ``providers:`` entry's ``models:`` mapping, if any."""
     from hermes_cli.runtime_provider import _normalize_custom_provider_name
 
@@ -363,7 +363,7 @@ def _declared_provider_models(cfg: Dict[str, Any], provider_norm: str) -> Option
     return None
 
 
-def _validate_effort(value: Any) -> Tuple[bool, str]:
+def _validate_effort(value: Any) -> tuple[bool, str]:
     """Return (valid, normalized_effort). "" and "none"/valid levels pass.
 
     YAML 1.1 booleans mirror ``parse_reasoning_effort`` semantics: ``off``/
@@ -393,9 +393,9 @@ def _parse_fallback(
     route_name: str,
     index: int,
     item: Any,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     known_providers: set,
-    issues: List[ConfigIssue],
+    issues: list[ConfigIssue],
 ) -> Optional[FallbackSpec]:
     prefix = f"model_routes: route '{route_name}' fallback #{index}"
     if not isinstance(item, dict):
@@ -451,9 +451,9 @@ def _parse_fallback(
 def _parse_route(
     name: str,
     entry: Any,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     known_providers: set,
-    issues: List[ConfigIssue],
+    issues: list[ConfigIssue],
 ) -> Optional[RouteSpec]:
     prefix = f"model_routes: route '{name}'"
     if not isinstance(entry, dict):
@@ -535,7 +535,7 @@ def _parse_route(
     else:
         description = description.strip()
 
-    accepted: Tuple[str, ...] = ()
+    accepted: tuple[str, ...] = ()
     raw_accepted = entry.get("accepted")
     if raw_accepted is not None:
         if not isinstance(raw_accepted, list):
@@ -547,7 +547,7 @@ def _parse_route(
             ))
             has_error = True
         else:
-            items: List[str] = []
+            items: list[str] = []
             for i, item in enumerate(raw_accepted, 1):
                 if not isinstance(item, str) or not item.strip():
                     issues.append(ConfigIssue(
@@ -560,7 +560,7 @@ def _parse_route(
                 items.append(item.strip())
             accepted = tuple(items)
 
-    fallbacks: Tuple[FallbackSpec, ...] = ()
+    fallbacks: tuple[FallbackSpec, ...] = ()
     raw_fallbacks = entry.get("fallbacks")
     if raw_fallbacks is not None:
         if not isinstance(raw_fallbacks, list):
@@ -571,7 +571,7 @@ def _parse_route(
             ))
             has_error = True
         else:
-            parsed: List[FallbackSpec] = []
+            parsed: list[FallbackSpec] = []
             for i, item in enumerate(raw_fallbacks, 1):
                 fb = _parse_fallback(name, i, item, cfg, known_providers, issues)
                 if fb is None:
@@ -615,8 +615,8 @@ def _parse_route(
     )
 
 
-def _parse_routes(raw: Any, cfg: Dict[str, Any], issues: List[ConfigIssue]) -> Dict[str, RouteSpec]:
-    routes: Dict[str, RouteSpec] = {}
+def _parse_routes(raw: Any, cfg: dict[str, Any], issues: list[ConfigIssue]) -> dict[str, RouteSpec]:
+    routes: dict[str, RouteSpec] = {}
     if raw is None:
         return routes
     if not isinstance(raw, dict):
@@ -629,7 +629,7 @@ def _parse_routes(raw: Any, cfg: Dict[str, Any], issues: List[ConfigIssue]) -> D
 
     # YAML silently merges exact duplicate keys, so duplicates are only
     # detectable as case-insensitive collisions (dev vs DEV).
-    by_lower: Dict[str, List[str]] = {}
+    by_lower: dict[str, list[str]] = {}
     for name in raw:
         by_lower.setdefault(_norm(name), []).append(str(name))
     collided: set = set()
@@ -652,7 +652,7 @@ def _parse_routes(raw: Any, cfg: Dict[str, Any], issues: List[ConfigIssue]) -> D
     return routes
 
 
-def _parse_health(raw: Any, issues: List[ConfigIssue]) -> HealthConfig:
+def _parse_health(raw: Any, issues: list[ConfigIssue]) -> HealthConfig:
     if raw is None:
         return HealthConfig()
     if not isinstance(raw, dict):
@@ -663,7 +663,7 @@ def _parse_health(raw: Any, issues: List[ConfigIssue]) -> HealthConfig:
         ))
         return HealthConfig()
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     for key in sorted(set(raw) - _HEALTH_KEYS):
         issues.append(ConfigIssue(
             "warning",
@@ -734,9 +734,9 @@ def _load_health_config_readonly() -> HealthConfig:
 
 def _parse_static_rules(
     raw: Any,
-    routes: Dict[str, RouteSpec],
-    issues: List[ConfigIssue],
-) -> List[Dict[str, Any]]:
+    routes: dict[str, RouteSpec],
+    issues: list[ConfigIssue],
+) -> list[dict[str, Any]]:
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -748,7 +748,7 @@ def _parse_static_rules(
         return []
 
     valid_names = {_norm(name) for name in routes}
-    rules: List[Dict[str, Any]] = []
+    rules: list[dict[str, Any]] = []
     for i, item in enumerate(raw, 1):
         prefix = f"model_routes: static_rules #{i}"
         if not isinstance(item, dict):
@@ -815,7 +815,7 @@ def _parse_static_rules(
     return rules
 
 
-def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
+def _parse_refusal(raw: Any, issues: list[ConfigIssue]) -> RefusalConfig:
     if raw is None:
         return RefusalConfig()
     if not isinstance(raw, dict):
@@ -834,7 +834,7 @@ def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
             f"Supported refusal keys: {', '.join(sorted(_REFUSAL_KEYS))}",
         ))
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     for key in (
         "enabled", "api_fallback", "clean_fork", "mask_on_refusal",
         "soft_detect", "notify",
@@ -916,9 +916,9 @@ def _is_permissive_route(route_name: str) -> bool:
 
 def _parse_mood_routes(
     raw: Any,
-    routes: Dict[str, RouteSpec],
-    issues: List[ConfigIssue],
-) -> Tuple[Tuple[str, str], ...]:
+    routes: dict[str, RouteSpec],
+    issues: list[ConfigIssue],
+) -> tuple[tuple[str, str], ...]:
     """Validate the mood -> route map, dropping anything unsafe or unusable."""
     if not isinstance(raw, dict):
         issues.append(ConfigIssue(
@@ -929,7 +929,7 @@ def _parse_mood_routes(
         ))
         return ()
 
-    pairs: List[Tuple[str, str]] = []
+    pairs: list[tuple[str, str]] = []
     for mood, route in raw.items():
         mood_name = str(mood).strip().lower()
         if mood_name not in _MOOD_NAMES:
@@ -974,8 +974,8 @@ def _parse_mood_routes(
 
 def _parse_moods(
     raw: Any,
-    routes: Dict[str, RouteSpec],
-    issues: List[ConfigIssue],
+    routes: dict[str, RouteSpec],
+    issues: list[ConfigIssue],
 ) -> MoodsConfig:
     """Parse ``model_routes.moods`` for tone injection and future routing."""
     if raw is None:
@@ -996,7 +996,7 @@ def _parse_moods(
             f"Supported moods keys: {', '.join(sorted(_MOODS_KEYS))}",
         ))
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     for key in ("enabled", "apply_model_routing"):
         if key not in raw:
             continue
@@ -1049,9 +1049,9 @@ def _parse_moods(
 
 def _parse_router(
     raw: Any,
-    routes: Dict[str, RouteSpec],
-    cfg: Dict[str, Any],
-    issues: List[ConfigIssue],
+    routes: dict[str, RouteSpec],
+    cfg: dict[str, Any],
+    issues: list[ConfigIssue],
 ) -> RouterConfig:
     if raw is None:
         return _with_effective_router_mode(RouterConfig())
@@ -1070,7 +1070,7 @@ def _parse_router(
             f"Supported router keys: {', '.join(sorted(_ROUTER_KEYS))}",
         ))
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
 
     if "mode" in raw:
         mode_raw = raw["mode"]
@@ -1197,7 +1197,7 @@ def _parse_router(
                 "Change to:\n  label_routes:\n    SYSTEM_DEV: <route-name>",
             ))
         else:
-            pairs: List[Tuple[str, str]] = []
+            pairs: list[tuple[str, str]] = []
             for label, route in label_routes.items():
                 label_text = str(label).strip().upper()
                 if label_text not in _ROUTER_LABELS:
@@ -1248,7 +1248,7 @@ def _parse_router(
     return router
 
 
-def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
+def load_routes(cfg: Optional[dict[str, Any]] = None) -> RouteCatalog:
     """Parse+validate ``cfg["model_routes"]`` into a :class:`RouteCatalog`.
 
     Absent/empty section → dormant catalog (no routes, default health, no
@@ -1286,7 +1286,7 @@ def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
     return catalog
 
 
-def validate_model_routes(cfg: Optional[Dict[str, Any]] = None) -> List[ConfigIssue]:
+def validate_model_routes(cfg: Optional[dict[str, Any]] = None) -> list[ConfigIssue]:
     """Config-validation hook — called by ``config.validate_config_structure``."""
     if cfg is None:
         cfg = load_config()
@@ -1334,7 +1334,7 @@ def _lookup_route(catalog: RouteCatalog, route_name: str) -> Optional[RouteSpec]
 
 def resolve_route_detailed(
     route_name: str,
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
     allow_recovery_probe: bool = False,
@@ -1357,13 +1357,13 @@ def resolve_route_detailed(
         logger.warning("model_routes: unknown route %r", route_name)
         return RouteResolution(None, f"unknown route {str(route_name or '').strip()!r}")
 
-    chain: List[Tuple[str, str, str, str]] = [
+    chain: list[tuple[str, str, str, str]] = [
         (spec.provider, spec.model, spec.reasoning_effort, "default")
     ]
     for i, fb in enumerate(spec.fallbacks, 1):  # source index is 1-based
         chain.append((fb.provider, fb.model, fb.reasoning_effort, f"fallback:{i}"))
 
-    failures: List[str] = []
+    failures: list[str] = []
     for provider, model, effort, source in chain:
         healthy, reason = provider_health(
             provider,
@@ -1397,11 +1397,11 @@ def resolve_route_detailed(
 
 def resolve_route(
     route_name: str,
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
     allow_recovery_probe: bool = False,
-) -> Optional[Dict[str, str]]:
+) -> Optional[dict[str, str]]:
     """Return the first cached-healthy runtime; active recovery is opt-in.
 
     The safe default is read-only and performs no provider I/O. Live callers
@@ -1418,11 +1418,11 @@ def resolve_route(
 
 def resolve_route_runtime(
     route_name: str,
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
     allow_recovery_probe: bool = False,
-) -> Optional[Dict[str, str]]:
+) -> Optional[dict[str, str]]:
     """Resolve a healthy route through the canonical runtime-provider chain.
 
     The returned snapshot is deliberately secret-free: it proves that the
@@ -1480,7 +1480,7 @@ def _health_checks_enabled(health: HealthConfig) -> bool:
     return health.enabled
 
 
-def _cfg_runtime_fallback(provider: str, cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _cfg_runtime_fallback(provider: str, cfg: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Minimal probe runtime straight from the ``providers:`` entry, key-less.
 
     Preserves skill-gate semantics: a known base_url with a missing key still
@@ -1530,12 +1530,12 @@ def _cfg_runtime_fallback(provider: str, cfg: Optional[Dict[str, Any]]) -> Dict[
 def _probe_provider(
     provider: str,
     model: str,
-    cfg: Optional[Dict[str, Any]],
+    cfg: Optional[dict[str, Any]],
     health: HealthConfig,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """One live probe. anthropic_messages mode sends a 1-token message (also
     catches credit exhaustion); OpenAI-compatible modes GET /models."""
-    runtime: Dict[str, Any] = {}
+    runtime: dict[str, Any] = {}
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -1593,12 +1593,12 @@ def _probe_provider(
         if exc.code in (402, 429) or exc.code >= 500:
             return False, f"HTTP {exc.code}"
         return True, f"assumed healthy (auth-scoped HTTP {exc.code})"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Connection refused / DNS / timeout — provider is genuinely unreachable.
         return False, str(exc)[:80]
 
 
-def _read_health_cache(path: Path) -> Dict[str, Any]:
+def _read_health_cache(path: Path) -> dict[str, Any]:
     try:
         cache = json.loads(path.read_text(encoding="utf-8"))
         return cache if isinstance(cache, dict) else {}
@@ -1615,7 +1615,7 @@ def _health_entry_timestamp(entry: Any) -> float:
         return float("-inf")
 
 
-def _health_cache_signature(path: Path) -> Optional[Tuple[str, int, int, int]]:
+def _health_cache_signature(path: Path) -> Optional[tuple[str, int, int, int]]:
     try:
         stat = path.stat()
     except OSError:
@@ -1628,7 +1628,7 @@ def _health_cache_signature(path: Path) -> Optional[Tuple[str, int, int, int]]:
     )
 
 
-def _update_unhealthy_memo_locked(path: Path, cache: Dict[str, Any]) -> None:
+def _update_unhealthy_memo_locked(path: Path, cache: dict[str, Any]) -> None:
     _unhealthy_memo["mtime"] = _health_cache_signature(path)
     _unhealthy_memo["cache"] = cache
     _unhealthy_memo["value"] = any(
@@ -1637,7 +1637,7 @@ def _update_unhealthy_memo_locked(path: Path, cache: Dict[str, Any]) -> None:
     )
 
 
-def _read_health_cache_memoized_locked(path: Path) -> Dict[str, Any]:
+def _read_health_cache_memoized_locked(path: Path) -> dict[str, Any]:
     """Return the cached read-only snapshot when the file is unchanged."""
     signature = _health_cache_signature(path)
     if signature is None:
@@ -1653,7 +1653,7 @@ def _read_health_cache_memoized_locked(path: Path) -> Dict[str, Any]:
     return cache
 
 
-def _store_health_verdict(path: Path, key: str, entry: Dict[str, Any]) -> bool:
+def _store_health_verdict(path: Path, key: str, entry: dict[str, Any]) -> bool:
     """Merge one verdict into the shared cache under an exclusive flock.
 
     Concurrent hermes processes (gateway + interactive CLI) share this file;
@@ -1718,10 +1718,10 @@ def provider_health(
     provider: str,
     model: str = "",
     *,
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
     health: Optional[HealthConfig] = None,
     allow_recovery_probe: bool = False,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Cached passive health verdict with opt-in fail-open recovery probing.
 
     Passive-first semantics:
@@ -1808,18 +1808,18 @@ def provider_health(
 # suppression is in-process only, so concurrent hermes processes still land
 # their own (idempotent) writes via the flock merge.
 _PASSIVE_WRITE_SUPPRESS_SECONDS = 5.0
-_last_passive_unhealthy_write: Dict[str, float] = {}
+_last_passive_unhealthy_write: dict[str, float] = {}
 
 # mtime-keyed memo for has_unhealthy_verdicts() — the completion-success hook
 # runs per API call, so steady state is limited to cached config metadata plus
 # one cache-file stat, not full route parsing or a JSON read.
-_unhealthy_memo: Dict[str, Any] = {"mtime": None, "value": False}
+_unhealthy_memo: dict[str, Any] = {"mtime": None, "value": False}
 
 
 def provider_key_for_runtime(
     provider: str = "",
     base_url: str = "",
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
 ) -> str:
     """Map an agent's runtime identity to its ``providers:`` config key.
 
@@ -1846,8 +1846,7 @@ def provider_key_for_runtime(
         return ""
 
     target = _normalize_custom_provider_name(str(provider or ""))
-    if target.startswith("custom:"):
-        target = target[len("custom:"):]
+    target = target.removeprefix("custom:")
     base = str(base_url or "").strip().rstrip("/").lower()
 
     url_match = ""
@@ -1965,9 +1964,9 @@ def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
 
 
 def runtime_satisfies_route(
-    runtime: Dict[str, Any],
+    runtime: dict[str, Any],
     route_name: str,
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
 ) -> bool:
@@ -2008,10 +2007,10 @@ def runtime_satisfies_route(
 
 
 def route_catalog_for_schema(
-    cfg: Optional[Dict[str, Any]] = None,
+    cfg: Optional[dict[str, Any]] = None,
     *,
     catalog: Optional[RouteCatalog] = None,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     """(name, description) pairs for valid routes, in declaration order."""
     catalog = catalog or load_routes(cfg)
     return [(spec.name, spec.description) for spec in catalog.routes.values()]

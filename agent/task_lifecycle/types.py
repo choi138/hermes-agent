@@ -51,20 +51,20 @@ class Phase(str, Enum):
 
 #: Phases where no real execution has been observed yet. Reporting any of
 #: these as "running" is the misreporting bug this module prevents.
-UNRESOLVED_PHASES: FrozenSet[Phase] = frozenset({Phase.ACCEPTED, Phase.READY})
+UNRESOLVED_PHASES: frozenset[Phase] = frozenset({Phase.ACCEPTED, Phase.READY})
 
-EXECUTION_PHASES: FrozenSet[Phase] = frozenset(
+EXECUTION_PHASES: frozenset[Phase] = frozenset(
     {Phase.RUNNING, Phase.EXECUTION_FINISHED}
 )
 
-VERIFICATION_PHASES: FrozenSet[Phase] = frozenset({Phase.VERIFYING, Phase.VERIFIED})
+VERIFICATION_PHASES: frozenset[Phase] = frozenset({Phase.VERIFYING, Phase.VERIFIED})
 
-DELIVERY_PHASES: FrozenSet[Phase] = frozenset(
+DELIVERY_PHASES: frozenset[Phase] = frozenset(
     {Phase.DELIVERING, Phase.DELIVERY_UNCONFIRMED, Phase.DELIVERED}
 )
 
 #: Terminal phases. ``DELIVERED`` is the only successful one.
-TERMINAL_PHASES: FrozenSet[Phase] = frozenset(
+TERMINAL_PHASES: frozenset[Phase] = frozenset(
     {Phase.DELIVERED, Phase.CANCELLED}
 )
 

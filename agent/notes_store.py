@@ -113,7 +113,7 @@ class NoteNotFoundError(KeyError):
 
 
 def _utcnow_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+    return _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
 
 
 def validate_topic_key(topic_key: str) -> str:
@@ -143,7 +143,7 @@ def note_ref(kind: str, topic_key: str) -> str:
 # One lock per note path, module-level so every store instance in the
 # process serializes on the same lock (same pattern as
 # agent.memory_journal._path_locks).
-_path_locks: Dict[str, threading.Lock] = {}
+_path_locks: dict[str, threading.Lock] = {}
 _path_locks_guard = threading.Lock()
 
 
@@ -204,14 +204,14 @@ def _threat_check(text: str) -> None:
         raise NoteValidationError(message)
 
 
-def _serialize(frontmatter: Dict[str, Any], body: str) -> str:
+def _serialize(frontmatter: dict[str, Any], body: str) -> str:
     fm = yaml.safe_dump(
         frontmatter, allow_unicode=True, sort_keys=False, default_flow_style=False
     ).strip()
     return f"{_FRONTMATTER_DELIM}\n{fm}\n{_FRONTMATTER_DELIM}\n{body.strip()}\n"
 
 
-def _parse(raw: str) -> Tuple[Dict[str, Any], str]:
+def _parse(raw: str) -> tuple[dict[str, Any], str]:
     """Parse a note file into (frontmatter, body). Raises on malformed files."""
     lines = raw.split("\n")
     if not lines or lines[0].strip() != _FRONTMATTER_DELIM:
@@ -288,7 +288,7 @@ class NotesStore:
     # -- validation -----------------------------------------------------------
 
     @staticmethod
-    def _validate_evidence(evidence: Sequence[str]) -> List[str]:
+    def _validate_evidence(evidence: Sequence[str]) -> list[str]:
         refs = [str(e).strip() for e in (evidence or []) if str(e).strip()]
         if not refs:
             raise NoteValidationError(
@@ -321,7 +321,7 @@ class NotesStore:
 
     # -- reads ----------------------------------------------------------------
 
-    def read(self, kind: str, topic_key: str) -> Dict[str, Any]:
+    def read(self, kind: str, topic_key: str) -> dict[str, Any]:
         path = self.path_for(kind, topic_key)
         if not path.exists():
             raise NoteNotFoundError(note_ref(kind, topic_key))
@@ -340,11 +340,11 @@ class NotesStore:
         self,
         kind: Optional[str] = None,
         status: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Frontmatter-only listing of canonical notes (archived superseded
         versions under ``.superseded/`` are excluded)."""
         kinds = [validate_kind(kind)] if kind else sorted(NOTE_KINDS)
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for k in kinds:
             kind_dir = self._base_dir / k
             if not kind_dir.is_dir():
@@ -362,12 +362,12 @@ class NotesStore:
                 out.append(fm)
         return out
 
-    def list_superseded(self, kind: str, topic_key: str) -> List[Dict[str, Any]]:
+    def list_superseded(self, kind: str, topic_key: str) -> list[dict[str, Any]]:
         """Archived same-key predecessors, oldest first."""
         kind = validate_kind(kind)
         topic_key = validate_topic_key(topic_key)
         arch_dir = self._base_dir / kind / _SUPERSEDED_DIRNAME
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for path in sorted(arch_dir.glob(f"{topic_key}.*.md")):
             try:
                 fm, body = _parse(path.read_text(encoding="utf-8"))
@@ -391,7 +391,7 @@ class NotesStore:
         confidence: str = "supported",
         status: str = "active",
         valid_from: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         path = self.path_for(kind, topic_key)
         if origin not in NOTE_ORIGINS:
             raise NoteValidationError(
@@ -445,7 +445,7 @@ class NotesStore:
         evidence_remove: Sequence[str] = (),
         confidence: Optional[str] = None,
         status: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Reconsolidation-style UPDATE: merge new gist/evidence into an
         existing note.
 
@@ -528,7 +528,7 @@ class NotesStore:
         new_topic_key: Optional[str] = None,
         confidence: str = "supported",
         status: str = "active",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Replace a note with a successor, preserving the predecessor.
 
         Same-key supersede archives the predecessor under
@@ -579,7 +579,7 @@ class NotesStore:
         }
         succ_serialized = _serialize(succ_frontmatter, new_body)
 
-        def _demoted_predecessor(old: Dict[str, Any]) -> str:
+        def _demoted_predecessor(old: dict[str, Any]) -> str:
             fm = {
                 "kind": old["kind"],
                 "topic_key": old["topic_key"],
@@ -593,7 +593,7 @@ class NotesStore:
             }
             return _serialize(fm, old["body"])
 
-        def _check_old(old: Dict[str, Any]) -> None:
+        def _check_old(old: dict[str, Any]) -> None:
             if old["status"] == "tombstoned":
                 raise NoteValidationError(
                     f"Note {note_ref(kind, topic_key)} is tombstoned; tombstones "
@@ -649,7 +649,7 @@ class NotesStore:
             _atomic_write(old_path, _demoted_predecessor(old))
         return self.read(succ_kind, succ_key)
 
-    def tombstone(self, kind: str, topic_key: str) -> Dict[str, Any]:
+    def tombstone(self, kind: str, topic_key: str) -> dict[str, Any]:
         """Permanent removal marker. Body is preserved for audit; the note
         leaves every read surface (list/search filter it out)."""
         return self.update(kind, topic_key, status="tombstoned")
@@ -688,7 +688,7 @@ class NotesStore:
         *,
         topic_key: Optional[str] = None,
         limit: int = 5,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Deterministic term + topic-key match over frontmatter and body.
 
         Scoring (fixed weights, auditable):
@@ -699,10 +699,10 @@ class NotesStore:
         then path (stable).
         """
         query_terms = [t.casefold() for t in terms if t and str(t).strip()]
-        query_segments: List[str] = []
+        query_segments: list[str] = []
         if topic_key:
             query_segments = [s for s in str(topic_key).casefold().split(".") if s]
-        scored: List[Tuple[int, str, str, Dict[str, Any]]] = []
+        scored: list[tuple[int, str, str, dict[str, Any]]] = []
         for meta in self.list_notes():
             if meta.get("status") == "tombstoned":
                 continue
@@ -750,7 +750,7 @@ class NotesStore:
     # -- L1 index line renderer (consumed by Phase 3 dream compile) ------------
 
     @staticmethod
-    def render_index_line(note: Dict[str, Any], *, gist_chars: int = 55) -> str:
+    def render_index_line(note: dict[str, Any], *, gist_chars: int = 55) -> str:
         """One-line index hook for a note (ADR-004 §6.1 L1 payload arithmetic:
         ~55 chars of gist per line). Phase 3's dream L1 compiler consumes
         these; Phase 1 only renders."""

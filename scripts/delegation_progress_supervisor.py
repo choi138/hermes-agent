@@ -171,7 +171,7 @@ def launch(argv, *, dry_run=False, wait=True):
         else:
             _atomic(config_path, config)
         loaded = subprocess.run(['/bin/launchctl', 'print', f'{domain}/{label}'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False).returncode == 0
         if not loaded:
             value = dict(Label=label, ProgramArguments=[sys.executable, str(Path(__file__).resolve()),
                          'run', '--config', str(config_path)], RunAtLoad=True,
@@ -184,7 +184,7 @@ def launch(argv, *, dry_run=False, wait=True):
             with os.fdopen(fd, 'wb') as stream:
                 plistlib.dump(value, stream)
             result = subprocess.run(['/bin/launchctl', 'bootstrap', domain, str(plist_path)],
-                                    capture_output=True, timeout=15)
+                                    capture_output=True, timeout=15, check=False)
             if result.returncode:
                 raise ValueError('launchd_bootstrap_failed')
     emit(dict(status='supervisor_owned', run_id=progress.manifest.run_id, owner=f'{domain}/{label}'))
@@ -200,7 +200,7 @@ def launch(argv, *, dry_run=False, wait=True):
             return 0 if state['status'] == 'finished' else 74
         # Detect loss of the launchd owner too; pending delivery remains untouched.
         owner = subprocess.run(['/bin/launchctl', 'print', f'{domain}/{label}'],
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, check=False)
         exited_without_receipt = ('state = not running' in owner.stdout and 'last exit code = 0' in owner.stdout)
         if owner.returncode or exited_without_receipt:
             # Completion can race the first state read and launchctl's response.

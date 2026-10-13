@@ -204,7 +204,7 @@ async def _send_attention(adapter, source, content, metadata, execution, token, 
     deadline = asyncio.get_running_loop().time() + (resolve_timeout('gateway.process_attention_send', default=10) or 10)
     try:
         while True:
-            done, _ = await asyncio.wait({send}, timeout=.1)
+            _done, _ = await asyncio.wait({send}, timeout=.1)
             if not await asyncio.to_thread(attention_authorized, execution, token):
                 await asyncio.to_thread(abandon_obligation, turn_id)
                 return None

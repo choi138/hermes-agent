@@ -34,7 +34,7 @@ def _review_flags(review_memory: bool, review_skills: bool) -> int:
     )
 
 
-def review_snapshot_fingerprint(messages_snapshot: List[Dict[str, Any]]) -> str:
+def review_snapshot_fingerprint(messages_snapshot: list[dict[str, Any]]) -> str:
     """Return a content hash without retaining or logging transcript text."""
 
     try:
@@ -69,8 +69,8 @@ class BackgroundReviewCoordinator:
         queue_limit: int = 64,
     ) -> None:
         self._condition = threading.Condition()
-        self._pending: "OrderedDict[str, _ReviewRequest]" = OrderedDict()
-        self._completed: Dict[str, tuple[float, int]] = {}
+        self._pending: OrderedDict[str, _ReviewRequest] = OrderedDict()
+        self._completed: dict[str, tuple[float, int]] = {}
         self._active_key: Optional[str] = None
         self._active_flags = 0
         self._worker_alive = False
@@ -131,7 +131,7 @@ class BackgroundReviewCoordinator:
         self,
         *,
         owner_token: str,
-        messages_snapshot: List[Dict[str, Any]],
+        messages_snapshot: list[dict[str, Any]],
         review_memory: bool,
         review_skills: bool,
         target_factory: Callable[[bool, bool], Callable[[], Any]],
@@ -280,7 +280,7 @@ def ensure_background_review_owner_token(agent: Any) -> str:
     if not token:
         token = uuid.uuid4().hex
         try:
-            setattr(agent, "_background_review_owner_token", token)
+            agent._background_review_owner_token = token
         except Exception:
             # Slot-locked test doubles and third-party wrappers can still use
             # process-local dedupe for their lifetime.

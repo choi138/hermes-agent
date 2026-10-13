@@ -27,7 +27,7 @@ EP = [{"type": "episode", "uuid": "a" * 32}]
 SESSION = "sess-tool-1"
 
 
-def _call_write(**kw) -> Dict[str, Any]:
+def _call_write(**kw) -> dict[str, Any]:
     kw.setdefault("session_id", SESSION)
     return json.loads(notes_write_tool(**kw))
 
@@ -146,7 +146,7 @@ class TestNotesWriteTool:
 
 class _RecordingManager:
     def __init__(self):
-        self.calls: List[Dict[str, Any]] = []
+        self.calls: list[dict[str, Any]] = []
 
     def sync_note_backfill(self, note_path, content, *, session_id="", metadata=None):
         self.calls.append({
@@ -254,7 +254,7 @@ class TestNotesReadTool:
 # ---------------------------------------------------------------------------
 
 class TestMemoryProposeTool:
-    def _wal_records(self) -> List[Dict[str, Any]]:
+    def _wal_records(self) -> list[dict[str, Any]]:
         from hermes_constants import get_hermes_home
 
         path = (

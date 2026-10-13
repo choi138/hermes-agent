@@ -386,12 +386,12 @@ def verification_outcome(result):
     fallback = dict(outcome='unverified', evidence=[], next_action='Inspect the turn and verify its effects', repair_attempts=0)
     if result.get('failed') or result.get('interrupted'):
         return fallback
-    matches = re.findall(r'^```process_verification[^\S\n]*\n(.*?)\n```[^\S\n]*(?=\n|$)', result.get('final_response') or '', re.S | re.M)
-    if len(matches) != 1 or not re.search(r'^```process_verification[^\S\n]*\n.*?\n```\s*\Z', result.get('final_response') or '', re.S | re.M):
+    matches = re.findall(r'^```process_verification[^\S\n]*\n(.*?)\n```[^\S\n]*(?=\n|$)', result.get('final_response') or '', re.DOTALL | re.MULTILINE)
+    if len(matches) != 1 or not re.search(r'^```process_verification[^\S\n]*\n.*?\n```\s*\Z', result.get('final_response') or '', re.DOTALL | re.MULTILINE):
         return fallback
     # A terminal-looking block inside an open Markdown fence is still a quoted example.
     text = result.get('final_response') or ''
-    start = re.search(r'^```process_verification[^\S\n]*\n', text, re.M).start()
+    start = re.search(r'^```process_verification[^\S\n]*\n', text, re.MULTILINE).start()
     fence = None
     for line in text[:start].splitlines():
         marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line)
@@ -431,7 +431,7 @@ def verification_report(result, *, language_hint=''):
             if korean else 'Verification result could not be confirmed. '
             'Inspect the recorded evidence before retrying; no command was automatically repeated.')
     text = result.get('final_response') or ''
-    start = re.search(r'^```process_verification[^\S\n]*\n', text, re.M).start()
+    start = re.search(r'^```process_verification[^\S\n]*\n', text, re.MULTILINE).start()
     prose = text[:start].strip()
     # A model can repeat its assessment inside prose, including truncated JSON.
     # Render the validated assessment instead of exposing any repeated schema.

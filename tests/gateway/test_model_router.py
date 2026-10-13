@@ -2098,7 +2098,6 @@ def test_gateway_shadow_worker_inherits_turn_context(monkeypatch):
     def evaluate(**_kwargs):
         observed["marker"] = marker.get()
         finished.set()
-        return None
 
     monkeypatch.setattr(runner, "_evaluate_model_router_shadow", evaluate)
     try:
@@ -2291,7 +2290,7 @@ def _refusal_stage_runner(
 
 
 def test_refusal_notify_sent_after_successful_apply(monkeypatch, tmp_path):
-    runner, cfg, evidence = _refusal_stage_runner(monkeypatch, tmp_path, notify=True)
+    runner, cfg, _evidence = _refusal_stage_runner(monkeypatch, tmp_path, notify=True)
     source = _source()
     asyncio.run(
         runner._model_router_stage(
@@ -2340,7 +2339,7 @@ def test_refusal_switch_clean_fork_disabled_preserves_transcript_and_notice(
         {"role": "user", "content": "request"},
         {"role": "assistant", "content": "refusal"},
     ]
-    runner, cfg, evidence = _refusal_stage_runner(
+    runner, cfg, _evidence = _refusal_stage_runner(
         monkeypatch,
         tmp_path,
         clean_fork=False,

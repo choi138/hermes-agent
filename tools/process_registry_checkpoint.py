@@ -75,6 +75,10 @@ def _legacy_profile_home(registry, entry):
 
 
 class ProcessCheckpointMixin:
+    def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
+        """Subclass supplies the live PID decision. See ProcessRegistry."""
+        raise NotImplementedError
+
     # ----- Checkpoint (crash recovery) -----
 
     def retry_checkpoint_recovery(self):
@@ -91,7 +95,7 @@ class ProcessCheckpointMixin:
         self._checkpoint_recovery_retry_at = retry_at
         return self.recover_from_checkpoint()
 
-    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None, *, strict=False):
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, *, strict=False):
         """Serialize snapshot plus replacement so an older writer cannot erase newer state."""
         with self._checkpoint_write_lock:
             self._write_checkpoint_serialized(extra_entries, strict=strict)
@@ -219,7 +223,7 @@ class ProcessCheckpointMixin:
         self._unresolved_remote_entries[str(checkpoint_path)] = [
             entry for entry in entries if entry['session_id'] in owned and entry.get("pid_scope", "host") != "host"]
         recovered = 0
-        unresolved_scope_entries: List[Dict[str, Any]] = []
+        unresolved_scope_entries: list[dict[str, Any]] = []
         known = getattr(self, '_checkpoint_known_ids', {})
         known[str(checkpoint_path)] = owned
         self._checkpoint_known_ids = known
@@ -281,16 +285,20 @@ class ProcessCheckpointMixin:
                         "parent_session_id": session.parent_session_id,
                     })
                 continue
-            # Alive AND the same process: across a restart the kernel may have
-            # recycled the PID onto a stranger, and adopting it would let a later
-            # kill tree-kill e.g. a browser.
-            if not self._host_pid_is_ours(pid, entry.get("host_start_time")):
-                if self._is_host_pid_alive(pid):
-                    logger.info(
-                        "Not recovering session %s: pid %d is alive but its "
-                        "start time no longer matches — PID was recycled onto "
-                        "an unrelated process; refusing to adopt it.",
-                        entry.get("session_id", "?"), pid)
+            # Alive and still ours: re-attach. A start-time probe that cannot
+            # be read is not proof the PID was reused — dropping it would leave
+            # a live child unsupervised, and marking it exited would invent a
+            # completion. A positive mismatch means the number was recycled:
+            # do not adopt it and do not signal it.
+            fate = self._detached_host_fate(pid, entry.get("host_start_time"))
+            if fate == "reused":
+                logger.info(
+                    "Not recovering session %s: pid %d is alive but its "
+                    "start time no longer matches — PID was recycled onto "
+                    "an unrelated process; refusing to adopt or signal it.",
+                    entry.get("session_id", "?"), pid)
+                continue
+            if fate != "running":
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -322,8 +330,10 @@ class ProcessCheckpointMixin:
                 })
         if not hasattr(self, "_unresolved_remote_entries"):
             self._unresolved_remote_entries = {}
-        self._unresolved_remote_entries[str(checkpoint_path)] = [
-            entry for entry in unresolved_scope_entries if entry.get("pid_scope", "host") != "host"]
+        # Retain failed host-scope stops as well as unresolved SSH records.
+        # A later unrelated checkpoint write must not erase the only retry
+        # handle for descendants whose wrapper is already dead.
+        self._unresolved_remote_entries[str(checkpoint_path)] = unresolved_scope_entries
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         pending = getattr(self, '_checkpoint_recovery_waiting', {})
         pending[str(checkpoint_path)] = waiting

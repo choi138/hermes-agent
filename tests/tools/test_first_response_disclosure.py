@@ -24,7 +24,7 @@ EAGER = {
 
 def overlay_yaml():
     artifact = (ROOT / "profile-config" / "tool-search-overlay.md").read_text()
-    blocks = re.findall(r"```yaml\n(.*?)\n```", artifact, re.S)
+    blocks = re.findall(r"```yaml\n(.*?)\n```", artifact, re.DOTALL)
     assert len(blocks) == 1
     return yaml.safe_load(blocks[0])
 
@@ -43,7 +43,7 @@ def production_assembly(tmp_path, monkeypatch):
     # only configured-service readiness and side-effect handlers are offline fixtures.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import model_tools as model
-    import hermes_cli.config as config
+    from hermes_cli import config
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     import tools.registry as registry_module
     from tools.registry import ToolRegistry
@@ -85,7 +85,7 @@ def production_assembly(tmp_path, monkeypatch):
 
 
 def test_exact_overlay_preserves_defaults_and_all_eager_safety_tools(production_assembly):
-    model, current, scopes, calls, registry = production_assembly
+    model, current, scopes, _calls, registry = production_assembly
     cfg = ts.ToolSearchConfig.from_raw(current["tools"]["tool_search"])
     assert ts._DEFAULT_DEFERRED_TOOLS <= cfg.effective_defer_tools
     assert not (cfg.effective_defer_tools & EAGER)
@@ -103,7 +103,7 @@ def test_exact_overlay_preserves_defaults_and_all_eager_safety_tools(production_
 
 
 def test_actual_provider_array_catalog_and_describe_are_lossless(production_assembly, capsys):
-    model, current, scopes, calls, registry = production_assembly
+    model, current, scopes, _calls, _registry = production_assembly
     raw = model.get_tool_definitions(scopes, quiet_mode=True, skip_tool_search_assembly=True)
     cfg = ts.ToolSearchConfig.from_raw(current["tools"]["tool_search"])
     before = ts.assemble_tool_defs(raw, context_length=128000, config=ts.ToolSearchConfig.from_raw(None))
@@ -147,7 +147,7 @@ def test_actual_provider_array_catalog_and_describe_are_lossless(production_asse
 
 
 def test_real_bridge_scoped_control_and_argument_rejection(production_assembly):
-    model, current, scopes, calls, registry = production_assembly
+    model, _current, scopes, calls, _registry = production_assembly
     name = "mcp__first_response__scoped_control"
     payload = {"calls": [{"name": name, "arguments": {"value": "fixture"}}]}
     result = json.loads(model.handle_function_call("tool_call", payload, enabled_toolsets=scopes))

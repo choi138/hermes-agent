@@ -64,7 +64,7 @@ def _check_reconnect_recovers_before_upload(setup_sync, monkeypatch, failure):
 
 
 def test_other_remote_cannot_consume_intent(setup_sync):
-    host, local, other, uploads, manager = setup_sync
+    host, _local, other, uploads, manager = setup_sync
     def fail(*args):
         raise TimeoutError('offline')
     old = manager(fail)
@@ -83,7 +83,7 @@ def test_other_remote_cannot_consume_intent(setup_sync):
 
 
 def test_corrupt_intent_blocks_upload(setup_sync):
-    host, local, other, uploads, manager = setup_sync
+    host, _local, _other, uploads, manager = setup_sync
     (host/'.sync-back-intent.json').write_text('{broken')
     with pytest.raises(json.JSONDecodeError):
         manager().sync(force=True)
@@ -91,7 +91,7 @@ def test_corrupt_intent_blocks_upload(setup_sync):
 
 
 def _check_recovery_uses_original_mapping(setup_sync, monkeypatch):
-    host, local, other, uploads, manager = setup_sync
+    host, local, other, _uploads, manager = setup_sync
     def fail(*args):
         raise TimeoutError('offline')
     old = manager(fail)
@@ -105,7 +105,7 @@ def _check_recovery_uses_original_mapping(setup_sync, monkeypatch):
 
 
 def _check_recovery_in_new_process_preserves_unchanged_remote_baseline(setup_sync):
-    host, local, other, uploads, manager = setup_sync
+    host, local, other, _uploads, manager = setup_sync
     def fail(*args):
         raise TimeoutError('offline')
     old = manager(fail)
@@ -126,7 +126,7 @@ manager = file_sync.FileSyncManager(lambda: [(sys.argv[1], sys.argv[2])],
 manager.sync(force=True)
 '''
     result = subprocess.run([sys.executable, '-c', code, str(local), str(other)],
-                            capture_output=True, text=True, timeout=10)
+                            capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0, result.stderr
     assert local.read_text() == other.read_text() == 'new host edit'
     assert not (host/'.sync-back-intent.json').exists()

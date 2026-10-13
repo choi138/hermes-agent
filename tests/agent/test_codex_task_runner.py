@@ -51,7 +51,7 @@ sys.argv = sys.argv[4:]
             "--allowed-root", str(tmp_path), "--output-dir", str(inputs["output_dir"]),
             "--tier", tier, "--timeout", str(timeout), *extra_args]
     completed = subprocess.run([sys.executable, str(bootstrap), str(script.parent.parent),
-        str(child), str(output_limit), str(script), *args], capture_output=True, text=True, timeout=15)
+        str(child), str(output_limit), str(script), *args], capture_output=True, text=True, timeout=15, check=False)
     if not expect_status:
         return completed
     result = json.loads(completed.stdout)
@@ -245,9 +245,9 @@ def test_cli_help_dry_run_and_real_script_with_injected_process(inputs, tmp_path
     script = Path(__file__).resolve().parents[2] / "scripts/run_codex_task.py"
     args = ["--spec", str(inputs["spec"]), "--workdir", str(tmp_path),
             "--allowed-root", str(tmp_path), "--output-dir", str(inputs["output_dir"])]
-    help_result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True)
+    help_result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, check=False)
     assert help_result.returncode == 0 and "--tier" in help_result.stdout
-    dry = subprocess.run([sys.executable, str(script), *args, "--dry-run"], capture_output=True, text=True)
+    dry = subprocess.run([sys.executable, str(script), *args, "--dry-run"], capture_output=True, text=True, check=False)
     assert dry.returncode == 0
     dry_receipt = json.loads(dry.stdout)
     assert dry_receipt["argv"][0] == "codex"
@@ -271,7 +271,7 @@ script = sys.argv[3]
 sys.argv = sys.argv[3:]
 runpy.run_path(script, run_name="__main__")
 ''')
-    executed = subprocess.run([sys.executable, str(bootstrap), str(script.parent.parent), str(child), str(script), *args], capture_output=True, text=True, timeout=15)
+    executed = subprocess.run([sys.executable, str(bootstrap), str(script.parent.parent), str(child), str(script), *args], capture_output=True, text=True, timeout=15, check=False)
     assert executed.returncode == 23, executed.stderr
     result = json.loads(executed.stdout)
     assert result["status"] == "cli_failed"

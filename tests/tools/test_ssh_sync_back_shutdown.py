@@ -58,13 +58,13 @@ def test_shutdown_syncs_edits_and_unblocks_another_session(tmp_path, monkeypatch
                 assert proc.poll() is None, (tmp_path/'stderr').read_text()
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
-            second = file_sync.FileSyncManager(lambda: [], lambda *a: None, lambda *a: None,
+            second = file_sync.FileSyncManager(list, lambda *a: None, lambda *a: None,
                                                selective_download_fn=lambda *a: None)
             second.sync(force=True)
             # A second session can run a command and read the returned result.
             result = subprocess.run([sys.executable, '-c',
                 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text())',
-                str(tmp_path/'host/result.txt')], capture_output=True, text=True, timeout=2)
+                str(tmp_path/'host/result.txt')], capture_output=True, text=True, timeout=2, check=False)
             assert result.returncode == 0
             assert result.stdout.strip() == 'completed remotely', (tmp_path/'stderr').read_text()
             proc.wait(timeout=3)

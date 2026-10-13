@@ -50,7 +50,7 @@ def load_context(store, bindings, *, owner, project, profile, task_digest, limit
         kind = 'rule' if policy_confirmed else ('decision' if key[0] == 'decision' else 'fact')
         status = ('unconfirmed' if note['status'] == 'unconfirmed' else
                   'advisory' if note.get('confidence') == 'contested' else 'confirmed')
-        stamp = datetime.fromisoformat(note['valid_from'].replace('Z', '+00:00'))
+        stamp = datetime.fromisoformat(note['valid_from'])
         revision = int(stamp.timestamp() * 1000000)
         item = MemoryItem(ref, kind, note['body'],
             f"{note['path']} sha256={source_digest} evidence={note['evidence']}", revision, scope, status)

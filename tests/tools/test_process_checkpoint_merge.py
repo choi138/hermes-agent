@@ -7,6 +7,25 @@ import pytest
 from tools.process_registry import ProcessRegistry
 
 
+def test_owned_checkpoint_recovery_preserves_release_policy_and_wsl_identity(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    producer = ProcessRegistry()
+    session = producer._new_session('wsl.exe -e sleep 60', 'owner', 'owner', '', None,
+                                    persist_on_release=True)
+    session.pid = os.getpid()
+    session.host_start_time = producer._safe_host_start_time(session.pid)
+    session.wsl_chain = True
+    producer._running[session.id] = session
+    producer._write_checkpoint(strict=True)
+
+    recovered = ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 1
+    restored = recovered.get(session.id)
+    assert restored.persist_on_release and restored.wsl_chain
+    assert recovered.kill_all('owner') == 0
+    assert recovered.get(session.id) is restored and not restored.exited
+
+
 @pytest.mark.parametrize('payload', [{}, '', 0, [None]])
 def test_corrupt_primary_checkpoint_is_rejected_before_ssh_sidecar_merge(tmp_path, payload):
     from tools.process_registry_checkpoint import _read_checkpoint, _write_checkpoint_files

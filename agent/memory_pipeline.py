@@ -144,7 +144,7 @@ _MIN_QUOTE_RESIDUAL_LEN = 8
 # The deferred-grounding sidecar is append-heavy but also needs atomic
 # compaction after sweeps. Serialize both operations across threads/processes
 # so an append cannot be lost behind a read-modify-replace cycle.
-_pending_path_locks: Dict[str, threading.Lock] = {}
+_pending_path_locks: dict[str, threading.Lock] = {}
 _pending_path_locks_guard = threading.Lock()
 
 try:
@@ -222,7 +222,7 @@ def _quote_admissibility_error(quote: str) -> Optional[str]:
     return None
 
 
-def _memory_config() -> Dict[str, Any]:
+def _memory_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config
 
@@ -253,7 +253,7 @@ def notes_max_entries() -> int:
         return DEFAULT_NOTES_MAX_ENTRIES
 
 
-def evidence_ref_is_tainted(ref: Dict[str, Any]) -> bool:
+def evidence_ref_is_tainted(ref: dict[str, Any]) -> bool:
     """Phase-1 origin-taint interface (ADR-004 §① echo-chamber rule).
 
     Callers MUST set ``tainted: true`` on any evidence ref whose span
@@ -273,7 +273,7 @@ def evidence_ref_is_tainted(ref: Dict[str, Any]) -> bool:
     return bool(ref.get("tainted"))
 
 
-def serialize_evidence_ref(ref: Dict[str, Any]) -> str:
+def serialize_evidence_ref(ref: dict[str, Any]) -> str:
     """Compact string form stored in note frontmatter ``evidence`` lists.
 
     The quote is scrubbed before serialization: frontmatter re-enters
@@ -300,9 +300,18 @@ class _Proposal:
     snapshot, the scrubbed content, and the validated evidence refs."""
 
     __slots__ = (
-        "token", "content", "content_sha", "kind", "evidence_refs",
-        "neighbor_refs", "session_id", "origin", "caller", "created_ts",
-        "expires_ts", "candidates",
+        "caller",
+        "candidates",
+        "content",
+        "content_sha",
+        "created_ts",
+        "evidence_refs",
+        "expires_ts",
+        "kind",
+        "neighbor_refs",
+        "origin",
+        "session_id",
+        "token",
     )
 
     def __init__(
@@ -310,12 +319,12 @@ class _Proposal:
         *,
         content: str,
         kind: str,
-        evidence_refs: List[Dict[str, Any]],
-        neighbor_refs: List[str],
+        evidence_refs: list[dict[str, Any]],
+        neighbor_refs: list[str],
         session_id: str,
         origin: str,
         caller: str,
-        candidates: Optional[Dict[str, Dict[str, Any]]] = None,
+        candidates: Optional[dict[str, dict[str, Any]]] = None,
     ):
         self.token = _uuid.uuid4().hex
         self.content = content
@@ -355,7 +364,7 @@ class MemoryWritePipeline:
         self._pending_grounding_path = (
             home / "state" / "notes-pending-grounding.jsonl"
         )
-        self._proposals: Dict[str, _Proposal] = {}
+        self._proposals: dict[str, _Proposal] = {}
         self._proposals_lock = threading.Lock()
 
     @property
@@ -364,7 +373,7 @@ class MemoryWritePipeline:
 
     # -- step 6: ledger (fail-open telemetry) ----------------------------------
 
-    def _ledger(self, record: Dict[str, Any]) -> None:
+    def _ledger(self, record: dict[str, Any]) -> None:
         try:
             record = {"ts": round(time.time(), 3), **record}
             _append_jsonl(self._ledger_path, record)
@@ -378,12 +387,12 @@ class MemoryWritePipeline:
         content: str,
         *,
         kind_hint: str,
-        evidence_refs: Optional[List[Dict[str, Any]]] = None,
+        evidence_refs: Optional[list[dict[str, Any]]] = None,
         origin: str = "user",
         session_id: str = "",
         caller: str = "agent",
         topic_key_hint: str = "",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Steps 0–3. On success returns the neighbor list plus a TTL'd
         token; the caller must decide the verdict and call :meth:`confirm`
         with that token — there is no single-step write path."""
@@ -433,8 +442,8 @@ class MemoryWritePipeline:
         # caller sees whether each ref will ground before spending the token.
         # Failed quote refs may carry exact, taint-clean journal excerpts the
         # caller can select at confirm by opaque id.
-        grounding_preview: List[Dict[str, Any]] = []
-        issued_candidates: Dict[str, Dict[str, Any]] = {}
+        grounding_preview: list[dict[str, Any]] = []
+        issued_candidates: dict[str, dict[str, Any]] = {}
         for ref_index, ref in enumerate(evidence_refs):
             check = self._ground_ref(ref)
             preview = dict(check)
@@ -569,10 +578,10 @@ class MemoryWritePipeline:
         topic_key: str = "",
         kind: str = "",
         target: str = "",
-        evidence_overrides: Optional[Dict[Any, str]] = None,
+        evidence_overrides: Optional[dict[Any, str]] = None,
         session_id: str = "",
         caller: str = "agent",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Steps 4–6. ``target`` (\"kind/topic_key\") names the neighbor an
         UPDATE/SUPERSEDE acts on and MUST come from the token's neighbor
         snapshot. ``kind`` may only differ from the proposed kind on
@@ -675,8 +684,8 @@ class MemoryWritePipeline:
             )
 
         # Step 5 — grounded admission (mechanical, zero LLM calls).
-        grounding: List[Dict[str, Any]] = []
-        deferred: List[Dict[str, Any]] = []
+        grounding: list[dict[str, Any]] = []
+        deferred: list[dict[str, Any]] = []
         for ref_index, ref in enumerate(effective_refs):
             check = self._ground_ref(ref)
             grounding.append(check)
@@ -715,7 +724,7 @@ class MemoryWritePipeline:
         # so the write-approval gate can stage a token-free replayable
         # payload (the token TTL is far shorter than a human review cycle).
         write_kind = (kind_arg or proposal.kind)
-        plan: Dict[str, Any] = {
+        plan: dict[str, Any] = {
             "tool": "notes_write",
             "verdict": verdict,
             "content": proposal.content,
@@ -803,7 +812,7 @@ class MemoryWritePipeline:
         if gated is not None:
             return gated
 
-        pending_records: List[Dict[str, Any]] = []
+        pending_records: list[dict[str, Any]] = []
         if deferred:
             pending_records = self._pending_records_for_plan(plan)
             try:
@@ -898,7 +907,7 @@ class MemoryWritePipeline:
 
     @staticmethod
     def _candidate_search_eligible(
-        ref: Dict[str, Any], check: Dict[str, Any]
+        ref: dict[str, Any], check: dict[str, Any]
     ) -> bool:
         """Only quote-resolution failures get recognition candidates.
 
@@ -914,8 +923,8 @@ class MemoryWritePipeline:
 
     @staticmethod
     def _deferred_grounding_eligible(
-        ref: Dict[str, Any],
-        check: Dict[str, Any],
+        ref: dict[str, Any],
+        check: dict[str, Any],
         *,
         current_session_id: str,
     ) -> bool:
@@ -941,8 +950,8 @@ class MemoryWritePipeline:
 
     @staticmethod
     def _wal_record_spans(
-        rec: Dict[str, Any], *, session_id: str
-    ) -> List[Dict[str, Any]]:
+        rec: dict[str, Any], *, session_id: str
+    ) -> list[dict[str, Any]]:
         if rec.get("type") == "turn":
             return [
                 {
@@ -971,8 +980,8 @@ class MemoryWritePipeline:
 
     @staticmethod
     def _l0_record_spans(
-        rec: Dict[str, Any], *, month: str
-    ) -> List[Dict[str, Any]]:
+        rec: dict[str, Any], *, month: str
+    ) -> list[dict[str, Any]]:
         body = rec.get("body") or {}
         rec_taint = rec.get("taint") if isinstance(rec.get("taint"), dict) else {}
         if isinstance(body, dict):
@@ -1053,13 +1062,13 @@ class MemoryWritePipeline:
 
     def _find_grounding_candidates(
         self,
-        ref: Dict[str, Any],
+        ref: dict[str, Any],
         *,
         session_id: str,
         ref_index: int,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Find up to three exact, taint-clean journal excerpts for ``ref``."""
-        spans: List[Dict[str, Any]] = []
+        spans: list[dict[str, Any]] = []
         rtype = ref.get("type")
         ref_session = str(ref.get("session_id") or "")
         ref_month = str(ref.get("month") or "")
@@ -1107,7 +1116,7 @@ class MemoryWritePipeline:
         from agent.memory_taint import matched_quote_taint
 
         quote = str(ref.get("quote") or "").strip()
-        ranked: List[tuple] = []
+        ranked: list[tuple] = []
         seen = set()
         for order, span in enumerate(spans):
             key = (
@@ -1140,7 +1149,7 @@ class MemoryWritePipeline:
                 excerpt,
             ))
 
-        issued: List[Dict[str, Any]] = []
+        issued: list[dict[str, Any]] = []
         for _, _, _, span, excerpt in sorted(ranked)[:3]:
             candidate_id = _uuid.uuid4().hex[:8]
             if span["source"] == "wal":
@@ -1183,7 +1192,7 @@ class MemoryWritePipeline:
 
     @staticmethod
     def _apply_evidence_overrides(
-        proposal: _Proposal, overrides: Optional[Dict[Any, str]]
+        proposal: _Proposal, overrides: Optional[dict[Any, str]]
     ) -> tuple:
         refs = [dict(ref) for ref in proposal.evidence_refs]
         if overrides is None:
@@ -1238,7 +1247,7 @@ class MemoryWritePipeline:
             f"unknown evidence ref type {rtype!r}: use 'episode', 'wal', or 'l0'"
         )
 
-    def _ground_ref(self, ref: Dict[str, Any]) -> Dict[str, Any]:
+    def _ground_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
         """Step 5 for one ref. Mechanical: existence + quote substring match
         against the local journals where possible; episode UUIDs are
         format-only (their existence lives graph-side)."""
@@ -1376,7 +1385,7 @@ class MemoryWritePipeline:
     # -- deferred current-turn grounding ---------------------------------------
 
     @staticmethod
-    def _planned_note_ref(plan: Dict[str, Any]) -> str:
+    def _planned_note_ref(plan: dict[str, Any]) -> str:
         verdict = plan.get("verdict")
         if verdict == "ADD":
             return note_ref(plan["kind"], plan["topic_key"])
@@ -1388,11 +1397,11 @@ class MemoryWritePipeline:
         return note_ref(plan["target_kind"], plan["target_topic_key"])
 
     def _pending_records_for_plan(
-        self, plan: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+        self, plan: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         created_ts = round(time.time(), 3)
         target_ref = self._planned_note_ref(plan)
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
         for item in plan.get("deferred_grounding") or []:
             evidence_ref = dict(item.get("evidence_ref") or {})
             records.append({
@@ -1405,11 +1414,11 @@ class MemoryWritePipeline:
             })
         return records
 
-    def _read_pending_locked(self) -> List[Dict[str, Any]]:
+    def _read_pending_locked(self) -> list[dict[str, Any]]:
         path = self._pending_grounding_path
         if not path.exists() or path.stat().st_size == 0:
             return []
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as handle:
             for line_number, raw in enumerate(handle, start=1):
                 if not raw.strip():
@@ -1427,7 +1436,7 @@ class MemoryWritePipeline:
                 records.append(record)
         return records
 
-    def _rewrite_pending_locked(self, records: List[Dict[str, Any]]) -> None:
+    def _rewrite_pending_locked(self, records: list[dict[str, Any]]) -> None:
         path = self._pending_grounding_path
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
@@ -1452,14 +1461,14 @@ class MemoryWritePipeline:
                 pass
             raise
 
-    def _append_pending_records(self, records: List[Dict[str, Any]]) -> None:
+    def _append_pending_records(self, records: list[dict[str, Any]]) -> None:
         if not records:
             return
         with _pending_file_lock(self._pending_grounding_path):
             existing = self._read_pending_locked()
             self._rewrite_pending_locked(existing + records)
 
-    def _remove_pending_records(self, removed: List[Dict[str, Any]]) -> None:
+    def _remove_pending_records(self, removed: list[dict[str, Any]]) -> None:
         if not removed:
             return
         try:
@@ -1485,7 +1494,7 @@ class MemoryWritePipeline:
             raise NoteValidationError(f"invalid pending note ref {value!r}")
         return kind, topic_key
 
-    def _finish_deferred_success(self, entry: Dict[str, Any]) -> str:
+    def _finish_deferred_success(self, entry: dict[str, Any]) -> str:
         kind, topic_key = self._split_note_ref(entry.get("note_ref") or "")
         try:
             note = self._store.read(kind, topic_key)
@@ -1505,8 +1514,8 @@ class MemoryWritePipeline:
 
     def _finish_deferred_failure(
         self,
-        entry: Dict[str, Any],
-        other_pending: List[Dict[str, Any]],
+        entry: dict[str, Any],
+        other_pending: list[dict[str, Any]],
     ) -> str:
         kind, topic_key = self._split_note_ref(entry.get("note_ref") or "")
         try:
@@ -1537,7 +1546,7 @@ class MemoryWritePipeline:
         self._store.tombstone(kind, topic_key)
         return "tombstoned"
 
-    def sweep_pending_grounding(self) -> Dict[str, int]:
+    def sweep_pending_grounding(self) -> dict[str, int]:
         """Re-verify mature current-turn citations and compact the sidecar."""
         summary = {"checked": 0, "promoted": 0, "failed": 0, "pending": 0}
         path = self._pending_grounding_path
@@ -1557,7 +1566,7 @@ class MemoryWritePipeline:
                     summary["pending"] = len(entries)
                     return summary
 
-                kept: List[Dict[str, Any]] = []
+                kept: list[dict[str, Any]] = []
                 for index, original in enumerate(entries):
                     entry = dict(original)
                     try:
@@ -1652,13 +1661,13 @@ class MemoryWritePipeline:
 
     def _apply_write_gate(
         self,
-        plan: Dict[str, Any],
+        plan: dict[str, Any],
         *,
-        grounding: List[Dict[str, Any]],
+        grounding: list[dict[str, Any]],
         token: str,
         caller: str,
         proposal: _Proposal,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Evaluate the durable-write approval gate for a resolved plan.
 
         Returns None when the write should proceed; otherwise the tool
@@ -1751,7 +1760,7 @@ class MemoryWritePipeline:
         caller: str,
         check: str = "validation",
         reroute: str = "",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         self._ledger({
             "event": step,
             "result": "rejected",
@@ -1771,8 +1780,8 @@ class MemoryWritePipeline:
 # ---------------------------------------------------------------------------
 
 def apply_notes_plan(
-    plan: Dict[str, Any], *, store: Optional[NotesStore] = None
-) -> Dict[str, Any]:
+    plan: dict[str, Any], *, store: Optional[NotesStore] = None
+) -> dict[str, Any]:
     """Apply a fully-resolved notes write plan to the store.
 
     The plan is produced by :meth:`MemoryWritePipeline.confirm` AFTER scrub,
@@ -1816,8 +1825,8 @@ def apply_notes_plan(
 
 
 def dry_run_ground_ref(
-    ref: Dict[str, Any], *, hermes_home: Optional[Path] = None
-) -> Dict[str, Any]:
+    ref: dict[str, Any], *, hermes_home: Optional[Path] = None
+) -> dict[str, Any]:
     """Validate-only quote-grounding check (ADR-004 Phase 2 shadow metric).
 
     Runs exactly the mechanical §③-step-5 check a real admission would run
@@ -1834,7 +1843,7 @@ def dry_run_ground_ref(
     return pipeline._ground_ref(dict(ref or {}))
 
 
-def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
+def apply_notes_pending(payload: dict[str, Any]) -> dict[str, Any]:
     """Replay an approved staged notes write (write-approval pending store).
 
     Called by ``tools.memory_tool.apply_memory_pending`` when a pending
@@ -1843,7 +1852,7 @@ def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
     admission control at this point. Returns a store-style result dict.
     """
     pipeline = MemoryWritePipeline()
-    pending_records: List[Dict[str, Any]] = []
+    pending_records: list[dict[str, Any]] = []
     if payload.get("deferred_grounding"):
         pending_records = pipeline._pending_records_for_plan(payload)
         try:
@@ -1909,7 +1918,7 @@ def apply_notes_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def maybe_enqueue_note_backfill(
     manager: Any,
-    note: Dict[str, Any],
+    note: dict[str, Any],
     *,
     session_id: str = "",
 ) -> bool:

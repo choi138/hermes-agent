@@ -170,7 +170,7 @@ def test_unbuildable_private_transport_falls_back_to_the_existing_client(monkeyp
     from agent.auxiliary_client import _create_openai_client
 
     if failure == "returns_none":
-        builder = lambda *_a, **_k: None  # noqa: E731 - bad CA/proxy path inside the seam
+        builder = lambda *_a, **_k: None
     else:
         def builder(base_url, *, async_mode=False, verify=None):  # pre-private_transport signature
             return None

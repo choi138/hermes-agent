@@ -12,7 +12,7 @@ def test_default_discord_toolset_offers_runtime_control():
 
 
 def test_route_catalog_controls_switch_schema(monkeypatch):
-    monkeypatch.setattr("agent.runtime_control._route_catalog_pairs", lambda: [])
+    monkeypatch.setattr("agent.runtime_control._route_catalog_pairs", list)
     invalidate_check_fn_cache()
     assert registry.get_definitions({"model_switch"}) == []
 

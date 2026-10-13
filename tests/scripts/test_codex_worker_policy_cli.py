@@ -27,7 +27,7 @@ def run_cli(args, *extra):
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args, *extra],
         capture_output=True, text=True, timeout=20,
-    )
+    check=False)
 
 
 def test_legacy_pinned_effort_preserves_explicit_model_pin(cli_case):
@@ -196,7 +196,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     completed = subprocess.run(
         [sys.executable, str(bootstrap), str(ROOT), str(child), str(SCRIPT), *args],
         capture_output=True, text=True, timeout=20,
-    )
+    check=False)
     assert completed.returncode == 19, completed.stderr
     receipt = json.loads(completed.stdout)
     assert receipt["status"] == "cli_failed"

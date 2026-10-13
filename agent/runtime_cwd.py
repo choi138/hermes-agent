@@ -44,6 +44,16 @@ def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
 
+def scoped_session_cwd() -> str:
+    """Return the current session's declared cwd without local path validation.
+
+    Remote and container paths may not exist on the Hermes host. Callers that only need
+    logical workspace identity should preserve the declared value instead of resolving it.
+    """
+    value = _SESSION_CWD.get()
+    return "" if value is _UNSET else str(value).strip()
+
+
 def reset_session_cwd(token: Token) -> None:
     """Restore the logical cwd that was active before the matching ``set_session_cwd``."""
     _SESSION_CWD.reset(token)
@@ -76,18 +86,23 @@ def _existing_dir(raw: str, label: str) -> Path | None:
     return None
 
 
-def _resolve_configured_cwd(*, override_is_final: bool) -> Path | None:
+def _resolve_configured_cwd(
+    *, override_is_final: bool, include_session_override: bool = True,
+) -> Path | None:
     """Session override, then TERMINAL_CWD; each validated as a real directory.
 
     ``override_is_final``: a set-but-missing session override yields None
     instead of falling through to TERMINAL_CWD.
+    ``include_session_override``: skip a session cwd known to be a launch artifact
+    while still consulting the active profile's TERMINAL_CWD.
     """
-    override = _SESSION_CWD.get()
-    override = "" if override is _UNSET else str(override).strip()
-    if override:
-        p = _existing_dir(override, "configured working directory")
-        if p is not None or override_is_final:
-            return p
+    if include_session_override:
+        override = _SESSION_CWD.get()
+        override = "" if override is _UNSET else str(override).strip()
+        if override:
+            p = _existing_dir(override, "configured working directory")
+            if p is not None or override_is_final:
+                return p
     raw = scope_terminal_cwd().strip()
     return _existing_dir(raw, "TERMINAL_CWD") if raw else None
 
@@ -97,7 +112,7 @@ def resolve_agent_cwd() -> Path:
     return _resolve_configured_cwd(override_is_final=False) or Path(os.getcwd())
 
 
-def resolve_context_cwd(task_id: str | None = None) -> Path | PurePosixPath | None:
+def resolve_context_cwd(task_id: str | None = None, *, include_session_override: bool = True) -> Path | PurePosixPath | None:
     """Configured project cwd without testing a remote path on the controller.
 
     A missing explicit local path is also kept: it must not turn into the
@@ -105,8 +120,8 @@ def resolve_context_cwd(task_id: str | None = None) -> Path | PurePosixPath | No
     """
     from agent.prompt_backend import resolve_prompt_backend
 
-    backend = resolve_prompt_backend(task_id)
+    backend = resolve_prompt_backend(task_id, include_session_override=include_session_override)
     if backend.is_remote:
         return PurePosixPath(backend.cwd)
-    raw = _session_cwd_override() or scope_terminal_cwd().strip()
+    raw = (_session_cwd_override() if include_session_override else "") or scope_terminal_cwd().strip()
     return Path(raw).expanduser() if raw else None

@@ -34,7 +34,7 @@ _STATUS_DISPLAY = {
 }
 
 
-def _entry(label: str, path: Path, content: str, status: str) -> Dict[str, Any]:
+def _entry(label: str, path: Path, content: str, status: str) -> dict[str, Any]:
     return {
         "label": label, "path": str(path), "chars": len(content), "est_tokens": estimate_tokens_rough(content),
         "loaded": status in ("loaded", "truncated", "flagged"), "status": status,
@@ -59,9 +59,9 @@ def _loaded_status(content: str, rendered_len: int, max_chars: int, user_authore
 
 def list_context_file_sources(
     cwd: Optional[str] = None, context_length: Optional[int] = None, allow_install_tree_fallback: bool = False,
-    home_override: "Path | None" = None, skip_soul: bool = False,
+    home_override: Path | None = None, skip_soul: bool = False,
     task_id: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """One dict per context file Hermes considered, in the builder's priority order.
 
     Same signature semantics as ``build_context_files_prompt`` (``cwd=None`` → launch dir, install-tree guard
@@ -71,8 +71,8 @@ def list_context_file_sources(
     max_chars = _pb._get_context_file_max_chars(context_length)
     from agent.prompt_backend import BackendPath, read_backend, resolve_prompt_backend
 
-    def project_sources(cwd_path, suppressed: bool) -> List[Dict[str, Any]]:
-        sources: List[Dict[str, Any]] = []
+    def project_sources(cwd_path, suppressed: bool) -> list[dict[str, Any]]:
+        sources: list[dict[str, Any]] = []
         winner: Optional[str] = None
         for kind, label, path, content in _pb.discover_context_files(cwd_path):
             if not content:
@@ -109,7 +109,7 @@ def list_context_file_sources(
     return sources
 
 
-def context_file_sources_for_agent(agent: Any) -> List[Dict[str, Any]]:
+def context_file_sources_for_agent(agent: Any) -> list[dict[str, Any]]:
     """The manifest for a live agent, resolved exactly like ``agent.system_prompt._context_files_part``
     (session cwd, install-tree policy per platform, the agent's own profile home)."""
     if getattr(agent, "skip_context_files", False):
@@ -118,7 +118,7 @@ def context_file_sources_for_agent(agent: Any) -> List[Dict[str, Any]]:
     from agent.system_prompt import _agent_home
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
     task_id = getattr(agent, "session_id", None)
-    cwd = None if launch_artifact else resolve_context_cwd(task_id)
+    cwd = resolve_context_cwd(task_id, include_session_override=not launch_artifact)
     ctx_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     return list_context_file_sources(
         cwd=str(cwd) if cwd is not None else None, context_length=ctx_len if isinstance(ctx_len, int) else None,
@@ -127,7 +127,7 @@ def context_file_sources_for_agent(agent: Any) -> List[Dict[str, Any]]:
     )
 
 
-def render_context_file_lines(sources: List[Dict[str, Any]]) -> List[str]:
+def render_context_file_lines(sources: list[dict[str, Any]]) -> list[str]:
     """Plain-text ``Context files`` block for ``/context``; [] when nothing was found."""
     if not sources:
         return []
@@ -136,5 +136,5 @@ def render_context_file_lines(sources: List[Dict[str, Any]]) -> List[str]:
     for src in sources:
         glyph, note = _STATUS_DISPLAY.get(str(src.get("status") or ""), ("•", ""))
         suffix = f"  ({note})" if note else ""
-        lines.append(f"{glyph} {str(src.get('label') or ''):<{width}} ~{int(src.get('est_tokens') or 0):>9,} tokens{suffix}")
+        lines.append(f"{glyph} {src.get('label') or ''!s:<{width}} ~{int(src.get('est_tokens') or 0):>9,} tokens{suffix}")
     return lines

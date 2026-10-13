@@ -148,7 +148,7 @@ def test_worker_startup_and_reload_keep_profile_ssh_off_local_workspace(tmp_path
             "'config': cli.CLI_CONFIG['terminal']}))"
         )],
         cwd=workspace, env=env, text=True, capture_output=True,
-    )
+    check=False)
     assert result.returncode == 0, result.stderr
     state = json.loads(result.stdout.strip().splitlines()[-1])
     assert state["task"] == "t_contract"

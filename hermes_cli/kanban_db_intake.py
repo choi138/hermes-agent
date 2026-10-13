@@ -305,4 +305,4 @@ def retry_failed_task(
 
 
 # Facade bindings (including test patch seams) are resolved only after this module loads.
-from hermes_cli import kanban_db as _kb  # noqa: E402
+from hermes_cli import kanban_db as _kb

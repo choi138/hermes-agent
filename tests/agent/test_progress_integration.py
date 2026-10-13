@@ -33,7 +33,7 @@ def launch_args(lane):
 
 def test_actual_cli_registers_before_fast_worker(lane, tmp_path):
     import os
-    repo, artifacts, manifest, state = lane
+    _repo, _artifacts, manifest, state = lane
     binary = tmp_path / 'bin'
     binary.mkdir()
     fake = binary / 'codex'
@@ -53,7 +53,7 @@ print(json.dumps({'type':'item.completed','item':{'id':'first','type':'command_e
                              '--progress-code-scope', 'runner.py',
                              '--progress-code-scope', 'tests/test_pin.py'],
                             env=dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH']),
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15, check=False)
     assert result.returncode == 0, result.stderr
     outputs = [json.loads(line) for line in result.stdout.splitlines()]
     assert outputs[0]['status'] == 'progress_registered'
@@ -80,7 +80,7 @@ print(json.dumps({'type':'item.completed','item':{'id':'first','type':'command_e
     set_stage(manifest, 'stopped')
     boot = fixture['bootstrap'](tmp_path, fixture['GOOD'])
     delivered = subprocess.run([sys.executable, str(boot), *fixture['bridge_args'](p, manifest)],
-                               capture_output=True, text=True, timeout=15)
+                               capture_output=True, text=True, timeout=15, check=False)
     assert delivered.returncode == 0, delivered.stdout + delivered.stderr
     assert p.peek() is None
     assert json.loads(delivered.stdout.splitlines()[-1])['status'] == 'stopped_and_delivered'
@@ -164,7 +164,7 @@ def test_canonical_summary_requires_exact_command_identity_and_complete_summary(
 def test_progress_launch_dry_run_no_files(lane):
     repo, artifacts, manifest, state = lane
     before = {p: p.read_bytes() for p in repo.parent.rglob('*') if p.is_file()}
-    result = subprocess.run([sys.executable, *launch_args(lane), '--dry-run'], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([sys.executable, *launch_args(lane), '--dry-run'], capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0 and json.loads(result.stdout)['status'] == 'planned'
     assert before == {p: p.read_bytes() for p in repo.parent.rglob('*') if p.is_file()}
     assert not manifest.exists() and not state.exists() and list(artifacts.iterdir()) == []
@@ -173,7 +173,7 @@ def test_progress_launch_dry_run_no_files(lane):
 def test_known_manifest_and_short_first_event_visible_while_cli_running(lane, tmp_path):
     import os
     import time
-    repo, artifacts, manifest, state = lane
+    _repo, _artifacts, manifest, state = lane
     binary = tmp_path / 'bin'
     binary.mkdir()
     release = tmp_path / 'release'

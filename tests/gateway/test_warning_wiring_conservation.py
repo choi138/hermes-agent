@@ -2,12 +2,12 @@
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-from agent.status_output import StatusOutputMixin
-from agent.notification_presentation import notification_turn
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 from gateway.config import Platform
 from gateway.session import SessionSource
+from agent.status_output import StatusOutputMixin
+from agent.notification_presentation import notification_turn
 
 
 def test_actual_wiring_retains_observers_and_controls_across_muted_turn():

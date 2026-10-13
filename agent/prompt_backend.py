@@ -42,7 +42,7 @@ class PromptBackend:
         return bool(provider_flag(self.kind, "is_remote", True))
 
 
-def resolve_prompt_backend(task_id: str | None = None, cwd=None) -> PromptBackend:
+def resolve_prompt_backend(task_id: str | None = None, cwd=None, *, include_session_override: bool = True) -> PromptBackend:
     from agent.runtime_cwd import _session_cwd_override
     from gateway.session_context import get_session_env
     from tools import terminal_tool as tt
@@ -60,7 +60,7 @@ def resolve_prompt_backend(task_id: str | None = None, cwd=None) -> PromptBacken
             # A live session's transport owns the target, not ambient config.
             for key in ("host", "user", "port"):
                 config["ssh_" + key] = getattr(env, key, config.get("ssh_" + key))
-    selected_cwd = overrides.get("cwd") or _session_cwd_override() or config["cwd"]
+    selected_cwd = (overrides.get("cwd") or _session_cwd_override() if include_session_override else "") or config["cwd"]
     if tt._is_container_backend(config["env_type"]) and tt._is_unusable_container_cwd(selected_cwd):
         selected_cwd = "/workspace" if tt._resolve_task_host_cwd(config, task_id) else config["cwd"]
     selected_cwd = tt._resolve_command_cwd(

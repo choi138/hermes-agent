@@ -494,7 +494,7 @@ def _claim_race_runner(tmp_path, chat_id):
 async def test_resume_claim_rejects_route_replacement_or_suspension_at_authorization_boundary(
     tmp_path, replacement,
 ):
-    runner, adapter, source, session_key, _turn_id = _claim_race_runner(
+    runner, adapter, _source, session_key, _turn_id = _claim_race_runner(
         tmp_path / replacement, f"claim-{replacement}",
     )
     original_session_id = runner.session_store._entries[session_key].session_id
@@ -1413,7 +1413,7 @@ async def test_m1_replan_r1_restart_steer_effect_fixture(tmp_path, _m1_replan_ho
     from agent.prompt_builder import steer_user_row
 
     source = make_restart_source(chat_id="m1-r1-crash-fixture")
-    runner, _adapter, config = _m1_replan_runner(tmp_path / "runtime")
+    runner, _adapter, _config = _m1_replan_runner(tmp_path / "runtime")
     key, turn = _seed_retry_wait(runner.session_store, source)
     sid = runner.session_store._entries[key].session_id
     for row in [
@@ -1429,7 +1429,7 @@ async def test_m1_replan_r1_restart_steer_effect_fixture(tmp_path, _m1_replan_ho
     full = failed_turn_recovery({"failed": True, "failure_retryable": True,
         "failure_reason": "timeout", "messages": history, "current_turn_user_idx": 0})
     assert full["status"] == BLOCKED
-    restarted, adapter, _ = _m1_replan_runner(tmp_path / "runtime")
+    restarted, _adapter, _ = _m1_replan_runner(tmp_path / "runtime")
     calls = []
     async def spy(**kwargs):
         calls.append(kwargs)
@@ -1793,7 +1793,7 @@ async def test_m1_pi_cancel_write_quarantines_exact_attempt(
 def test_m1_pi_publication_requires_complete_identity(tmp_path, field):
     store = _store(tmp_path)
     source = make_restart_source(chat_id="publication-identity")
-    key, event = _m1_pi_claim_event(store, source, phase="executing")
+    key, _event = _m1_pi_claim_event(store, source, phase="executing")
     entry = store._entries[key]
     receipt = dict(entry.active_turn)
     evidence = store.load_turn_recovery_evidence(receipt)

@@ -156,7 +156,7 @@ async def test_authorization_is_rechecked_at_worker_dispatch(tmp_path, monkeypat
     )
     runner, adapter, _ = _m1_replan_runner(tmp_path / "runtime")
     source = make_restart_source(chat_id="auth-dispatch")
-    key, event = _m1_pi_claim_event(runner.session_store, source)
+    _key, event = _m1_pi_claim_event(runner.session_store, source)
     client = MagicMock()
     client.chat.completions.create.return_value = _provider_response("MUST NOT RUN")
     _m1_replan_patch_agent_runtime(monkeypatch, client)

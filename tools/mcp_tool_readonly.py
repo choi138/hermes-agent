@@ -276,7 +276,7 @@ class BoundReadOnlyMCPTool:
 
         return self._validate_live_server_binding()
 
-    def call(self, args: Dict[str, Any], *, deadline: float) -> Dict[str, Any]:
+    def call(self, args: dict[str, Any], *, deadline: float) -> dict[str, Any]:
         if isinstance(deadline, bool):
             raise RuntimeError("Read-only MCP capability deadline is invalid")
         try:
@@ -307,7 +307,7 @@ class BoundReadOnlyMCPTool:
             raise TimeoutError("Read-only MCP capability deadline expired")
         rpc_started = [False]
 
-        async def _call_exact_session() -> Dict[str, Any]:
+        async def _call_exact_session() -> dict[str, Any]:
             call_timeout = min(
                 self.max_timeout, deadline_value - time.monotonic()
             )
@@ -343,7 +343,7 @@ class BoundReadOnlyMCPTool:
                         raise TimeoutError("Read-only MCP capability deadline expired")
                     return serialized
 
-        async def _call_with_shutdown() -> Dict[str, Any]:
+        async def _call_with_shutdown() -> dict[str, Any]:
             rpc_task = asyncio.create_task(_call_exact_session())
 
             def _consume_result(done: asyncio.Task) -> None:
@@ -427,21 +427,21 @@ def _raw_yaml_document_is_unambiguous(raw_text: str) -> bool:
 
 def _load_raw_mcp_server_config(
     server_name: str, *, profile_home: str = ""
-) -> Dict[str, Any] | None:
+) -> dict[str, Any] | None:
     """Load one raw MCP server subtree without dotenv or config interpolation."""
     if not isinstance(server_name, str) or not server_name:
         return None
     import yaml
 
-    target_lines: List[str] = []
-    server_names: List[str] = []
+    target_lines: list[str] = []
+    server_names: list[str] = []
     root_seen = False
     in_servers = False
     server_indent: int | None = None
     capturing_target = False
     target_count = 0
     total_chars = 0
-    document_lines: List[str] = []
+    document_lines: list[str] = []
 
     try:
         from hermes_constants import get_config_path, get_hermes_home
@@ -886,10 +886,10 @@ def _bounded_read_only_json(value: Any, budget: list[int], depth: int = 0) -> An
     raise RuntimeError("Read-only MCP response is malformed")
 
 
-def _serialize_read_only_result(result: Any, max_response_chars: int) -> Dict[str, Any]:
+def _serialize_read_only_result(result: Any, max_response_chars: int) -> dict[str, Any]:
     if getattr(result, "isError", False):
         raise RuntimeError("Read-only MCP tool returned an error")
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     structured = getattr(result, "structuredContent", None)
     if structured is not None:
         payload["structuredContent"] = _bounded_read_only_json(

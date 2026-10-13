@@ -92,7 +92,7 @@ class _CodexRealClient:
         self.closed = threading.Event()
         _install_socket_shutdown_path(self, stream)
 
-    def copy(self, **_kwargs: Any) -> "_CodexRealClient":
+    def copy(self, **_kwargs: Any) -> _CodexRealClient:
         return _CodexRealClient(self.stream)
 
     def close(self) -> None:
@@ -107,7 +107,7 @@ class _AnthropicStreamContext:
     def __enter__(self) -> _BlockingStream:
         return self.stream
 
-    def __exit__(self, *_args: Any) -> None:
+    def __exit__(self, *_args: object) -> None:
         self.stream.close()
 
 
@@ -172,7 +172,7 @@ def _cancel_silent_request(
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
     # Thread start-up on a loaded CI runner can exceed 1 s; the bound is only "eventually entered the transport".
-    assert started.wait(timeout=5), "request never entered its silent transport"
+    assert started.wait(timeout=5), f"request never entered its silent transport: {result!r}"
     cancelled_at = time.monotonic()
     cancel_event.set()
     worker.join(timeout=5)
@@ -277,7 +277,7 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
             self.responses = _SharedResponses(self)
             _install_socket_shutdown_path(self, owner_stream)
 
-        def copy(self, **_kwargs: Any) -> "_SharedRealClient":
+        def copy(self, **_kwargs: Any) -> _SharedRealClient:
             return _SharedRealClient()
 
         def close(self) -> None:
@@ -388,7 +388,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
             self.closed = threading.Event()
             _install_socket_shutdown_path(self, stream)
 
-        def copy(self, **_kwargs: Any) -> "_RealClient":
+        def copy(self, **_kwargs: Any) -> _RealClient:
             copied = _RealClient()
             attempts.append(copied)
             return copied

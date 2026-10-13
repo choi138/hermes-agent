@@ -1,6 +1,8 @@
 """Real completion ledger -> gateway injection -> turn fencing -> durable marker."""
 from types import SimpleNamespace
 
+import asyncio
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform
@@ -97,8 +99,8 @@ print(json.dumps({'turn_id':result['turn_id'], 'session_key':entry.session_key})
     identities = []
     for home in homes:
         env = {**os.environ, 'HERMES_HOME': str(home), 'REPORT_TEST_STATE': state}
-        completed = subprocess.run([sys.executable, '-c', child], cwd=Path(__file__).resolve().parents[2],
-            env=env, text=True, capture_output=True, timeout=45)
+        completed = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', child], cwd=Path(__file__).resolve().parents[2],
+            env=env, text=True, capture_output=True, timeout=45, check=False)
         assert completed.returncode == 0, completed.stderr
         identities.append(json.loads(completed.stdout.splitlines()[-1]))
     for index in [0, 1, 0]:
@@ -606,7 +608,7 @@ async def send(*args,**kwargs):
 runner.transport.send=send
 asyncio.run(reconcile(runner))
 """
-    subprocess.run([sys.executable,'-c',consumer,str(restarted_effect)],env=os.environ.copy(),check=True,timeout=20)
+    await asyncio.to_thread(subprocess.run, [sys.executable,'-c',consumer,str(restarted_effect)],env=os.environ.copy(),check=True,timeout=20)
     assert not restarted_effect.exists()
     assert len(calls) == 1
     if crash_point == 'after_receipt':
