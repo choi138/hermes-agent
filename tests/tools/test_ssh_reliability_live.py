@@ -12,7 +12,11 @@ from tools.environments.ssh_process import launch_command
 
 
 @pytest.fixture
-def ssh_server(tmp_path):
+def ssh_server(tmp_path, monkeypatch):
+    # Configuration identity probes must use the same isolated config as execution.
+    target_flags = SSHEnvironment._target_flags
+    monkeypatch.setattr(SSHEnvironment, '_target_flags',
+                        lambda self, flag: ['-F', '/dev/null', *target_flags(self, flag)])
     sshd = shutil.which('sshd') or '/usr/sbin/sshd'
     if not shutil.which('ssh-keygen') or not __import__('os').path.exists(sshd):
         pytest.skip('OpenSSH server required')
@@ -246,6 +250,8 @@ from tools.process_registry import ProcessRegistry
 from tools import process_registry_followups as ledger
 from gateway.session_context import set_session_vars
 original = SSHEnvironment._build_ssh_command
+target_flags = SSHEnvironment._target_flags
+SSHEnvironment._target_flags = lambda self, flag: ['-F', '/dev/null', *target_flags(self, flag)]
 def isolated(self, extra_args=None, send_env=()):
     return original(self, ['-F', '/dev/null', '-o', 'UserKnownHostsFile=/dev/null',
                           '-o', 'StrictHostKeyChecking=no', *(extra_args or [])], send_env)
