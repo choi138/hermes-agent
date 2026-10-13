@@ -5,8 +5,6 @@ import socket
 import subprocess
 import time
 
-import asyncio
-
 import pytest
 
 from tools.environments.ssh import SSHEnvironment

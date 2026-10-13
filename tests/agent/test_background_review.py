@@ -4,11 +4,32 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
 
 _REAL_THREAD = threading.Thread
+
+
+@pytest.fixture(autouse=True)
+def _isolated_review_coordinator(monkeypatch, request):
+    """A captured worker must not leave singleton queue state for the next test."""
+    import agent.background_review as review_module
+    import agent.background_review_coordinator as coordinator_module
+
+    # Bounded concurrency tests measure acknowledgement/cleanup, not locale parsing.
+    # Summary-format tests retain the real translator.
+    if request.node.name.startswith("test_live_turn_") or (
+        request.node.name == "test_next_review_waits_for_prior_cleanup"
+    ):
+        monkeypatch.setattr(review_module, "t", lambda key, **kwargs: key)
+    monkeypatch.setattr(
+        coordinator_module,
+        "_COORDINATOR",
+        coordinator_module.BackgroundReviewCoordinator(),
+    )
 
 
 class _TurnBoundaryReached(Exception):

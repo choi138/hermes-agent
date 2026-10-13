@@ -176,7 +176,7 @@ def test_timeout_reaps_owned_child_and_sigterm_cancels_cli(inputs, tmp_path):
         os.kill(pid, 0)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_repeated_cleanup_of_reaped_leaders_and_stubborn_children(inputs, tmp_path):
     import psutil
 
