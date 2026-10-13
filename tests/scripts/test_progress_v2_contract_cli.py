@@ -245,11 +245,14 @@ def test_validation_cli_with_real_canonical_gate_log(tmp_path):
     repo = p.manifest.worktree
     (repo / 'scripts').mkdir()
     (repo / 'tests').mkdir()
-    # Match the outer requested interpreter; run_tests.sh otherwise prefers a
-    # machine-wide shared venv ahead of HERMES_PYTHON in this temporary repo.
+    # Keep the temporary checkout on the outer requested interpreter and copy
+    # the real runner's shell activation dependency alongside its Python runner.
     (repo / '.venv').symlink_to(sys.prefix, target_is_directory=True)
-    for name in ('run_tests.sh', 'run_tests_parallel.py'):
+    for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
         shutil.copyfile(ROOT / 'scripts' / name, repo / 'scripts' / name)
+    (repo / 'scripts/ci').mkdir()
+    shutil.copyfile(ROOT / 'scripts/ci/list_os_marked_tests.py',
+                    repo / 'scripts/ci/list_os_marked_tests.py')
     (repo / 'tests/test_gate.py').write_text('def test_gate():\n    assert 1 + 1 == 2\n')
     manifest = tmp_path / 'manifest.json'
     _atomic(manifest, {k: str(v) if isinstance(v, Path) else v for k, v in vars(p.manifest).items()})
