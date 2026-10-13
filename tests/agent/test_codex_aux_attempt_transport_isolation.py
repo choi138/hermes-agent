@@ -21,7 +21,8 @@ def _prepare_local_provider_helpers():
     import importlib
 
     for name in ("agent.codex_runtime", "agent.codex_responses_adapter",
-                 "agent.auxiliary_codex_response", "agent.agent_runtime_helpers"):
+                 "agent.auxiliary_codex_response", "agent.agent_runtime_helpers",
+                 "openai.resources.responses"):
         importlib.import_module(name)
 
 

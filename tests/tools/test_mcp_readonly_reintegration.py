@@ -2,6 +2,7 @@
 
 import asyncio
 import http.server
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -151,6 +152,8 @@ def test_hidden_cached_and_adopted_registrations(tmp_path, monkeypatch):
     home_a.mkdir()
     home_b.mkdir()
     bound, server, config, token_a, scope_a = _bind(home_a, monkeypatch)
+    owner_identity = registration._adopter_identity_digest(server.name, config)
+    assert owner_identity is not None
     token_b = None
     scope_b = None
     try:
@@ -158,6 +161,10 @@ def test_hidden_cached_and_adopted_registrations(tmp_path, monkeypatch):
         token_b = set_hermes_home_override(home_b)
         scope_b = mcp_tool._mcp_registry_scope()
         assert scope_a != scope_b
+        # A synthetic live server has no transport identity receipt yet: the
+        # official cross-profile guard must refuse it even with identical YAML.
+        assert registration._register_connected_into_current_scope({server.name: config}) == 0
+        server._resolved_identity = owner_identity
         assert registration._register_connected_into_current_scope({server.name: config}) == 1
         assert not registry.get_definitions(set(server._registered_tool_names))
         adopted = readonly.bind_read_only_mcp_tool(
@@ -241,6 +248,25 @@ def test_raw_config_rejects_duplicate_and_unsafe_url(tmp_path):
         reset_hermes_home_override(token)
 
 
+@pytest.mark.parametrize("document", [
+    "settings: {enabled: true, enabled: false}\n",
+    "settings: {enabled: true, 'enabled': false}\n",
+    "? [complex, key]\n: value\n",
+    "settings: &recursive [*recursive]\n",
+    "settings: " + "[" * 66 + "value" + "]" * 66 + "\n",
+    "settings: [" + ",".join(["value"] * 10_001) + "]\n",
+    "settings: [unterminated\n",
+], ids=["duplicate", "quoted-duplicate", "complex-key", "cycle", "depth", "budget", "malformed"])
+def test_raw_yaml_parser_rejects_ambiguous_or_unbounded_documents(document):
+    assert not readonly._raw_yaml_document_is_unambiguous(document)
+
+
+def test_raw_yaml_parser_accepts_repeated_nonrecursive_aliases():
+    assert readonly._raw_yaml_document_is_unambiguous(
+        "defaults: &defaults {enabled: true}\nsettings: [*defaults, *defaults]\n"
+    )
+
+
 def test_http_redirect_policy_blocks_second_request(monkeypatch):
     hits = []
 
@@ -321,7 +347,10 @@ def test_streamable_http_client_does_not_follow_redirect(monkeypatch):
 def test_external_graphiti_provider_loads_with_safe_raw_config(tmp_path, monkeypatch):
     from plugins import memory
 
-    plugin_parent = Path(__file__).resolve().parents[3] / "hermes-external-plugins-20260923"
+    plugin_parent = Path(os.environ.get(
+        "HERMES_TEST_EXTERNAL_PLUGINS_DIR",
+        str(Path(__file__).resolve().parents[3] / "hermes-external-plugins-20260923"),
+    ))
     assert (plugin_parent / "graphiti_canonical" / "plugin.yaml").is_file()
     monkeypatch.setattr(memory, "_get_user_plugins_dir", lambda: plugin_parent)
     home = tmp_path / "profile"

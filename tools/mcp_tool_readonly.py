@@ -387,12 +387,13 @@ def _empty_yaml_mapping_value(rest: str) -> bool:
 
 
 def _raw_yaml_document_is_unambiguous(raw_text: str) -> bool:
-    import yaml
-    from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+    from ruamel.yaml import YAML
+    from ruamel.yaml.error import YAMLError
+    from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
     try:
-        root = yaml.compose(raw_text, Loader=yaml.BaseLoader)
-    except yaml.YAMLError:
+        root = YAML(typ="base", pure=True).compose(raw_text)
+    except YAMLError:
         return False
     if root is None:
         return False
@@ -431,7 +432,7 @@ def _load_raw_mcp_server_config(
     """Load one raw MCP server subtree without dotenv or config interpolation."""
     if not isinstance(server_name, str) or not server_name:
         return None
-    import yaml
+    import hermes_yaml as yaml
 
     target_lines: list[str] = []
     server_names: list[str] = []
