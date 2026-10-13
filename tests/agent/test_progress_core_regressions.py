@@ -177,8 +177,11 @@ def install_runner(repo):
     source = Path(__file__).resolve().parents[2]
     (repo / "scripts").mkdir(exist_ok=True)
     (repo / "tests").mkdir(exist_ok=True)
-    for name in ("run_tests.sh", "run_tests_parallel.py"):
+    for name in ("run_tests.sh", "run_tests_parallel.py", "_activation.sh"):
         shutil.copyfile(source / "scripts" / name, repo / "scripts" / name)
+    (repo / "scripts/ci").mkdir(exist_ok=True)
+    shutil.copyfile(source / "scripts/ci/list_os_marked_tests.py",
+                    repo / "scripts/ci/list_os_marked_tests.py")
     (repo / "tests/test_fixture.py").write_text(
         "import pytest\ndef test_good():\n    pass\n"
         "@pytest.mark.skip(reason='fixture')\ndef test_skip():\n    pass\n")
