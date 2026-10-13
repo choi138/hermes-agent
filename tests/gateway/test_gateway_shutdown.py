@@ -159,10 +159,17 @@ async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
 @pytest.mark.asyncio
 async def test_unexpected_signal_starts_teardown_after_bounded_interrupt_grace():
     runner, adapter = make_restart_runner()
+    # The object.__new__ fixture has no hosted worker, persisted session, or tool
+    # processes. Keep their I/O outside the interrupt-grace timing assertion.
+    runner._stop_hosted_room_worker = AsyncMock(return_value=True)
+    runner._notify_active_sessions_of_shutdown = AsyncMock()
+    runner._async_session_store = AsyncMock()
+    runner._finalize_shutdown_agents = AsyncMock()
     runner._restart_drain_timeout = 0.0
     runner._signal_initiated_shutdown = True
     runner._signal_interrupt_grace_timeout = 0.01
-    runner._running_agents = {"session": MagicMock()}
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
 
     disconnect_started = asyncio.Event()
 
@@ -173,12 +180,16 @@ async def test_unexpected_signal_starts_teardown_after_bounded_interrupt_grace()
 
     with patch("gateway.status.remove_pid_file"), patch(
         "gateway.status.publish_runtime_status"
+    ), patch.object(
+        gateway_run.GatewayRunner, "_stop_kill_tool_subprocesses_off_loop",
+        new=AsyncMock(return_value=[]),
     ):
         stop_task = asyncio.create_task(runner.stop())
         await asyncio.wait_for(disconnect_started.wait(), timeout=2.0)
         await stop_task
 
     assert runner._shutdown_event.is_set() is True
+    running_agent.interrupt.assert_called()
 
 
 @pytest.mark.parametrize(

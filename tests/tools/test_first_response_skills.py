@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]

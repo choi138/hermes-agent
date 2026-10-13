@@ -1194,6 +1194,12 @@ class _CodexStreamGuard:
         self, client: Any, total_timeout: Optional[float],
         no_progress_timeout: Optional[float] = None, *, owns_client: bool = True,
     ):
+        # Socket wakeups must never perform a first module import while holding
+        # finish/cancellation arbitration on the watchdog thread.
+        from agent.agent_runtime_helpers import _shutdown_socket, force_close_tcp_sockets
+
+        self._shutdown_socket = _shutdown_socket
+        self._force_close_tcp_sockets = force_close_tcp_sockets
         self._client = client
         # False when the attempt runs on a caller-owned/shared client (no Hermes private-transport
         # factory). Then neither the watchdog nor the owner may shut down or close that client —
@@ -1284,8 +1290,7 @@ class _CodexStreamGuard:
         if threading.get_ident() != self._owner_tid:
             sock = _attempt_stream_socket(stream)
             if sock is not None:
-                from agent.agent_runtime_helpers import _shutdown_socket
-                _shutdown_socket(sock)
+                self._shutdown_socket(sock)
                 return
         _close_quietly(stream, failure_note)
 
@@ -1325,8 +1330,7 @@ class _CodexStreamGuard:
             try:
                 # Hold finish arbitration through shutdown: the owner cannot close and
                 # recycle an FD while this timer is still about to touch its socket.
-                from agent.agent_runtime_helpers import force_close_tcp_sockets
-                shutdown_count = force_close_tcp_sockets(self._client)
+                shutdown_count = self._force_close_tcp_sockets(self._client)
                 logger.info("Codex auxiliary attempt aborted (timeout=%s, tcp_shutdown=%d)",
                             timeout_won, shutdown_count)
             except Exception:
@@ -1616,16 +1620,28 @@ class _CodexCompletionsAdapter:
         issuer_kind = resp_kwargs.pop("_issuer_kind", None)
         issuer_model = str(resp_kwargs.get("model") or model)
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+        # Local module loading is preparation, not provider silence. Complete it
+        # before the watchdog starts and before allocating an owned attempt client.
+        from agent.codex_runtime import _consume_codex_event_stream
+        from agent.sdk_transform_bypass import bypass_sdk_request_transform
+        from agent.auxiliary_codex_response import _parse_codex_final_response
+
         attempt_client = self._attempt_client()
+        try:
+            # The SDK resolves Responses lazily; that resource initialization and
+            # wire preparation also precede the provider's no-progress clock.
+            create_response = attempt_client.responses.create
+            stream_kwargs = bypass_sdk_request_transform({**resp_kwargs, "stream": True})
+        except BaseException:
+            if attempt_client is not self._client:
+                _close_quietly(attempt_client, "attempt client close after preparation failure failed")
+            raise
         guard = _CodexStreamGuard(attempt_client, total_timeout, no_progress_timeout=kwargs.get("no_progress_timeout"),
                                   owns_client=attempt_client is not self._client)
         try:
             guard.start()
-            from agent.codex_runtime import _consume_codex_event_stream
-            from agent.sdk_transform_bypass import bypass_sdk_request_transform
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
-            stream_kwargs = bypass_sdk_request_transform({**resp_kwargs, "stream": True})
-            event_stream = attempt_client.responses.create(**stream_kwargs)
+            event_stream = create_response(**stream_kwargs)
             guard.attach_stream(event_stream)
             try:
                 # A watchdog may have expired while responses.create() was blocked. The
@@ -1644,8 +1660,6 @@ class _CodexCompletionsAdapter:
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
             guard.check_cancelled()
-            from agent.auxiliary_codex_response import _parse_codex_final_response
-
             text_parts, tool_calls_raw, usage, finish_reason = _parse_codex_final_response(
                 final, issuer_kind=issuer_kind, issuer_model=issuer_model,
             )

@@ -2097,7 +2097,6 @@ def test_m1_pi_version_type_never_coerces_into_v1(tmp_path, version):
 async def test_m1_r1_compaction_evidence_publication(tmp_path, monkeypatch, _m1_replan_home, mode):
     """Exercise real publication and settlement; summary generation is outside this test cut."""
     import copy
-    import time
     from agent import conversation_compression as cc
     from gateway.session import AsyncSessionStore
     from gateway.run_turn import GatewayTurnMixin
@@ -2138,7 +2137,7 @@ async def test_m1_r1_compaction_evidence_publication(tmp_path, monkeypatch, _m1_
         lease=SimpleNamespace(holder=None, watermark=None, ttl=60),
         new_system_prompt="sys", system_message="sys", compressed_user_turn_outcome="none",
         messages_before_compression=copy.deepcopy(rows), made_progress=True,
-        attempt=cc._Attempt(snapshot={}, generation=0, started_at=time.monotonic()),
+        attempt=cc._begin_compression_attempt(agent, force=True, defer_notification=False),
     )
     assert outcome.session_commit_succeeded, outcome.split_status
     assert outcome.compacted_in_place is (mode != "rotated")

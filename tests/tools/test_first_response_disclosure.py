@@ -7,7 +7,7 @@ import socket
 from pathlib import Path
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from tools import tool_search as ts
 

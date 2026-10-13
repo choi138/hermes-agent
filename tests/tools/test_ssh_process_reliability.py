@@ -10,6 +10,23 @@ from tools.environments.ssh import SSHEnvironment
 from tools.environments.ssh_process import launch_command, observe
 
 
+@pytest.fixture(autouse=True)
+def isolated_openssh_configuration(monkeypatch, tmp_path):
+    """Protocol fixtures must resolve their own target, independent of host SSH config."""
+    from tools.environments import ssh
+    config = tmp_path / 'ssh-config'
+    config.write_text('Host *\n  CanonicalizeHostname no\n')
+    config.chmod(0o600)
+    capture = ssh.run_capture
+
+    def resolve_isolated(command, **kwargs):
+        if command[:2] == ['ssh', '-G']:
+            command = ['ssh', '-F', str(config), *command[1:]]
+        return capture(command, **kwargs)
+
+    monkeypatch.setattr(ssh, 'run_capture', resolve_isolated)
+
+
 class ShellTransport:
     host, user, port = 'isolated', 'test', 22
 

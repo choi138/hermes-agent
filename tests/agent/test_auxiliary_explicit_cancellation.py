@@ -13,6 +13,17 @@ import pytest
 from agent import auxiliary_client as aux
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _prepare_local_provider_helpers():
+    """Measure cancellation of the synthetic transport after local module preparation."""
+    import importlib
+
+    for name in ("agent.auxiliary_wire", "agent.codex_runtime", "agent.codex_responses_adapter",
+                 "agent.auxiliary_stream_watchdog", "agent.chat_completion_helpers",
+                 "agent.agent_runtime_helpers"):
+        importlib.import_module(name)
+
+
 class _BlockingStream:
     def __init__(self, started: threading.Event) -> None:
         self.started = started

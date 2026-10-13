@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import yaml
+import hermes_yaml as yaml
 
 from agent.redact import redact_sensitive_text
 from utils import atomic_replace

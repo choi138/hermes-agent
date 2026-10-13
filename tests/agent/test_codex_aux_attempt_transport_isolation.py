@@ -15,6 +15,16 @@ from openai import OpenAI
 from agent.auxiliary_client import _CodexCompletionsAdapter
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _prepare_local_provider_helpers():
+    """Prepare local modules before timing synthetic concurrent provider requests."""
+    import importlib
+
+    for name in ("agent.codex_runtime", "agent.codex_responses_adapter",
+                 "agent.auxiliary_codex_response", "agent.agent_runtime_helpers"):
+        importlib.import_module(name)
+
+
 def _hermes_cached(**kwargs) -> OpenAI:
     """Stand-in for a Hermes-built shared client: carries the private-transport factory that
     ``_create_openai_client`` installs, resolved at call time so tests can patch the builder."""
