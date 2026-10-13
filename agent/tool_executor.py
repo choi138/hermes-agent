@@ -706,7 +706,11 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
-    block_message, block_error_type = scope_block, "tool_scope_block"
+    from tools.process_registry_followups import verification_tool_block
+
+    policy_block = verification_tool_block(ref.name, ref.args)
+    block_message = scope_block or policy_block
+    block_error_type = "tool_scope_block" if scope_block else "verification_read_only"
     if block_message is None:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)
@@ -727,8 +731,10 @@ def _dispatch_authorized_once(
             }
             block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
 
-    from tools.process_registry_followups import verification_tool_block
-    block_message = block_message or verification_tool_block(ref.name, ref.args)
+    policy_block = verification_tool_block(ref.name, ref.args)
+    if block_body is None and policy_block:
+        block_body = {"error": policy_block}
+        block_error_type = "verification_read_only"
     guardrail_decision = None
     if block_body is None:
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
@@ -778,15 +784,23 @@ def _run_agent_tool_execution_middleware(
     trace = middleware_trace if middleware_trace is not None else []
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
     from tools.process_registry_followups import verification_tool_block
-    policy_block = verification_tool_block(function_name, function_args)
-    if policy_block:
-        # Before Relay/plugins as well as after rewrites at actual dispatch.
+    def _verification_block(args: dict) -> str | None:
+        policy_block = verification_tool_block(function_name, args)
+        if policy_block is None:
+            return None
         if begin_execution is not None:
             begin_execution()
         state.blocked = True
-        state.result = _blocked_tool_result(agent,
-            _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, trace),
-            block_message=policy_block, block_error_type="verification_read_only", guardrail_decision=None)
+        state.args = args
+        return _blocked_tool_result(
+            agent, _ToolCallRef(function_name, args, effective_task_id, tool_call_id, trace),
+            block_body={"error": policy_block}, block_error_type="verification_read_only", guardrail_decision=None,
+        )
+
+    # Reject effects before Relay or plugins; recheck each rewritten boundary.
+    policy_result = _verification_block(function_args)
+    if policy_result is not None:
+        state.result = policy_result
         return state
     dispatch_lock = threading.Lock()
 
@@ -812,6 +826,9 @@ def _run_agent_tool_execution_middleware(
     _authorized_dispatch = bind_prepared_dispatch(_authorized_dispatch)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
+        policy_result = _verification_block(relay_args)
+        if policy_result is not None:
+            return policy_result
         request_result = apply_tool_request_middleware(
             function_name,
             relay_args,

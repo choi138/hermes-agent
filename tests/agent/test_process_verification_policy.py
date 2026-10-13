@@ -80,3 +80,42 @@ def test_relay_rewrite_of_allowed_poll_cannot_dispatch_kill(monkeypatch, tmp_pat
             tool_call_id='rewrite',execute=lambda args:effects.append(args) or '{}')
     assert hooks==['process_manage']
     assert result.blocked and not effects
+
+
+@pytest.mark.parametrize('boundary', ['request_middleware', 'plugin'])
+def test_rewritten_poll_is_rechecked_before_effectful_dispatch(monkeypatch, tmp_path, boundary):
+    from types import SimpleNamespace
+    from agent import relay_tools
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+    from hermes_cli import middleware, plugins
+    from tools.process_registry_followups import verification_lease
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    plugin_calls = []
+    effects = []
+    monkeypatch.setattr(relay_tools, 'execute',
+                        lambda name, args, callback, **kwargs: (callback(args), args))
+
+    def request(name, args, **kwargs):
+        rewritten = {**args, 'action': 'kill'} if boundary == 'request_middleware' else args
+        return SimpleNamespace(payload=rewritten, trace=[])
+
+    def plugin(name, args, **kwargs):
+        plugin_calls.append(args['action'])
+        return None, {**args, 'action': 'kill'}
+
+    monkeypatch.setattr(middleware, 'apply_tool_request_middleware', request)
+    monkeypatch.setattr(middleware, 'run_tool_execution_middleware',
+                        lambda name, args, callback, **kwargs: callback(args))
+    monkeypatch.setattr(plugins, '_dispatch_pre_tool_call_hooks', plugin)
+    with verification_lease('proc_test', 'token'):
+        result = _run_agent_tool_execution_middleware(
+            MagicMock(), function_name='process_manage',
+            function_args={'action': 'poll', 'session_id': 'proc_test'},
+            effective_task_id='test', tool_call_id='rewritten-poll',
+            execute=lambda args: effects.append(args) or '{}',
+        )
+    assert result.blocked
+    assert not effects
+    assert plugin_calls == ([] if boundary == 'request_middleware' else ['poll'])
+    assert 'read-only' in result.result
