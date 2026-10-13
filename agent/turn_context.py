@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block, strip_graphiti_lookup_status_blocks
+from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
 from agent.skills_index_delta import stage_skills_index_note
@@ -983,8 +983,6 @@ def _memory_turn_start_and_prefetch(
             ext_prefetch_cache = agent._memory_manager.prefetch_all(
                 _query, session_id=agent.session_id, **_author_name_kwargs(_author),
             ) or ""
-    if ext_prefetch_cache:
-        ext_prefetch_cache = strip_graphiti_lookup_status_blocks(ext_prefetch_cache)
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:

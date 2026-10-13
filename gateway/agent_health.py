@@ -132,21 +132,6 @@ _API_RETRIES_RE = re.compile(
     r"API call failed after (?P<retries>\d+) retries\.",
     re.IGNORECASE,
 )
-_GRAPHITI_NAME_RE = re.compile(
-    r"MCP server ['\"](?P<name>[^'\"]*graphiti[^'\"]*)['\"]",
-    re.IGNORECASE,
-)
-_MCP_PARKED_RE = re.compile(
-    r"\bparking\b"
-    r"|state:\s*[a-z]+\s*(?:->|=>|→|➜)\s*parked",
-    re.IGNORECASE,
-)
-_MCP_RECOVERED_RE = re.compile(
-    r"state:\s*parked\s*(?:->|=>|→|➜)\s*connected",
-    re.IGNORECASE,
-)
-_MCP_REVIVAL_RE = re.compile(r"\breviv(?:e|ed|es|ing|al|als)\b", re.IGNORECASE)
-
 # ---------------------------------------------------------------------------
 # Structured failover suffix
 # ---------------------------------------------------------------------------
@@ -258,41 +243,6 @@ def classify_log_record(logger_name: str, message: str) -> Optional[HealthEvent]
             )
         return None
 
-    if logger_name == "tools.mcp_tool":
-        graphiti = _GRAPHITI_NAME_RE.search(message)
-        if not graphiti:
-            return None
-        resource = graphiti.group("name")
-        # A concrete parked -> connected transition is stronger evidence than
-        # the generic revival wording used in surrounding log text.  Classify
-        # it first so messages such as "revived ... (state: parked → connected)"
-        # are reported as recovery, while revival chatter without a transition
-        # remains suppressed below.
-        if _MCP_RECOVERED_RE.search(message):
-            return HealthEvent(
-                rule="C4.graphiti_recovered",
-                category="C",
-                title="Graphiti 메모리 백엔드 복구",
-                reason=f"MCP 서버 {resource}가 parked 상태에서 connected로 복구했습니다.",
-                action="추가 조치가 필요하지 않은지 최근 메모리 호출을 확인하세요.",
-                resource=resource,
-                details=(message[:1800],),
-                mention=True,
-            )
-        if _MCP_REVIVAL_RE.search(message):
-            return None
-        if _MCP_PARKED_RE.search(message):
-            return HealthEvent(
-                rule="C4.graphiti_parked",
-                category="C",
-                title="Graphiti 메모리 백엔드 parked",
-                reason=f"MCP 서버 {resource} 연결이 parked 상태로 전이했습니다.",
-                action="컨테이너와 MCP 세션 상태를 확인하세요. 복구 전이도 별도로 알립니다.",
-                resource=resource,
-                details=(message[:1800],),
-                mention=True,
-            )
-        return None
 
     return None
 

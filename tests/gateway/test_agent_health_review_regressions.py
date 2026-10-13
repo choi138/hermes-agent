@@ -168,26 +168,6 @@ def test_stream_stale_classifier_matches_real_emitter_shape_with_optional_prefix
     assert event.rule == "C3.stream_stale"
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        (
-            "MCP server 'graphiti-memory' failed initial connection after "
-            "3 attempts, parking until a reconnect is requested: unavailable"
-        ),
-        (
-            "MCP server 'graphiti-memory' failed after 5 reconnection attempts, "
-            "parking; will self-probe every 300s until it recovers: unavailable"
-        ),
-    ],
-)
-def test_graphiti_parked_classifier_matches_real_mcp_emitters(message):
-    event = classify_log_record("tools.mcp_tool", message)
-    assert event is not None
-    assert event.rule == "C4.graphiti_parked"
-    assert event.resource == "graphiti-memory"
-
-
 def test_handler_install_is_idempotent():
     logger = logging.Logger("health-handler-test")
     install_agent_health_log_handler(logger)

@@ -2,7 +2,6 @@
 
 import asyncio
 import http.server
-import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -342,29 +341,3 @@ def test_streamable_http_client_does_not_follow_redirect(monkeypatch):
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-
-
-def test_external_graphiti_provider_loads_with_safe_raw_config(tmp_path, monkeypatch):
-    from plugins import memory
-
-    plugin_parent = Path(os.environ.get(
-        "HERMES_TEST_EXTERNAL_PLUGINS_DIR",
-        str(Path(__file__).resolve().parents[3] / "hermes-external-plugins-20260923"),
-    ))
-    assert (plugin_parent / "graphiti_canonical" / "plugin.yaml").is_file()
-    monkeypatch.setattr(memory, "_get_user_plugins_dir", lambda: plugin_parent)
-    home = tmp_path / "profile"
-    home.mkdir()
-    config = _config()
-    config["tools"]["include"] = sorted({*TOOLS, "search_nodes", "search_episodes", "get_entity_edge"})
-    (home / "config.yaml").write_text(yaml.safe_dump({"mcp_servers": {"graphiti_canonical": config}}))
-    token = set_hermes_home_override(home)
-    try:
-        provider = memory.load_memory_provider("graphiti_canonical", register_skills=False)
-        assert provider is not None
-        assert provider.is_available()
-        config["follow_redirects"] = True
-        (home / "config.yaml").write_text(yaml.safe_dump({"mcp_servers": {"graphiti_canonical": config}}))
-        assert not provider.is_available()
-    finally:
-        reset_hermes_home_override(token)

@@ -25,23 +25,23 @@ def test_budget_applies_rule_session_cooldown():
 
 def test_budget_does_not_split_global_cooldown_by_resource():
     budget = AlertBudget(cooldown_seconds=900, hourly_cap=12)
-    canonical = HealthEvent(
-        rule="C4.graphiti_parked",
+    first_resource = HealthEvent(
+        rule="C3.stream_stale",
         category="C",
         title="test",
         reason="test",
-        resource="graphiti_canonical",
+        resource="provider-a",
     )
-    search = HealthEvent(
-        rule="C4.graphiti_parked",
+    second_resource = HealthEvent(
+        rule="C3.stream_stale",
         category="C",
         title="test",
         reason="test",
-        resource="graphiti_search",
+        resource="provider-b",
     )
 
-    assert budget.admit(canonical, now=0) is not None
-    assert budget.admit(search, now=1) is None
+    assert budget.admit(first_resource, now=0) is not None
+    assert budget.admit(second_resource, now=1) is None
 
 
 def test_budget_applies_global_hourly_cap():

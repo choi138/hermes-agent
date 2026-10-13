@@ -376,8 +376,7 @@ def _read_env_key(name: str) -> str:
 
 def _api_key() -> str:
     return (
-        _read_env_key("HERMES_GRAPHITI_EMBEDDER_API_KEY")
-        or _read_env_key("GOOGLE_API_KEY")
+        _read_env_key("GOOGLE_API_KEY")
         or _read_env_key("GEMINI_API_KEY")
     )
 
@@ -404,7 +403,7 @@ def _call_gemini(
     """
     key = _api_key()
     if not key:
-        raise RuntimeError("no Gemini API key resolved (HERMES_GRAPHITI_EMBEDDER_API_KEY/GOOGLE_API_KEY/GEMINI_API_KEY)")
+        raise RuntimeError("no Gemini API key resolved (GOOGLE_API_KEY/GEMINI_API_KEY)")
     payload: dict[str, Any] = {
         "contents": [{"parts": [{"text": user_prompt}]}],
         "generationConfig": {

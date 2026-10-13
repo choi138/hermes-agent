@@ -518,7 +518,7 @@ def test_incomplete_structured_normal_is_not_authoritative(payload):
 
 def test_missing_api_key_takes_fallback_path(monkeypatch, tmp_path):
     # No complete seam → real _call_gemini path; no key anywhere → fallback.
-    for name in ("HERMES_GRAPHITI_EMBEDDER_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
+    for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     called = []
     monkeypatch.setattr(mr_mod, "_urlopen", lambda *a, **k: called.append(1))
@@ -527,6 +527,16 @@ def test_missing_api_key_takes_fallback_path(monkeypatch, tmp_path):
     )
     assert called == []  # never reached the network seam
     assert detail["source"] == "fallback"
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ({"GOOGLE_API_KEY": "google", "GEMINI_API_KEY": "gemini"}, "google"),
+    ({"GEMINI_API_KEY": "gemini"}, "gemini"),
+    ({}, ""),
+])
+def test_classifier_key_selection_preserves_standard_provider_keys(monkeypatch, keys, expected):
+    monkeypatch.setattr(mr_mod, "_read_env_key", lambda name: keys.get(name, ""))
+    assert mr_mod._api_key() == expected
 
 
 def test_classifier_key_read_uses_cached_scope_aware_env_resolver(monkeypatch):

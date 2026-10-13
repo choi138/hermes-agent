@@ -416,65 +416,6 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._ends_at_block_boundary(text)
 
 
-_GRAPHITI_STATUS_MARKER = "# Graphiti Lookup Status"
-_GRAPHITI_STATUS_FIELD_NAMES = frozenset(
-    {"source", "routing_policy", "status", "candidate_count", "fallback_allowed", "note"}
-)
-
-
-def _graphiti_status_block_at(lines: list[str], index: int) -> tuple[int, dict[str, str]]:
-    fields: dict[str, str] = {}
-    cursor = index + 1
-    while cursor < len(lines):
-        stripped = lines[cursor].strip()
-        if not stripped or stripped.startswith("# "):
-            break
-        key, separator, value = stripped.partition(":")
-        normalized_key = key.strip()
-        # A malformed block must not cause only its valid-looking prefix to disappear.
-        if not separator or normalized_key not in _GRAPHITI_STATUS_FIELD_NAMES or normalized_key in fields:
-            return cursor, {}
-        fields[normalized_key] = value.strip()
-        cursor += 1
-    return cursor, fields
-
-
-def strip_graphiti_lookup_status_blocks(raw_context: str) -> str:
-    """Remove well-formed provider status metadata, never treating it as a permission signal."""
-    if not isinstance(raw_context, str) or not raw_context:
-        return ""
-    lines = raw_context.splitlines(keepends=True)
-    output: list[str] = []
-    index = 0
-    while index < len(lines):
-        if lines[index].rstrip("\r\n") != _GRAPHITI_STATUS_MARKER:
-            output.append(lines[index])
-            index += 1
-            continue
-        end, fields = _graphiti_status_block_at(lines, index)
-        valid_block = (
-            fields.get("source") == "graphiti_historical_memory"
-            and fields.get("routing_policy") in {"graphiti_first", "advisory"}
-            and fields.get("status") in {"ok", "ok_low_relevance", "empty", "filtered", "timeout", "error"}
-            and ("fallback_allowed" not in fields or fields["fallback_allowed"] in {"true", "false"})
-            and (
-                "candidate_count" not in fields
-                or (fields["candidate_count"].isascii() and fields["candidate_count"].isdecimal())
-            )
-        )
-        if not valid_block:
-            output.append(lines[index])
-            index += 1
-            continue
-        while output and not output[-1].strip():
-            output.pop()
-        index = end
-        while index < len(lines) and not lines[index].strip():
-            index += 1
-        if output and index == len(lines):
-            output[-1] = output[-1].rstrip("\r\n")
-    return "".join(output)
-
 # A markdown bullet: a marker, whitespace, then content. The whitespace matters — it is what keeps
 # ``**Preferences**`` (a bold heading) and ``*emphasis*`` out of the rule.
 _RECALL_BULLET_RE = re.compile(r"[-*+]\s+\S")

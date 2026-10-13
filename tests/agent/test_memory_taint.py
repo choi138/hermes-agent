@@ -259,7 +259,7 @@ class TestThresholdBoundary:
 
     def test_tiny_segment_fully_contained_in_corpus_is_tainted(self, registry):
         mt.record_injected_text(
-            SESSION, "graphiti 데몬 포트는 9876이다. neo4j는 7687.",
+            SESSION, "검색 데몬 포트는 9876이다. 저장소는 7687.",
             source="prefetch",
         )
         # A short verbatim echo: few shingles, but every one is borrowed —

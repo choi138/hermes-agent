@@ -41,8 +41,8 @@ Every durable *notes* write flows through here::
      7. backfill seam  notes create/update enqueue a typed episode backfill
         (source_name="hermes-notes", source_id=note_path) via the existing
         mem-sync path — config-gated OFF by default (see
-        notes_backfill_enabled) until the graphiti daemon pass-through
-        deploy.
+        notes_backfill_enabled) until the external backend supports the
+        typed-episode ingest fields.
 
 The *instruction* tier (MEMORY.md/USER.md via the ``memory`` tool + its
 skill-gate) and the *evidence* tier (per-turn graph ingest) keep their
@@ -234,11 +234,9 @@ def _memory_config() -> dict[str, Any]:
 def notes_backfill_enabled() -> bool:
     """Config gate for the §③ step-7 typed-episode backfill (default OFF).
 
-    The graphiti daemon's IngestRequest pass-through
-    (saga/episode_type/source_name/source_id/episode_metadata) is MERGED
-    upstream but NOT YET DEPLOYED to the live daemon — until that deploy,
-    nothing may send the new ingest fields, so the backfill enqueue is
-    inert unless ``memory.notes_backfill_enabled: true`` is set explicitly.
+    Typed-episode ingest fields require an explicitly compatible external
+    backend. Backfill stays inert unless ``memory.notes_backfill_enabled:
+    true`` is set; ordinary local notes and provider writes keep their paths.
     """
     return bool(_memory_config().get("notes_backfill_enabled", False))
 
