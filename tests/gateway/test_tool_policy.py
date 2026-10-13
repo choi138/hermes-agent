@@ -215,7 +215,11 @@ def test_discord_core_compaction_preserves_every_non_description_contract():
     # bounds) remain byte-equivalent after descriptions are removed.
     assert schemas == original
     assert _without_descriptions(compacted) == _without_descriptions(original)
-    assert canonical_tool_schema_metrics(compacted).json_bytes <= 12_000
+    compacted_metrics = canonical_tool_schema_metrics(compacted)
+    # The release adds structured action schemas. Keep the documented runtime
+    # budget and prove descriptions shrink rather than freezing an old subset size.
+    assert schema_within_budget("discord-core", compacted_metrics)
+    assert compacted_metrics.json_bytes < canonical_tool_schema_metrics(original).json_bytes
     assert apply_gateway_tool_schema_policy("discord-core", compacted) == compacted
 
     # Full schemas remain available to authorized operator sessions.
@@ -619,6 +623,11 @@ def _provider_stop_response(text="done"):
                 "kanban_attach",
                 "kanban_attach_url",
                 "kanban_attachments",
+                # Native progressive discovery adds these bridges while keeping
+                # the coordinator's complete authorized Kanban surface visible.
+                "tool_search",
+                "tool_describe",
+                "tool_call",
             },
         ),
         (
