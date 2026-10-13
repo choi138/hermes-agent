@@ -26,6 +26,17 @@ from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
+@pytest.fixture(autouse=True)
+def _isolate_reset_notice_translation(monkeypatch):
+    # These tests bound resource cleanup, not cold locale-catalog parsing.
+    # Keep real cleanup, session rotation and the original timing deadlines.
+    import gateway.slash_commands_session as reset_commands
+    from hermes_cli import tips
+
+    monkeypatch.setattr(reset_commands, "t", lambda key, **kwargs: key)
+    monkeypatch.setattr(tips, "get_random_tip", lambda: "")
+
+
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
@@ -54,6 +65,8 @@ def _make_runner_with_cached_agent(close_fn):
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    # This bare runner has no plugin lifecycle; cleanup is the real worker path.
+    runner._finalize_session_off_loop = AsyncMock(return_value=[])
     runner._session_model_overrides = {}
     runner._pending_model_notes = {}
     runner._background_tasks = set()

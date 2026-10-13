@@ -250,7 +250,7 @@ async def test_compaction_readonly_steer_uses_raw_owner_evidence(
         lease=SimpleNamespace(holder=None, watermark=None, ttl=60),
         new_system_prompt="sys", system_message="sys", compressed_user_turn_outcome="none",
         messages_before_compression=deepcopy(original_rows), made_progress=True,
-        attempt=cc._Attempt(snapshot={}, generation=0, started_at=time.monotonic()),
+        attempt=cc._begin_compression_attempt(agent, force=True, defer_notification=False),
     )
     assert outcome.session_commit_succeeded and outcome.compacted_in_place
     audit = db.get_turn_recovery_rows(sid, owner)

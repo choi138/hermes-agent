@@ -1058,12 +1058,21 @@ def _m1_replan_event(text, source, message_id):
 
 
 def _m1_replan_patch_agent_runtime(monkeypatch, client, tool_name="read_file"):
-    from tests.agent.test_run_agent import _make_tool_defs
-
+    # Keep this cold-interpreter fixture independent of the desktop/TUI test
+    # module: importing that module starts its server and redirects stdout.
+    # This is the same minimal definition its _make_tool_defs helper returns.
+    tool_defs = [{
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": f"{tool_name} tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", lambda **_kwargs: client)
     monkeypatch.setattr(
         "model_tools.get_tool_definitions",
-        lambda *_args, **_kwargs: _make_tool_defs(tool_name),
+        lambda *_args, **_kwargs: tool_defs,
     )
     monkeypatch.setattr("model_tools.check_toolset_requirements", lambda *_args, **_kwargs: {})
     monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *_args, **_kwargs: 0.0)

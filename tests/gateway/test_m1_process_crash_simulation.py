@@ -141,11 +141,16 @@ async def _child(root: Path, scenario: str, stage: str):
                 "record": entry.active_turn, "sent": adapter.sent,
             }
 
-        (root / "ready.json").write_text(json.dumps({
+        # Existence is the parent's crash-boundary signal. Publish only after
+        # the receipt is complete, so a slow filesystem cannot expose an empty
+        # ready.json between open/truncate and write.
+        ready_tmp = root / "ready.json.tmp"
+        ready_tmp.write_text(json.dumps({
             "pid": os.getpid(), "record": entry.active_turn,
             "requests": len(state["requests"]), "initial_requests": initial_count,
             "sent": adapter.sent,
         }))
+        ready_tmp.replace(root / "ready.json")
         # Parent kills this exact interpreter. No cleanup or graceful shutdown runs.
         await asyncio.Event().wait()
     else:

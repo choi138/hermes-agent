@@ -132,33 +132,33 @@ manager.sync(force=True)
     assert not (host/'.sync-back-intent.json').exists()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize('failure', ['timeout', 'oversize'])
 def test_reconnect_linux(setup_sync, monkeypatch, failure):
     _check_reconnect_recovers_before_upload(setup_sync, monkeypatch, failure)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize('failure', ['timeout', 'oversize'])
 def test_reconnect_macos(setup_sync, monkeypatch, failure):
     _check_reconnect_recovers_before_upload(setup_sync, monkeypatch, failure)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_original_mapping_linux(setup_sync, monkeypatch):
     _check_recovery_uses_original_mapping(setup_sync, monkeypatch)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_original_mapping_macos(setup_sync, monkeypatch):
     _check_recovery_uses_original_mapping(setup_sync, monkeypatch)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_new_process_baseline_linux(setup_sync):
     _check_recovery_in_new_process_preserves_unchanged_remote_baseline(setup_sync)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_new_process_baseline_macos(setup_sync):
     _check_recovery_in_new_process_preserves_unchanged_remote_baseline(setup_sync)
