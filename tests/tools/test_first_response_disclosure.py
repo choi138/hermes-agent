@@ -122,8 +122,9 @@ def test_actual_provider_array_catalog_and_describe_are_lossless(production_asse
     for entry in catalog:
         assert entry.name in listing
         assert entry.schema["function"] == by_name[entry.name]
-    # Describe ALL newly deferred tools, including nested schemas and full descriptions.
-    for name in sorted(cfg.effective_defer_tools - ts._DEFAULT_DEFERRED_TOOLS):
+    # Describe every available deferred tool, including defaults added by a release.
+    # Restore nested schemas and full descriptions through the real bridge.
+    for name in sorted(names(deferred)):
         response = json.loads(model.handle_function_call(
             "tool_describe", {"names": [name]}, enabled_toolsets=scopes))
         assert response["tools"][name] == {

@@ -29,6 +29,7 @@ tools:
       - todo_list
       - process_manage
       - cronjob_manage
+      - manage_catalog
       - drive_preview
       - gui_tour
       - desktop_preview
