@@ -47,6 +47,16 @@ _GATEWAY_INJECTED_PREFIX_LINE_RE = re.compile(
     r")"
 )
 _SLACK_SENDER_SUFFIX_RE = re.compile(r" \| Slack user <@[^>\s]+>$")
+# Recall drops only routing metadata. Reply pointers stay: what the user replied to is
+# meaningful search context, unlike a message id or a router note.
+_RECALL_ROUTING_LINE_RE = re.compile(
+    r"(?:"
+    r"\[Triggering message id: [^\r\n]*\]"
+    r"|\[Routing directive: [^\r\n]*\]"
+    r"|\[Note: model was just switched from [^\r\n]* "
+    r"by the model router[^\r\n]*\]"
+    r")"
+)
 _UNVERIFIED_TAG = "[unverified] "  # history backfill marks senders outside the allowlist
 _TURN_AUTHOR_NAME_CAP = 200  # agent/turn_author.py caps the author name; the prefix allows longer
 # gateway/session.py `neutralize_untrusted_inline_text` cuts a display name to exactly this many
@@ -575,16 +585,35 @@ class MemoryManager:
                 index += 1
         return "".join(lines[index:]) or None
 
+    @staticmethod
+    def _strip_recall_routing_lines(text: str) -> str:
+        """Drop leading gateway routing lines (and the blank lines after them) from a recall query."""
+        lines = text.splitlines(keepends=True)
+        index = 0
+        while index < len(lines) and _RECALL_ROUTING_LINE_RE.fullmatch(lines[index].rstrip("\r\n")):
+            index += 1
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+        return "".join(lines[index:]) if index else text
+
     def _recall_query(self, query: str, author_name: Optional[str]) -> Optional[str]:
-        """The authored text to recall against: no skill scaffolding, no gateway sender prefix.
-        None when nothing substantive is left (a prefix-only or trivial message)."""
+        """The authored text to recall against: no skill scaffolding, no leading gateway routing
+        lines (``[Triggering message id: ...]`` etc.), no gateway sender prefix.
+        None when nothing substantive is left (a prefix-only or trivial message).
+
+        The triviality gate runs on the cleaned text: the raw Discord turn always starts with a
+        routing line, so judging the raw text never classified ``ok``-style replies as trivial,
+        and the routing line itself became the dominant recall query."""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return None
-        stripped = strip_sender_attribution(clean_query, author_name)
-        if stripped != clean_query and is_trivial_prompt(stripped):
+        clean_query = self._strip_recall_routing_lines(clean_query)
+        if not clean_query.strip():
             return None
-        return stripped
+        stripped = strip_sender_attribution(clean_query, author_name)
+        if is_trivial_prompt(stripped):
+            return None
+        return stripped.strip()
 
     def prefetch_all(self, query: str, *, session_id: str = "", author_name: Optional[str] = None) -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal).

@@ -851,6 +851,12 @@ class AIAgent(
         except (TypeError, ValueError, AttributeError):
             logger.warning("Invalid background review coordinator settings; keeping last valid values")
 
+        # The coordinator calls the factory on its own worker thread, so the owning profile
+        # scope (HERMES_HOME override, secret scope, prompt callbacks) must be captured here,
+        # while the foreground turn still holds it. Capturing inside the factory snapshots the
+        # worker's empty context and background writes escape to the process-default home.
+        _scoped_runner = propagate_context_to_thread(lambda fn: fn())
+
         def _target_factory(memory_flag: bool, skills_flag: bool):
             def _run() -> bool:
                 review_run = prepare_background_review_run(self)
@@ -871,8 +877,7 @@ class AIAgent(
                     explicit=explicit))
                 return not review_run.cancel_requested.is_set()
 
-            # Capture the owning profile while the foreground turn still has its scope.
-            return propagate_context_to_thread(_run)
+            return lambda: _scoped_runner(_run)
 
         disposition = coordinator.submit(
             owner_token=ensure_background_review_owner_token(self),

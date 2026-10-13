@@ -1489,7 +1489,8 @@ class TestTrivialPromptClassifier:
         from agent.memory_provider import is_trivial_prompt
 
         for t in ("hi", "HI!", "hey.", "hello", "yo", "sup~", "thanks :)",
-                  "done???", "ok", "yes.", "k", "", "   ", "/help", "lgtm"):
+                  "done???", "ok", "yes.", "k", "", "   ", "/help", "lgtm",
+                  "ㅇㅋ", "ㅇㅇ", "ㅇㅋㅋㅋ", "넵!", "네네", "고마워~", "알겠어"):
             assert is_trivial_prompt(t), f"expected trivial: {t!r}"
 
     def test_substantive_and_prefix_collisions_pass_through(self):
@@ -1498,7 +1499,8 @@ class TestTrivialPromptClassifier:
         # Words that merely START with a trivial word must not match.
         for t in ("k8s", "yolo", "hive", "note", "supper", "hind",
                   "hello world", "ok so what's next", "what's my name",
-                  "hey can you check the logs", "continue the migration plan"):
+                  "hey can you check the logs", "continue the migration plan",
+                  "ㅇㅇ 잘 됨?", "좋아 진행해줘", "네이버 로그인 확인해줘", "응답 시간 재 봐"):
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
 
 

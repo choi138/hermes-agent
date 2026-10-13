@@ -57,8 +57,11 @@ class RecallStatus:
 TRIVIAL_PROMPT_RE = re.compile(
     r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
     r'hi|hey|hello|yo|sup|'
-    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
-    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
+    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k|'
+    # Korean acknowledgements (whole message only; "ㅇㅇ 잘 됨?" stays substantive).
+    r'ㅇㅋ|ㅇㅇ|ㄱㄱ|ㄳ|ㄱㅅ|ㅇㅎ|ㅎㅇ|응+|웅+|엉|넵|넴|넹|네+|옙|'
+    r'오케이|오키|좋아|좋아요|고마워|고마워요|감사|감사해요|감사합니다|땡큐|알겠어|알겠어요|알았어)'
+    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0ㅋㅎ]*$',
     re.IGNORECASE,
 )
 

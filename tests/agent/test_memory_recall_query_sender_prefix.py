@@ -129,7 +129,6 @@ def test_short_author_is_not_treated_as_capped():
 @pytest.mark.parametrize(
     "note",
     [
-        '[Triggering message id: `1` - use as `message_id`]',
         '[Replying to: "line1\nline2"]',  # reply pointer keeps the quoted message whole
         "[The user sent a document: 'a.pdf'. It is saved at: /x.]",
         "[The user sent an image~ Here's what I can see:\na cat\n\non a sofa]\n"
@@ -208,6 +207,63 @@ def test_prefix_only_message_skips_recall():
     prefetched, queued = _recall_queries("[Alice] ", "Alice")
     assert prefetched == []
     assert queued == []
+
+
+# The real Discord turn shape (gateway/run_inbound.py): a routing line, a blank line, then the
+# attributed message. The routing line is metadata, not a question; left in, it dominated recall.
+_DISCORD_ROUTING = (
+    "[Triggering message id: `1557028244295782483` — use as `message_id` for reply/react/pin "
+    "via the discord tools.]\n\n"
+)
+
+
+def test_discord_routing_line_is_dropped_from_recall_query():
+    text = _DISCORD_ROUTING + "[최근원] Graphiti랑 Hindsight 비교했을 때 결과 어떻게 나왔었지?"
+    prefetched, queued = _recall_queries(text, "최근원")
+    assert prefetched == ["Graphiti랑 Hindsight 비교했을 때 결과 어떻게 나왔었지?"]
+    assert queued == prefetched
+
+
+@pytest.mark.parametrize("ack", ["ㅇㅋ", "ㅇㅇ", "ok", "ㅇㅋㅋㅋ", "넵!", "고마워~", "좋아"])
+def test_discord_acknowledgement_skips_recall(ack):
+    # Before the fix the routing line made every Discord turn non-trivial.
+    prefetched, queued = _recall_queries(_DISCORD_ROUTING + f"[최근원] {ack}", "최근원")
+    assert prefetched == []
+    assert queued == []
+
+
+def test_routing_only_message_skips_recall():
+    prefetched, queued = _recall_queries(_DISCORD_ROUTING + "[최근원] ", "최근원")
+    assert prefetched == []
+    assert queued == []
+
+
+def test_stacked_routing_lines_are_all_dropped():
+    text = (
+        _DISCORD_ROUTING
+        + "[Routing directive: answer in thread]\n"
+        + "[Note: model was just switched from a to b by the model router.]\n\n"
+        + "[최근원] 배포 상태 알려줘"
+    )
+    prefetched, _ = _recall_queries(text, "최근원")
+    assert prefetched == ["배포 상태 알려줘"]
+
+
+def test_reply_pointer_after_routing_line_is_kept():
+    text = _DISCORD_ROUTING + '[Replying to: "어제 회의록"]\n\n[최근원] 이거 요약해줘'
+    prefetched, _ = _recall_queries(text, "최근원")
+    assert prefetched == ['[Replying to: "어제 회의록"]\n\n이거 요약해줘']
+
+
+def test_short_but_substantive_korean_message_still_recalls():
+    prefetched, _ = _recall_queries(_DISCORD_ROUTING + "[최근원] ㅇㅇ 잘 됨?", "최근원")
+    assert prefetched == ["ㅇㅇ 잘 됨?"]
+
+
+def test_routing_text_inside_the_body_is_kept():
+    text = "[최근원] 이 줄 왜 붙어?\n[Triggering message id: `1` — x]"
+    prefetched, _ = _recall_queries(text, "최근원")
+    assert prefetched == ["이 줄 왜 붙어?\n[Triggering message id: `1` — x]"]
 
 
 def test_default_call_without_author_is_unchanged():
