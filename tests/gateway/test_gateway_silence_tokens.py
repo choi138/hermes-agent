@@ -97,10 +97,12 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply_expected", [None, True], ids=["adapter-unknown", "addressed"])
-async def test_human_turn_gets_a_visible_fallback_for_a_silence_marker(monkeypatch, tmp_path, reply_expected):
+@pytest.mark.parametrize('report_only', [False, True])
+async def test_human_turn_gets_a_visible_fallback_for_a_silence_marker(monkeypatch, tmp_path, reply_expected, report_only):
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value={
         "final_response": "[SILENT]",
+        "process_report_disposition": "report_only" if report_only else None,
         "messages": [
             {"role": "user", "content": "side chatter"},
             {"role": "assistant", "content": "[SILENT]"},
@@ -116,7 +118,10 @@ async def test_human_turn_gets_a_visible_fallback_for_a_silence_marker(monkeypat
         _event(reply_expected=reply_expected), _source(), "agent:main:telegram:group:-1001:12345", 1
     )
 
-    assert response and not is_intentional_silence_response(response)
+    if report_only:
+        assert response == ''
+    else:
+        assert response and not is_intentional_silence_response(response)
 
 
 @pytest.mark.asyncio
@@ -187,7 +192,8 @@ async def test_scheduled_heartbeat_silence_suppresses_delivery(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
-async def test_queued_human_turn_also_gets_the_visible_fallback():
+@pytest.mark.parametrize('report_only', [False, True])
+async def test_queued_human_turn_also_gets_the_visible_fallback(report_only):
     runner = gateway_run.GatewayRunner(GatewayConfig())
     runner._deliver_queued_first_response = AsyncMock()
     turn_ctx = SimpleNamespace(
@@ -200,16 +206,21 @@ async def test_queued_human_turn_also_gets_the_visible_fallback():
         _status_thread_metadata=None,
         event_message_id=None,
         inbound_message_id="msg-42",
+        event=_event(),
         run_generation=1,
     )
-    result = {"final_response": "NO_REPLY", "failed": False}
+    result = {"final_response": "NO_REPLY", "failed": False,
+              "process_report_disposition": "report_only" if report_only else None}
 
     await runner._run_agent_deliver_first_response(
         turn_ctx, None, result, result, None,
     )
 
-    delivered = runner._deliver_queued_first_response.await_args.args[0]
-    assert delivered and not is_intentional_silence_response(delivered)
+    if report_only:
+        runner._deliver_queued_first_response.assert_not_awaited()
+    else:
+        delivered = runner._deliver_queued_first_response.await_args.args[0]
+        assert delivered and not is_intentional_silence_response(delivered)
 
 
 @pytest.mark.asyncio

@@ -72,8 +72,11 @@ class Manifest:
     worker_cli: str = 'codex'
     sender_profile: str | None = None
     expected_bot_id: str | None = None
+    delivery_owner: str = "manual"
 
     def __post_init__(self):
+        if self.delivery_owner not in ("manual", "gateway"):
+            raise ValueError("delivery_owner")
         from scripts.delegation_progress_discord_send import validate_profile
         validate_profile(self.sender_profile, self.expected_bot_id)
         if self.worker_cli not in ('codex', 'claude'):
@@ -141,6 +144,8 @@ class Manifest:
         # Preserve existing Codex bindings, bind the additional adapter explicitly.
         if self.worker_cli != 'codex':
             values['worker_cli'] = self.worker_cli
+        if self.delivery_owner != "manual":
+            values["delivery_owner"] = self.delivery_owner
         values.update(self.sender_identity())
         return _digest(_json(values))
 
@@ -640,7 +645,7 @@ def _events(manifest, state, now, *, limit=1024 * 1024):
 
 
 TERMINAL = {"cli_completed", "cli_failed", "timed_out", "cancelled", "launch_failed",
-            "output_limit", "artifact_or_transport_failed", "registration_failed"}
+            "output_limit", "artifact_or_transport_failed", "registration_failed", "cleanup_failed"}
 
 
 def _receipt(manifest, state):
@@ -760,15 +765,19 @@ def validate_registration(request, manifest_path, state_dir, thread_id, task_lab
 
 
 def register_run(request, run_dir, manifest_path, state_dir, thread_id, task_label, *, code_scope=(),
-                 sender_profile=None, expected_bot_id=None):
+                 sender_profile=None, expected_bot_id=None, delivery_owner="manual"):
     """Opt-in callback. Durable baseline precedes exclusive manifest publication."""
     validate_registration(request, manifest_path, state_dir, thread_id, task_label, code_scope=code_scope,
                           sender_profile=sender_profile, expected_bot_id=expected_bot_id)
     manifest = Manifest(uuid.uuid4().hex, request.workdir, request.allowed_root, run_dir,
                         thread_id, task_label, run_dir / "events.jsonl", run_dir / "status.json",
                         code_scope=code_scope, worker_cli=request.cli,
-                        sender_profile=sender_profile, expected_bot_id=expected_bot_id)
-    progress = Progress(manifest, state_dir)
+                        sender_profile=sender_profile, expected_bot_id=expected_bot_id, delivery_owner=delivery_owner)
+    if delivery_owner == "gateway":
+        from agent.delegation_progress_gateway import GatewayProgress
+        progress = GatewayProgress(manifest, state_dir)
+    else:
+        progress = Progress(manifest, state_dir)
     snapshot = progress.tick()["snapshot"]
     # A bounded inventory is a valid, explicitly partial baseline. A failed
     # git/event read is not registration. Preserve all coverage gaps in state.
@@ -1001,6 +1010,8 @@ class Progress:
         return self._observe(state, self.clock() if now is None else now, force_full=True)
 
     def _tick(self, state, now):
+        if self.manifest.delivery_owner != "manual":
+            raise ValueError("manual_owner_required")
         if state["stopped"]:
             return {"snapshot": state["final_snapshot"], "queued": [], "stopped": True}
         snapshot = state['final_snapshot'] if state.get('closing') else self._observe(state, now)
@@ -1050,12 +1061,28 @@ class Progress:
         pending = self._load()["pending"]
         return pending[0] if pending else None
 
+    def admit(self, message_id):
+        """Pin the exact gateway head before handing it to the transport."""
+        if self.manifest.delivery_owner != "gateway":
+            raise ValueError("gateway_owner_required")
+        with self._transaction():
+            state = self._load()
+            if not state["pending"] or state["pending"][0]["id"] != message_id:
+                raise ValueError("admit_requires_exact_head_id")
+            state["pending"][0]["admitted"] = True
+            _atomic(self.path, state)
+            return dict(state["pending"][0])
+
     def ack(self, message_id, *, dry_run=False):
         def consume(state):
+            if self.manifest.delivery_owner == "gateway" and (message_id in state.get("delivered_ids", []) or (state.get("delivered") or {}).get("id") == message_id):
+                return {"acked": message_id}
             if not state["pending"] or state["pending"][0]["id"] != message_id:
                 raise ValueError("ack_requires_exact_head_id")
             message = state["pending"].pop(0)
             state["delivered"] = {"id": message["id"], "observed_at": message["observed_at"]}
+            if self.manifest.delivery_owner == "gateway":
+                state["delivered_ids"] = (state.get("delivered_ids", []) + [message_id])[-64:]
             if state.get('closing') and not state['pending']:
                 state['stopped'] = True
             return {"acked": message_id}

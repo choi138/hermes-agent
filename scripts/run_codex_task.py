@@ -3,12 +3,47 @@
 import argparse
 from dataclasses import asdict
 import json
+import os
+import shlex
 from pathlib import Path
 import signal
 import sys
 
 
+def reexec_login_shell(argv):
+    """Load the audited zsh login environment without accepting a shell program."""
+    remaining = []
+    index = 0
+    found = False
+    while index < len(argv):
+        value = argv[index]
+        if value == "--progress-login-shell":
+            if index + 1 >= len(argv) or argv[index + 1] != "zsh":
+                raise ValueError("progress_login_shell")
+            found = True
+            index += 2
+            continue
+        if value == "--progress-login-shell=zsh":
+            found = True
+            index += 1
+            continue
+        remaining.append(value)
+        index += 1
+    if not found:
+        # argparse allows abbreviations; do not re-execute one recursively.
+        raise ValueError("use_full_progress_login_shell_flag")
+    environment = os.environ.copy()
+    environment["ASDF_NODEJS_VERSION"] = "22.19.0"
+    command = shlex.join([sys.executable, str(Path(__file__).resolve()), *remaining])
+    # The fixed assignment also survives a zshrc that selects another default.
+    os.execvpe("/bin/zsh", ["/bin/zsh", "-ic", "ASDF_NODEJS_VERSION=22.19.0 exec " + command], environment)
+
+
 def main():
+    if sys.argv[1:2] == ["progress"]:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from agent.delegation_progress_gateway import main as progress_main
+        return progress_main(sys.argv[2:])
     if sys.argv[1:2] == ["lifecycle"]:
         return lifecycle_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
@@ -59,6 +94,9 @@ def main():
     parser.add_argument("--progress-code-scope", action="append", default=[], help="Approved relative source file for bounded progress evidence; repeat for the complete task scope")
     parser.add_argument('--progress-sender-profile', choices=('default', 'koharu'), help='Trusted operator sender identity; omission preserves legacy default')
     parser.add_argument('--progress-expected-bot-id', help='Audited public bot ID; required for koharu')
+    parser.add_argument("--progress-owner", choices=("manual", "gateway"), default="manual")
+    parser.add_argument("--progress-login-shell", choices=("zsh",),
+                        help="Gateway-only: load audited interactive zsh credentials before worker launch")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from agent.codex_task_runner import TaskRequest, WorkerSelection, run_task
@@ -72,6 +110,12 @@ def main():
 
     previous = signal.signal(signal.SIGTERM, cancelled)
     try:
+        if args.progress_login_shell is not None and not args.dry_run:
+            if args.progress_owner != "gateway":
+                raise ValueError("progress_login_shell_requires_gateway_owner")
+            if not all((args.progress_manifest, args.progress_state_dir, args.progress_thread, args.progress_label)):
+                raise ValueError("All progress options are required")
+            reexec_login_shell(sys.argv[1:])
         legacy = any(value is not None for value in (args.tier, args.selection, args.pinned_tier))
         if args.cli == "claude":
             codex_only = (
@@ -161,7 +205,7 @@ def main():
         identity = dict(sender_profile=args.progress_sender_profile, expected_bot_id=args.progress_expected_bot_id)
         from scripts.delegation_progress_discord_send import validate_profile
         validate_profile(**identity)
-        if (any(options) or args.progress_code_scope or any(identity.values())) and not all(options):
+        if (any(options) or args.progress_code_scope or any(identity.values()) or args.progress_owner == "gateway") and not all(options):
             raise ValueError("All progress options are required")
         if action != "spawn":
             result = {"status": action, "exit_code": 0 if action == "skipped" else 74,
@@ -172,16 +216,27 @@ def main():
                       "acceptance": {"status": "unknown", "independent_validation": False}}
         elif any(options):
             from agent.delegation_progress import Progress, register_run, validate_registration
+            if args.progress_owner == "gateway":
+                from agent.delegation_progress_gateway import GatewayProgress as Progress
+            registered = {}
             validate_registration(request, *options, code_scope=args.progress_code_scope, **identity)
             def register(checked, run_dir):
-                manifest = register_run(checked, run_dir, *options, code_scope=args.progress_code_scope, **identity)
+                manifest = register_run(checked, run_dir, *options, code_scope=args.progress_code_scope, delivery_owner=args.progress_owner, **identity)
+                registered["manifest"] = manifest
                 baseline = Progress(manifest, args.progress_state_dir)._load()
                 print(json.dumps({"status": "progress_registered", "run_id": manifest.run_id,
                                   "manifest": args.progress_manifest, **manifest.sender_identity(),
                                   "baseline_complete": not baseline.get('observation_errors'),
                                   "baseline_errors": baseline.get('observation_errors', [])}), flush=True)
+            def started(checked, run_dir, process):
+                from agent.delegation_progress import _atomic
+                _atomic(Path(str(args.progress_manifest) + ".worker-start.json"), {
+                    "run_id": registered["manifest"].run_id, "pid": process.pid,
+                    "process_start": getattr(process, "_hermes_started_at", None), "cli": checked.cli})
             result = (request.inspect(policy_receipt) if args.dry_run
-                      else run_task(request, before_spawn=register, policy_receipt=policy_receipt))
+                      else run_task(request, before_spawn=register,
+                                    after_spawn=started if args.progress_owner == "gateway" else None,
+                                    policy_receipt=policy_receipt))
         else:
             result = (request.inspect(policy_receipt) if args.dry_run
                       else run_task(request, policy_receipt=policy_receipt))

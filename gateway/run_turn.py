@@ -1528,7 +1528,9 @@ class GatewayTurnMixin:
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        if (_intentional_silence and not (
+                silence_allowed(_silence_kind, _silence_reply_expected)
+                or agent_result.get('process_report_disposition') == 'report_only')):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -4033,7 +4035,8 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            if (silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
+                    or _delivery_result.get('process_report_disposition') == 'report_only'):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",

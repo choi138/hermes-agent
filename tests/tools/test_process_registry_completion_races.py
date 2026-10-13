@@ -38,14 +38,27 @@ def test_duplicate_finisher_leaves_completion_to_the_owner(monkeypatch):
     monkeypatch.setattr(registry, "_write_checkpoint", checkpoint)
     owner = threading.Thread(target=registry._move_to_finished, args=(session,), daemon=True)
     owner.start()
+    duplicate_started = threading.Event()
+    duplicate_result = []
+
+    def finish_duplicate():
+        duplicate_started.set()
+        duplicate_result.append(registry._move_to_finished(session))
+
+    duplicate = threading.Thread(target=finish_duplicate, daemon=True)
     try:
         assert entered.wait(5)
-        assert registry._move_to_finished(session) is False
+        duplicate.start()
+        assert duplicate_started.wait(5)
         assert not session._completion_event.is_set(), "duplicate released waiters before the notice"
         assert registry.completion_queue.empty()
     finally:
         release.set()
         owner.join(5)
+        if duplicate.ident is not None:
+            duplicate.join(5)
+    assert not owner.is_alive() and not duplicate.is_alive()
+    assert duplicate_result == [False]
     assert session._completion_event.is_set()
     assert registry.completion_queue.qsize() == 1
 
@@ -440,3 +453,26 @@ def test_capacity_pruning_keeps_a_session_whose_scope_stop_is_pending(monkeypatc
 
     assert session.id in registry._finished
     assert "proc_newer_0" not in registry._finished  # the oldest prunable one goes instead
+
+
+def test_gateway_foreground_report_waits_for_readers_complete_result(monkeypatch, tmp_path):
+    """Gateway result observation may fence publication only after the final drain."""
+    from tools import process_registry_followups as followups
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    registry = ProcessRegistry()
+    session = _finalizing_session(registry)
+    session.remote_root = '/private/fixture'
+    session.watcher_platform = 'discord'
+    session.session_key = 'owner'
+    followups.reserve(session)
+    observed, barriers = {}, []
+    with followups.task_request_scope('verify', observed=observed, publication_barrier=lambda: barriers.append(True)):
+        partial = registry.poll(session.id)
+        assert partial['output_preview'] == 'partial'
+        assert 'completion_reporting' not in partial and observed == {} and barriers == []
+        session.append_output('-final')
+        session._completion_event.set()
+        complete = registry.poll(session.id)
+    assert complete['output_preview'] == 'partial-final'
+    assert 'process_reports' in complete['completion_reporting']
+    assert observed == {session.id: 'owner'} and barriers == [True]

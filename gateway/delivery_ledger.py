@@ -216,6 +216,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_delivery_obligations_turn "
         "ON delivery_obligations(session_key, turn_id)"
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delivery_obligation_receipts (
+            obligation_id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            observed_at REAL NOT NULL
+        )"""
+    )
 
 
 def _transaction():
@@ -434,13 +441,20 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+def mark_delivered(obligation_id: str, *, message_id=None) -> None:
+    if message_id is None:
+        _update_state(obligation_id, "delivered")
+        return
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute("INSERT OR REPLACE INTO delivery_obligation_receipts VALUES (?,?,?)",
+                     (obligation_id, str(message_id), time.time()))
+        conn.execute("UPDATE delivery_obligations SET state='delivered',updated_at=?,last_error=NULL WHERE obligation_id=? AND state!='abandoned'",
+                     (time.time(), obligation_id))
 
 
 def mark_uncertain(obligation_id: str, error: str = '') -> None:
     """Process-report transport may have accepted the send; require reconciliation."""
-    if not obligation_id.startswith(('process-attention:', 'process-report:')):
+    if not obligation_id.startswith(('process-attention:', 'process-report:', 'delegation-progress:')):
         raise ValueError('uncertain state is reserved for process reports')
     with _DB_LOCK, _transaction() as conn:
         conn.execute("UPDATE delivery_obligations SET state='uncertain',updated_at=?,last_error=? WHERE obligation_id=? AND state NOT IN ('delivered','abandoned')",
@@ -551,6 +565,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at, turn_id, response_kind) in rows:
+            if oid.startswith("delegation-progress:"):
+                continue  # Only the remote outbox observer may revalidate or acknowledge this generation.
             allowed = process_attention_authorized(oid, connection=conn)
             if allowed is not True:
                 if allowed is False:
@@ -720,6 +736,14 @@ def _prune_unlocked(conn, now: float) -> None:
                             ELSE 2
                           END, updated_at ASC
                  LIMIT ?)""", (total - _MAX_ROWS,))
+    # Receipt evidence remains while its obligation exists, including unsettled sends.
+    conn.execute(
+        """DELETE FROM delivery_obligation_receipts
+           WHERE NOT EXISTS (
+               SELECT 1 FROM delivery_obligations
+               WHERE delivery_obligations.obligation_id = delivery_obligation_receipts.obligation_id
+           )"""
+    )
 
 
 def ledger_enabled(config: Optional[dict[str, Any]] = None) -> bool:

@@ -572,6 +572,7 @@ class ProcessSession:
     observation_error: str = ""
     observation_operation: str = "dispatch"
     verification_scope: dict = field(default_factory=dict)
+    delegation_progress: dict = field(default_factory=dict)
     observation_retry_at: float = 0.0
     _finalize_lock: Any = field(default_factory=threading.Lock, repr=False)
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -669,13 +670,13 @@ _WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id
 _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
     "cancel_requested", "cancel_confirmed", "execution_seconds", "profile_home", "remote_root", "remote_identity", "remote_connection", "remote_offset",
-    "observation_state", "last_observed_at", "observation_error", "observation_operation", "verification_scope", "observation_retry_at",
+    "observation_state", "last_observed_at", "observation_error", "observation_operation", "verification_scope", "delegation_progress", "observation_retry_at",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release")
 _CHECKPOINT_DEFAULTS = {
-    f.name: (f.default_factory() if f.name in {"watch_patterns", "remote_identity", "remote_connection", "verification_scope"} else f.default)
+    f.name: (f.default_factory() if f.name in {"watch_patterns", "remote_identity", "remote_connection", "verification_scope", "delegation_progress"} else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
     if f.name in _CHECKPOINT_FIELDS
 }
@@ -1372,6 +1373,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 'followup_actions': ['inspect this execution and its artifacts', 'report evidence or remaining work'],
                 'automatic_repair_budget': 0,
             }
+            if session.notify_on_complete:
+                from tools.delegation_notifications import prepare_launch
+                tracked, binding = prepare_launch(command, session, temp_dir)
+                if binding:
+                    from tools.process_registry_followups import fence_publication
+                    fence_publication()
+                    session.delegation_progress = binding
+                    launch_options['stdin_data'] = tracked
             session.observation_state = "dispatch_pending"
             with self._lock:
                 self._running[session.id] = session
@@ -2196,6 +2205,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # final drain is partial and must not suppress the full completion.
             if not finalizing:
                 self._poll_observed.add(session_id)
+                from tools.process_registry_followups import observe_result
+                observe_result(session, result)
         if session.detached:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
@@ -2248,6 +2259,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 logger.warning('Verification status unavailable for %s: %s', session.id, safe_error(exc))
         if exited and observed_completion_output and not finalizing:
             self._completion_consumed.add(session_id)
+            from tools.process_registry_followups import observe_result
+            observe_result(session, result)
         return result
 
     def wait(self, session_id: str, timeout: int | None = None) -> dict:
@@ -2283,6 +2296,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if session.exited and not self._reader_finalizing(session):
                 self._completion_consumed.add(session_id)
                 result = self._exit_snapshot(session, "exited")
+                from tools.process_registry_followups import observe_result
+                observe_result(session, result)
             elif _is_interrupted():
                 result = {
                     "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),

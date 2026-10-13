@@ -1566,3 +1566,25 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
+
+
+@pytest.mark.asyncio
+async def test_process_report_barrier_prevents_preview_from_settling_final():
+    from gateway.platforms.base import SendResult
+    adapter = MagicMock()
+    adapter.SUPPORTS_NATIVE_STREAMING = False
+    adapter.SUPPORTS_STREAMING_DRAFTS = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id='preview'))
+    adapter.edit_message = AsyncMock(return_value=SendResult(success=False, error='final refused'))
+    consumer = GatewayStreamConsumer(adapter, '123', config=StreamConsumerConfig(buffer_threshold=1))
+    await consumer._send_or_edit('parent preview')
+    task = asyncio.create_task(consumer.run())
+    await asyncio.to_thread(consumer.defer_publication_sync)
+    count = adapter.send.await_count + adapter.edit_message.await_count
+    consumer.on_delta('completion plus internal process_reports')
+    consumer.finish('verified completion')
+    await task
+    assert adapter.send.await_count + adapter.edit_message.await_count == count
+    assert not consumer.final_response_sent and not consumer.already_sent
+    assert consumer.delivered_final_matches('verified completion') is False

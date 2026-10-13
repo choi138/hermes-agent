@@ -392,6 +392,57 @@ class TestRuntimeFailedSweep:
 
 
 class TestPrune:
+    def test_receipts_follow_retention_without_losing_unsettled_evidence(self):
+        now = time.time()
+        for oid in ("expired", "retained", "unsettled"):
+            _record(oid)
+            dl.mark_delivered(oid, message_id=f"receipt-{oid}")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id='expired'",
+                (now - dl._RETENTION_SECONDS - 60,),
+            )
+            conn.execute(
+                "UPDATE delivery_obligations SET state='attempting', updated_at=? "
+                "WHERE obligation_id='unsettled'",
+                (now - dl._RETENTION_SECONDS - 60,),
+            )
+
+        with dl._connect() as conn:
+            dl._prune_unlocked(conn, now)
+
+        assert _row("expired") is None
+        assert _row("unsettled")["state"] == "attempting"
+        with dl._connect() as conn:
+            receipts = dict(conn.execute(
+                "SELECT obligation_id, message_id FROM delivery_obligation_receipts"
+            ))
+        assert receipts == {
+            "retained": "receipt-retained", "unsettled": "receipt-unsettled"
+        }
+
+    def test_receipts_follow_row_cap_and_remove_existing_orphans(self, monkeypatch):
+        for oid in ("old", "recent", "active"):
+            _record(oid)
+            dl.mark_delivered(oid, message_id=f"receipt-{oid}")
+        now = time.time()
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET updated_at=? WHERE obligation_id='old'", (now - 60,))
+            conn.execute("UPDATE delivery_obligations SET state='pending' WHERE obligation_id='active'")
+            conn.execute("INSERT INTO delivery_obligation_receipts VALUES ('orphan', 'orphan-receipt', ?)", (now,))
+        monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+
+        with dl._connect() as conn:
+            dl._prune_unlocked(conn, now)
+
+        assert _row("old") is None
+        assert _row("active")["state"] == "pending"
+        with dl._connect() as conn:
+            receipts = dict(conn.execute(
+                "SELECT obligation_id, message_id FROM delivery_obligation_receipts"
+            ))
+        assert receipts == {"recent": "receipt-recent", "active": "receipt-active"}
+
     def test_old_delivered_rows_pruned(self):
         _record()
         dl.mark_delivered("ob-1")

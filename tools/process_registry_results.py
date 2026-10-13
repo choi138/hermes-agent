@@ -23,7 +23,8 @@ _RESULT_FIELDS = (
     "parent_session_id", "started_at", "exit_code", "completion_reason",
     "termination_source", "notify_on_complete", "remote_root", "remote_connection", "remote_identity",
     "observation_state", "last_observed_at", "observation_retry_at", "profile_home",
-    "cancel_requested", "cancel_confirmed", "execution_seconds", "observation_error", "observation_operation", "verification_scope",
+    "cancel_requested", "cancel_confirmed", "execution_seconds", "observation_error", "observation_operation", "verification_scope", "delegation_progress",
+    "watcher_platform", "watcher_chat_id", "watcher_thread_id", "watcher_user_id", "watcher_user_name", "watcher_message_id",
 )
 
 

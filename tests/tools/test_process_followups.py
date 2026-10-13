@@ -401,3 +401,130 @@ def test_verification_assessment_must_be_terminal_and_unquoted():
     for text in (block+'\nActual verification failed.', '> '+block, block+'\n'+block,
                  '````text\n'+block, '~~~text\n'+block):
         assert verification_outcome({'final_response':text})['outcome'] == 'unverified'
+
+
+@pytest.mark.parametrize('mode', ['read_only', 'queued', 'auto_first', 'wrong_owner', 'cancelled', 'correction'])
+def test_foreground_claim_requires_scoped_assessment_and_preserves_ownership(monkeypatch, tmp_path, mode):
+    from tools.process_registry import ProcessRegistry
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_foreground', command='true', session_key='owner', parent_session_id='parent',
+        remote_root='/private/job', notify_on_complete=True, watcher_platform='discord', exited=True, exit_code=0)
+    registry = ProcessRegistry()
+    registry._finished[session.id] = session
+    followups.reserve(session)
+    row = followups.pending()[0]
+    observed, barriers = {}, []
+    with followups.task_request_scope('verify', observed=observed, publication_barrier=lambda: barriers.append(True)):
+        output = registry.wait(session.id, timeout=1)
+    assert observed == {session.id: 'owner'} and barriers == [True]
+    assert 'process_reports' in output['completion_reporting']
+    assert followups.get_state(session.id)['phase'] == 'pending'
+    assessment = {'outcome': 'verified', 'evidence': ['artifact compared'], 'next_action': 'none'}
+    if mode == 'read_only':
+        assert followups.admission(session.id, row['token']) and followups.begin(session.id, row['token'])
+        return
+    if mode in {'queued', 'auto_first'}:
+        assert followups.admission(session.id, row['token'])
+    if mode == 'auto_first':
+        assert followups.begin(session.id, row['token'])
+    if mode == 'cancelled':
+        followups.cancel(session.id)
+    claimed = followups.claim_foreground_report(session.id, 'other' if mode == 'wrong_owner' else 'owner',
+        'foreground-turn', assessment, '검증한 결과를 보고해요.')
+    assert claimed == (mode in {'queued', 'correction'})
+    if not claimed:
+        return
+    assert followups.report_authorized('owner', 'foreground-turn')
+    assert not followups.begin(session.id, row['token'])
+    assert not followups.claim_foreground_report(session.id, 'owner', 'again', assessment, 'duplicate')
+    if mode == 'correction':
+        followups.report_state(session.id, row['token'], delivered=True)
+        with followups._db(read_only=True) as db:
+            version = db.execute('SELECT version FROM process_followups WHERE execution_id=?', (session.id,)).fetchone()[0]
+        assert not followups.request_report_revision(session.id, 'owner', version-1, 'new artifact')
+        assert followups.request_report_revision(session.id, 'owner', version, 'explicit correction')
+        new = followups.pending()[0]
+        assert new['token'] != row['token']
+        import json
+        previous = json.loads(new['payload'])['report_revisions'][0]
+        assert previous['report_delivered'] and previous['followup_turn_id'] == 'foreground-turn'
+        assert followups.claim_foreground_report(session.id, 'owner', 'corrected-turn', assessment, 'correction')
+
+
+@pytest.mark.parametrize('state', ['pending', 'attempting', 'delivered', 'uncertain'])
+def test_inflight_progress_fences_both_terminal_claimers(monkeypatch, tmp_path, state):
+    from gateway import delivery_ledger as delivery
+    from tools.delegation_notifications import claim_progress
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_fenced', command='true', session_key='owner')
+    followups.reserve(session)
+    row = followups.pending()[0]
+    oid = 'delegation-progress:proc_fenced:run:1'
+    delivery.record_obligation(obligation_id=oid, session_key='owner', platform='discord',
+        chat_id='123', thread_id='123', content='progress', response_kind='delegation_progress')
+    assert claim_progress(session.id, oid)
+    if state != 'attempting':
+        with followups._db() as db:
+            db.execute('UPDATE delivery_obligations SET state=? WHERE obligation_id=?', (state, oid))
+    assessment = {'outcome': 'verified', 'evidence': ['checked'], 'next_action': 'none'}
+    allowed = state != 'attempting'
+    assert followups.claim_foreground_report(session.id, 'owner', 'turn', assessment, 'done') == allowed
+    if not allowed:
+        assert not followups.admission(session.id, row['token'])
+        delivery.mark_delivered(oid, message_id='progress-receipt')
+        assert followups.admission(session.id, row['token']) and followups.begin(session.id, row['token'])
+    else:
+        assert not claim_progress(session.id, oid)
+
+
+def test_begin_rechecks_progress_after_automatic_admission(monkeypatch, tmp_path):
+    from gateway import delivery_ledger as delivery
+    from tools.delegation_notifications import claim_progress
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_begin_fence', command='true', session_key='owner')
+    followups.reserve(session)
+    row = followups.pending()[0]
+    assert followups.admission(session.id, row['token'])
+    oid = 'delegation-progress:proc_begin_fence:run:1'
+    delivery.record_obligation(obligation_id=oid, session_key='owner', platform='discord',
+        chat_id='123', thread_id='123', content='progress', response_kind='delegation_progress')
+    assert claim_progress(session.id, oid)
+    assert not followups.begin(session.id, row['token'])
+    delivery.mark_delivered(oid, message_id='progress-receipt')
+    with followups._db() as db:
+        db.execute('UPDATE process_followups SET next_attempt=0 WHERE execution_id=?', (session.id,))
+    assert followups.admission(session.id, row['token'])
+    assert followups.begin(session.id, row['token'])
+
+
+@pytest.mark.parametrize('fence', ['````text', '~~~markdown'])
+def test_literal_report_examples_survive_public_parser(fence):
+    import json
+    report = {'execution_id': 'proc_example', 'outcome': 'verified', 'evidence': ['passed'],
+              'next_action': 'none', 'report': 'Example only'}
+    block = '```process_reports\n' + json.dumps({'reports': [report]}) + '\n```'
+    # Use the actual outer closing delimiter, including an unterminated outer fence.
+    closer = '````' if fence.startswith('`') else '~~~'
+    for text in (fence + '\n' + block, fence + '\n' + block + '\n' + closer):
+        public, reports = followups.foreground_reports({'final_response': text})
+        assert public == text and reports == []
+    text = fence + '\n' + block + '\n' + closer + '\nActual result:\n' + block
+    public, reports = followups.foreground_reports({'final_response': text})
+    assert public.endswith('Actual result:') and block in public
+    assert len(reports) == 1
+
+
+def test_reported_result_read_allows_normal_answer(monkeypatch, tmp_path):
+    from tools.process_registry import ProcessRegistry
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    session = ProcessSession(id='proc_reread', command='true', session_key='owner',
+        remote_root='/private', notify_on_complete=True, watcher_platform='discord', exited=True, exit_code=0)
+    followups.reserve(session)
+    with followups._db() as db:
+        db.execute("UPDATE process_followups SET phase='reported' WHERE execution_id=?", (session.id,))
+    registry = ProcessRegistry()
+    registry._finished[session.id] = session
+    observed, barriers = {}, []
+    with followups.task_request_scope('show prior result', observed=observed, publication_barrier=lambda: barriers.append(True)):
+        result = registry.wait(session.id, timeout=1)
+    assert 'completion_reporting' not in result and observed == {} and barriers == []
