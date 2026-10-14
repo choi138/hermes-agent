@@ -21,7 +21,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory_propose",  # no curator proposals in the parent's name
         "send_message",  # no cross-platform side effects
         "cronjob_manage",  # no scheduling more work in the parent's name
-        "start_chat",
     ]
 )
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]

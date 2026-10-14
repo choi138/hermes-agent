@@ -77,3 +77,19 @@ def test_model_response_time_accumulates_without_token_usage(tmp_path, monkeypat
         assert agent.session_model_response_seconds == pytest.approx(1)
     finally:
         agent.close()
+
+
+def test_long_decode_context_buckets_use_the_first_hop(tmp_path, monkeypatch, caplog):
+    """A multi-hop Gemini long decode sums every hop's re-sent prefix for billing; the context engine's
+    prompt AND canonical input/cache buckets carry hop 1, so cache_read never exceeds prompt there."""
+    a = _agent(tmp_path, monkeypatch)
+    usage = _usage(32_840, 0, 32_968)
+    usage.initial_prompt_tokens, usage.initial_cached_tokens = 100, 40
+    seen = {}
+    monkeypatch.setattr(a.context_compressor, "update_from_response", lambda u: seen.update(u))
+    try:
+        line = _line(a, caplog, SimpleNamespace(usage=usage, id=None, model="anthropic/claude-fable-5.1"))
+    finally:
+        a.close()
+    assert " in=32968 " in line  # the log line keeps the billed sum
+    assert (seen["prompt_tokens"], seen["input_tokens"], seen["cache_read_tokens"]) == (100, 60, 40)
