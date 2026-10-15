@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -141,6 +142,8 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     target = root / "pyproject.toml"
     text = _without_release_age(text)
     _copy_core_inputs(source, root)
+    # copy2 preserves a sealed input's mode; only the generated manifest is mutable.
+    target.chmod(target.stat().st_mode | stat.S_IWUSR)
     target.write_text(text, encoding="utf-8")
 
 
