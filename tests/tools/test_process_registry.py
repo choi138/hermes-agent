@@ -983,7 +983,8 @@ class TestSpawnEnvSanitization:
                 registry.spawn_via_env(env, command, notify_on_complete=True)
 
         assert str(failure.value) == (
-            f'Delegation progress tracking unavailable ({reason}); no command was dispatched')
+            f'Delegation progress tracking unavailable ({reason}); no command was dispatched. '
+            'Restore SSH/temp-dir access and retry the command.')
         assert 'SSH' in failure.value.retry_hint
         assert 'temp-dir access' in failure.value.retry_hint
         assert 'retry' in failure.value.retry_hint

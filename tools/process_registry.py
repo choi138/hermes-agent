@@ -1385,7 +1385,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 except ProgressRootUnavailable as exc:
                     from tools.environments.base import EnvironmentConnectionError
                     raise EnvironmentConnectionError(
-                        f'Delegation progress tracking unavailable ({exc.reason}); no command was dispatched',
+                        f'Delegation progress tracking unavailable ({exc.reason}); no command was dispatched. '
+                        'Restore SSH/temp-dir access and retry the command.',
                         retry_hint='Restore SSH/temp-dir access and retry the command.') from None
                 if binding:
                     from tools.process_registry_followups import fence_publication
