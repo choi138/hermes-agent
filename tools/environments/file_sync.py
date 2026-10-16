@@ -379,6 +379,13 @@ class FileSyncManager:
         except OSError:
             return None
 
+    @staticmethod
+    def _host_digest(host_path: str) -> str | None:
+        try:
+            return _sha256_file(host_path)
+        except OSError:
+            return None
+
     def _adopt_shared_copies(
         self, state_path: Path, to_upload: list[tuple[str, str]], new_files: dict[str, tuple]
     ) -> tuple[list[tuple[str, str]], dict[str, str]]:
@@ -389,6 +396,10 @@ class FileSyncManager:
         candidates = {remote: shared[remote][2] for host, remote in to_upload
                       if remote in shared
                       and shared[remote][:2] == (_resolve_host_path_str(host), self._shared_key(host, new_files[remote]))}
+        hosts = {remote: host for host, remote in to_upload}
+        # A timestamp-preserving replace (cp -p, rsync -t) keeps the key; confirm the host bytes too.
+        candidates = {remote: digest for remote, digest in candidates.items()
+                      if self._host_digest(hosts[remote]) == digest}
         if not candidates:
             return to_upload, {}
         try:

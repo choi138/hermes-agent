@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from hermes_constants import get_hermes_home
-from tools.environments.file_sync import FileSyncManager
+from tools.environments.file_sync import _SHARED_STATE_VERSION, FileSyncManager
 
 IDENTITY = json.dumps(["mac", "me", 22, "/Users/me"])
 
@@ -118,8 +118,13 @@ def test_remote_check_failure_falls_back_to_full_upload(host_files):
     assert len(remote.uploads) == 3
 
 
-@pytest.mark.parametrize("content", ["not json", json.dumps({"version": 1, "identity": "other", "files": {}}),
-                                     json.dumps({"version": 1, "identity": IDENTITY, "files": {"x": 1}})])
+@pytest.mark.parametrize("content", [
+    "not json",
+    json.dumps({"version": 1, "identity": IDENTITY, "files": {}}),
+    json.dumps({"version": _SHARED_STATE_VERSION, "identity": "other", "files": {}}),
+    json.dumps({"version": _SHARED_STATE_VERSION, "identity": IDENTITY, "files": {"x": 1}}),
+    json.dumps({"version": _SHARED_STATE_VERSION, "identity": IDENTITY, "files": {"x": {"host": "h"}}}),
+])
 def test_unusable_shared_state_is_ignored(host_files, content):
     remote = FakeRemote()
     _manager(remote, host_files).sync(force=True)
@@ -232,3 +237,18 @@ def test_entries_for_removed_host_files_are_pruned(host_files, tmp_path):
 
     shared = json.loads(_state_files()[0].read_text(encoding="utf-8"))
     assert sorted(shared["files"]) == ["/Users/me/.hermes/a.py", "/Users/me/.hermes/b.py", "/Users/me/.hermes/d.md"]
+
+
+def test_timestamp_preserving_replace_is_uploaded(host_files):
+    remote = FakeRemote()
+    _manager(remote, host_files).sync(force=True)
+    path = Path(host_files["a.py"])
+    stat = path.stat()
+    path.write_text("content of b.py", encoding="utf-8")
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    remote.uploads.clear()
+    _manager(remote, host_files).sync(force=True)
+
+    assert remote.uploads == ["/Users/me/.hermes/a.py"]
+    assert remote.files["/Users/me/.hermes/a.py"] == b"content of b.py"
