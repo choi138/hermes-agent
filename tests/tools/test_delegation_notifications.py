@@ -3,7 +3,7 @@ import asyncio
 from pathlib import Path
 from subprocess import CalledProcessError, TimeoutExpired
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -11,6 +11,185 @@ from gateway import delivery_ledger as delivery
 from tools import process_registry_followups as followups
 from tools import delegation_notifications as notifications
 from tools.process_registry import ProcessSession
+
+
+@pytest.fixture
+def multiplexed_progress(monkeypatch, tmp_path):
+    from hermes_constants import (
+        get_hermes_home, get_process_hermes_home,
+        reset_hermes_home_override, set_hermes_home_override,
+    )
+    launch = tmp_path / 'launch'
+    profile = launch / 'profiles' / 'koharu'
+    monkeypatch.setenv('HERMES_HOME', str(launch))
+    token = set_hermes_home_override(profile)
+    session = ProcessSession(id='proc_multiplexed', command='worker', session_key='owner',
+        watcher_platform='discord', watcher_chat_id='4242', watcher_thread_id='123',
+        remote_connection={'profile_home': str(profile)}, delegation_progress={'thread': '123'})
+    source = SimpleNamespace(thread_id='123', chat_id='4242')
+    send = AsyncMock(return_value=SimpleNamespace(success=True, message_id='profile-receipt'))
+    adapter = SimpleNamespace(send=send, _owner_profile='koharu')
+    runner = SimpleNamespace(_build_process_event_source=lambda evt: source,
+        _delivery_adapter_for=lambda source: adapter)
+    observe = Mock(side_effect=lambda *args, **kwargs: {'message': {'id': kwargs.get('admit')}})
+    monkeypatch.setattr(notifications, 'remote_observe', observe)
+    message = {'id': 'run:1', 'content': 'progress'}
+    try:
+        assert get_process_hermes_home() == launch
+        assert get_hermes_home() == profile
+        followups.reserve(session)
+        with delivery._transaction():
+            pass
+        yield SimpleNamespace(launch=launch, profile=profile, session=session, runner=runner,
+            send=send, observe=observe, message=message,
+            oid=f'delegation-progress:{session.id}:{message["id"]}')
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_multiplexed_progress_delivers_in_profile_db(multiplexed_progress):
+    case = multiplexed_progress
+    await notifications.send_progress(case.runner, case.session, case.message)
+
+    case.send.assert_awaited_once()
+    with followups._db(read_only=True) as db:
+        row = db.execute('SELECT state,adapter_profile FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone()
+        assert tuple(row) == ('delivered', 'koharu')
+        assert db.execute('SELECT message_id FROM delivery_obligation_receipts WHERE obligation_id=?',
+            (case.oid,)).fetchone()[0] == 'profile-receipt'
+    with delivery._transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_obligations WHERE obligation_id LIKE 'delegation-progress:%'").fetchone()[0] == 0
+    assert case.observe.call_args_list == [call(case.session, admit='run:1'), call(case.session, ack='run:1')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['superseded', 'transport'])
+async def test_multiplexed_progress_failure_stays_in_profile_db(multiplexed_progress, failure):
+    case = multiplexed_progress
+    if failure == 'superseded':
+        case.observe.side_effect = None
+        case.observe.return_value = {'message': {'id': 'run:2'}}
+        await notifications.send_progress(case.runner, case.session, case.message)
+        case.send.assert_not_awaited()
+    else:
+        case.send.side_effect = RuntimeError('transport interrupted')
+        with pytest.raises(RuntimeError, match='transport interrupted'):
+            await notifications.send_progress(case.runner, case.session, case.message)
+        case.send.assert_awaited_once()
+    with followups._db(read_only=True) as db:
+        row = db.execute('SELECT state,attempts FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone()
+        assert tuple(row) == ('failed' if failure == 'superseded' else 'uncertain', 0)
+        assert db.execute('SELECT COUNT(*) FROM delivery_obligation_receipts').fetchone()[0] == 0
+    assert case.observe.call_args_list == [call(case.session, admit='run:1')]
+
+
+@pytest.mark.asyncio
+async def test_multiplexed_progress_recovers_dead_owner_in_profile_db(multiplexed_progress, monkeypatch):
+    case = multiplexed_progress
+    case.observe.side_effect = None
+    case.observe.return_value = {'message': {'id': 'run:2'}}
+    await notifications.send_progress(case.runner, case.session, case.message)
+    assert notifications.claim_progress(case.session.id, case.oid)
+    with followups._db() as db:
+        db.execute('UPDATE delivery_obligations SET owner_pid=?,owner_started_at=? WHERE obligation_id=?',
+            (999999, 1, case.oid))
+    monkeypatch.setattr(delivery, '_owner_alive', lambda *args: False)
+
+    notifications.recover_progress(case.session.id)
+
+    with followups._db(read_only=True) as db:
+        row = db.execute('SELECT state,last_error FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone()
+        assert tuple(row) == ('uncertain', 'progress_sender_exited_receipt_unknown')
+    case.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multiplexed_progress_fences_followup_begin(multiplexed_progress):
+    case = multiplexed_progress
+    token = followups.pending()[0]['token']
+    assert followups.admission(case.session.id, token)
+    async def send(*args, **kwargs):
+        with followups._db(read_only=True) as db:
+            assert followups.progress_inflight(db, case.session.id)
+        assert not followups.begin(case.session.id, token)
+        assert followups.get_state(case.session.id)['phase'] == 'pending'
+        return SimpleNamespace(success=True, message_id='profile-receipt')
+    case.send.side_effect = send
+
+    await notifications.send_progress(case.runner, case.session, case.message)
+
+    case.send.assert_awaited_once()
+    assert followups.get_state(case.session.id)['phase'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_multiplexed_running_followup_abandons_progress(multiplexed_progress):
+    case = multiplexed_progress
+    token = followups.pending()[0]['token']
+    assert followups.admission(case.session.id, token)
+    assert followups.begin(case.session.id, token)
+
+    await notifications.send_progress(case.runner, case.session, case.message)
+
+    assert not notifications.claim_progress(case.session.id, case.oid)
+    with followups._db(read_only=True) as db:
+        assert db.execute('SELECT state FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone()[0] == 'abandoned'
+    assert followups.get_state(case.session.id)['phase'] == 'running'
+    case.send.assert_not_awaited()
+    case.observe.assert_not_called()
+
+
+def test_profile_progress_record_preserves_payload_and_claim(multiplexed_progress):
+    case = multiplexed_progress
+    payload = dict(obligation_id=case.oid, session_key='owner', platform='discord',
+        chat_id='4242', thread_id='123', content='progress', adapter_profile='koharu')
+    notifications._record_progress(**payload)
+    with followups._db() as db:
+        db.execute("UPDATE delivery_obligations SET state='uncertain',attempts=3,"
+            "owner_pid=999999,owner_started_at=1 WHERE obligation_id=?", (case.oid,))
+        before = tuple(db.execute('SELECT * FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone())
+
+    notifications._record_progress(**payload)
+    with pytest.raises(ValueError, match='Delivery obligation payload conflict'):
+        notifications._record_progress(**{**payload, 'content': 'changed'})
+
+    with followups._db(read_only=True) as db:
+        assert tuple(db.execute('SELECT * FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone()) == before
+
+
+@pytest.mark.parametrize('state,foreign_owner', [
+    ('attempting', True), ('delivered', False), ('abandoned', False),
+])
+def test_profile_progress_transitions_preserve_foreign_or_terminal_claim(
+    multiplexed_progress, state, foreign_owner,
+):
+    case = multiplexed_progress
+    notifications._record_progress(obligation_id=case.oid, session_key='owner', platform='discord',
+        chat_id='4242', thread_id='123', content='progress', adapter_profile='koharu')
+    with followups._db() as db:
+        db.execute('UPDATE delivery_obligations SET state=?,attempts=3 WHERE obligation_id=?',
+            (state, case.oid))
+        if foreign_owner:
+            db.execute('UPDATE delivery_obligations SET owner_pid=999999,owner_started_at=1 '
+                'WHERE obligation_id=?', (case.oid,))
+        before = tuple(db.execute('SELECT * FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone())
+
+    assert not notifications._release_progress_claim(case.oid, 'unsent')
+    notifications._mark_progress_uncertain(case.oid, 'interrupted')
+    notifications._mark_progress_delivered(case.oid, message_id='wrong-receipt')
+
+    with followups._db(read_only=True) as db:
+        assert tuple(db.execute('SELECT * FROM delivery_obligations WHERE obligation_id=?',
+            (case.oid,)).fetchone()) == before
+        assert db.execute('SELECT COUNT(*) FROM delivery_obligation_receipts').fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

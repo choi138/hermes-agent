@@ -146,10 +146,80 @@ def _cancelled(db, session):
     return bool(row and row[0] >= session.started_at)
 
 
+def _record_progress(*, obligation_id, session_key, platform, chat_id, thread_id,
+                     content, adapter_profile=None):
+    from gateway import delivery_ledger as ledger
+    from tools.process_registry_followups import _db
+    now, (pid, started) = time.time(), ledger._owner_stamp()
+    stored_profile = str(adapter_profile).strip() if adapter_profile else 'default'
+    expected = (session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+                content, stored_profile, 'delegation_progress')
+    with _db() as db:
+        ledger._initialize_schema(db)
+        existing = db.execute(
+            'SELECT session_key,platform,chat_id,thread_id,content,adapter_profile,response_kind '
+            'FROM delivery_obligations WHERE obligation_id=?', (obligation_id,)).fetchone()
+        if existing is not None:
+            if tuple(existing) != expected:
+                raise ValueError('Delivery obligation payload conflict')
+            return
+        db.execute('''INSERT INTO delivery_obligations
+            (obligation_id,session_key,platform,chat_id,thread_id,content,adapter_profile,
+             response_kind,state,attempts,created_at,updated_at,owner_pid,owner_started_at)
+            VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?)''',
+            (obligation_id, *expected, now, now, pid, started))
+        ledger._prune_unlocked(db, now)
+
+
+def _release_progress_claim(obligation_id, error=''):
+    from gateway import delivery_ledger as ledger
+    from tools.process_registry_followups import _db
+    pid, started = ledger._owner_stamp()
+    if started is None:
+        return False
+    with _db() as db:
+        ledger._initialize_schema(db)
+        return db.execute('''UPDATE delivery_obligations SET state='failed',
+            attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,updated_at=?,last_error=?
+            WHERE obligation_id=? AND state='attempting'
+              AND owner_pid IS ? AND owner_started_at IS ?''',
+            (time.time(), error[:500] if error else None, obligation_id, pid, started)).rowcount == 1
+
+
+def _mark_progress_delivered(obligation_id, *, message_id=None):
+    from gateway import delivery_ledger as ledger
+    from tools.process_registry_followups import _db
+    pid, started = ledger._owner_stamp()
+    with _db() as db:
+        ledger._initialize_schema(db)
+        updated = db.execute('''UPDATE delivery_obligations
+            SET state='delivered',updated_at=?,last_error=NULL
+            WHERE obligation_id=? AND state IN ('attempting','uncertain')
+              AND owner_pid IS ? AND owner_started_at IS ?''',
+            (time.time(), obligation_id, pid, started)).rowcount
+        if updated and message_id is not None:
+            db.execute('INSERT OR REPLACE INTO delivery_obligation_receipts VALUES (?,?,?)',
+                       (obligation_id, str(message_id), time.time()))
+
+
+def _mark_progress_uncertain(obligation_id, error='', *, owner=None):
+    from gateway import delivery_ledger as ledger
+    from tools.process_registry_followups import _db
+    pid, started = ledger._owner_stamp() if owner is None else owner
+    with _db() as db:
+        ledger._initialize_schema(db)
+        db.execute('''UPDATE delivery_obligations SET state='uncertain',updated_at=?,last_error=?
+            WHERE obligation_id=? AND state='attempting'
+              AND owner_pid IS ? AND owner_started_at IS ?''',
+            (time.time(), error[:500] if error else None, obligation_id, pid, started))
+
+
 def claim_progress(execution, oid, session=None):
     """Atomic with foreground/automatic terminal claims in the same profile database."""
+    from gateway import delivery_ledger as ledger
     from tools.process_registry_followups import _db
     with _db() as db:
+        ledger._initialize_schema(db)
         row = db.execute('SELECT phase FROM process_followups WHERE execution_id=?', (execution,)).fetchone()
         if (row and row[0] not in {'pending', 'queued'}) or (session and _cancelled(db, session)):
             db.execute("UPDATE delivery_obligations SET state='abandoned' WHERE obligation_id=? AND state!='delivered'", (oid,))
@@ -157,8 +227,7 @@ def claim_progress(execution, oid, session=None):
         if db.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id LIKE ? AND obligation_id!=? AND state='attempting'",
                       (f'delegation-progress:{execution}:%', oid)).fetchone():
             return False
-        from gateway.delivery_ledger import _owner_stamp
-        pid, started = _owner_stamp()
+        pid, started = ledger._owner_stamp()
         return db.execute("UPDATE delivery_obligations SET state='attempting',updated_at=?,owner_pid=?,owner_started_at=? WHERE obligation_id=? AND state IN ('pending','failed')", (time.time(), pid, started, oid)).rowcount == 1
 
 
@@ -167,15 +236,13 @@ def recover_progress(execution):
     from gateway import delivery_ledger as ledger
     from tools.process_registry_followups import _db
     with _db() as db:
-        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if 'delivery_obligations' not in tables:
-            return
+        ledger._initialize_schema(db)
         rows = db.execute("SELECT obligation_id,owner_pid,owner_started_at FROM delivery_obligations WHERE obligation_id LIKE ? AND state='attempting'",
                           (f'delegation-progress:{execution}:%',)).fetchall()
         for oid, pid, started in rows:
             if not ledger._owner_alive(pid, started):
-                db.execute("UPDATE delivery_obligations SET state='uncertain',last_error=?,updated_at=? WHERE obligation_id=? AND state='attempting'",
-                           ('progress_sender_exited_receipt_unknown', time.time(), oid))
+                db.execute("UPDATE delivery_obligations SET state='uncertain',last_error=?,updated_at=? WHERE obligation_id=? AND state='attempting' AND owner_pid IS ? AND owner_started_at IS ?",
+                           ('progress_sender_exited_receipt_unknown', time.time(), oid, pid, started))
 
 
 async def reconcile_progress(runner, registry):
@@ -272,18 +339,17 @@ async def send_progress(runner, session, message):
     content = scrub_payload(message['content'])
     # Fixed renderer, but do not allow worker-controlled paths to notify Discord users.
     content = content.replace('@', '@\u200b')
-    await asyncio.to_thread(ledger.record_obligation, obligation_id=oid, session_key=session.session_key,
+    await asyncio.to_thread(_record_progress, obligation_id=oid, session_key=session.session_key,
         platform=evt['platform'], chat_id=source.chat_id, thread_id=source.thread_id,
-        content=content, adapter_profile=getattr(adapter, '_owner_profile', None),
-        response_kind='delegation_progress', preserve_existing=True)
+        content=content, adapter_profile=getattr(adapter, '_owner_profile', None))
     with _db(read_only=True) as db:
         state = db.execute('SELECT state FROM delivery_obligations WHERE obligation_id=?', (oid,)).fetchone()[0]
     if state == 'attempting':
-        from gateway.delivery_ledger import _owner_alive
         with _db(read_only=True) as db:
             owner = db.execute('SELECT owner_pid,owner_started_at FROM delivery_obligations WHERE obligation_id=?', (oid,)).fetchone()
-        if not _owner_alive(*owner):
-            await asyncio.to_thread(ledger.mark_uncertain, oid, 'Progress sender exited; receipt unknown, do not replay')
+        if not ledger._owner_alive(*owner):
+            await asyncio.to_thread(_mark_progress_uncertain, oid,
+                'Progress sender exited; receipt unknown, do not replay', owner=tuple(owner))
         return
     if state in {'delivered', 'uncertain', 'abandoned'}:
         await asyncio.to_thread(remote_observe, session, ack=message['id'])
@@ -294,7 +360,7 @@ async def send_progress(runner, session, message):
     except asyncio.CancelledError:
         async def release_unsent():
             if await claim:
-                await asyncio.to_thread(ledger.release_runtime_claim, oid, 'progress_claim_cancelled_unsent')
+                await asyncio.to_thread(_release_progress_claim, oid, 'progress_claim_cancelled_unsent')
         settlement = asyncio.create_task(release_unsent())
         _sends.add(settlement)
         settlement.add_done_callback(_sends.discard)
@@ -305,7 +371,7 @@ async def send_progress(runner, session, message):
     try:
         admission = await asyncio.to_thread(remote_observe, session, admit=message['id'])
         if admission.get('message', {}).get('id') != message['id']:
-            await asyncio.to_thread(ledger.release_runtime_claim, oid, 'progress_head_superseded_unsent')
+            await asyncio.to_thread(_release_progress_claim, oid, 'progress_head_superseded_unsent')
             return
         # Keep ownership until transport resolves; caller cancellation is uncertain, never blindly replayed.
         send = asyncio.create_task(adapter.send(source.chat_id, content,
@@ -319,13 +385,13 @@ async def send_progress(runner, session, message):
                 try:
                     receipt = await send
                     if getattr(receipt, 'success', False):
-                        await asyncio.to_thread(ledger.mark_delivered, oid, message_id=getattr(receipt, 'message_id', None))
+                        await asyncio.to_thread(_mark_progress_delivered, oid, message_id=getattr(receipt, 'message_id', None))
                         await asyncio.to_thread(remote_observe, session, ack=message['id'])
                     else:
-                        await asyncio.to_thread(ledger.mark_uncertain, oid,
+                        await asyncio.to_thread(_mark_progress_uncertain, oid,
                             'progress_late_receipt_unknown:' + scrub_payload(str(getattr(receipt, 'error', '') or 'unconfirmed'))[:350])
                 except BaseException:
-                    await asyncio.to_thread(ledger.mark_uncertain, oid, 'Late progress send interrupted')
+                    await asyncio.to_thread(_mark_progress_uncertain, oid, 'Late progress send interrupted')
             task = asyncio.create_task(settle())
             _sends.add(task)
             task.add_done_callback(_sends.discard)
@@ -334,18 +400,18 @@ async def send_progress(runner, session, message):
                 raise
             return
         if not getattr(result, 'success', False):
-            await asyncio.to_thread(ledger.mark_uncertain, oid,
+            await asyncio.to_thread(_mark_progress_uncertain, oid,
                 'progress_receipt_unknown:' + scrub_payload(str(getattr(result, 'error', '') or 'unconfirmed'))[:350])
             return
-        await asyncio.to_thread(ledger.mark_delivered, oid, message_id=getattr(result, "message_id", None))
+        await asyncio.to_thread(_mark_progress_delivered, oid, message_id=getattr(result, "message_id", None))
         await asyncio.to_thread(remote_observe, session, ack=message['id'])
     except asyncio.CancelledError:
         if not sending:
-            await asyncio.to_thread(ledger.release_runtime_claim, oid, 'progress_admission_cancelled_unsent')
+            await asyncio.to_thread(_release_progress_claim, oid, 'progress_admission_cancelled_unsent')
         raise
     except BaseException as exc:
         if not sending:
-            await asyncio.to_thread(ledger.release_runtime_claim, oid, _cause(exc))
+            await asyncio.to_thread(_release_progress_claim, oid, _cause(exc))
         else:
-            await asyncio.to_thread(ledger.mark_uncertain, oid, 'progress_send_interrupted:' + _cause(exc))
+            await asyncio.to_thread(_mark_progress_uncertain, oid, 'progress_send_interrupted:' + _cause(exc))
         raise
