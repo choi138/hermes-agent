@@ -587,10 +587,44 @@ def test_multiplexed_gateway_authorizes_profile_reports_from_the_profile_store(m
     assert delivery.turn_delivery_state(KEY, 'foreground-turn') != 'abandoned'
 
 
-def test_legacy_main_key_keeps_the_ambient_follow_up_store(monkeypatch, tmp_path):
-    """Single-home gateways key sessions as ``agent:main``; their follow-ups stay in the ambient home."""
+def test_default_profile_reports_resolve_to_the_launch_home_from_a_satellite_scope(monkeypatch, tmp_path):
+    """``agent:main`` follow-ups live in the launch home; a sweep that inherited a satellite's
+    scope must not read the satellite's store for them and abandon valid default-profile reports."""
     from gateway import delivery_ledger as delivery
-    assert delivery._followups_home_override('agent:main:discord:dm:1') is None
-    assert delivery._followups_home_override(None) is None
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from tools.process_registry import ProcessRegistry
+    root = tmp_path / 'root'
+    satellite = root / 'profiles' / 'koharu'
+    satellite.mkdir(parents=True)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+    key = 'agent:main:discord:thread:7:7'
+    session = ProcessSession(id='proc_default_owner', command='true', session_key=key, parent_session_id='parent',
+        remote_root='/private/job', notify_on_complete=True, watcher_platform='discord', exited=True, exit_code=0)
+    registry = ProcessRegistry()
+    registry._finished[session.id] = session
+    followups.reserve(session)
+    row = followups.pending()[0]
+    with followups.task_request_scope('verify', observed={}, publication_barrier=lambda: None):
+        registry.wait(session.id, timeout=1)
+    assert followups.admission(session.id, row['token'])
+    assessment = {'outcome': 'verified', 'evidence': ['artifact compared'], 'next_action': 'none'}
+    assert followups.claim_foreground_report(session.id, key, 'default-turn', assessment, 'report text')
+    report = 'process-report:' + delivery.compute_obligation_id(key, 'default-turn', 'process_verification_report')
+    delivery.record_obligation(obligation_id=report, session_key=key, platform='discord', chat_id='7',
+        thread_id='7', content='report text', adapter_profile='default', turn_id='default-turn',
+        response_kind='process_verification_report')
+    scope = set_hermes_home_override(satellite)  # e.g. a retry timer started from a satellite turn
+    try:
+        assert delivery.process_attention_authorized(report) is True
+        with delivery._DB_LOCK, delivery._transaction() as conn:
+            assert delivery.process_attention_authorized(report, connection=conn) is True
+    finally:
+        reset_hermes_home_override(scope)
+
+
+def test_session_keys_map_to_their_runtime_profile_home(monkeypatch, tmp_path):
+    from gateway import delivery_ledger as delivery
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    assert delivery._followups_home_override('agent:main:discord:dm:1') == tmp_path
+    assert delivery._followups_home_override(None) == tmp_path
     assert delivery._followups_home_override('agent:koharu:discord:dm:1') == tmp_path / 'profiles' / 'koharu'

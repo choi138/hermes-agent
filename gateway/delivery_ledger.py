@@ -409,23 +409,22 @@ def _followups_home_override(session_key):
     runtime profile's home, so a multiplexed gateway must not read follow-ups through the ledger
     connection: that table is empty there and every report would be abandoned unsent. The owner
     comes from the ``agent:<profile>:...`` key, never from ``adapter_profile`` (the delivery bot,
-    which differs from the runtime profile for a shared bot routing to a satellite).
-    ``None`` keeps the caller's current home: legacy ``agent:main`` keys and single-home gateways.
+    which differs from the runtime profile for a shared bot routing to a satellite). Everything
+    else -- ``agent:main`` and unparseable keys -- belongs to the launch home, exactly the store
+    the ledger connection used to read; resolving it explicitly keeps a sweep that inherited a
+    satellite's scope from reading the satellite's store for default-profile rows.
     """
     parts = str(session_key or '').split(':')
     if len(parts) < 2 or parts[0] != 'agent' or parts[1] in ('', 'main'):
-        return None
+        return get_process_hermes_home()
     from gateway.session import profile_from_session_key_namespace
     from hermes_cli.profiles import get_profile_dir
     return get_profile_dir(profile_from_session_key_namespace(parts[1]))
 
 
 def _read_followups_as(session_key, read):
-    home = _followups_home_override(session_key)
-    if home is None:
-        return read()
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    token = set_hermes_home_override(home)
+    token = set_hermes_home_override(_followups_home_override(session_key))
     try:
         return read()
     finally:
