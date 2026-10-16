@@ -531,12 +531,13 @@ def test_reported_result_read_allows_normal_answer(monkeypatch, tmp_path):
 
 
 def test_multiplexed_gateway_authorizes_profile_reports_from_the_profile_store(monkeypatch, tmp_path):
-    """The ledger lives in the launch home but follow-ups live in the served profile's home.
+    """The ledger lives in the launch home but follow-ups live in the runtime profile's home.
 
     Reading follow-ups through the ledger connection found no row there, so every verification
     report was abandoned unsent and only the reconciliation notice reached the chat.
     """
     from gateway import delivery_ledger as delivery
+    KEY = 'agent:koharu:discord:thread:4242:4242'  # runtime owner is encoded in the key
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from tools.process_registry import ProcessRegistry
     root = tmp_path / 'root'
@@ -546,7 +547,7 @@ def test_multiplexed_gateway_authorizes_profile_reports_from_the_profile_store(m
 
     scope = set_hermes_home_override(profile_home)
     try:
-        session = ProcessSession(id='proc_multiplexed', command='true', session_key='owner', parent_session_id='parent',
+        session = ProcessSession(id='proc_multiplexed', command='true', session_key=KEY, parent_session_id='parent',
             remote_root='/private/job', notify_on_complete=True, watcher_platform='discord', exited=True, exit_code=0)
         registry = ProcessRegistry()
         registry._finished[session.id] = session
@@ -556,9 +557,9 @@ def test_multiplexed_gateway_authorizes_profile_reports_from_the_profile_store(m
             registry.wait(session.id, timeout=1)
         assert followups.admission(session.id, row['token'])
         assessment = {'outcome': 'verified', 'evidence': ['artifact compared'], 'next_action': 'none'}
-        assert followups.claim_foreground_report(session.id, 'owner', 'foreground-turn', assessment, 'report text')
-        assert followups.report_authorized('owner', 'foreground-turn')
-        stalled = ProcessSession(id='proc_multiplexed_attention', command='true', session_key='owner')
+        assert followups.claim_foreground_report(session.id, KEY, 'foreground-turn', assessment, 'report text')
+        assert followups.report_authorized(KEY, 'foreground-turn')
+        stalled = ProcessSession(id='proc_multiplexed_attention', command='true', session_key=KEY)
         followups.reserve(stalled)
         stalled_row = [r for r in followups.pending() if r['execution_id'] == stalled.id][0]
         assert followups.admission(stalled.id, stalled_row['token']) and followups.begin(stalled.id, stalled_row['token'])
@@ -569,18 +570,27 @@ def test_multiplexed_gateway_authorizes_profile_reports_from_the_profile_store(m
 
     # The ledger is the launch home's store, which has no follow-up rows of its own.
     assert delivery._db_path() == root / 'state.db'
-    assert not followups.report_authorized('owner', 'foreground-turn')
-    report = 'process-report:' + delivery.compute_obligation_id('owner', 'foreground-turn', 'process_verification_report')
-    delivery.record_obligation(obligation_id=report, session_key='owner', platform='discord', chat_id='4242',
-        thread_id='4242', content='report text', adapter_profile='koharu', turn_id='foreground-turn',
+    assert not followups.report_authorized(KEY, 'foreground-turn')
+    report = 'process-report:' + delivery.compute_obligation_id(KEY, 'foreground-turn', 'process_verification_report')
+    delivery.record_obligation(obligation_id=report, session_key=KEY, platform='discord', chat_id='4242',
+        thread_id='4242', content='report text', adapter_profile='shared-bot', turn_id='foreground-turn',
         response_kind='process_verification_report')
     attention = f"process-attention:{stalled.id}:{stalled_row['token']}"
-    delivery.record_obligation(obligation_id=attention, session_key='owner', platform='discord', chat_id='4242',
-        thread_id='4242', content='needs reconciliation', adapter_profile='koharu', turn_id=attention)
+    delivery.record_obligation(obligation_id=attention, session_key=KEY, platform='discord', chat_id='4242',
+        thread_id='4242', content='needs reconciliation', adapter_profile='shared-bot', turn_id=attention)
 
     for oid in (report, attention):
         assert delivery.process_attention_authorized(oid) is True
         with delivery._DB_LOCK, delivery._transaction() as conn:  # the restart/retry sweeps pass their connection
             assert delivery.process_attention_authorized(oid, connection=conn) is True
     assert delivery.claim_pending_obligation(report)
-    assert delivery.turn_delivery_state('owner', 'foreground-turn') != 'abandoned'
+    assert delivery.turn_delivery_state(KEY, 'foreground-turn') != 'abandoned'
+
+
+def test_legacy_main_key_keeps_the_ambient_follow_up_store(monkeypatch, tmp_path):
+    """Single-home gateways key sessions as ``agent:main``; their follow-ups stay in the ambient home."""
+    from gateway import delivery_ledger as delivery
+    assert delivery._followups_home_override('agent:main:discord:dm:1') is None
+    assert delivery._followups_home_override(None) is None
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    assert delivery._followups_home_override('agent:koharu:discord:dm:1') == tmp_path / 'profiles' / 'koharu'

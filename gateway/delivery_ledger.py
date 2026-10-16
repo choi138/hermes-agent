@@ -402,22 +402,26 @@ def public_obligation_id(obligation_id):
     return obligation_id
 
 
-def _followups_home_override(adapter_profile):
-    """Home whose state DB holds the owning profile's process follow-ups.
+def _followups_home_override(session_key):
+    """Home whose state DB holds the follow-ups of the profile that RUNS *session_key*.
 
     The ledger lives in the launch home (see ``_db_path``) while follow-ups are written under the
-    served profile's home, so a multiplexed gateway must not read follow-ups through the ledger
-    connection: that table is empty there and every report would be abandoned unsent.
-    ``None`` keeps the caller's current home (single-home gateways and legacy rows).
+    runtime profile's home, so a multiplexed gateway must not read follow-ups through the ledger
+    connection: that table is empty there and every report would be abandoned unsent. The owner
+    comes from the ``agent:<profile>:...`` key, never from ``adapter_profile`` (the delivery bot,
+    which differs from the runtime profile for a shared bot routing to a satellite).
+    ``None`` keeps the caller's current home: legacy ``agent:main`` keys and single-home gateways.
     """
-    if not adapter_profile:
+    parts = str(session_key or '').split(':')
+    if len(parts) < 2 or parts[0] != 'agent' or parts[1] in ('', 'main'):
         return None
+    from gateway.session import profile_from_session_key_namespace
     from hermes_cli.profiles import get_profile_dir
-    return get_profile_dir(adapter_profile)
+    return get_profile_dir(profile_from_session_key_namespace(parts[1]))
 
 
-def _read_followups_as(adapter_profile, read):
-    home = _followups_home_override(adapter_profile)
+def _read_followups_as(session_key, read):
+    home = _followups_home_override(session_key)
     if home is None:
         return read()
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -434,8 +438,7 @@ def process_attention_authorized(obligation_id, *, connection=None):
         try:
             from tools.process_registry_followups import report_authorized
             def read(conn):
-                return conn.execute('SELECT session_key,turn_id,adapter_profile FROM delivery_obligations WHERE obligation_id=?',
-                                    (obligation_id,)).fetchone()
+                return conn.execute('SELECT session_key,turn_id FROM delivery_obligations WHERE obligation_id=?', (obligation_id,)).fetchone()
             if connection is not None:
                 row = read(connection)
             else:
@@ -443,7 +446,7 @@ def process_attention_authorized(obligation_id, *, connection=None):
                     row = read(conn)
             if not row:
                 return False
-            return _read_followups_as(row[2], lambda: report_authorized(row[0], row[1]))
+            return _read_followups_as(row[0], lambda: report_authorized(row[0], row[1]))
         except (sqlite3.Error, OSError, ValueError):
             logger.warning('Process report authorization unavailable: %s', obligation_id, exc_info=True)
             return None
@@ -458,11 +461,11 @@ def process_attention_authorized(obligation_id, *, connection=None):
         return None
     try:
         if connection is not None:
-            row = connection.execute('SELECT adapter_profile FROM delivery_obligations WHERE obligation_id=?',
+            row = connection.execute('SELECT session_key FROM delivery_obligations WHERE obligation_id=?',
                                      (obligation_id,)).fetchone()
         else:
             with _DB_LOCK, _transaction() as conn:
-                row = conn.execute('SELECT adapter_profile FROM delivery_obligations WHERE obligation_id=?',
+                row = conn.execute('SELECT session_key FROM delivery_obligations WHERE obligation_id=?',
                                    (obligation_id,)).fetchone()
         return _read_followups_as(row[0] if row else None, lambda: attention_authorized(parts[1], parts[2]))
     except (sqlite3.Error, OSError, ValueError) as exc:
