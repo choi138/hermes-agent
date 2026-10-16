@@ -528,3 +528,59 @@ def test_reported_result_read_allows_normal_answer(monkeypatch, tmp_path):
     with followups.task_request_scope('show prior result', observed=observed, publication_barrier=lambda: barriers.append(True)):
         result = registry.wait(session.id, timeout=1)
     assert 'completion_reporting' not in result and observed == {} and barriers == []
+
+
+def test_multiplexed_gateway_authorizes_profile_reports_from_the_profile_store(monkeypatch, tmp_path):
+    """The ledger lives in the launch home but follow-ups live in the served profile's home.
+
+    Reading follow-ups through the ledger connection found no row there, so every verification
+    report was abandoned unsent and only the reconciliation notice reached the chat.
+    """
+    from gateway import delivery_ledger as delivery
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from tools.process_registry import ProcessRegistry
+    root = tmp_path / 'root'
+    profile_home = root / 'profiles' / 'koharu'
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+
+    scope = set_hermes_home_override(profile_home)
+    try:
+        session = ProcessSession(id='proc_multiplexed', command='true', session_key='owner', parent_session_id='parent',
+            remote_root='/private/job', notify_on_complete=True, watcher_platform='discord', exited=True, exit_code=0)
+        registry = ProcessRegistry()
+        registry._finished[session.id] = session
+        followups.reserve(session)
+        row = followups.pending()[0]
+        with followups.task_request_scope('verify', observed={}, publication_barrier=lambda: None):
+            registry.wait(session.id, timeout=1)
+        assert followups.admission(session.id, row['token'])
+        assessment = {'outcome': 'verified', 'evidence': ['artifact compared'], 'next_action': 'none'}
+        assert followups.claim_foreground_report(session.id, 'owner', 'foreground-turn', assessment, 'report text')
+        assert followups.report_authorized('owner', 'foreground-turn')
+        stalled = ProcessSession(id='proc_multiplexed_attention', command='true', session_key='owner')
+        followups.reserve(stalled)
+        stalled_row = [r for r in followups.pending() if r['execution_id'] == stalled.id][0]
+        assert followups.admission(stalled.id, stalled_row['token']) and followups.begin(stalled.id, stalled_row['token'])
+        monkeypatch.setattr(followups, '_owner_alive', lambda _: False)
+        assert [r for r in followups.pending() if r['execution_id'] == stalled.id][0]['phase'] == 'needs_reconciliation'
+    finally:
+        reset_hermes_home_override(scope)
+
+    # The ledger is the launch home's store, which has no follow-up rows of its own.
+    assert delivery._db_path() == root / 'state.db'
+    assert not followups.report_authorized('owner', 'foreground-turn')
+    report = 'process-report:' + delivery.compute_obligation_id('owner', 'foreground-turn', 'process_verification_report')
+    delivery.record_obligation(obligation_id=report, session_key='owner', platform='discord', chat_id='4242',
+        thread_id='4242', content='report text', adapter_profile='koharu', turn_id='foreground-turn',
+        response_kind='process_verification_report')
+    attention = f"process-attention:{stalled.id}:{stalled_row['token']}"
+    delivery.record_obligation(obligation_id=attention, session_key='owner', platform='discord', chat_id='4242',
+        thread_id='4242', content='needs reconciliation', adapter_profile='koharu', turn_id=attention)
+
+    for oid in (report, attention):
+        assert delivery.process_attention_authorized(oid) is True
+        with delivery._DB_LOCK, delivery._transaction() as conn:  # the restart/retry sweeps pass their connection
+            assert delivery.process_attention_authorized(oid, connection=conn) is True
+    assert delivery.claim_pending_obligation(report)
+    assert delivery.turn_delivery_state('owner', 'foreground-turn') != 'abandoned'

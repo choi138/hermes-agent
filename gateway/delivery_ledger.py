@@ -402,19 +402,49 @@ def public_obligation_id(obligation_id):
     return obligation_id
 
 
+def _followups_home_override(adapter_profile):
+    """Home whose state DB holds the owning profile's process follow-ups.
+
+    The ledger lives in the launch home (see ``_db_path``) while follow-ups are written under the
+    served profile's home, so a multiplexed gateway must not read follow-ups through the ledger
+    connection: that table is empty there and every report would be abandoned unsent.
+    ``None`` keeps the caller's current home (single-home gateways and legacy rows).
+    """
+    if not adapter_profile:
+        return None
+    from hermes_cli.profiles import get_profile_dir
+    return get_profile_dir(adapter_profile)
+
+
+def _read_followups_as(adapter_profile, read):
+    home = _followups_home_override(adapter_profile)
+    if home is None:
+        return read()
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(home)
+    try:
+        return read()
+    finally:
+        reset_hermes_home_override(token)
+
+
 def process_attention_authorized(obligation_id, *, connection=None):
     """The state DB fences process-report retries even if ledger cleanup failed."""
     if obligation_id.startswith('process-report:'):
         try:
             from tools.process_registry_followups import report_authorized
             def read(conn):
-                row = conn.execute('SELECT session_key,turn_id FROM delivery_obligations WHERE obligation_id=?', (obligation_id,)).fetchone()
-                return report_authorized(*row, connection=conn) if row else False
+                return conn.execute('SELECT session_key,turn_id,adapter_profile FROM delivery_obligations WHERE obligation_id=?',
+                                    (obligation_id,)).fetchone()
             if connection is not None:
-                return read(connection)
-            with _DB_LOCK, _transaction() as conn:
-                return read(conn)
-        except (sqlite3.Error, OSError):
+                row = read(connection)
+            else:
+                with _DB_LOCK, _transaction() as conn:
+                    row = read(conn)
+            if not row:
+                return False
+            return _read_followups_as(row[2], lambda: report_authorized(row[0], row[1]))
+        except (sqlite3.Error, OSError, ValueError):
             logger.warning('Process report authorization unavailable: %s', obligation_id, exc_info=True)
             return None
     if not obligation_id.startswith('process-attention:'):
@@ -428,10 +458,14 @@ def process_attention_authorized(obligation_id, *, connection=None):
         return None
     try:
         if connection is not None:
-            return connection.execute("SELECT 1 FROM process_followups WHERE execution_id=? AND token=? AND phase='needs_reconciliation'",
-                                      (parts[1], parts[2])).fetchone() is not None
-        return attention_authorized(parts[1], parts[2])
-    except (sqlite3.Error, OSError) as exc:
+            row = connection.execute('SELECT adapter_profile FROM delivery_obligations WHERE obligation_id=?',
+                                     (obligation_id,)).fetchone()
+        else:
+            with _DB_LOCK, _transaction() as conn:
+                row = conn.execute('SELECT adapter_profile FROM delivery_obligations WHERE obligation_id=?',
+                                   (obligation_id,)).fetchone()
+        return _read_followups_as(row[0] if row else None, lambda: attention_authorized(parts[1], parts[2]))
+    except (sqlite3.Error, OSError, ValueError) as exc:
         from tools.environments.ssh_process import safe_error
         logger.warning('Process attention authorization unavailable: %s: %s', public_obligation_id(obligation_id), safe_error(exc))
         return None  # Retry later; unavailable is neither authorized nor cancelled.
