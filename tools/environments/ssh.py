@@ -26,6 +26,21 @@ logger = logging.getLogger(__name__)
 # Skip multiplexing there; each command pays a fresh connection but the backend works. See #73927.
 _SSH_MULTIPLEX = os.name != "nt"
 
+_REMOTE_HASH_PROGRAM = r'''
+import hashlib, json, sys
+result = {}
+for path in json.load(sys.stdin):
+    try:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as source:
+            for chunk in iter(lambda: source.read(65536), b''):
+                digest.update(chunk)
+        result[path] = digest.hexdigest()
+    except OSError:
+        result[path] = None
+json.dump(result, sys.stdout)
+'''
+
 # Module-level binding: tests patch ``ssh._load_hermes_env_vars`` to fake the .env file.
 _load_hermes_env_vars = load_hermes_env_vars
 
@@ -119,7 +134,8 @@ class SSHEnvironment(BaseEnvironment):
                 get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
                 upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
                 bulk_upload_fn=self._ssh_bulk_upload, selective_download_fn=self._ssh_download_changes,
-                sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]), fail_closed=True)
+                sync_back_identity=json.dumps([self.host, self.user, self.port, self._remote_home]), fail_closed=True,
+                verify_remote_fn=self._ssh_remote_hashes)
             # Bootstrap has no synchronized-file dependency. Upload is required at
             # the first ordinary execution boundary; status-only observation stays independent.
         self.init_session()
@@ -354,6 +370,13 @@ class SSHEnvironment(BaseEnvironment):
                 raise _sync_error(f"SSH bulk download failed: {stderr}",
                                   f"File sync from {self.host}")
 
+
+    def _ssh_remote_hashes(self, remote_paths: list[str], timeout: float) -> dict[str, str | None]:
+        result = self._run_ssh("python3 -c " + shlex.quote(_REMOTE_HASH_PROGRAM), timeout,
+                               stdin_data=json.dumps(remote_paths))
+        if result.returncode != 0:
+            raise OSError(f"remote hash check failed (rc={result.returncode}): {result.stderr.strip()[:500]}")
+        return json.loads(result.stdout)
 
     def _ssh_download_changes(self, dest: Path, request: dict, timeout: float) -> None:
         from tools.environments.ssh_sync_back import download_changes
