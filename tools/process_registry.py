@@ -1374,13 +1374,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 'automatic_repair_budget': 0,
             }
             if session.notify_on_complete:
-                from tools.delegation_notifications import prepare_launch
+                from tools.delegation_notifications import ProgressRootUnavailable, prepare_launch
                 def resolve_progress_root(root):
                     result = env._run_ssh(f"cd -P -- {q(root)} && pwd -P", timeout=10)
                     if result.returncode:
-                        raise ValueError('progress_temp_root_resolution_failed')
+                        raise subprocess.CalledProcessError(result.returncode, 'pwd -P')
                     return result.stdout
-                tracked, binding = prepare_launch(command, session, temp_dir, resolve_root=resolve_progress_root)
+                try:
+                    tracked, binding = prepare_launch(command, session, temp_dir, resolve_root=resolve_progress_root)
+                except ProgressRootUnavailable as exc:
+                    from tools.environments.base import EnvironmentConnectionError
+                    raise EnvironmentConnectionError(
+                        f'Delegation progress tracking unavailable ({exc.reason}); no command was dispatched',
+                        retry_hint='Restore SSH/temp-dir access and retry the command.') from None
                 if binding:
                     from tools.process_registry_followups import fence_publication
                     fence_publication()

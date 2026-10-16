@@ -6,6 +6,7 @@ import re
 import shlex
 import time
 from pathlib import PurePosixPath
+from subprocess import CalledProcessError
 
 logger = logging.getLogger(__name__)
 
@@ -18,22 +19,41 @@ _sends = set()
 _poll_tasks = {}
 
 
+class ProgressRootUnavailable(RuntimeError):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _canonical_temp_root(temp_dir, resolve_root):
     try:
         root = resolve_root(temp_dir)
-    except Exception:
-        logger.warning('progress_temp_root_resolution_failed')
-        return None
-    if isinstance(root, str):
-        root = root.removesuffix('\n')
-    if (not isinstance(root, str) or not re.fullmatch(r'/[A-Za-z0-9._/-]*', root)
-            or '..' in root.split('/')):
-        logger.warning('progress_temp_root_invalid')
-        return None
-    return root
+    except CalledProcessError as exc:
+        reason = f'resolver_exit:{exc.returncode:d}'
+    except Exception as exc:
+        reason = f'resolver_exception:{type(exc).__name__}'
+    else:
+        if isinstance(root, str):
+            root = root.removesuffix('\n')
+        if not isinstance(root, str):
+            reason = 'invalid_root:chars'
+        elif not root:
+            reason = 'invalid_root:empty'
+        elif '\n' in root:
+            reason = 'invalid_root:multiline'
+        elif not root.startswith('/'):
+            reason = 'invalid_root:relative'
+        elif '..' in root.split('/'):
+            reason = 'invalid_root:dotdot'
+        elif not re.fullmatch(r'/[A-Za-z0-9._/-]*', root):
+            reason = 'invalid_root:chars'
+        else:
+            return root
+    logger.warning('%s', reason)
+    raise ProgressRootUnavailable(reason) from None
 
 
-def prepare_launch(command, session, temp_dir, *, resolve_root=None):
+def prepare_launch(command, session, temp_dir, *, resolve_root):
     # Accept one argv, never parse/rewrite arbitrary shell programs or monitor jobs.
     try:
         if any(char in command for char in '$`\n\r~'):
@@ -70,8 +90,6 @@ def prepare_launch(command, session, temp_dir, *, resolve_root=None):
     except ValueError:
         return command, {}
     root = _canonical_temp_root(temp_dir, resolve_root)
-    if root is None:
-        return command, {}
     directory = f'{root.rstrip("/")}/delegation-{session.id}'
     binding = {'python': argv[0], 'runner': argv[1], 'manifest': directory+'/manifest.json',
                'state_dir': directory+'/state', 'thread': thread}

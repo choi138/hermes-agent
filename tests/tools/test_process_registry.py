@@ -943,6 +943,68 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
+    @pytest.mark.parametrize('resolution,reason', [
+        (subprocess.CompletedProcess('COMMAND_SENTINEL', 1, '/ROOT_PATH_SENTINEL', 'STDERR_SENTINEL'),
+            'resolver_exit:1'),
+        (subprocess.CompletedProcess('COMMAND_SENTINEL', 255, '/ROOT_PATH_SENTINEL', 'STDERR_SENTINEL'),
+            'resolver_exit:255'),
+        (subprocess.CompletedProcess('COMMAND_SENTINEL', 0, ''), 'invalid_root:empty'),
+        (subprocess.CompletedProcess('COMMAND_SENTINEL', 0, '/ROOT_PATH_SENTINEL\n/STDOUT_SENTINEL'),
+            'invalid_root:multiline'),
+        (subprocess.TimeoutExpired('COMMAND_SENTINEL', 10, output='STDOUT_SENTINEL', stderr='STDERR_SENTINEL'),
+            'resolver_exception:TimeoutExpired'),
+        (RuntimeError('EXCEPTION_MESSAGE_SENTINEL'), 'resolver_exception:RuntimeError'),
+    ])
+    def test_ssh_progress_root_failure_prevents_dispatch(self, registry, monkeypatch, tmp_path, caplog,
+                                                        resolution, reason):
+        from tools.environments.base import EnvironmentConnectionError
+        from tools.environments.ssh import SSHEnvironment
+
+        monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+        route = {'HERMES_SESSION_PLATFORM': 'discord', 'HERMES_SESSION_THREAD_ID': '123'}
+        monkeypatch.setattr('gateway.session_context.get_session_env', lambda key, default='': route.get(key, default))
+        monkeypatch.setattr('gateway.session_context.async_delivery_supported', lambda: True)
+        env = MagicMock(spec=SSHEnvironment)
+        env.host, env.user, env.port, env.key_path = 'example.invalid', 'worker', 22, ''
+        env.cwd, env._connection_identity = '/repo', 'bound'
+        env.get_temp_dir.return_value = '/tmp'
+        env._run_ssh.side_effect = [subprocess.CompletedProcess('prerequisite', 0), resolution]
+        session = _make_session(sid='proc_root_unavailable')
+        checkpoint = tmp_path / 'procs.json'
+        command = ('/usr/bin/python3 /release/scripts/run_codex_task.py --prompt COMMAND_SENTINEL '
+                   '--progress-code-scope /ROOT_PATH_SENTINEL --progress-sender-profile worker '
+                   '--progress-login-shell zsh')
+
+        with patch.object(registry, '_new_session', return_value=session), \
+                patch.object(registry, '_write_checkpoint', wraps=registry._write_checkpoint) as write_checkpoint, \
+                patch('tools.process_registry.CHECKPOINT_PATH', checkpoint), \
+                patch.object(registry, '_track_started') as track_started:
+            with pytest.raises(EnvironmentConnectionError) as failure:
+                registry.spawn_via_env(env, command, notify_on_complete=True)
+
+        assert str(failure.value) == (
+            f'Delegation progress tracking unavailable ({reason}); no command was dispatched')
+        assert 'SSH' in failure.value.retry_hint
+        assert 'temp-dir access' in failure.value.retry_hint
+        assert 'retry' in failure.value.retry_hint
+        assert [record.getMessage() for record in caplog.records] == [reason]
+        diagnostic = str(failure.value) + failure.value.retry_hint + caplog.text
+        for secret in ['COMMAND_SENTINEL', 'ROOT_PATH_SENTINEL', 'STDOUT_SENTINEL',
+                       'STDERR_SENTINEL', 'EXCEPTION_MESSAGE_SENTINEL', str(tmp_path), command]:
+            assert secret not in diagnostic
+        if isinstance(resolution, Exception):
+            assert str(resolution) not in diagnostic
+        assert env._run_ssh.call_count == 2
+        assert env._run_ssh.call_args.args == ('cd -P -- /tmp && pwd -P',)
+        env.execute.assert_not_called()
+        env._execute_prepared.assert_not_called()
+        assert session.observation_state == ''
+        assert session.id not in registry._running
+        assert session.id not in registry._finished
+        write_checkpoint.assert_not_called()
+        assert not checkpoint.exists()
+        track_started.assert_not_called()
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False

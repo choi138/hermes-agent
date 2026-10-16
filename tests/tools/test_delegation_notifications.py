@@ -1,7 +1,7 @@
 """Transport cancellation must not allow a final report to overtake progress."""
 import asyncio
 from pathlib import Path
-from subprocess import TimeoutExpired
+from subprocess import CalledProcessError, TimeoutExpired
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -61,11 +61,25 @@ def test_gateway_registration_preserves_v3_policy_scope_and_identity(tmp_path):
         '--progress-code-scope', '/repo/app', '--progress-sender-profile', 'koharu',
         '--progress-expected-bot-id=123', '--progress-login-shell', 'zsh']
     session = ProcessSession(id='proc_v3', command='', watcher_platform='discord', watcher_thread_id='456')
+    resolve_root = Mock(return_value=str(tmp_path.resolve()))
     tracked, binding = notifications.prepare_launch(shlex.join(argv), session, str(tmp_path),
-        resolve_root=lambda root: str(tmp_path.resolve()))
+        resolve_root=resolve_root)
+    resolve_root.assert_called_once_with(str(tmp_path))
     assert binding and shlex.join(argv) in tracked
-    for reserved in ['--progress-owner=manual', '--progress-manifest', '--progress-thread']:
-        assert notifications.prepare_launch(shlex.join(argv+[reserved]), session, str(tmp_path))[1] == {}
+
+
+@pytest.mark.parametrize('reserved', [
+    '--progress-owner=manual', '--progress-manifest', '--progress-thread',
+    '--progress-manifest=/fake/manifest', '--progress-thread=123',
+    '--progress-state-dir', '--progress-label', '--progress-unknown',
+])
+def test_gateway_launch_rejects_reserved_progress_flags(tmp_path, reserved):
+    session = ProcessSession(id='proc_reserved', command='', watcher_platform='discord', watcher_thread_id='456')
+    command = '/usr/bin/python3 /release/scripts/run_codex_task.py --prompt hi ' + reserved
+    resolve_root = Mock(return_value=str(tmp_path.resolve()))
+
+    assert notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root) == (command, {})
+    resolve_root.assert_not_called()
 
 
 def test_gateway_launch_uses_canonical_temp_root(tmp_path):
@@ -94,50 +108,72 @@ def test_gateway_launch_uses_canonical_temp_root(tmp_path):
     assert _path(Path(binding['manifest']).parent) == directory.resolve()
 
 
-@pytest.mark.parametrize('value', [
-    '', 'relative/tmp', '/private/tmp\n/private/other', '/private/../tmp',
-    '/private/secret value', '/private/$(secret)', '/private/secret\tvalue',
-    '/private/secret\rvalue', '/private/secret\x00value', '/private/secret\x7fvalue',
-    '/private/비밀', '/private/tmp\n\n', '\n', None,
+@pytest.mark.parametrize('value,category', [
+    ('', 'empty'), ('ROOT_PATH_SENTINEL/relative', 'relative'),
+    ('/ROOT_PATH_SENTINEL\n/STDOUT_SENTINEL', 'multiline'), ('/ROOT_PATH_SENTINEL/../tmp', 'dotdot'),
+    ('/ROOT_PATH_SENTINEL/secret value', 'chars'), ('/ROOT_PATH_SENTINEL/$(secret)', 'chars'),
+    ('/ROOT_PATH_SENTINEL/secret\tvalue', 'chars'), ('/ROOT_PATH_SENTINEL/secret\rvalue', 'chars'),
+    ('/ROOT_PATH_SENTINEL/secret\x00value', 'chars'), ('/ROOT_PATH_SENTINEL/secret\x7fvalue', 'chars'),
+    ('/ROOT_PATH_SENTINEL/비밀', 'chars'), ('/ROOT_PATH_SENTINEL\n\n', 'multiline'),
+    ('\n', 'empty'), (None, 'chars'), (b'/ROOT_PATH_SENTINEL', 'chars'),
 ])
-def test_invalid_resolved_temp_root_leaves_launch_untracked(tmp_path, caplog, value):
+def test_invalid_resolved_temp_root_blocks_launch(tmp_path, caplog, value, category):
     session = ProcessSession(id='proc_invalid_root', command='', watcher_platform='discord', watcher_thread_id='123')
     command = '/usr/bin/python3 /release/scripts/run_codex_task.py --prompt hi'
     resolve_root = Mock(return_value=value)
 
-    assert notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root) == (command, {})
+    with pytest.raises(notifications.ProgressRootUnavailable) as failure:
+        notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root)
 
     resolve_root.assert_called_once_with(str(tmp_path))
-    assert [record.getMessage() for record in caplog.records] == ['progress_temp_root_invalid']
+    reason = 'invalid_root:' + category
+    assert failure.value.reason == str(failure.value) == reason
+    assert [record.getMessage() for record in caplog.records] == [reason]
+    assert all(record.levelname == 'WARNING' for record in caplog.records)
+    diagnostic = str(failure.value) + caplog.text
+    for secret in ['ROOT_PATH_SENTINEL', 'STDOUT_SENTINEL', str(tmp_path), command]:
+        assert secret not in diagnostic
+    if isinstance(value, str) and value.strip():
+        assert value not in diagnostic
 
 
-@pytest.mark.parametrize('error', [RuntimeError('private secret'), TimeoutExpired('private secret', 10)])
-def test_temp_root_resolution_failure_leaves_launch_untracked(tmp_path, caplog, error):
+@pytest.mark.parametrize('error,reason', [
+    (RuntimeError('EXCEPTION_MESSAGE_SENTINEL'), 'resolver_exception:RuntimeError'),
+    (TimeoutExpired('COMMAND_SENTINEL', 10, output='STDOUT_SENTINEL', stderr='STDERR_SENTINEL'),
+        'resolver_exception:TimeoutExpired'),
+    (TypeError('EXCEPTION_MESSAGE_SENTINEL'), 'resolver_exception:TypeError'),
+    (CalledProcessError(1, '/ROOT_PATH_SENTINEL/COMMAND_SENTINEL', output='STDOUT_SENTINEL',
+        stderr='STDERR_SENTINEL'), 'resolver_exit:1'),
+    (CalledProcessError(255, '/ROOT_PATH_SENTINEL/COMMAND_SENTINEL', output='STDOUT_SENTINEL',
+        stderr='STDERR_SENTINEL'), 'resolver_exit:255'),
+])
+def test_temp_root_resolution_failure_blocks_launch(tmp_path, caplog, error, reason):
     session = ProcessSession(id='proc_failed_root', command='', watcher_platform='discord', watcher_thread_id='123')
     command = '/usr/bin/python3 /release/scripts/run_codex_task.py --prompt hi'
     resolve_root = Mock(side_effect=error)
 
-    assert notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root) == (command, {})
+    with pytest.raises(notifications.ProgressRootUnavailable) as failure:
+        notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root)
 
     resolve_root.assert_called_once_with(str(tmp_path))
-    assert [record.getMessage() for record in caplog.records] == ['progress_temp_root_resolution_failed']
-
-
-def test_missing_temp_root_resolver_leaves_launch_untracked(tmp_path, caplog):
-    session = ProcessSession(id='proc_no_resolver', command='', watcher_platform='discord', watcher_thread_id='123')
-    command = '/usr/bin/python3 /release/scripts/run_codex_task.py --prompt hi'
-
-    assert notifications.prepare_launch(command, session, str(tmp_path)) == (command, {})
-    assert [record.getMessage() for record in caplog.records] == ['progress_temp_root_resolution_failed']
+    assert failure.value.reason == str(failure.value) == reason
+    assert [record.getMessage() for record in caplog.records] == [reason]
+    assert all(record.levelname == 'WARNING' for record in caplog.records)
+    diagnostic = str(failure.value) + caplog.text
+    for secret in ['EXCEPTION_MESSAGE_SENTINEL', 'COMMAND_SENTINEL', 'STDOUT_SENTINEL',
+                   'STDERR_SENTINEL', 'ROOT_PATH_SENTINEL', str(error), str(tmp_path), command]:
+        assert secret not in diagnostic
 
 
 @pytest.mark.parametrize('root', ['/private/tmp\n', '/'])
 def test_temp_root_accepts_pwd_output_and_filesystem_root(root):
     session = ProcessSession(id='proc_pwd', command='', watcher_platform='discord', watcher_thread_id='123')
     command = '/usr/bin/python3 /release/scripts/run_codex_task.py --prompt hi'
+    resolve_root = Mock(return_value=root)
 
-    tracked, binding = notifications.prepare_launch(command, session, '/tmp', resolve_root=lambda temp_dir: root)
+    tracked, binding = notifications.prepare_launch(command, session, '/tmp', resolve_root=resolve_root)
 
+    resolve_root.assert_called_once_with('/tmp')
     directory = root.removesuffix('\n').rstrip('/') + '/delegation-proc_pwd'
     assert binding['manifest'] == directory + '/manifest.json'
     assert binding['state_dir'] == directory + '/state'
@@ -155,19 +191,13 @@ def test_temp_root_accepts_pwd_output_and_filesystem_root(root):
 ])
 def test_ineligible_launch_does_not_resolve_temp_root(tmp_path, command, platform, thread):
     session = ProcessSession(id='proc_ineligible', command='', watcher_platform=platform, watcher_thread_id=thread)
-    resolve_root = Mock()
+    resolve_root = Mock(return_value=str(tmp_path.resolve()))
 
     assert notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root) == (command, {})
     resolve_root.assert_not_called()
 
 
-@pytest.mark.parametrize('resolution,tracked', [
-    (SimpleNamespace(returncode=0, stdout='/private/tmp\n'), True),
-    (SimpleNamespace(returncode=1, stdout='/private/tmp\n', stderr='private secret'), False),
-    (SimpleNamespace(returncode=0, stdout=''), False),
-    (TimeoutExpired('private secret', 10), False),
-])
-def test_ssh_spawn_resolves_only_progress_paths(monkeypatch, tmp_path, resolution, tracked):
+def test_ssh_spawn_resolves_only_progress_paths(monkeypatch, tmp_path):
     import shlex
     from tools.environments.ssh import SSHEnvironment
     from tools.process_registry import ProcessRegistry
@@ -179,7 +209,7 @@ def test_ssh_spawn_resolves_only_progress_paths(monkeypatch, tmp_path, resolutio
     env.host, env.user, env.port, env.key_path = 'example.invalid', 'worker', 22, ''
     env.cwd, env._connection_identity = '/repo', 'bound'
     env.get_temp_dir.return_value = '/tmp'
-    env._run_ssh.side_effect = [SimpleNamespace(returncode=0), resolution]
+    env._run_ssh.side_effect = [SimpleNamespace(returncode=0), SimpleNamespace(returncode=0, stdout='/private/tmp\n')]
     env._execute_prepared.return_value = {'returncode': 0, 'output': 'HERMES_PROCESS_LAUNCH_V1:123\n'}
     registry = ProcessRegistry()
     monkeypatch.setattr(registry, '_write_checkpoint', Mock())
@@ -194,9 +224,6 @@ def test_ssh_spawn_resolves_only_progress_paths(monkeypatch, tmp_path, resolutio
     assert poller.call_args.args[3] == (env, f'/tmp/hermes_bg_{session.id}.log',
         f'/tmp/hermes_bg_{session.id}.pid', f'/tmp/hermes_bg_{session.id}.exit')
     launched = env._execute_prepared.call_args.kwargs['stdin_data']
-    if not tracked:
-        assert launched == command and session.delegation_progress == {}
-        return
     binding = session.delegation_progress
     assert binding['manifest'] == f'/private/tmp/delegation-{session.id}/manifest.json'
     assert binding['state_dir'] == f'/private/tmp/delegation-{session.id}/state'
@@ -288,7 +315,7 @@ async def test_restart_recovers_finished_registration_without_replaying_unknown_
 def test_shell_program_is_not_rewritten(suffix, tmp_path):
     session = ProcessSession(id='proc_shell', command='', watcher_platform='discord', watcher_thread_id='123')
     command = '/usr/bin/python3 /release/scripts/run_codex_task.py --prompt hi' + suffix
-    resolve_root = Mock()
+    resolve_root = Mock(return_value=str(tmp_path.resolve()))
     assert notifications.prepare_launch(command, session, str(tmp_path), resolve_root=resolve_root) == (command, {})
     resolve_root.assert_not_called()
 
