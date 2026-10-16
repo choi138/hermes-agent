@@ -205,3 +205,30 @@ def test_same_remote_path_from_other_host_source_is_uploaded(tmp_path):
 
     assert remote.uploads == ["/Users/me/.hermes/SKILL.md"]
     assert remote.files["/Users/me/.hermes/SKILL.md"] == b"instructions B"
+
+
+def test_host_permission_change_is_uploaded(host_files):
+    remote = FakeRemote()
+    _manager(remote, host_files).sync(force=True)
+    path = Path(host_files["a.py"])
+    stat = path.stat()
+    path.chmod(0o755)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    remote.uploads.clear()
+    _manager(remote, host_files).sync(force=True)
+
+    assert remote.uploads == ["/Users/me/.hermes/a.py"]
+
+
+def test_entries_for_removed_host_files_are_pruned(host_files, tmp_path):
+    remote = FakeRemote()
+    _manager(remote, host_files).sync(force=True)
+    Path(host_files["c.json"]).unlink()
+
+    new_file = tmp_path / "d.md"
+    new_file.write_text("new skill", encoding="utf-8")
+    _manager(remote, {"d.md": str(new_file)}).sync(force=True)
+
+    shared = json.loads(_state_files()[0].read_text(encoding="utf-8"))
+    assert sorted(shared["files"]) == ["/Users/me/.hermes/a.py", "/Users/me/.hermes/b.py", "/Users/me/.hermes/d.md"]
