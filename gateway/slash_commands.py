@@ -427,6 +427,8 @@ class GatewaySlashCommandsMixin(
         # Stop must reach cancellation even when the session index cannot be
         # written. Resolving/touching a route first can fail before its fence is saved.
         session_key = self._session_key_for_source(source)
+        from tools.process_registry_continuation import record_stop
+        record_stop(session_key)
         session_entry = await self.async_session_store.lookup_by_session_key(session_key)
 
         async def _stop(key: str, invalidation_reason: str) -> None:

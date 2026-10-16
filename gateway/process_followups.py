@@ -98,6 +98,8 @@ async def deliver_foreground_report(runner, evt):
 
 
 async def reconcile(runner):
+    from gateway.process_continuations import reconcile as reconcile_continuations
+    await reconcile_continuations(runner)
     from tools.process_registry_followups import pending, admission, reject_admission, defer, cancel
     from tools.process_registry_notifications import format_process_notification
     from gateway.wake import adapter_supports_push

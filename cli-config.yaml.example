@@ -1163,6 +1163,12 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # Allow terminal(background=true, notify=true, continue_on_complete=true) to resume
+  # already-approved work in a normal turn after read-only completion verification.
+  # A newer user message, /stop, cancellation, or an old completion suppresses it.
+  process_continue_on_complete: false
+  process_continue_max_chain: 3
+  process_continue_max_age_seconds: 3600
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration

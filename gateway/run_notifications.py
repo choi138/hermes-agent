@@ -1185,8 +1185,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         try:
             metadata: dict[str, Any] = {"notification_origin": "process_registry_synthetic"}
             synth_text = _mark_internal_notification(synth_text)
-            if evt.get("process_followup"):
-                metadata["process_followup"] = evt["process_followup"]
+            from gateway.process_continuations import event_metadata
+            metadata.update(event_metadata(evt))
             session_key = str(evt.get("session_key") or "").strip()
             from agent.notification_presentation import diagnostic_process_event
             if diagnostic_process_event(evt):

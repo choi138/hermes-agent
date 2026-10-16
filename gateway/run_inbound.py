@@ -616,34 +616,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
+            if self._queue_for_process_verification(_quick_key, event):
+                return True, None
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
             self._hm_merge_pending_for_source(source, _quick_key, event)
             return True, None
         return False, None
-
-    def _hm_busy_telegram_grace_queue(
-        self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str
-    ) -> bool:
-        """Queue a Telegram text follow-up that lands within the post-start grace window."""
-        _grace = float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0"))
-        _grace_state = self._peek_session_state(_quick_key)
-        _started_at = _grace_state.turn.started_ts if _grace_state else 0
-        if not (
-            source.platform == Platform.TELEGRAM and event.message_type == MessageType.TEXT
-            and _grace > 0 and _started_at and (time.time() - _started_at) <= _grace
-        ):
-            return False
-        logger.debug(
-            "Telegram follow-up arrived %.2fs after run start for %s — queueing without interrupt",
-            time.time() - _started_at, _quick_key,
-        )
-        if effective_busy_input_mode != "queue":
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
-        else:
-            adapter = self._delivery_adapter_for(source)
-            if adapter:
-                self._enqueue_fifo(_quick_key, event, adapter)
-        return True
 
     @staticmethod
     def _hm_text_only(event: MessageEvent) -> bool:
@@ -696,9 +674,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from tools.process_registry_continuation import record_user_event
+        record_user_event(_quick_key, event)
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
+
+        if self._queue_for_process_verification(_quick_key, event):
+            return None
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
@@ -1326,6 +1309,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
+        from tools.process_registry_continuation import record_user_event
+        record_user_event(_quick_key, event)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

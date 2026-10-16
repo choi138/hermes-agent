@@ -92,7 +92,7 @@ def foreground_reports(result):
     if len(spans) != 1:
         return public, []
     start, end = spans[0]
-    match = re.fullmatch(r'```process_reports[^\S\n]*\n(.*?)\n```[^\S\n]*\n?', text[start:end], re.S)
+    match = re.fullmatch(r'```process_reports[^\S\n]*\n(.*?)\n```[^\S\n]*\n?', text[start:end], re.DOTALL)
     if match is None or text[end:].strip():
         return public, []
     try:
@@ -202,6 +202,7 @@ def _db(*, read_only=False):
             next_attempt REAL NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '')''')
         if 'process_followup_cancellations' not in tables:
             conn.execute('CREATE TABLE IF NOT EXISTS process_followup_cancellations (session_key TEXT PRIMARY KEY, cancelled_at REAL NOT NULL)')
+        _ensure_continuation_watermarks(conn)
         with conn:
             if read_only:
                 conn.execute('PRAGMA query_only=ON')
@@ -210,6 +211,18 @@ def _db(*, read_only=False):
             yield conn
     finally:
         conn.close()
+
+
+def _ensure_continuation_watermarks(conn):
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(process_followup_cancellations)')}
+    if {'user_received_at', 'stopped_at'} <= columns:
+        return
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(process_followup_cancellations)')}
+        for column in ('user_received_at', 'stopped_at'):
+            if column not in columns:
+                conn.execute(f'ALTER TABLE process_followup_cancellations ADD COLUMN {column} REAL NOT NULL DEFAULT 0')
 
 
 def scrub_payload(value):
@@ -228,9 +241,11 @@ def reserve(session):
     payload = {name: getattr(session, name) for name in (
         'session_key', 'parent_session_id', 'started_at', 'exit_code', 'completion_reason',
         'termination_source', 'task_id', 'owner_task_id', 'cancel_requested', 'cancel_confirmed', 'observation_error', 'verification_scope')}
-    from tools.process_registry import ProcessRegistry, _completion_output
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_results import completion_output
     payload.update(ProcessRegistry._exit_fields(session))
-    completion = _completion_output(session)
+    payload.update(continue_on_complete=session.continue_on_complete, continuation=session.continuation)
+    completion = completion_output(session)
     payload.update(type='completion', session_id=session.id,
                    command=redact_sensitive_text(session.command, code_file=True, force=True),
                    output=redact_terminal_output(completion['output'], session.command, force=True),
@@ -239,7 +254,7 @@ def reserve(session):
     for name in ('platform', 'chat_id', 'user_id', 'user_name', 'thread_id', 'message_id'):
         payload[name] = getattr(session, 'watcher_' + name)
     now = time.time()
-    payload['timings'] = {'completion_observed_at': now, 'execution_seconds': session.execution_seconds,
+    payload['timings'] = {'completion_observed_at': session.exited_at or now, 'execution_seconds': session.execution_seconds,
                           'execution_observed_seconds': max(0, now - session.started_at) if session.started_at else None}
     payload = scrub_payload(payload)
     phase = 'pending'
@@ -431,7 +446,7 @@ def defer(execution, token, reason):
 def cancel_for_session(session_key):
     with _db() as db:
         now = time.time()
-        db.execute('INSERT OR REPLACE INTO process_followup_cancellations VALUES (?,?)', (session_key, now))
+        db.execute('INSERT INTO process_followup_cancellations (session_key,cancelled_at) VALUES (?,?) ON CONFLICT(session_key) DO UPDATE SET cancelled_at=excluded.cancelled_at', (session_key, now))
         rows = db.execute("SELECT execution_id,payload,token FROM process_followups WHERE phase IN ('pending','queued','running','dispatching','cancel_requested','turn_finished','failed','needs_reconciliation','needs_reconciliation_reported')").fetchall()
         for row in rows:
             if json.loads(row['payload']).get('session_key') == session_key:
@@ -461,7 +476,7 @@ def get_state(execution):
 def enabled(session):
     root = getattr(session, 'remote_root', '')
     platform = getattr(session, 'watcher_platform', '')
-    return bool(isinstance(root, str) and root and session.notify_on_complete
+    return bool(((isinstance(root, str) and root) or getattr(session, 'continue_on_complete', False)) and session.notify_on_complete
                 and isinstance(platform, str) and platform and platform != 'api_server')
 
 

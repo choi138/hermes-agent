@@ -804,6 +804,39 @@ class GatewayBusySessionMixin:
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
+    def _hm_busy_telegram_grace_queue(
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str
+    ) -> bool:
+        """Queue a Telegram text follow-up that lands within the post-start grace window."""
+        _grace = float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0"))
+        _grace_state = self._peek_session_state(_quick_key)
+        _started_at = _grace_state.turn.started_ts if _grace_state else 0
+        if not (
+            source.platform == Platform.TELEGRAM and event.message_type == MessageType.TEXT
+            and _grace > 0 and _started_at and (time.time() - _started_at) <= _grace
+        ):
+            return False
+        logger.debug(
+            "Telegram follow-up arrived %.2fs after run start for %s — queueing without interrupt",
+            time.time() - _started_at, _quick_key,
+        )
+        if effective_busy_input_mode != "queue":
+            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
+        else:
+            adapter = self._delivery_adapter_for(source)
+            if adapter:
+                self._enqueue_fifo(_quick_key, event, adapter)
+        return True
+
+    def _queue_for_process_verification(self, key: str, event: MessageEvent) -> bool:
+        state = self._peek_session_state(key)
+        running_event = state.turn.event if state else None
+        if not (getattr(running_event, 'metadata', None) or {}).get('process_followup'):
+            return False
+        logger.debug('PRIORITY queue (process follow-up turn is read-only) for session %s', key)
+        self._queue_or_replace_pending_event(key, event)
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
@@ -830,6 +863,11 @@ class GatewayBusySessionMixin:
         if not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
+
+        from tools.process_registry_continuation import record_user_event
+        record_user_event(session_key, event)
+        if not event.get_command() and self._queue_for_process_verification(session_key, event):
+            return True
 
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
@@ -1016,6 +1054,8 @@ class GatewayBusySessionMixin:
         return format_status_text()
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+        from tools.process_registry_continuation import record_stop
+        record_stop(quick_key)
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
         from gateway.run import _INTERRUPT_REASON_STOP
         await self._interrupt_and_clear_session(

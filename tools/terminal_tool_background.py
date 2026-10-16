@@ -150,6 +150,7 @@ def spawn_background_process(
     heartbeat_seconds: int = 0,
     persist_on_release: bool = False,
     mounted_host: Optional[str] = None,
+    continue_on_complete: bool = False,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -168,14 +169,17 @@ def spawn_background_process(
     )
     proc_session = None
     try:
-        proc_session = _spawn(
-            process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
-            effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty, notify_on_complete=notify_on_complete,
-            persist_on_release=persist_on_release,
-        )
+        from tools.process_registry_continuation import launch_scope, launch_result, durable_launch
+        with launch_scope(continue_on_complete):
+            proc_session = _spawn(
+                process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
+                effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
+                effective_pty=effective_pty, notify_on_complete=notify_on_complete,
+                persist_on_release=persist_on_release,
+            )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
+        result_data.update(launch_result(proc_session, continue_on_complete))
         if proc_session.remote_root and proc_session.pid is None:
             result_data.update(
                 output="Background dispatch is unconfirmed. Do not rerun; poll this session_id to reconcile.",
@@ -230,7 +234,7 @@ def spawn_background_process(
         if watch_patterns:
             proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
-        if getattr(proc_session, "remote_root", ""):
+        if durable_launch(proc_session):
             from tools.process_registry_followups import enabled, reserve
             # A fast remote job can finish before notification routing is attached.
             with proc_session._finalize_lock:

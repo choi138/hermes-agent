@@ -3175,6 +3175,10 @@ class GatewayTurnMixin:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
+            session_key = turn_kwargs.get('session_key')
+            generation = turn_kwargs.get('run_generation')
+            if session_key and (generation is None or self._is_session_run_current(session_key, generation)):
+                self._session_state(session_key).turn.event = turn_kwargs.get('event')
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:

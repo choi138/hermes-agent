@@ -25,6 +25,7 @@ _RESULT_FIELDS = (
     "observation_state", "last_observed_at", "observation_retry_at", "profile_home",
     "cancel_requested", "cancel_confirmed", "execution_seconds", "observation_error", "observation_operation", "verification_scope", "delegation_progress",
     "watcher_platform", "watcher_chat_id", "watcher_thread_id", "watcher_user_id", "watcher_user_name", "watcher_message_id",
+    'continue_on_complete', 'continuation', 'exited_at',
 )
 
 
@@ -128,3 +129,15 @@ def load_completed_results(prefix: str = "") -> dict:
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
             logger.debug("Skipping unreadable process result %s", path.name, exc_info=True)
     return results
+
+
+def completion_output(session) -> dict:
+    """``output`` sized by the session's ``completion_output_chars`` plus ``output_cut`` when trimmed.
+
+    Shared by the completion notification AND the wait/poll/kill snapshots: a bot in an api_server
+    or one-shot session cannot receive notifications and polls instead, so the polled result must
+    carry the same whole reply and the same cut marker (#115334)."""
+    from tools.process_registry import COMPLETION_OUTPUT_CHARS, _output_tail
+    limit = session.completion_output_chars or COMPLETION_OUTPUT_CHARS
+    cut = len(session.output_buffer) - limit
+    return {"output": _output_tail(session, limit), **({"output_cut": cut} if cut > 0 else {})}

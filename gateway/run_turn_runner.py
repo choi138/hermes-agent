@@ -15,7 +15,6 @@ import queue
 import re
 import threading
 import time
-import uuid
 from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -1851,13 +1850,14 @@ class TurnRunner:
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
+        from gateway.process_continuations import admit_turn, complete_turn
+        continuation_authority = None
+        followup = None
         try:
-            followup = (getattr(ctx.event, "metadata", None) or {}).get("process_followup")
-            if followup:
-                from tools.process_registry_followups import begin, finish
-                if not begin(followup["execution_id"], followup["token"]):
-                    return {"final_response": "NO_REPLY", "process_followup_disposition": "skipped",
-                            "messages": [], "api_calls": 0, "tools": []}
+            followup, continuation_authority, admitted = admit_turn(ctx.event, session_key)
+            if not admitted:
+                return {"final_response": "NO_REPLY", "process_followup_disposition": "skipped",
+                        "messages": [], "api_calls": 0, "tools": []}
             resume_marker = ctx.turn_resume_marker
             if ctx.event is not None and getattr(
                 ctx.event, "_gateway_resume_dispatch_stale", False,
@@ -1906,30 +1906,8 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None and not resume_marker:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
-            if not resume_marker and ctx.session_key:
-                turn_id = f"{ctx.session_id}:{ctx.session_id}:{uuid.uuid4().hex[:8]}"
-                begin = getattr(getattr(self._runner, "session_store", None), "begin_active_turn", None)
-                if callable(begin):
-                    try:
-                        extra = {"process_followup": followup} if followup else {}
-                        owner = (ctx.persist_user_display_metadata or {}).get("gateway_input_owner")
-                        recorded = begin(
-                            ctx.session_key, turn_id,
-                            getattr(self._runner, "_boot_id", "unknown-boot"),
-                            origin_session_id=ctx.session_id, origin_owner=owner, **extra,
-                        )
-                        if followup and not recorded:
-                            raise RuntimeError("Follow-up turn marker was not persisted")
-                        if recorded:
-                            kwargs["turn_id"] = turn_id
-                            if ctx.event is not None:
-                                ctx.event._gateway_active_turn_id = turn_id
-                    except Exception:
-                        logger.warning("Could not record agent turn for %s", ctx.session_key, exc_info=True)
-                        if followup:
-                            raise
-                elif followup:
-                    raise RuntimeError("Follow-up requires durable active turn storage")
+            from gateway.process_continuations import record_active_turn
+            record_active_turn(self._runner, ctx, kwargs, followup)
             from agent.notification_presentation import notification_turn
             if followup:
                 from tools.process_registry_followups import authorized
@@ -1960,7 +1938,8 @@ class TurnRunner:
                     if stream is not None:
                         stream.defer_publication_sync()
                 request_scope = task_request_scope(ctx.message or '', observed=observed_results, publication_barrier=barrier) if not followup else nullcontext()
-                with lease, request_scope, notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+                from tools.process_registry_continuation import turn_scope
+                with lease, request_scope, turn_scope(ctx.event, session_key, continuation_authority), notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                     if resume_marker and not (
                         self._runner.session_store.resume_owner_matches(
                             session_key, resume_marker, phase="executing",
@@ -1986,6 +1965,7 @@ class TurnRunner:
                         model_response_seconds=max(0, getattr(agent, 'session_model_response_seconds', 0.0) - model_baseline))
             if followup:
                 from gateway.process_followups import prepare_report
+                from tools.process_registry_followups import finish
                 turn_id = kwargs.get('turn_id')
                 report_text, obligation_id = prepare_report(self._runner, ctx, result, turn_id)
                 if obligation_id is None:
@@ -2009,6 +1989,7 @@ class TurnRunner:
                     reason='Live verification turn failed: ' + safe_error(exc))
             raise
         finally:
+            complete_turn(ctx.event, continuation_authority)
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

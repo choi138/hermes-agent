@@ -1372,6 +1372,7 @@ def terminal_tool(
     _completion_output_chars: int = 0,
     heartbeat: int = 0,
     persist_on_release: bool = False,
+    continue_on_complete: bool = False,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1397,6 +1398,10 @@ def terminal_tool(
     from hermes_cli.observability.shared_metrics_loop import record_terminal_backend as _metered
     plan = None
     try:
+        if not isinstance(continue_on_complete, bool):
+            return _error_json('continue_on_complete must be a boolean.')
+        if continue_on_complete and not (background and notify_on_complete):
+            return _error_json('continue_on_complete requires background=true and notify_on_complete=true (notify=true).')
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
@@ -1456,6 +1461,7 @@ def terminal_tool(
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
+                continue_on_complete=continue_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
                 completion_output_chars=_completion_output_chars,
@@ -1529,6 +1535,11 @@ TERMINAL_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
                 ]
+            },
+            "continue_on_complete": {
+                "type": "boolean",
+                "default": False,
+                "description": "Gateway-only (not CLI, TUI, or API-server sessions). With background=true and notify=true: opt in at launch to a bounded normal continuation of the task the user already approved, after read-only completion verification. Requires agent.process_continue_on_complete config (default off); does not authorize new scope or publication."
             },
             "heartbeat": {
                 "type": "integer",
@@ -1612,6 +1623,11 @@ def _handle_terminal(args, **kw):
             )
     if heartbeat:
         notify_on_complete = True  # the heartbeat rides the completion delivery path
+    continuation = args.get('continue_on_complete', False)
+    if not isinstance(continuation, bool):
+        return tool_error('continue_on_complete must be a boolean.')
+    if continuation and not (args.get('background', False) and notify_on_complete):
+        return tool_error('continue_on_complete requires background=true and notify_on_complete=true (notify=true).')
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -1621,6 +1637,7 @@ def _handle_terminal(args, **kw):
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
+        continue_on_complete=continuation,
         watch_patterns=watch_patterns,
         heartbeat=heartbeat,
         persist_on_release=persist_on_release,

@@ -35,6 +35,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import format_process_notification, is_child_process_notification, should_surface_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_results import completion_output
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
 
@@ -525,15 +526,6 @@ def _output_tail(session: "ProcessSession", n: int) -> str:
     return strip_ansi(session.output_buffer[-n:])
 
 
-def _completion_output(session: "ProcessSession") -> dict:
-    """``output`` sized by the session's ``completion_output_chars`` plus ``output_cut`` when trimmed.
-
-    Shared by the completion notification AND the wait/poll/kill snapshots: a bot in an api_server
-    or one-shot session cannot receive notifications and polls instead, so the polled result must
-    carry the same whole reply and the same cut marker (#115334)."""
-    limit = session.completion_output_chars or COMPLETION_OUTPUT_CHARS
-    cut = len(session.output_buffer) - limit
-    return {"output": _output_tail(session, limit), **({"output_cut": cut} if cut > 0 else {})}
 
 
 @dataclass
@@ -597,6 +589,8 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    continue_on_complete: bool = False          # Launch-authorized, config-gated normal turn after verification
+    continuation: dict = field(default_factory=dict)
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
     watch_patterns: list[str] = field(default_factory=list)
     heartbeat_seconds: int = 0                  # 0 = off; else a "heartbeat" event every N s while running
@@ -673,10 +667,10 @@ _CHECKPOINT_FIELDS = (
     "observation_state", "last_observed_at", "observation_error", "observation_operation", "verification_scope", "delegation_progress", "observation_retry_at",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+    "parent_session_id", "notify_on_complete", "continue_on_complete", "continuation", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release")
 _CHECKPOINT_DEFAULTS = {
-    f.name: (f.default_factory() if f.name in {"watch_patterns", "remote_identity", "remote_connection", "verification_scope", "delegation_progress"} else f.default)
+    f.name: (f.default_factory() if f.name in {"watch_patterns", "remote_identity", "remote_connection", "verification_scope", "delegation_progress", "continuation"} else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
     if f.name in _CHECKPOINT_FIELDS
 }
@@ -1130,12 +1124,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         from gateway.session_context import get_session_env
         extra.setdefault('profile_home', str(get_hermes_home()))
 
-        return ProcessSession(
+        session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
             wsl_chain=_is_wsl_launcher_command(command),
             started_at=time.time(), **extra)
+        from tools.process_registry_continuation import arm_session
+        arm_session(session)
+        return session
 
     @staticmethod
     def _env_temp_dir(env: Any) -> str:
@@ -1770,7 +1767,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
                 **self._exit_fields(session),
                 # A consumer that relays the output (a bot DM's reply) must know it is not whole.
-                **_completion_output(session),
+                **completion_output(session),
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,
@@ -2353,7 +2350,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         """Result dict for an exited session: exit metadata + the completion-sized output tail."""
         return {
             "status": status, "command": session.command,
-            **ProcessRegistry._exit_fields(session), **_completion_output(session)}
+            **ProcessRegistry._exit_fields(session), **completion_output(session)}
 
     def kill_process(
         self, session_id: str, *, source: str = "process.kill", consume_output: bool = True,
@@ -2431,7 +2428,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # Capture output, mark consumed, THEN expose ``exited`` to watcher tasks —
             # closes the delayed-notification race without losing the transcript.
             with session._lock:
-                output = _completion_output(session)
+                output = completion_output(session)
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 session.exited = True
@@ -2514,7 +2511,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if self._detached_host_fate(session.pid, session.host_start_time) != "running":
                 scope_stopped = self._stop_scope(session)
                 with session._lock:
-                    output = _completion_output(session)
+                    output = completion_output(session)
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 # No waitable handle, so this is not a collected exit. Close the
