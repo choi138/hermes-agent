@@ -45,7 +45,7 @@ _monotonic = time.monotonic
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
 _SHARED_STATE_DIR = "sync-state"
-_SHARED_STATE_VERSION = 1
+_SHARED_STATE_VERSION = 2
 _REMOTE_VERIFY_TIMEOUT = 20.0
 
 # Transport callbacks provided by each backend
@@ -313,7 +313,8 @@ class FileSyncManager:
             self._last_sync_time = _monotonic()
             if state_path is not None:
                 self._store_shared_state(
-                    state_path, {remote: (new_files[remote], digest) for remote, digest in pushed_hashes.items()},
+                    state_path, {remote: (_resolve_host_path_str(host), new_files[remote], pushed_hashes[remote])
+                                 for host, remote in to_upload},
                     to_delete)
         except Exception as exc:
             self._synced_files = prev_files
@@ -333,19 +334,20 @@ class FileSyncManager:
         digest = hashlib.sha256(self._sync_back_identity.encode()).hexdigest()[:32]
         return get_hermes_home() / _SHARED_STATE_DIR / f"{digest}.json"
 
-    def _load_shared_state(self, path: Path) -> dict[str, tuple[tuple, str]]:
+    def _load_shared_state(self, path: Path) -> dict[str, tuple[str, tuple, str]]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if data.get("version") != _SHARED_STATE_VERSION or data.get("identity") != self._sync_back_identity:
                 return {}
-            return {remote: (tuple(entry["key"]), entry["hash"]) for remote, entry in data["files"].items()}
+            return {remote: (entry["host"], tuple(entry["key"]), entry["hash"])
+                    for remote, entry in data["files"].items()}
         except FileNotFoundError:
             return {}
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.warning("file_sync: ignoring unreadable shared sync state %s: %s", path, exc)
             return {}
 
-    def _store_shared_state(self, path: Path, updates: dict[str, tuple[tuple, str]], removed: list[str]) -> None:
+    def _store_shared_state(self, path: Path, updates: dict[str, tuple[str, tuple, str]], removed: list[str]) -> None:
         """Merge under the held .sync.lock; a failure only costs a future re-upload."""
         try:
             files = self._load_shared_state(path)
@@ -353,8 +355,8 @@ class FileSyncManager:
                 files.pop(remote, None)
             files.update(updates)
             payload = {"version": _SHARED_STATE_VERSION, "identity": self._sync_back_identity,
-                       "files": {remote: {"key": list(key), "hash": digest}
-                                 for remote, (key, digest) in files.items()}}
+                       "files": {remote: {"host": host, "key": list(key), "hash": digest}
+                                 for remote, (host, key, digest) in files.items()}}
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
             try:
@@ -372,8 +374,9 @@ class FileSyncManager:
     ) -> tuple[list[tuple[str, str]], dict[str, str]]:
         """Drop uploads whose unchanged host file is already on the remote byte-for-byte."""
         shared = self._load_shared_state(state_path)
-        candidates = {remote: shared[remote][1] for _, remote in to_upload
-                      if remote in shared and shared[remote][0] == new_files[remote]}
+        # One remote path can map from different host files (project_skills/<i> per cwd).
+        candidates = {remote: shared[remote][2] for host, remote in to_upload
+                      if remote in shared and shared[remote][:2] == (_resolve_host_path_str(host), new_files[remote])}
         if not candidates:
             return to_upload, {}
         try:

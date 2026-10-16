@@ -186,3 +186,22 @@ def test_manager_without_remote_check_keeps_no_shared_state(host_files):
 
     assert len(remote.uploads) == 6
     assert _state_files() == []
+
+
+def test_same_remote_path_from_other_host_source_is_uploaded(tmp_path):
+    first_dir, second_dir = tmp_path / "project_a", tmp_path / "project_b"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first, second = first_dir / "SKILL.md", second_dir / "SKILL.md"
+    first.write_text("instructions A", encoding="utf-8")
+    second.write_text("instructions B", encoding="utf-8")
+    stamp = first.stat().st_mtime
+    os.utime(second, (stamp, stamp))
+
+    remote = FakeRemote()
+    _manager(remote, {"SKILL.md": str(first)}).sync(force=True)
+    remote.uploads.clear()
+    _manager(remote, {"SKILL.md": str(second)}).sync(force=True)
+
+    assert remote.uploads == ["/Users/me/.hermes/SKILL.md"]
+    assert remote.files["/Users/me/.hermes/SKILL.md"] == b"instructions B"
