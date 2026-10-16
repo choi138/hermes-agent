@@ -1375,7 +1375,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             }
             if session.notify_on_complete:
                 from tools.delegation_notifications import prepare_launch
-                tracked, binding = prepare_launch(command, session, temp_dir)
+                def resolve_progress_root(root):
+                    result = env._run_ssh(f"cd -P -- {q(root)} && pwd -P", timeout=10)
+                    if result.returncode:
+                        raise ValueError('progress_temp_root_resolution_failed')
+                    return result.stdout
+                tracked, binding = prepare_launch(command, session, temp_dir, resolve_root=resolve_progress_root)
                 if binding:
                     from tools.process_registry_followups import fence_publication
                     fence_publication()

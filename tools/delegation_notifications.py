@@ -18,7 +18,22 @@ _sends = set()
 _poll_tasks = {}
 
 
-def prepare_launch(command, session, temp_dir):
+def _canonical_temp_root(temp_dir, resolve_root):
+    try:
+        root = resolve_root(temp_dir)
+    except Exception:
+        logger.warning('progress_temp_root_resolution_failed')
+        return None
+    if isinstance(root, str):
+        root = root.removesuffix('\n')
+    if (not isinstance(root, str) or not re.fullmatch(r'/[A-Za-z0-9._/-]*', root)
+            or '..' in root.split('/')):
+        logger.warning('progress_temp_root_invalid')
+        return None
+    return root
+
+
+def prepare_launch(command, session, temp_dir, *, resolve_root=None):
     # Accept one argv, never parse/rewrite arbitrary shell programs or monitor jobs.
     try:
         if any(char in command for char in '$`\n\r~'):
@@ -54,7 +69,10 @@ def prepare_launch(command, session, temp_dir):
             return command, {}
     except ValueError:
         return command, {}
-    directory = f'{temp_dir}/delegation-{session.id}'
+    root = _canonical_temp_root(temp_dir, resolve_root)
+    if root is None:
+        return command, {}
+    directory = f'{root.rstrip("/")}/delegation-{session.id}'
     binding = {'python': argv[0], 'runner': argv[1], 'manifest': directory+'/manifest.json',
                'state_dir': directory+'/state', 'thread': thread}
     argv += ['--progress-manifest', binding['manifest'], '--progress-state-dir', binding['state_dir'],
