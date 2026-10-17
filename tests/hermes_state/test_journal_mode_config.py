@@ -60,7 +60,11 @@ def test_wal_probe_unknown_never_emits_set_pragma(monkeypatch, tmp_path, caplog)
             self.pragmas: list[str] = []
 
         def execute(self, sql, *args, **kwargs):  # type: ignore[override]
-            if str(sql).lstrip().lower().startswith("pragma"):
+            normalized = str(sql).lstrip().lower()
+            # The per-file journal-init lock reads only these metadata pragmas; they never
+            # touch the database file or its -wal/-shm sidecars.
+            if normalized.startswith("pragma") and normalized not in (
+                    "pragma database_list", "pragma busy_timeout"):
                 self.pragmas.append(str(sql))
             return super().execute(sql, *args, **kwargs)
 
