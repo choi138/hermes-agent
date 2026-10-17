@@ -273,6 +273,46 @@ The gateway runs as a long-lived process, managed via:
 
 ## Background process notifications
 
+### Approved process continuations
+
+`agent.process_continue_on_complete` is **false by default**. When enabled,
+`terminal(background=true, continue_on_complete=true)` launched in a real gateway user turn
+authorizes one full-tool continuation after its read-only verification report is durably recorded.
+An authorized continuation can launch the next step of the same approved task. The default
+`agent.process_continue_max_chain` is **10**; `agent.process_continue_max_age_seconds` defaults to
+3600. A verification turn cannot authorize itself, and CLI/delegated launches are not eligible.
+
+Ordinary messages do not revoke that approval. During verification they retain the existing
+user-first queue behavior; subsequent turns receive the normal conversation history. `/stop`
+and session cancellation revoke all pending authority. The stop receipt is appended and fsynced
+in the owning profile's home, off the gateway event loop and independently of SQLite locks.
+Receipt timestamps remain attached to queued, steered and replayed user events, but are not
+cancellation watermarks.
+
+Launch approval survives a gateway restart. Recovery honors the profile's fsynced stop journal;
+process ownership fences dispatch claims, not approval. A failed stop write keeps the current
+process's session quarantine, immediately warns the original chat/thread (with the same owner
+mention setting), and retries the same receipt once after a short delay. If storage remains
+unavailable, a restart can lose that stop: the warning asks the user to send `/stop` again.
+
+A continuation interrupted while running gets one new turn for the same execution. Its internal
+note requires inspecting current state and conversation before continuing, not blindly repeating
+side effects. The transactional execution fence rotates the token, rejecting stale dispatches and
+late completions. This resume consumes no extra chain step. A queued resume that never started
+can be reclaimed after another restart; a restart after it started stops automatic recovery with
+a repeated-restart notice. Live or unproven claim owners are never taken over.
+
+Stopped, refused-at-cap and uncertain executions produce a short Korean notice in the original
+chat/thread. Notices reuse the profile-scoped `HERMES_HEALTH_MENTION` owner-notification setting
+and the existing delivery ledger, with one stable obligation per execution. Successful deliveries
+are recorded atomically in the execution payload as well, so ledger retention cannot resurrect
+them on restart; failures follow the existing delivery retry policy. The transport ACK
+crash window has the ledger's honest at-least-once semantics: recovery can include its visible
+duplicate-warning marker. Strict exactly-once remote delivery cannot be proved without a
+transport idempotency/lookup contract. No new notices are created while the continuation gate is off.
+
+### Watchers and delivery
+
 `terminal(background=true, notify_on_complete=true)` starts a gateway watcher that detects
 completion and triggers a new agent turn. Verbosity: `display.background_process_notifications`
 (or `HERMES_BACKGROUND_NOTIFICATIONS`): `concise` (default; one line, failures append an output

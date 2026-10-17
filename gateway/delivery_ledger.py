@@ -433,6 +433,35 @@ def _read_followups_as(session_key, read):
 
 def process_attention_authorized(obligation_id, *, connection=None):
     """The state DB fences process-report retries even if ledger cleanup failed."""
+    if obligation_id.startswith('process-continuation-stop-write:'):
+        from tools.process_registry_continuation import settings
+        try:
+            if connection is not None:
+                row = connection.execute('SELECT session_key FROM delivery_obligations WHERE obligation_id=?',
+                                         (obligation_id,)).fetchone()
+            else:
+                with _DB_LOCK, _transaction() as conn:
+                    row = conn.execute('SELECT session_key FROM delivery_obligations WHERE obligation_id=?',
+                                       (obligation_id,)).fetchone()
+            if not row:
+                return False
+            return _read_followups_as(row[0], lambda: True if settings()[0] else None)
+        except (sqlite3.Error, OSError, ValueError):
+            logger.warning('Stop-write notice authorization unavailable: %s', obligation_id, exc_info=True)
+            return None
+    if obligation_id.startswith('process-continuation-stop:'):
+        from tools.process_registry_continuation import settings, notice_pending
+        if not settings()[0]:
+            return None
+        execution = obligation_id.removeprefix('process-continuation-stop:')
+        try:
+            if connection is not None:
+                return notice_pending(execution, connection=connection)
+            with _DB_LOCK, _transaction() as conn:
+                return notice_pending(execution, connection=conn)
+        except (sqlite3.Error, OSError):
+            logger.warning('Continuation notice authorization unavailable: %s', execution, exc_info=True)
+            return None
     if obligation_id.startswith('process-report:'):
         try:
             from tools.process_registry_followups import report_authorized
@@ -478,6 +507,16 @@ def mark_attempting(obligation_id: str) -> None:
 
 
 def mark_delivered(obligation_id: str, *, message_id=None) -> None:
+    if obligation_id.startswith('process-continuation-stop:'):
+        from tools.process_registry_continuation import acknowledge_notice
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("UPDATE delivery_obligations SET state='delivered',updated_at=?,last_error=NULL WHERE obligation_id=?",
+                         (time.time(), obligation_id))
+            if message_id is not None:
+                conn.execute('INSERT OR REPLACE INTO delivery_obligation_receipts VALUES (?,?,?)',
+                             (obligation_id, str(message_id), time.time()))
+            acknowledge_notice(obligation_id.removeprefix('process-continuation-stop:'), connection=conn)
+        return
     if message_id is None:
         _update_state(obligation_id, "delivered")
         return

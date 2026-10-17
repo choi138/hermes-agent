@@ -1,6 +1,6 @@
-"""Launch-time authority and durable fences for bounded process continuations."""
+"""Launch-time authority, stop receipts and durable process continuation ownership."""
 
-import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -8,18 +8,16 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar
 
-from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+from hermes_constants import get_hermes_home
 from tools.process_registry_followups import _db, _owner_alive, _owner_for_pid
 
 _turn = ContextVar('process_continuation_turn', default=None)
 _requested = ContextVar('process_continuation_requested', default=False)
 _FINISHED = {'turn_finished', 'reported', 'approval_wait', 'verification_failed'}
-_failed_fences = {}
-_pending_fences = {}
-_received_fences = {}
-_live_authorities = {}
+_stops = {}
+_failures = {}
 _fence_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
@@ -32,99 +30,78 @@ def _agent_config():
 def settings():
     cfg = _agent_config()
     return (cfg.get('process_continue_on_complete') is True,
-            max(0, int(cfg.get('process_continue_max_chain', 3))),
+            max(0, int(cfg.get('process_continue_max_chain', 10))),
             max(0, int(cfg.get('process_continue_max_age_seconds', 3600))))
 
 
 def record_user_event(key, event):
-    """Record admission, including messages queued before they enter a transcript."""
+    """Preserve receipt time through queue, steer and resend without revoking authority."""
     if event.internal or getattr(event, '_process_user_recorded', False):
         return
     now = getattr(event, '_process_user_received_at', None)
     if now is None:
         now = time.time()
     event._process_user_received_at = now
-    _record_fence(key, now, user=True, stop=event.get_command() == 'stop')
     event._process_user_recorded = True
 
 
-def record_stop(key):
-    _record_fence(key, time.time(), stop=True)
-
-
-def _record_fence(key, received_at, *, user=False, stop=False):
+def receive_stop(key):
+    """Quarantine immediately, before yielding to the persistence worker."""
     identity = (str(get_hermes_home()), key)
-    token = object()
-    try:
-        enabled = _agent_config().get('process_continue_on_complete') is True
-    except Exception:
-        _finish_fence(identity, token, received_at, failed=True)
-        logger.warning('Could not read continuation config for %s; prior authority quarantined',
-                       key, exc_info=True)
-        return
+    received_at = time.time()
     with _fence_lock:
-        previous_user, previous_stop = _received_fences.get(identity, (0, 0))
-        _received_fences[identity] = (max(previous_user, received_at if user else 0),
-                                      max(previous_stop, received_at if stop else 0))
-        if not enabled and not _live_authorities.get(identity):
-            return
-        _pending_fences.setdefault(identity, {})[token] = received_at
+        _stops[identity] = max(received_at, _stops.get(identity, 0))
+    return received_at
+
+
+def record_stop(key, received_at=None):
+    """Durable SQLite-independent stop receipt. Gateway callers run this off-loop."""
+    home = get_hermes_home()
+    if received_at is None:
+        received_at = receive_stop(key)
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        _persist_fence(identity, token, received_at, user=user, stop=stop)
-        return
-    try:
-        context = copy_context()
-        loop.run_in_executor(None, lambda: context.run(
-            _persist_fence, identity, token, received_at, user=user, stop=stop))
+        if _agent_config().get('process_continue_on_complete') is not True:
+            return True
+        path = _stop_path(key)
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(received_at) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        from utils import fsync_directory
+        fsync_directory(home)
+        return True
     except Exception:
-        _finish_fence(identity, token, received_at, failed=True)
-        logger.warning('Could not schedule continuation fence for %s; prior authority quarantined',
-                       key, exc_info=True)
+        logger.warning('Could not persist continuation stop for %s; authority quarantined', key, exc_info=True)
+        return False
 
 
-def _finish_fence(identity, token, received_at, *, failed=False):
+def stop_write_failures(key, received_at):
+    with _db(read_only=True) as db:
+        rows = db.execute("""SELECT execution_id,payload FROM process_followups
+            WHERE json_extract(payload,'$.session_key')=? AND json_extract(payload,'$.continue_on_complete')=1
+            AND json_extract(payload,'$.continuation.origin_received_at')<=?
+            AND COALESCE(json_extract(payload,'$.continuation_status.phase'),'ready')!='done'
+            AND COALESCE(json_extract(payload,'$.continuation_status.notice_delivered'),0)=0""",
+            (key, received_at)).fetchall()
+    return [(row['execution_id'], json.loads(row['payload'])) for row in rows]
+
+
+def _stop_path(key):
+    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()
+    return get_hermes_home() / f'continuation-stop-{digest}.jsonl'
+
+
+def stopped_after(key, origin):
     with _fence_lock:
-        pending = _pending_fences.get(identity, {})
-        pending.pop(token, None)
-        if not pending:
-            _pending_fences.pop(identity, None)
-        if failed:
-            _failed_fences[identity] = max(received_at, _failed_fences.get(identity, 0))
-
-
-def _persist_fence(identity, token, received_at, *, user, stop):
-    home_token = set_hermes_home_override(identity[0])
+        if _stops.get((str(get_hermes_home()), key), 0) >= origin:
+            return True
     try:
-        with _db(busy_timeout_ms=100) as db:
-            db.execute('''INSERT INTO process_followup_cancellations
-                (session_key,cancelled_at,user_received_at,stopped_at) VALUES (?,0,?,?)
-                ON CONFLICT(session_key) DO UPDATE SET
-                user_received_at=MAX(user_received_at,excluded.user_received_at),
-                stopped_at=MAX(stopped_at,excluded.stopped_at)''',
-                (identity[1], received_at if user else 0, received_at if stop else 0))
-    except Exception:
-        _finish_fence(identity, token, received_at, failed=True)
-        logger.warning('Could not persist continuation fence for %s; prior authority quarantined',
-                       identity[1], exc_info=True)
-    else:
-        _finish_fence(identity, token, received_at)
-    finally:
-        reset_hermes_home_override(home_token)
-
-
-def track_authority(execution, payload):
-    identity = (str(get_hermes_home()), payload.get('session_key'))
-    with _fence_lock:
-        live = _live_authorities.setdefault(identity, set())
-        if payload.get('continue_on_complete') and payload.get('continuation_status', {}).get('phase') not in {
-                'done', 'skipped', 'uncertain'}:
-            live.add(execution)
-        else:
-            live.discard(execution)
-        if not live:
-            _live_authorities.pop(identity, None)
+        with _stop_path(key).open(encoding='utf-8') as stream:
+            return any(float(json.loads(line)) >= origin for line in stream)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, TypeError):
+        return True
 
 
 @contextmanager
@@ -182,25 +159,32 @@ def launch_result(session, requested):
 
 
 def durable_launch(session):
-    return bool(session.remote_root or session.continue_on_complete)
+    return bool(session.remote_root or session.continue_on_complete or session.continuation.get('refused_reason'))
 
 
 def arm_session(session):
     """Called by the registry BEFORE dispatch, including fast local processes."""
-    if not _requested.get() or arming_reason():
+    if not _requested.get():
+        return
+    reason = arming_reason()
+    refused = reason == 'not armed: process_continue_max_chain reached'
+    if reason and not refused:
         return
     authority = _turn.get()
     if authority['session_key'] != session.session_key:
         return
-    session.continue_on_complete = True
+    session.continue_on_complete = not refused
     session.continuation = {**authority, 'launched_at': session.started_at}
-    track_authority(session.id, {'session_key': session.session_key, 'continue_on_complete': True})
     session.notify_on_complete = True
     from gateway.session_context import get_session_env
     from tools.terminal_tool_background import _stamp_gateway_routing
     from tools.process_registry_followups import task_request
     _stamp_gateway_routing(session, get_session_env)
     session.verification_scope = {'cwd': session.cwd, 'task_request': task_request()}
+    if refused:
+        session.continuation['refused_reason'] = 'chain cap reached'
+        from tools.process_registry_followups import reserve
+        reserve(session)
 
 
 def _skip_reason(db, row, payload):
@@ -208,58 +192,107 @@ def _skip_reason(db, row, payload):
     auth = payload.get('continuation') or {}
     if not gate:
         return 'config gate disabled'
+    reason = _stop_reason(db, payload)
+    if reason:
+        return reason
     if row['phase'] not in _FINISHED or payload.get('followup_cancelled'):
         return 'follow-up cancelled, failed, or needs reconciliation'
     if payload.get('verification', {}).get('outcome') not in {'verified', 'verification_failed', 'approval_wait'}:
         return 'verification needs reconciliation'
     if auth.get('chain', cap) >= cap:
         return 'chain cap reached'
-    if chain_count(db, auth.get('chain_id')) >= cap:
+    if chain_count(db, auth.get('chain_id'), excluding=row['execution_id']) >= cap:
         return 'chain cap reached'
     completed = payload.get('timings', {}).get('completion_observed_at', 0)
     if time.time() - completed > age:
         return 'completion too old'
-    mark = db.execute('SELECT * FROM process_followup_cancellations WHERE session_key=?',
-                      (payload.get('session_key'),)).fetchone()
-    origin = auth.get('origin_received_at')
-    if not origin:
-        return 'originating user turn is unknown'
-    with _fence_lock:
-        identity = (str(get_hermes_home()), payload.get('session_key'))
-        failed = max(_failed_fences.get(identity, 0),
-                     max(_pending_fences.get(identity, {}).values(), default=0))
-        received_user, received_stop = _received_fences.get(identity, (0, 0))
-    if failed >= origin:
-        return 'continuation fence persistence failed'
-    if received_stop >= origin or (mark and max(mark['stopped_at'], mark['cancelled_at']) >= origin):
-        return 'session stopped or cancelled after originating turn'
-    if received_user > origin or (mark and mark['user_received_at'] > origin):
-        return 'newer user message'
     return ''
 
 
-def chain_count(db, chain_id):
+def _stop_reason(db, payload):
+    auth = payload.get('continuation') or {}
+    origin = auth.get('origin_received_at')
+    if not origin:
+        return 'originating user turn is unknown'
+    mark = db.execute('SELECT * FROM process_followup_cancellations WHERE session_key=?',
+                      (payload.get('session_key'),)).fetchone()
+    if stopped_after(payload['session_key'], origin) or (mark and max(mark['stopped_at'], mark['cancelled_at']) >= origin):
+        return 'session stopped or cancelled after originating turn'
+    return ''
+
+
+def chain_count(db, chain_id, *, excluding=''):
     return db.execute("""SELECT COUNT(*) FROM process_followups
         WHERE json_extract(payload,'$.continuation.chain_id')=?
-        AND json_extract(payload,'$.continuation_status.phase') IN ('running','done','uncertain')""",
-        (chain_id,)).fetchone()[0]
+        AND execution_id!=?
+        AND (json_extract(payload,'$.continuation_status.phase') IN ('running','done','uncertain')
+            OR (json_extract(payload,'$.continuation_status.phase')='queued'
+                AND json_extract(payload,'$.continuation_status.resume_count')=1))""",
+        (chain_id, excluding)).fetchone()[0]
 
 
 def _save(db, execution, payload):
     db.execute('UPDATE process_followups SET payload=? WHERE execution_id=?', (json.dumps(payload), execution))
-    track_authority(execution, payload)
+
+
+def record_failure(execution, reason):
+    with _fence_lock:
+        _failures[(str(get_hermes_home()), execution)] = reason
+    try:
+        path = _failure_path(execution)
+        with path.open('w', encoding='utf-8') as stream:
+            json.dump(reason, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        from utils import fsync_directory
+        fsync_directory(path.parent)
+    except OSError:
+        logger.warning('Could not persist continuation failure for %s', execution, exc_info=True)
+
+
+def _failure_path(execution):
+    digest = hashlib.sha256(execution.encode('utf-8')).hexdigest()
+    return get_hermes_home() / f'continuation-failure-{digest}.json'
+
+
+def _failure_reason(execution):
+    with _fence_lock:
+        reason = _failures.get((str(get_hermes_home()), execution))
+    if reason:
+        return reason
+    try:
+        return json.loads(_failure_path(execution).read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return ''
+    except (OSError, ValueError):
+        return 'continuation fence persistence failed'
 
 
 def candidates():
-    """Recover only unexecuted queue claims. Running effects are never replayed."""
+    """Reconcile pending authority and interrupted claims through their execution fence."""
     with _db(read_only=True) as db:
         rows = db.execute("""SELECT * FROM process_followups
             WHERE json_extract(payload,'$.continue_on_complete')=1
             AND COALESCE(json_extract(payload,'$.continuation_status.phase'),'ready')
-                NOT IN ('running','done','skipped','uncertain')""").fetchall()
-    for row in rows:
-        track_authority(row['execution_id'], json.loads(row['payload']))
+                NOT IN ('done','skipped','uncertain')""").fetchall()
     return [dict(row) for row in rows]
+
+
+def _recover_claim(status):
+    phase = status.get('phase')
+    if phase in {'done', 'skipped', 'uncertain'}:
+        return False
+    if phase not in {'queued', 'running'}:
+        return True
+    owner = status.get('owner')
+    if not owner or owner == _owner_for_pid(os.getpid()) or _owner_alive(owner) is not False:
+        return False
+    if phase == 'running':
+        if status.get('resume_count', 0):
+            status.update(phase='uncertain', reason='게이트웨이 재시작이 반복돼 자동 재개를 멈췄어')
+            return False
+        status['resume_count'] = 1
+    return True
 
 
 def claim(execution):
@@ -276,14 +309,26 @@ def claim(execution):
         if not row:
             return None
         payload = json.loads(row['payload'])
-        status = payload.get('continuation_status', {})
-        if status.get('phase') in {'running', 'done', 'skipped', 'uncertain'}:
+        status = payload.setdefault('continuation_status', {})
+        failure = _failure_reason(execution)
+        if failure:
+            payload['continuation_status'] = {**status, 'phase': 'uncertain', 'reason': failure}
+            _save(db, execution, payload)
             return None
-        if status.get('phase') == 'queued' and _owner_alive(status['owner']) is not False:
+        if status.get('phase') in {'done', 'skipped', 'uncertain'}:
+            return None
+        reason = _stop_reason(db, payload) if settings()[0] else ''
+        if reason:
+            payload['continuation_status'] = {**status, 'phase': 'skipped', 'reason': reason}
+            _save(db, execution, payload)
+            return None
+        if not _recover_claim(status):
+            if status.get('phase') == 'uncertain':
+                _save(db, execution, payload)
             return None
         if row['phase'] in {'pending', 'queued', 'running', 'dispatching'}:
             return None  # verification has not finished
-        reason = _skip_reason(db, row, payload)
+        reason = _failure_reason(execution) or _skip_reason(db, row, payload)
         if reason:
             payload['continuation_status'] = {'phase': 'skipped', 'reason': reason}
             _save(db, execution, payload)
@@ -292,9 +337,12 @@ def claim(execution):
                 observed['session_key'], observed.get('followup_turn_id')):
             return None
         if delivery_state not in {'pending', 'delivered'}:
+            payload['continuation_status'] = {'phase': 'skipped', 'reason': 'verification report needs reconciliation'}
+            _save(db, execution, payload)
             return None
-        token = status.get('token') or uuid.uuid4().hex
-        payload['continuation_status'] = {'phase': 'queued', 'token': token, 'owner': _owner_for_pid(os.getpid())}
+        token = uuid.uuid4().hex
+        payload['continuation_status'] = {'phase': 'queued', 'token': token,
+            'owner': _owner_for_pid(os.getpid()), 'resume_count': status.get('resume_count', 0)}
         _save(db, execution, payload)
         return {**payload, 'process_continuation': {'execution_id': execution, 'token': token}}
 
@@ -305,7 +353,7 @@ def admission_failed(execution, token, *, uncertain=False):
         payload = json.loads(row['payload'])
         status = payload.get('continuation_status', {})
         if status.get('token') == token and status.get('phase') == 'queued':
-            status['phase'] = 'uncertain' if uncertain else 'ready'
+            status.update(phase='uncertain' if uncertain else 'skipped', reason='continuation admission failed')
             _save(db, execution, payload)
 
 
@@ -318,7 +366,7 @@ def begin(execution, token, key):
         status = payload.get('continuation_status', {})
         if status.get('token') != token or status.get('phase') != 'queued' or payload.get('session_key') != key:
             return None
-        reason = _skip_reason(db, row, payload)
+        reason = _failure_reason(execution) or _skip_reason(db, row, payload)
         status.update(phase='skipped' if reason else 'running', reason=reason)
         _save(db, execution, payload)
         if reason:
@@ -327,11 +375,43 @@ def begin(execution, token, key):
         return {**auth, 'chain': auth['chain'] + 1}
 
 
-def finish(execution, token):
+def finish(execution, token, *, reason=''):
     with _db() as db:
         row = db.execute('SELECT payload FROM process_followups WHERE execution_id=?', (execution,)).fetchone()
         payload = json.loads(row['payload'])
         status = payload.get('continuation_status', {})
         if status.get('token') == token and status.get('phase') == 'running':
-            status['phase'] = 'done'
+            status.update(phase='uncertain' if reason else 'done', reason=reason)
             _save(db, execution, payload)
+
+
+def interrupt(execution, token, reason):
+    with _db() as db:
+        row = db.execute('SELECT payload FROM process_followups WHERE execution_id=?', (execution,)).fetchone()
+        if row:
+            payload = json.loads(row['payload'])
+            status = payload.get('continuation_status', {})
+            if status.get('token') == token and status.get('phase') in {'queued', 'running'}:
+                status.update(phase='uncertain', reason=reason)
+                _save(db, execution, payload)
+
+
+def stopped_executions():
+    with _db(read_only=True) as db:
+        rows = db.execute("""SELECT execution_id,payload FROM process_followups
+            WHERE json_extract(payload,'$.continuation_status.phase') IN ('skipped','uncertain')
+            AND COALESCE(json_extract(payload,'$.continuation_status.notice_delivered'),0)=0""").fetchall()
+    return [(row['execution_id'], json.loads(row['payload'])) for row in rows]
+
+
+def notice_pending(execution, *, connection):
+    return connection.execute("""SELECT 1 FROM process_followups WHERE execution_id=?
+        AND COALESCE(json_extract(payload,'$.continuation_status.notice_delivered'),0)=0""",
+        (execution,)).fetchone() is not None
+
+
+def acknowledge_notice(execution, *, connection):
+    """Keep the delivery tombstone in the same transaction, beyond ledger retention."""
+    connection.execute("""UPDATE process_followups
+        SET payload=json_set(payload,'$.continuation_status.notice_delivered',1)
+        WHERE execution_id=?""", (execution,))

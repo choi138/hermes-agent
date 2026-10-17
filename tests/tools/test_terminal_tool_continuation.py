@@ -84,7 +84,7 @@ def test_verification_and_capped_or_unrelated_internal_turn_cannot_arm(home, kin
     config(home)
     event = MessageEvent(text='verify', internal=kind != 'capped', metadata=(
         {'process_followup': {'execution_id': 'proc', 'token': 'token'}} if kind == 'verification' else {}))
-    authority = {'chain': 3, 'chain_id': 'chain'} if kind == 'capped' else None
+    authority = {'chain': continuation.settings()[1], 'chain_id': 'chain'} if kind == 'capped' else None
     with continuation.turn_scope(event, 'session', authority), continuation.launch_scope(True):
         if kind == 'verification':
             with followups.verification_lease('proc', 'token'):
@@ -116,7 +116,7 @@ def test_old_watermark_schema_upgrades_without_losing_cancellation(home):
     with followups._db(read_only=True) as db:
         row = db.execute("SELECT * FROM process_followup_cancellations WHERE session_key='session'").fetchone()
     assert row['cancelled_at'] == 123
-    assert row['stopped_at'] > 123
+    assert continuation.stopped_after('session', 123)
 
 
 @pytest.mark.parametrize('surface', ['cli', 'tui', 'api_server'])

@@ -523,7 +523,8 @@ class GatewayStartupMixin:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
-                if row['obligation_id'].startswith('process-report:'):
+                if row['obligation_id'].startswith(('process-report:', 'process-continuation-stop:',
+                                                  'process-continuation-stop-write:')):
                     from gateway.delivery_ledger import process_attention_authorized, abandon_obligation
                     allowed = await asyncio.to_thread(process_attention_authorized, row['obligation_id'])
                     if allowed is not True:
@@ -541,6 +542,8 @@ class GatewayStartupMixin:
                     if result is None:
                         continue  # Cancellation already abandoned this obligation.
                 else:
+                    if row['obligation_id'].startswith(('process-continuation-stop:', 'process-continuation-stop-write:')):
+                        metadata = {**(metadata or {}), '_interim_send': True, 'notify': True}
                     result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
                     if (row['obligation_id'].startswith('process-report:') and not result.success
                             and (adapter._is_timeout_error(result.error) or adapter._is_partial_delivery(result))):
@@ -666,24 +669,8 @@ class GatewayStartupMixin:
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
-        # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
-        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
-        restart_candidates = [
-            entry for entry in candidates
-            if not (
-                isinstance(getattr(entry, "active_turn", None), dict)
-                and entry.active_turn.get("status") == "retry_wait"
-            )
-        ]
-        if restart_candidates:
-            try:
-                from gateway import restart_loop_guard as _rlg
-                _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window, max_gap_seconds=_max_gap):
-                    return None
-            except Exception as exc:
-                logger.debug("Restart-loop guard check skipped: %s", exc)
-        return candidates
+        from gateway.process_continuations import filter_restart_candidates
+        return filter_restart_candidates(self, candidates)
 
     def _schedule_retryable_turn_wakeup(self, session_key: str, turn_id: str) -> bool:
         """Arm one delayed call into the existing resume scheduler for an exact attempt."""
@@ -789,6 +776,7 @@ class GatewayStartupMixin:
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Re-enter fresh orphaned agent turns, with legacy resume-note fallback."""
+        from gateway.process_continuations import recover_orphaned_turn
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window,
             _is_fresh_gateway_interruption,
@@ -801,28 +789,9 @@ class GatewayStartupMixin:
         for entry in candidates:
             record = _orphaned_active_turn(entry, getattr(self, "_boot_id", None))
             if record is not None:
-                # The delivery sweep only claims recoverable rows. A delivered or still-owned
-                # answer is just as conclusive: never re-pay for its agent turn.
-                try:
-                    from gateway.delivery_ledger import has_turn_obligation
-                    if has_turn_obligation(entry.session_key, record.get("turn_id")):
-                        if self.session_store.finish_active_turn(
-                            entry.session_key, record.get("turn_id"),
-                            expected_resume_count=record.get("resume_count"),
-                        ):
-                            self.session_store.clear_resume_pending(entry.session_key)
-                        continue
-                except Exception:
-                    logger.warning("Skipping auto-resume for %s: delivery ledger unavailable",
-                                   entry.session_key, exc_info=True)
-                    continue
-                if record.get("process_followup"):
-                    from tools.process_registry_followups import require_reconciliation
-                    marker = record["process_followup"]
-                    require_reconciliation(marker["execution_id"], marker["token"])
-                    self.session_store.finish_active_turn(entry.session_key, record.get("turn_id"), force=True)
-                    self.session_store.clear_resume_pending(entry.session_key)
-                    # No durable answer: effects are uncertain, so never replay the model turn.
+                recovery = recover_orphaned_turn(self, entry, record)
+                if recovery is not None:
+                    scheduled += recovery
                     continue
                 stamp = record.get("failed_at") or record.get("interrupted_at") or record.get("started_at")
                 if not _is_fresh_gateway_interruption(stamp, window_secs=window):

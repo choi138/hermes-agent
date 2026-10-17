@@ -1167,7 +1167,7 @@ agent:
   # already-approved work in a normal turn after read-only completion verification.
   # A newer user message, /stop, cancellation, or an old completion suppresses it.
   process_continue_on_complete: false
-  process_continue_max_chain: 3
+  process_continue_max_chain: 10
   process_continue_max_age_seconds: 3600
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens

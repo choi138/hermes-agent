@@ -1851,7 +1851,7 @@ class TurnRunner:
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         from gateway.process_continuations import admit_turn, complete_turn
-        continuation_authority = None
+        continuation_authority = result = None
         followup = None
         try:
             followup, continuation_authority, admitted = admit_turn(ctx.event, session_key)
@@ -1989,7 +1989,7 @@ class TurnRunner:
                     reason='Live verification turn failed: ' + safe_error(exc))
             raise
         finally:
-            complete_turn(ctx.event, continuation_authority)
+            complete_turn(ctx.event, continuation_authority, result)
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

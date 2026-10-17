@@ -215,12 +215,12 @@ def _db(*, read_only=False, busy_timeout_ms=5000):
 
 def _ensure_continuation_watermarks(conn):
     columns = {row[1] for row in conn.execute('PRAGMA table_info(process_followup_cancellations)')}
-    if {'user_received_at', 'stopped_at'} <= columns:
+    if 'stopped_at' in columns:
         return
     with conn:
         conn.execute('BEGIN IMMEDIATE')
         columns = {row[1] for row in conn.execute('PRAGMA table_info(process_followup_cancellations)')}
-        for column in ('user_received_at', 'stopped_at'):
+        for column in ('stopped_at',):
             if column not in columns:
                 conn.execute(f'ALTER TABLE process_followup_cancellations ADD COLUMN {column} REAL NOT NULL DEFAULT 0')
 
@@ -245,9 +245,9 @@ def reserve(session):
     from tools.process_registry_results import completion_output
     payload.update(ProcessRegistry._exit_fields(session))
     payload.update(continue_on_complete=session.continue_on_complete, continuation=session.continuation)
-    if session.continue_on_complete:
-        from tools.process_registry_continuation import track_authority
-        track_authority(session.id, payload)
+    refused = session.continuation.get('refused_reason')
+    if refused:
+        payload['continuation_status'] = {'phase': 'skipped', 'reason': refused}
     completion = completion_output(session)
     payload.update(type='completion', session_id=session.id,
                    command=redact_sensitive_text(session.command, code_file=True, force=True),
@@ -260,7 +260,7 @@ def reserve(session):
     payload['timings'] = {'completion_observed_at': session.exited_at or now, 'execution_seconds': session.execution_seconds,
                           'execution_observed_seconds': max(0, now - session.started_at) if session.started_at else None}
     payload = scrub_payload(payload)
-    phase = 'pending'
+    phase = 'cancelled' if refused else 'pending'
     with _db() as db:
         cancellation = db.execute('SELECT cancelled_at FROM process_followup_cancellations WHERE session_key=?',
                                   (session.session_key,)).fetchone()
@@ -447,6 +447,8 @@ def defer(execution, token, reason):
 
 
 def cancel_for_session(session_key):
+    from tools.process_registry_continuation import record_stop
+    record_stop(session_key)
     with _db() as db:
         now = time.time()
         db.execute('INSERT INTO process_followup_cancellations (session_key,cancelled_at) VALUES (?,?) ON CONFLICT(session_key) DO UPDATE SET cancelled_at=excluded.cancelled_at', (session_key, now))

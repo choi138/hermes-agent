@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
     "agent": {
         # Opt in at background launch to continue already-approved work after verification.
         "process_continue_on_complete": False,
-        "process_continue_max_chain": 3,
+        "process_continue_max_chain": 10,
         "process_continue_max_age_seconds": 3600,
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).

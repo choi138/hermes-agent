@@ -167,6 +167,7 @@ class SessionLifecycleMixin:
         self, session_key: str, entry: SessionEntry, turn_id: str, boot_id: str,
         resume_count: int, *, origin_session_id: Optional[str] = None,
         origin_owner: Optional[str] = None, process_followup: Optional[dict] = None,
+        process_continuation: Optional[dict] = None,
     ) -> None:
         """Persist one active-turn record after the caller establishes ownership. Lock held."""
         record = {
@@ -186,6 +187,8 @@ class SessionLifecycleMixin:
             })
         if process_followup:
             record["process_followup"] = dict(process_followup)
+        if process_continuation:
+            record['process_continuation'] = dict(process_continuation)
         prior = entry.active_turn
         if resume_count and prior and prior.get("turn_id") == turn_id:
             for key in (
@@ -208,7 +211,7 @@ class SessionLifecycleMixin:
 
     def begin_active_turn(
         self, session_key: str, turn_id: str, boot_id: str, resume_count: int = 0,
-        *, process_followup: Optional[dict] = None,
+        *, process_followup: Optional[dict] = None, process_continuation: Optional[dict] = None,
         origin_session_id: Optional[str] = None, origin_owner: Optional[str] = None,
     ) -> bool:
         """Persist the agent turn identity before dispatch without publishing a failed write."""
@@ -220,6 +223,7 @@ class SessionLifecycleMixin:
                 session_key, entry, turn_id, boot_id, resume_count,
                 origin_session_id=origin_session_id, origin_owner=origin_owner,
                 process_followup=process_followup,
+                process_continuation=process_continuation,
             )
             return True
 
