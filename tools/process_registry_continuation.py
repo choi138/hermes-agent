@@ -111,6 +111,7 @@ def turn_scope(event, key, continuation=None):
     received_at = getattr(event, '_process_user_received_at', None)
     authority = continuation if continuation is not None else (
         {'chain': 0, 'chain_id': uuid.uuid4().hex,
+         'approving_user_id': getattr(event.source, 'user_id', None),
          'origin_received_at': received_at if received_at is not None else event.timestamp.timestamp()}
         if real_user and not metadata.get('process_followup') else None)
     token = _turn.set({**authority, 'session_key': key} if authority is not None else None)

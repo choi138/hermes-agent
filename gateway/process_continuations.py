@@ -41,7 +41,8 @@ async def _warn_stop_failure(runner, key, received_at, source):
         try:
             adapter = runner._delivery_adapter_for(source)
             if adapter is not None:
-                content, metadata = _notice_message(runner, adapter, source, _stop_warning(execution))
+                content, metadata = _notice_message(runner, adapter, source, _stop_warning(execution),
+                    payload if execution is not None else None)
                 await adapter.send(source.chat_id, content, metadata=metadata)
         except Exception:
             logging.getLogger(__name__).warning('Direct stop storage warning failed for %s', key, exc_info=True)
@@ -307,7 +308,7 @@ async def _deliver_notice(runner, payload, turn_id, content):
         return
     profile = getattr(adapter, '_owner_profile', None)
     if state in {None, 'pending'}:
-        content, metadata = _notice_message(runner, adapter, source, content)
+        content, metadata = _notice_message(runner, adapter, source, content, payload)
         await asyncio.to_thread(record_obligation, obligation_id=turn_id, session_key=payload['session_key'],
             platform=getattr(source.platform, 'value', source.platform), chat_id=source.chat_id,
             thread_id=source.thread_id, content=content, adapter_profile=profile,
@@ -321,10 +322,24 @@ async def _deliver_notice(runner, payload, turn_id, content):
         schedule(source.platform, profile=profile)
 
 
-def _notice_message(runner, adapter, source, content):
+def _owner_mention(source, payload=None):
     from gateway.agent_health import _strip_control
     from gateway.platforms._shared import get_scoped_secret
     mention = _strip_control(str(get_scoped_secret('HERMES_HEALTH_MENTION', '') or '')).strip()
+    if mention:
+        return mention
+    payload = payload or {}
+    owner = str((payload.get('continuation') or {}).get('approving_user_id')
+        or payload.get('user_id') or getattr(source, 'user_id', '') or '')
+    if not owner or any(character.isspace() or character in '<>[]()' or ord(character) < 32 for character in owner):
+        return ''
+    platform = getattr(source.platform, 'value', source.platform)
+    template = {'discord': '<@{}>', 'slack': '<@{}>', 'telegram': '[owner](tg://user?id={})'}.get(platform, '@{}')
+    return template.format(owner)
+
+
+def _notice_message(runner, adapter, source, content, payload=None):
+    mention = _owner_mention(source, payload)
     if mention:
         content += '\n' + mention
     metadata = runner._thread_metadata_for_target(source.platform, source.chat_id, source.thread_id,

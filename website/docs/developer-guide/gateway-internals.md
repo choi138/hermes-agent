@@ -276,7 +276,7 @@ The gateway runs as a long-lived process, managed via:
 ### Approved process continuations
 
 `agent.process_continue_on_complete` is **false by default**. When enabled,
-`terminal(background=true, continue_on_complete=true)` launched in a real gateway user turn
+`terminal(background=true, notify_on_complete=true, continue_on_complete=true)` launched in a real gateway user turn
 authorizes one full-tool continuation after its read-only verification report is durably recorded.
 An authorized continuation can launch the next step of the same approved task. The default
 `agent.process_continue_max_chain` is **10**; `agent.process_continue_max_age_seconds` defaults to
@@ -291,8 +291,8 @@ cancellation watermarks.
 
 Launch approval survives a gateway restart. Recovery honors the profile's fsynced stop journal;
 process ownership fences dispatch claims, not approval. A failed stop write keeps the current
-process's session quarantine, immediately warns the original chat/thread (with the same owner
-mention setting), and retries the same receipt once after a short delay. If storage remains
+process's session quarantine, immediately warns the original chat/thread (mentioning the approving
+user unless `HERMES_HEALTH_MENTION` overrides it), and retries the same receipt once after a short delay. If storage remains
 unavailable, a restart can lose that stop: the warning asks the user to send `/stop` again.
 
 A continuation interrupted while running gets one new turn for the same execution. Its internal
@@ -303,13 +303,26 @@ can be reclaimed after another restart; a restart after it started stops automat
 a repeated-restart notice. Live or unproven claim owners are never taken over.
 
 Stopped, refused-at-cap and uncertain executions produce a short Korean notice in the original
-chat/thread. Notices reuse the profile-scoped `HERMES_HEALTH_MENTION` owner-notification setting
-and the existing delivery ledger, with one stable obligation per execution. Successful deliveries
-are recorded atomically in the execution payload as well, so ledger retention cannot resurrect
-them on restart; failures follow the existing delivery retry policy. The transport ACK
+chat/thread. Notices prefer the profile-scoped `HERMES_HEALTH_MENTION` setting, falling back to the
+approving user's platform mention (for example, `<@id>` on Discord). They reuse the existing
+delivery ledger, with one stable obligation per execution. Authorization reads the owning profile's
+gate and follow-up store, independently of the delivery bot's profile. Successful deliveries also
+leave a tombstone in that execution's payload: atomic with the ledger for a single store, a separate
+owning-profile transaction under multiplexing. Failures follow the existing delivery retry policy. The transport ACK
 crash window has the ledger's honest at-least-once semantics: recovery can include its visible
 duplicate-warning marker. Strict exactly-once remote delivery cannot be proved without a
 transport idempotency/lookup contract. No new notices are created while the continuation gate is off.
+
+#### Known limitations
+
+- **F00/F02/F08/F09 — gate disabled with pending approval:** reconciliation can still write a terminal skipped state, silently retiring completed, ready approved work instead of preserving it for re-enablement.
+- **F01/F14/F15/F22 — `busy_input_mode: interrupt`:** ordinary input taking the nonredirected interrupt path can terminalize a running continuation as uncertain without `/stop`.
+- **F03–F06 — local host-PID commands across a crash or forced restart:** completion while down, or later pruning of a restored detached PID, can lose the completion and continuation silently; SSH/sandbox sessions recover through the remote checkpoint path, which no continuity test covers yet.
+- **F07 — caller grants revoked after approval:** dispatch does not re-check current caller grants, so stored approval can still run after access is removed.
+- **F11 — configured chain cap above 10:** the configured limit can admit more than the product's ten-continuation maximum.
+- **F12/F13 — stop-receipt I/O errors:** directory-fsync errors can be suppressed without warning/retry, risking loss after a host crash; unreadable or malformed receipts instead permanently skip work as stopped, masking the actual error.
+- **F19 — session cancellation:** cancellation also revokes approval, not only explicit `/stop`.
+- **F20 — crash between remote send and delivery recording:** stop notices are at-least-once and may repeat; this crash-window trade-off is an owner-approved deliberate choice.
 
 ### Watchers and delivery
 

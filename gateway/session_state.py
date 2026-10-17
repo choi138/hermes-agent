@@ -24,6 +24,7 @@ class TurnState:
     # redirect re-anchors both to the redirecting message (#115001).
     event: Any = None
     process_user_event: Any = None
+    process_steer_events: list[tuple[str, Any]] = field(default_factory=list)
     process_interrupt_event: Any = None
     ctx: Any = None
     started_ts: float = 0.0  # 0.0 = not running
@@ -38,7 +39,18 @@ class TurnState:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
         self.agent = self.lease = self.event = self.ctx = self.process_user_event = None
         self.process_interrupt_event = None
+        self.process_steer_events.clear()
         self.started_ts = self.busy_ack_ts = 0.0
+
+    def leftover_steer_origin(self, text):
+        if not self.process_steer_events:
+            return self.process_user_event
+        pending = ''
+        for submitted, event in reversed(self.process_steer_events):
+            pending = submitted + ('\n' + pending if pending else '')
+            if pending == text:
+                return event
+        return self.process_steer_events[-1][1]
 
 
 @dataclass

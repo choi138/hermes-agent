@@ -3180,6 +3180,7 @@ class GatewayTurnMixin:
             if session_key and (generation is None or self._is_session_run_current(session_key, generation)):
                 self._session_state(session_key).turn.event = turn_kwargs.get('event')
                 self._session_state(session_key).turn.process_user_event = None
+                self._session_state(session_key).turn.process_steer_events.clear()
                 self._session_state(session_key).turn.process_interrupt_event = None
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
@@ -3957,7 +3958,7 @@ class GatewayTurnMixin:
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
         state = self._peek_session_state(session_key) if session_key else None
-        origin_event = state.turn.process_user_event if state else None
+        origin_event = state.turn.leftover_steer_origin(leftover_steer) if state and leftover_steer else None
         steer_event = dataclasses.replace(origin_event, text=leftover_steer) if leftover_steer and origin_event else None
         if leftover_steer:
             if not pending and not pending_event:

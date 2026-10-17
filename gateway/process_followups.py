@@ -198,7 +198,16 @@ async def reconcile_all(runner):
             logger.warning('Process follow-up reconciliation failed for profile %s: %s', home, safe_error(exc))
 
 
-async def _send_attention(adapter, source, content, metadata, execution, token, turn_id, *, runner=None):
+async def _send_attention(adapter, source, content, metadata, execution, token, turn_id, *, runner=None, session_key=None):
+    if session_key is None:
+        return await _send_attention_scoped(adapter, source, content, metadata, execution, token, turn_id, runner=runner)
+    from gateway.delivery_ledger import _followups_home_override
+    from gateway.run import _async_profile_runtime_scope
+    async with _async_profile_runtime_scope(_followups_home_override(session_key)):
+        return await _send_attention_scoped(adapter, source, content, metadata, execution, token, turn_id, runner=runner)
+
+
+async def _send_attention_scoped(adapter, source, content, metadata, execution, token, turn_id, *, runner=None):
     from tools.process_registry_followups import attention_authorized
     from gateway.delivery_ledger import abandon_obligation, mark_uncertain
     if attention_inflight(turn_id):
@@ -274,7 +283,13 @@ async def _send_attention(adapter, source, content, metadata, execution, token, 
                 await asyncio.to_thread(abandon_obligation, turn_id)
                 return None
             if send.done():
-                return send.result()
+                result = send.result()
+                if getattr(result, 'success', False) is True:
+                    from gateway.delivery_ledger import mark_delivered
+                    from tools.process_registry_followups import acknowledge_attention
+                    await asyncio.to_thread(mark_delivered, turn_id)
+                    await asyncio.to_thread(acknowledge_attention, execution, token)
+                return result
             if asyncio.get_running_loop().time() >= deadline:
                 detached = True
                 await asyncio.to_thread(mark_uncertain, turn_id, 'attention send deadline exceeded; transport still owns settlement; inspect conversation before manual resend')
@@ -324,6 +339,10 @@ async def _report_attention(runner, adapter, source, row, evt):
             return
         content = (f"Process {execution}: verification needs reconciliation. {row['reason']}. "
                    "The original execution remains recorded; no command was automatically repeated.")
+        from gateway.process_continuations import _owner_mention
+        mention = _owner_mention(source, evt)
+        if mention:
+            content += '\n' + mention
         if state is None:
             await asyncio.to_thread(record_obligation, obligation_id=turn_id, session_key=session_key,
                 platform=getattr(source.platform, 'value', source.platform), chat_id=source.chat_id,

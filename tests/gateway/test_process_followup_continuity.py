@@ -166,7 +166,9 @@ async def test_armed_completion_resumes_once_after_report(home):
     assert event.source.thread_id == 'topic'
     ctx = TurnContext(event=event, source=runner.source, session_key=runner.entry.session_key,
         session_id=runner.entry.session_id, message=event.text)
+    resumed = []
     def resume(message, **kwargs):
+        resumed.append(message)
         from tools import process_registry_continuation as continuation
         from tools.process_registry import ProcessRegistry
         assert ledger.verification_tool_block('terminal', {'command': 'true'}) is None
@@ -176,7 +178,9 @@ async def test_armed_completion_resumes_once_after_report(home):
         assert child.continuation['chain'] == 1
         assert child.continuation['chain_id'] == 'approved-task'
         return {'final_response': 'tests passed', 'messages': []}
-    TurnRunner(runner, ctx)._run_conversation_with_approval(SimpleNamespace(run_conversation=resume), [], None, None, None)
+    result = TurnRunner(runner, ctx)._run_conversation_with_approval(SimpleNamespace(run_conversation=resume), [], None, None, None)
+    assert resumed == [event.text], 'continuation callback must actually run exactly once'
+    assert result['final_response'] == 'tests passed'
     await reconcile(runner)
     assert len([e for e in runner.transport.events if e.metadata.get('process_continuation')]) == 1
 

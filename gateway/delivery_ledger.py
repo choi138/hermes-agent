@@ -431,6 +431,22 @@ def _read_followups_as(session_key, read):
         reset_hermes_home_override(token)
 
 
+def _continuation_notice_as(session_key, execution, connection, *, delivered=False):
+    from tools.process_registry_continuation import settings, notice_pending, acknowledge_notice
+    from tools.process_registry_followups import _db
+
+    def access():
+        if not delivered and not settings()[0]:
+            return None
+        operation = acknowledge_notice if delivered else notice_pending
+        if _followups_home_override(session_key) / 'state.db' == _db_path():
+            return operation(execution, connection=connection)
+        with _db(read_only=not delivered) as followups:
+            return operation(execution, connection=followups)
+
+    return _read_followups_as(session_key, access)
+
+
 def process_attention_authorized(obligation_id, *, connection=None):
     """The state DB fences process-report retries even if ledger cleanup failed."""
     if obligation_id.startswith('process-continuation-stop-write:'):
@@ -450,16 +466,17 @@ def process_attention_authorized(obligation_id, *, connection=None):
             logger.warning('Stop-write notice authorization unavailable: %s', obligation_id, exc_info=True)
             return None
     if obligation_id.startswith('process-continuation-stop:'):
-        from tools.process_registry_continuation import settings, notice_pending
-        if not settings()[0]:
-            return None
         execution = obligation_id.removeprefix('process-continuation-stop:')
+        def read(conn):
+            row = conn.execute('SELECT session_key FROM delivery_obligations WHERE obligation_id=?',
+                               (obligation_id,)).fetchone()
+            return _continuation_notice_as(row[0], execution, conn) if row else False
         try:
             if connection is not None:
-                return notice_pending(execution, connection=connection)
+                return read(connection)
             with _DB_LOCK, _transaction() as conn:
-                return notice_pending(execution, connection=conn)
-        except (sqlite3.Error, OSError):
+                return read(conn)
+        except (sqlite3.Error, OSError, ValueError):
             logger.warning('Continuation notice authorization unavailable: %s', execution, exc_info=True)
             return None
     if obligation_id.startswith('process-report:'):
@@ -508,14 +525,17 @@ def mark_attempting(obligation_id: str) -> None:
 
 def mark_delivered(obligation_id: str, *, message_id=None) -> None:
     if obligation_id.startswith('process-continuation-stop:'):
-        from tools.process_registry_continuation import acknowledge_notice
         with _DB_LOCK, _transaction() as conn:
+            row = conn.execute('SELECT session_key FROM delivery_obligations WHERE obligation_id=?',
+                               (obligation_id,)).fetchone()
             conn.execute("UPDATE delivery_obligations SET state='delivered',updated_at=?,last_error=NULL WHERE obligation_id=?",
                          (time.time(), obligation_id))
             if message_id is not None:
                 conn.execute('INSERT OR REPLACE INTO delivery_obligation_receipts VALUES (?,?,?)',
                              (obligation_id, str(message_id), time.time()))
-            acknowledge_notice(obligation_id.removeprefix('process-continuation-stop:'), connection=conn)
+            if row:
+                _continuation_notice_as(row[0], obligation_id.removeprefix('process-continuation-stop:'),
+                                        conn, delivered=True)
         return
     if message_id is None:
         _update_state(obligation_id, "delivered")

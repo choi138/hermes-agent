@@ -538,7 +538,8 @@ class GatewayStartupMixin:
                     _, execution, token = row['obligation_id'].split(':')
                     source = SessionSource(platform=Platform(row['platform']), chat_id=row['chat_id'], thread_id=row['thread_id'])
                     result = await _send_attention(adapter, source, content, {**(metadata or {}), '_interim_send': True},
-                                                   execution, token, row['obligation_id'], runner=self)
+                                                   execution, token, row['obligation_id'], runner=self,
+                                                   session_key=row.get('session_key'))
                     if result is None:
                         continue  # Cancellation already abandoned this obligation.
                 else:

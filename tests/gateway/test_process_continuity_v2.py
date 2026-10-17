@@ -1015,6 +1015,7 @@ async def test_c3_slow_stop_write_does_not_block_interrupt(enabled, monkeypatch)
         return False
     monkeypatch.setattr(continuation, 'record_stop', write)
     enabled._interrupt_and_clear_session = AsyncMock()
+    started = time.monotonic()
     command = asyncio.create_task(GatewayRunner._busy_stop_command(enabled,
         MessageEvent(text='/stop', source=enabled.source), enabled.entry.session_key, enabled.source))
     try:
@@ -1022,6 +1023,7 @@ async def test_c3_slow_stop_write_does_not_block_interrupt(enabled, monkeypatch)
         assert continuation.stopped_after(enabled.entry.session_key, 1)
         done, _pending = await asyncio.wait({command}, timeout=4)
         assert command in done, 'stop fsync must stop delaying the interrupt after about two seconds'
+        assert time.monotonic() - started < 6, 'event-loop blocking must not hide behind an asyncio timeout'
         enabled._interrupt_and_clear_session.assert_awaited_once()
     finally:
         release.set()

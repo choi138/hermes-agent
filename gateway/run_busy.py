@@ -619,7 +619,8 @@ class GatewayBusySessionMixin:
                     running_agent, "steer", steer_text, session_key, event=event
                 )
             if steered:
-                self._fold_into_running_turn(running_agent, session_key, event)
+                self._fold_into_running_turn(running_agent, session_key, event,
+                    steer_text=self._steer_text_with_origin(steer_text, event))
             else:
                 effective_mode = "queue"
         elif (
@@ -676,7 +677,7 @@ class GatewayBusySessionMixin:
             turn.ctx.inbound_message_id = inbound_id
         return True
 
-    def _fold_into_running_turn(self, running_agent, session_key: str, event: MessageEvent):
+    def _fold_into_running_turn(self, running_agent, session_key: str, event: MessageEvent, *, steer_text=None):
         """The running turn now answers *event* too (steer, redirect): if *event* was addressed to
         the bot, a bare silence marker must not end the turn. Returns the turn, or None when a newer
         turn already owns the slot."""
@@ -685,6 +686,8 @@ class GatewayBusySessionMixin:
             return None
         if turn.process_user_event is None:
             turn.process_user_event = event
+        if steer_text is not None:
+            turn.process_steer_events.append((steer_text.strip(), event))
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
@@ -1137,7 +1140,8 @@ class GatewayBusySessionMixin:
             return t("gateway.steer.failed", error=exc)
         if not accepted:
             return t("gateway.steer.rejected_empty")
-        self._fold_into_running_turn(running_agent, quick_key, event)
+        self._fold_into_running_turn(running_agent, quick_key, event,
+            steer_text=self._steer_text_with_origin(steer_text, event))
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)
                   else t("gateway.steer.target_run"))
