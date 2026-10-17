@@ -1,6 +1,7 @@
 """User input survives read-only verification; launch-approved work resumes once."""
 
 import time
+import asyncio
 import json
 import sqlite3
 import threading
@@ -21,6 +22,7 @@ from gateway.session import SessionSource, SessionStore, build_session_key
 from gateway.turn_context import TurnContext
 from tools import process_registry_followups as ledger
 from tools.process_registry import ProcessSession
+from tests.waiting import async_wait_until
 
 
 @pytest.fixture
@@ -335,6 +337,7 @@ async def test_fence_failure_preserves_dispatch_and_suppresses_continuation(home
             assert await runner._handle_message(event) == 'dispatched'
         else:
             await runner._handle_active_session_busy_message(event, key)
+        await async_wait_until(lambda: 'prior authority quarantined' in caplog.text)
     if entry.endswith('stop'):
         runner._interrupt_and_clear_session.assert_awaited_once()
         agent.steer.assert_not_called()
@@ -345,6 +348,276 @@ async def test_fence_failure_preserves_dispatch_and_suppresses_continuation(home
     assert 'warning' in caplog.text.lower()
     assert continuation.claim(session.id) is None
     assert continuation_status(session.id)['phase'] == 'skipped'
+
+
+def fence_entry(home, entry):
+    runner, source, key, agent, adapter = busy_runner('steer', followup=False)
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(_store=runner.session_store,
+        lookup_by_session_key=AsyncMock(return_value=None))
+    event = MessageEvent(text='/stop' if entry.endswith('stop') else 'new direction', source=source)
+    if entry == 'cold':
+        runner._hm_admit_event = AsyncMock(return_value=(event, source, False))
+        runner._hm_estop_gate = lambda *_: None
+        runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+        runner._hm_evict_idle_stale_agent = lambda *_: None
+        runner._is_session_running = lambda *_: False
+        runner._hm_dispatch_idle_commands = AsyncMock(return_value=(True, 'dispatched'))
+    calls = {
+        'busy_stop': lambda: runner._busy_stop_command(event, key, source),
+        'slash_stop': lambda: runner._handle_stop_command(event),
+        'inbound_stop': lambda: runner._hm_handle_running_session_message(event, source, key),
+        'inbound': lambda: runner._hm_handle_running_session_message(event, source, key),
+        'adapter': lambda: runner._handle_active_session_busy_message(event, key),
+        'cold': lambda: runner._handle_message(event),
+    }
+    return runner, key, agent, calls[entry]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['busy_stop', 'slash_stop', 'inbound_stop', 'inbound', 'adapter', 'cold'])
+@pytest.mark.parametrize('config', ['', 'agent:\n  process_continue_on_complete: false\n',
+    'agent:\n  process_continue_on_complete: false\n  process_continue_max_chain: invalid\n'])
+async def test_gate_off_input_never_opens_continuation_database(home, monkeypatch, entry, config):
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text(config)
+    runner, key, agent, dispatch = fence_entry(home, entry)
+    database = MagicMock(side_effect=AssertionError('gate-off input must not open state.db'))
+    monkeypatch.setattr(continuation, '_db', database)
+    await dispatch()
+    await asyncio.get_running_loop().run_in_executor(None, lambda: None)
+    database.assert_not_called()
+    if entry.endswith('stop'):
+        runner._interrupt_and_clear_session.assert_awaited_once()
+    elif entry == 'cold':
+        runner._hm_dispatch_idle_commands.assert_awaited_once()
+    else:
+        agent.steer.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['busy_stop', 'slash_stop', 'inbound_stop', 'inbound', 'adapter', 'cold'])
+async def test_locked_fence_does_not_delay_dispatch_or_stop(home, monkeypatch, caplog, entry):
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    completion = CompletionRunner(home)
+    session = armed_session(completion)
+    await verify(completion)
+    runner, key, agent, dispatch = fence_entry(home, entry)
+    update_payload(session.id, session_key=key)
+    database = continuation._db
+    attempted = threading.Event()
+
+    @contextmanager
+    def observe_db(**kwargs):
+        attempted.set()
+        with database(**kwargs) as connection:
+            yield connection
+
+    monkeypatch.setattr(continuation, '_db', observe_db)
+    writer = sqlite3.connect(home / 'state.db')
+    writer.execute('BEGIN IMMEDIATE')
+    try:
+        started = time.monotonic()
+        await dispatch()
+        elapsed = time.monotonic() - started
+        if entry.endswith('stop'):
+            runner._interrupt_and_clear_session.assert_awaited_once()
+        elif entry == 'cold':
+            runner._hm_dispatch_idle_commands.assert_awaited_once()
+        else:
+            agent.steer.assert_called_once()
+        assert elapsed < 2, f'dispatch stalled {elapsed:.2f}s behind a SQLite writer'
+        await async_wait_until(attempted.is_set)
+        await async_wait_until(lambda: 'prior authority quarantined' in caplog.text)
+    finally:
+        writer.rollback()
+        writer.close()
+    assert continuation.claim(session.id) is None
+    assert continuation_status(session.id)['phase'] == 'skipped'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['busy_stop', 'inbound'])
+async def test_unreadable_config_preserves_dispatch_and_quarantines(home, monkeypatch, entry):
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    completion = CompletionRunner(home)
+    session = armed_session(completion)
+    await verify(completion)
+    runner, key, agent, dispatch = fence_entry(home, entry)
+    update_payload(session.id, session_key=key)
+    (home / 'config.yaml').write_text('agent: [')
+    await dispatch()
+    if entry.endswith('stop'):
+        runner._interrupt_and_clear_session.assert_awaited_once()
+    else:
+        agent.steer.assert_called_once()
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    assert continuation.claim(session.id) is None
+    assert continuation_status(session.id)['reason'] == 'continuation fence persistence failed'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['queue', 'steer_fallback', 'rewrite', 'steer_drain',
+    'pending', 'merged', 'interrupt', 'steer_queued', 'steer_interrupt'])
+async def test_replayed_input_keeps_origin_before_newer_input(home, monkeypatch, path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    runner, source, key, agent, adapter = busy_runner('steer', followup=False)
+    clock = SimpleNamespace(time=MagicMock(return_value=100.0))
+    monkeypatch.setattr(continuation, 'time', clock)
+    text = '/queue job' if path == 'queue' else '/steer job' if path.startswith('steer') else 'job'
+    original = MessageEvent(text=text, source=source)
+    continuation.record_user_event(key, original)
+    if path == 'queue':
+        await runner._busy_queue_command(original, key, source)
+    elif path == 'steer_fallback':
+        runner._session_state(key).turn.agent = None
+        await runner._busy_steer_command(original, key, source)
+    elif path == 'rewrite':
+        monkeypatch.setattr('hermes_cli.lifecycle.ainvoke_hook',
+            AsyncMock(return_value=[{'action': 'rewrite', 'text': 'job'}]))
+        replay = await runner._hm_pre_gateway_dispatch_hook(original, source)
+    elif path in {'pending', 'merged'}:
+        from gateway.platforms.base import merge_pending_message_event
+        merge_pending_message_event(adapter._pending_messages, key, original)
+        if path == 'merged':
+            merge_pending_message_event(adapter._pending_messages, key,
+                MessageEvent(text='same request', source=source), merge_text=True)
+    elif path == 'interrupt':
+        agent._supports_active_turn_redirect = False
+        await runner._hm_busy_interrupt(original, source, agent, key)
+    else:
+        await runner._busy_steer_command(original, key, source)
+        if path == 'steer_queued':
+            runner._enqueue_fifo(key, MessageEvent(text='notification', source=source, internal=True), adapter)
+        elif path == 'steer_interrupt':
+            agent._supports_active_turn_redirect = False
+            await runner._hm_busy_interrupt(original, source, agent, key)
+    clock.time.return_value = 101.0
+    continuation.record_user_event(key, MessageEvent(text='newer request', source=source))
+    identity = (str(home), key)
+    await async_wait_until(lambda: identity not in continuation._pending_fences)
+    assert identity not in continuation._failed_fences
+    clock.time.return_value = 102.0
+    if path != 'rewrite':
+        replay, text = await runner._run_agent_drain_pending(
+            {'final_response': 'done', 'pending_steer': 'job' if path in {
+                'steer_drain', 'steer_queued', 'steer_interrupt'} else '',
+             'interrupted': path in {'interrupt', 'steer_interrupt'},
+             'interrupt_message': 'job'},
+            adapter, source, key)
+        if path == 'steer_interrupt':
+            assert replay._process_user_received_at == 100.0
+            replay, text = await runner._run_agent_drain_pending({'final_response': 'done'}, adapter, source, key)
+    continuation.record_user_event(key, replay)
+    tokens = set_session_vars(platform='discord', session_key=key, session_id='origin-session')
+    try:
+        with continuation.turn_scope(replay, key), continuation.launch_scope(True):
+            session = ProcessSession(id='replayed-process', command='true', session_key=key,
+                parent_session_id='origin-session', started_at=102.0, notify_on_complete=True)
+            continuation.arm_session(session)
+        assert session.continue_on_complete
+        assert session.continuation['origin_received_at'] == 100.0
+        assert replay._process_user_recorded
+        ledger.reserve(session)
+        update_payload(session.id, verification={'outcome': 'verified'},
+            timings={'completion_observed_at': 102.0})
+        with ledger._db() as connection:
+            connection.execute("UPDATE process_followups SET phase='reported' WHERE execution_id=?", (session.id,))
+        assert continuation.claim(session.id) is None
+        assert continuation_status(session.id)['reason'] == 'newer user message'
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_gate_off_still_fences_live_authority(home):
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    runner = CompletionRunner(home)
+    armed_session(runner)
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: false\n')
+    continuation.record_stop(runner.entry.session_key)
+    with ledger._db(read_only=True) as connection:
+        row = connection.execute('SELECT stopped_at FROM process_followup_cancellations WHERE session_key=?',
+            (runner.entry.session_key,)).fetchone()
+    assert row['stopped_at'] > 0
+
+
+@pytest.mark.asyncio
+async def test_pending_fence_quarantines_before_worker_persists(home, monkeypatch):
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    runner = CompletionRunner(home)
+    session = armed_session(runner)
+    await verify(runner)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    database = continuation._db
+    loop_thread = threading.get_ident()
+
+    @contextmanager
+    def delayed_fence(**kwargs):
+        if 'busy_timeout_ms' in kwargs:
+            assert threading.get_ident() != loop_thread
+            started.set()
+            assert release.wait(5)
+            try:
+                with database(**kwargs) as connection:
+                    yield connection
+            finally:
+                finished.set()
+        else:
+            with database(**kwargs) as connection:
+                yield connection
+
+    with monkeypatch.context() as pending:
+        pending.setattr(continuation, '_db', delayed_fence)
+        continuation.record_stop(runner.entry.session_key)
+        try:
+            await async_wait_until(started.is_set)
+            assert continuation.claim(session.id) is None
+            assert continuation_status(session.id)['phase'] == 'skipped'
+        finally:
+            release.set()
+            await async_wait_until(finished.is_set)
+
+
+@pytest.mark.asyncio
+async def test_fence_worker_keeps_receiving_profile(home, monkeypatch):
+    from tools import process_registry_continuation as continuation
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n')
+    other_home = home / 'other-profile'
+    other_home.mkdir()
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    database = continuation._db
+
+    @contextmanager
+    def delayed_fence(**kwargs):
+        started.set()
+        assert release.wait(5)
+        try:
+            with database(**kwargs) as connection:
+                yield connection
+        finally:
+            finished.set()
+
+    with monkeypatch.context() as delayed:
+        delayed.setattr(continuation, '_db', delayed_fence)
+        continuation.record_stop('profile-session')
+        try:
+            await async_wait_until(started.is_set)
+            monkeypatch.setenv('HERMES_HOME', str(other_home))
+        finally:
+            release.set()
+            await async_wait_until(finished.is_set)
+    with sqlite3.connect(home / 'state.db') as connection:
+        row = connection.execute('SELECT stopped_at FROM process_followup_cancellations '
+            'WHERE session_key=?', ('profile-session',)).fetchone()
+    assert row[0] > 0
+    assert not (other_home / 'state.db').exists()
 
 
 @pytest.mark.asyncio

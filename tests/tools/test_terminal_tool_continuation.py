@@ -108,6 +108,7 @@ def test_continuation_chain_is_inherited_and_cannot_exceed_cap(home):
 
 def test_old_watermark_schema_upgrades_without_losing_cancellation(home):
     import sqlite3
+    config(home)
     with sqlite3.connect(home / 'state.db') as db:
         db.execute('CREATE TABLE process_followup_cancellations (session_key TEXT PRIMARY KEY, cancelled_at REAL NOT NULL)')
         db.execute("INSERT INTO process_followup_cancellations VALUES ('session',123)")

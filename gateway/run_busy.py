@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import time
@@ -682,6 +683,8 @@ class GatewayBusySessionMixin:
         turn = self._session_state(session_key).turn
         if turn.agent is not running_agent:
             return None
+        if turn.process_user_event is None:
+            turn.process_user_event = event
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
@@ -915,6 +918,8 @@ class GatewayBusySessionMixin:
             effective_mode == "interrupt" and not redirected
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
+            if _busy_state.turn.agent is running_agent:
+                _busy_state.turn.process_interrupt_event = event
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
@@ -1084,7 +1089,7 @@ class GatewayBusySessionMixin:
             return t("gateway.queue.usage")
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            self._enqueue_fifo(quick_key, MessageEvent(
+            self._enqueue_fifo(quick_key, dataclasses.replace(event,
                 text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
                 source=event.source, raw_message=event.raw_message, message_id=event.message_id,
                 media_urls=list(getattr(event, "media_urls", []) or []),
@@ -1114,7 +1119,7 @@ class GatewayBusySessionMixin:
             # Turn-boundary fallback: queue the steer text as its own follow-up turn.
             adapter = self._delivery_adapter_for(source)
             if adapter:
-                self._enqueue_fifo(quick_key, MessageEvent(
+                self._enqueue_fifo(quick_key, dataclasses.replace(event,
                     text=steer_text, message_type=MessageType.TEXT, source=event.source,
                     message_id=event.message_id, channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,

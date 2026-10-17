@@ -3179,6 +3179,8 @@ class GatewayTurnMixin:
             generation = turn_kwargs.get('run_generation')
             if session_key and (generation is None or self._is_session_run_current(session_key, generation)):
                 self._session_state(session_key).turn.event = turn_kwargs.get('event')
+                self._session_state(session_key).turn.process_user_event = None
+                self._session_state(session_key).turn.process_interrupt_event = None
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:
@@ -3903,6 +3905,7 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        interrupt_event = None
         if result and adapter and session_key:
             while True:
                 pending_event = _dequeue_pending_event(adapter, session_key)
@@ -3935,6 +3938,8 @@ class GatewayTurnMixin:
                     )
                 else:
                     pending = interrupt_message
+                    state = self._peek_session_state(session_key)
+                    interrupt_event = state.turn.process_interrupt_event if state else None
             elif pending_event:
                 # Transcribe audio BEFORE it becomes the next user turn (real transcript, not a path).
                 _pending_text = pending_event.text or ""
@@ -3951,9 +3956,13 @@ class GatewayTurnMixin:
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
+        state = self._peek_session_state(session_key) if session_key else None
+        origin_event = state.turn.process_user_event if state else None
+        steer_event = dataclasses.replace(origin_event, text=leftover_steer) if leftover_steer and origin_event else None
         if leftover_steer:
             if not pending and not pending_event:
                 pending = leftover_steer
+                pending_event = steer_event
                 logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
             elif pending_event and adapter and session_key:
                 # User steered during the turn, but a background event or queued message arrived.
@@ -3972,7 +3981,7 @@ class GatewayTurnMixin:
                         overflow.insert(0, pending_event)
                     else:
                         self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
-                pending_event = None
+                pending_event = steer_event
                 pending = leftover_steer
                 logger.debug(
                     "Delivering leftover /steer before queued event for session %s: '%s...'",
@@ -3985,8 +3994,9 @@ class GatewayTurnMixin:
                 steer_prompt, steer_source = self._pinned_channel_inputs(
                     session_key, None, source, internal=True,
                 )
-                steer_event = MessageEvent(
+                steer_event = steer_event or MessageEvent(
                     text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
+                    _process_user_received_at=0.0,
                 )
                 if session_key:
                     self._enqueue_fifo(session_key, steer_event, adapter)
@@ -3994,6 +4004,9 @@ class GatewayTurnMixin:
                     "Enqueued leftover /steer behind pending message for session %s: '%s...'",
                     session_key or "?", leftover_steer[:40],
                 )
+
+        if pending and pending_event is None and interrupt_event is not None:
+            pending_event = dataclasses.replace(interrupt_event, text=pending)
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):

@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from typing import Any, Dict, Optional
 
 from hermes_cli.sqlite_runtime import is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable
@@ -48,6 +49,46 @@ _delete_overridden_warned_paths: set[str] = set()
 _delete_overridden_warned_lock = threading.Lock()
 _journal_upgrade_warned_paths: set = set()
 _journal_upgrade_warned_lock = threading.Lock()
+_journal_init_locks = weakref.WeakValueDictionary()
+_journal_init_guard = threading.Lock()
+
+
+def _reset_journal_init_locks() -> None:
+    global _journal_init_locks, _journal_init_guard
+    _journal_init_locks = weakref.WeakValueDictionary()
+    _journal_init_guard = threading.Lock()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_journal_init_locks)
+
+
+@contextlib.contextmanager
+def _journal_initialization(conn: sqlite3.Connection):
+    """Serialize mode probes/upgrades per file, before any opener can hold a shared read lock.
+
+    Concurrent DELETE-to-WAL upgrades can deadlock and return BUSY without invoking SQLite's
+    busy handler. Cover both canonical small-store opens and SessionDB, but not their transactions.
+    Weak ownership avoids retaining every profile path; forked children get fresh mutexes.
+    """
+    database = _connection_db_file(conn)
+    if not database:
+        yield
+        return
+    identity = os.path.realpath(database)
+    with _journal_init_guard:
+        lock = _journal_init_locks.get(identity)
+        if lock is None:
+            lock = threading.RLock()
+            _journal_init_locks[identity] = lock
+    timeout_ms = conn.execute('PRAGMA busy_timeout').fetchone()[0]
+    if not lock.acquire(timeout=max(0, timeout_ms) / 1000):
+        raise sqlite3.OperationalError('database is locked (journal initialization)')
+    try:
+        yield
+    finally:
+        lock.release()
+
 
 _CANNOT_VERIFY_DELETE_MSG = ("could not verify journal mode before applying configured journal_mode=delete (database "
                              "is locked — possible concurrent openers); refusing to downgrade a database this process "
@@ -274,6 +315,11 @@ def apply_wal_with_fallback(conn: sqlite3.Connection, *, db_label: str = "state.
     still documents the WAL-reset bug as real through 3.51.2 with serious consequences. Until a fixed
     runtime is delivered, keep new databases out of WAL.
     """
+    with _journal_initialization(conn):
+        return _apply_wal_with_fallback(conn, db_label=db_label, require_wal=require_wal)
+
+
+def _apply_wal_with_fallback(conn: sqlite3.Connection, *, db_label: str, require_wal: bool) -> str:
     configured = resolve_journal_mode()
 
     # Vulnerable SQLite: never enable WAL on non-WAL files (configured mode resolved first so an explicit DELETE

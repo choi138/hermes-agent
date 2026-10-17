@@ -114,6 +114,8 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    _process_user_received_at: Optional[float] = field(default=None, repr=False, compare=False)
+    _process_user_recorded: bool = field(default=False, repr=False, compare=False)
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

@@ -182,11 +182,11 @@ from hermes_constants import get_hermes_home
 
 
 @contextmanager
-def _db(*, read_only=False):
+def _db(*, read_only=False, busy_timeout_ms=5000):
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
     from hermes_cli.sqlite_util import open_db
-    conn = open_db(home / 'state.db', db_label="state.db (process_followups)", busy_timeout_ms=5000)
+    conn = open_db(home / 'state.db', db_label="state.db (process_followups)", busy_timeout_ms=busy_timeout_ms)
     conn.row_factory = sqlite3.Row
     try:
         tables = {row[0] for row in conn.execute(
@@ -245,6 +245,9 @@ def reserve(session):
     from tools.process_registry_results import completion_output
     payload.update(ProcessRegistry._exit_fields(session))
     payload.update(continue_on_complete=session.continue_on_complete, continuation=session.continuation)
+    if session.continue_on_complete:
+        from tools.process_registry_continuation import track_authority
+        track_authority(session.id, payload)
     completion = completion_output(session)
     payload.update(type='completion', session_id=session.id,
                    command=redact_sensitive_text(session.command, code_file=True, force=True),

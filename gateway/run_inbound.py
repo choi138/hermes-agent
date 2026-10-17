@@ -666,6 +666,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             _interrupt_text = _build_media_placeholder(event)
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
+        turn = self._session_state(_quick_key).turn
+        if turn.agent is running_agent:
+            turn.process_interrupt_event = event
         running_agent.interrupt(_interrupt_text)
 
     async def _hm_handle_running_session_message(

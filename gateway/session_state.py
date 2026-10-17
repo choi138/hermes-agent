@@ -23,6 +23,8 @@ class TurnState:
     # The MessageEvent that opened the running turn and the live TurnContext: a successful busy
     # redirect re-anchors both to the redirecting message (#115001).
     event: Any = None
+    process_user_event: Any = None
+    process_interrupt_event: Any = None
     ctx: Any = None
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
@@ -34,7 +36,8 @@ class TurnState:
 
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
-        self.agent = self.lease = self.event = self.ctx = None
+        self.agent = self.lease = self.event = self.ctx = self.process_user_event = None
+        self.process_interrupt_event = None
         self.started_ts = self.busy_ack_ts = 0.0
 
 
