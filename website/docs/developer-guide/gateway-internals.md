@@ -323,6 +323,7 @@ transport idempotency/lookup contract. No new notices are created while the cont
 - **F12/F13 — stop-receipt I/O errors:** directory-fsync errors can be suppressed without warning/retry, risking loss after a host crash; unreadable or malformed receipts instead permanently skip work as stopped, masking the actual error.
 - **F19 — session cancellation:** cancellation also revokes approval, not only explicit `/stop`.
 - **F20 — crash between remote send and delivery recording:** stop notices are at-least-once and may repeat; this crash-window trade-off is an owner-approved deliberate choice.
+- **`HERMES_HOME` spelled with `..`:** `_continuation_notice_as` compares the launch home and the session profile's home lexically, so `~/.hermes/profiles/coder/../coder` and `~/.hermes/profiles/coder` count as different stores. Recording a sent continuation notice then opens a second writer on the same `state.db` inside the ledger's open write transaction; it times out, the delivery record rolls back, the notice tombstone stays unset, and the ledger lock is held for the timeout. Set `HERMES_HOME` without `..` components.
 
 ### Watchers and delivery
 

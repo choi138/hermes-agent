@@ -200,6 +200,26 @@ async def test_f23_pending_suffix_uses_first_unconsumed_receipt(home, grouped):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('consumed', [False, True])
+async def test_f23_late_steer_after_drain_keeps_pending_origin(home, consumed):
+    """A steer accepted after the finalizer drained the pending text (records [..., A, B] with
+    pending text A) must not donate its identity to the replayed text (magi r7)."""
+    runner, source, key, agent, adapter = busy_runner('steer', followup=False)
+    names = (['consumed'] if consumed else []) + ['pending', 'late']
+    submitted = {}
+    for receipt, identity in enumerate(names, start=1):
+        event = MessageEvent(text=identity, source=source, message_id=identity,
+            _process_user_received_at=receipt * 100.0, _process_user_recorded=True)
+        await runner._hm_handle_running_session_message(event, source, key)
+        submitted[identity] = agent.steer.call_args.args[0]
+    replay, text = await runner._run_agent_drain_pending(
+        {'final_response': 'done', 'pending_steer': submitted['pending']}, adapter, source, key)
+    assert text == submitted['pending']
+    assert replay.message_id == 'pending', 'a late steer must not donate its identity'
+    assert replay._process_user_received_at == (200.0 if consumed else 100.0)
+
+
+@pytest.mark.asyncio
 async def test_d_single_leftover_steer_unchanged(home):
     runner, source, key, agent, adapter = busy_runner('steer', followup=False)
     event = MessageEvent(text='/steer unchanged', source=source, message_id='only',
