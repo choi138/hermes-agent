@@ -2885,7 +2885,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             )
         self._with_discord_recovery_db(_op)
 
-    def _record_discord_processing_start(self, event: MessageEvent, *, emoji_ack: bool) -> None:
+    def _record_discord_processing_start(
+        self, event: MessageEvent, *, emoji_ack: bool, absorbed_at: Optional[str] = None,
+    ) -> None:
         if not self._missed_message_backfill_enabled():
             return
         message = event.raw_message
@@ -2893,12 +2895,29 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         message_id = str(getattr(message, "id", "") or getattr(event, "message_id", "") or "")
         if not message_id:
             return
-        now = self._utc_now_iso()
+        now = absorbed_at or self._utc_now_iso()
 
         def _op(conn):
             conn.execute(
                 "UPDATE discord_messages SET status='processing', emoji_ack=?, updated_at=? WHERE message_id=?",
                 (1 if emoji_ack else 0, now, message_id),
+            )
+        self._with_discord_recovery_db(_op)
+
+    def _record_discord_covered_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        self._record_discord_message_seen(event.raw_message, status='discovered')
+        message_id = str(getattr(event.raw_message, 'id', '') or event.message_id or '')
+        status = {ProcessingOutcome.SUCCESS: 'responded', ProcessingOutcome.FAILURE: 'failed',
+                  ProcessingOutcome.CANCELLED: 'cancelled'}[outcome]
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                'UPDATE discord_messages SET status=?, replied=?, outage_response=0, updated_at=? '
+                'WHERE message_id=?',
+                (status, int(outcome == ProcessingOutcome.SUCCESS), now, message_id),
             )
         self._with_discord_recovery_db(_op)
 
@@ -3233,6 +3252,36 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         """Reactions enabled via ``extra.reactions`` (YAML, per profile) or ``DISCORD_REACTIONS``."""
         return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
 
+    def on_message_absorbed(self, event: MessageEvent) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        absorbed_at = self._utc_now_iso()
+        for covered in (event, *event.absorbed_events):
+            if getattr(covered, '_discord_absorption_task', None) is not None:
+                continue
+            task = asyncio.create_task(self._run_processing_hook(
+                'on_processing_covered', covered, absorbed_at=absorbed_at,
+            ))
+            covered._discord_absorption_task = task
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def on_processing_covered(
+        self, event: MessageEvent, outcome: Optional[ProcessingOutcome] = None, *,
+        absorbed_at: Optional[str] = None,
+    ) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        if outcome is None:
+            await asyncio.to_thread(
+                self._record_discord_processing_start, event, emoji_ack=False, absorbed_at=absorbed_at,
+            )
+        else:
+            claim = getattr(event, '_discord_absorption_task', None)
+            if claim is not None:
+                await asyncio.shield(claim)
+            await asyncio.to_thread(self._record_discord_covered_complete, event, outcome)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
@@ -3240,10 +3289,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
             acked = await self._add_reaction(message, "👀")
         await asyncio.to_thread(self._record_discord_processing_start, event, emoji_ack=acked)
+        for covered in event.absorbed_events:
+            await self._run_processing_hook('on_processing_covered', covered)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
+        for covered in event.absorbed_events:
+            await self._run_processing_hook('on_processing_covered', covered, outcome)
         if not self._reactions_enabled():
             return
         message = event.raw_message

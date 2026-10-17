@@ -19,7 +19,7 @@ from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -569,6 +569,11 @@ class GatewayBusySessionMixin:
                         session_key, _verb, _normalized_args,
                     )
                     _adapter = self._delivery_adapter_for(event.source)
+                    _run_hook = getattr(_adapter, '_run_processing_hook', None)
+                    if callable(_run_hook):
+                        await _run_hook(
+                            'on_processing_covered', event, ProcessingOutcome.SUCCESS,
+                        )
                     if _adapter and _reply:
                         _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
                         if _text:
@@ -690,6 +695,14 @@ class GatewayBusySessionMixin:
             turn.process_steer_events.append((steer_text.strip(), event))
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
+            turn.event.absorb_processing_event(event)
+            try:
+                adapter = self._intake_adapter_for(event.source)
+                hook = getattr(adapter, 'on_message_absorbed', None)
+                if callable(hook):
+                    hook(event)
+            except Exception:
+                logger.warning('Absorbed input claim failed', exc_info=True)
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
         return turn

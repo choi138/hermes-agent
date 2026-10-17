@@ -43,8 +43,12 @@ class TurnState:
         self.started_ts = self.busy_ack_ts = 0.0
 
     def leftover_steer_origin(self, text):
+        events = self.leftover_steer_events(text)
+        return events[0] if events else None
+
+    def leftover_steer_events(self, text, *, include_late=False):
         if not self.process_steer_events:
-            return self.process_user_event
+            return [self.process_user_event] if self.process_user_event is not None else []
         events = self.process_steer_events
         # The drained text is a contiguous run of unconsumed steers. A steer accepted after the
         # drain (e.g. during streaming cleanup) can follow that run, so the run need not end at
@@ -54,10 +58,10 @@ class TurnState:
             for start in range(end, -1, -1):
                 pending = events[start][0] + ('\n' + pending if pending else '')
                 if pending == text:
-                    return events[start][1]
+                    return [event for _, event in events[start:None if include_late else end + 1]]
                 if len(pending) > len(text):
                     break
-        return events[-1][1]
+        return [events[-1][1]]
 
 
 @dataclass

@@ -1844,6 +1844,7 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
+            existing.absorb_processing_event(event)
             if both_photo or incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -1863,6 +1864,7 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            existing.absorb_processing_event(event)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
@@ -3567,6 +3569,14 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
+    def on_message_absorbed(self, event: MessageEvent) -> None:
+        """Non-blocking, silent claim hook for an input accepted by a running turn."""
+
+    async def on_processing_covered(
+        self, event: MessageEvent, outcome: Optional[ProcessingOutcome] = None,
+    ) -> None:
+        """Silent lifecycle for absorbed or inline inputs; None starts a claim. Default: no-op."""
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes. Default: opt-in reaction ack — with
         ``_OK_EMOJI``/``_FAIL_EMOJI`` set and ``_add_reaction``/``_remove_reaction`` present, swap
@@ -3642,6 +3652,7 @@ class BasePlatformAdapter(ABC):
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
+            await self._run_processing_hook('on_processing_covered', event, ProcessingOutcome.SUCCESS)
             return
         if log_cmd is not None:
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,

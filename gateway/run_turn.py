@@ -3895,6 +3895,27 @@ class GatewayTurnMixin:
             overflow.clear()
         return pending_event
 
+    async def _detach_undrained_steers(self, turn, adapter, text):
+        matched = turn.leftover_steer_events(text)
+        undelivered = []
+        for event in turn.leftover_steer_events(text, include_late=True):
+            undelivered.extend((event, *event.absorbed_events))
+        if turn.event is not None:
+            turn.event.absorbed_events[:] = [
+                event for event in turn.event.absorbed_events
+                if not any(event is pending for pending in undelivered)
+            ]
+        run_hook = getattr(adapter, '_run_processing_hook', None)
+        if callable(run_hook):
+            for event in undelivered:
+                await run_hook('on_processing_covered', event, ProcessingOutcome.CANCELLED)
+        if not matched:
+            return None
+        replay = dataclasses.replace(matched[0], text=text, absorbed_events=list(matched[0].absorbed_events))
+        for event in matched[1:]:
+            replay.absorb_processing_event(event)
+        return replay
+
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
     ) -> tuple[Any, Optional[str]]:
@@ -3958,8 +3979,7 @@ class GatewayTurnMixin:
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
         state = self._peek_session_state(session_key) if session_key else None
-        origin_event = state.turn.leftover_steer_origin(leftover_steer) if state and leftover_steer else None
-        steer_event = dataclasses.replace(origin_event, text=leftover_steer) if leftover_steer and origin_event else None
+        steer_event = await self._detach_undrained_steers(state.turn, adapter, leftover_steer) if state and leftover_steer else None
         if leftover_steer:
             if not pending and not pending_event:
                 pending = leftover_steer
