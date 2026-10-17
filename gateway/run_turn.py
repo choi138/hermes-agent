@@ -4089,6 +4089,7 @@ class GatewayTurnMixin:
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        _text_delivered = _already_streamed or not first_response
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -4122,6 +4123,11 @@ class GatewayTurnMixin:
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+        run_hook = getattr(adapter, '_run_processing_hook', None)
+        if callable(run_hook) and turn_ctx.event is not None:
+            outcome = (ProcessingOutcome.SUCCESS if _text_delivered and _deliver_media
+                       else ProcessingOutcome.FAILURE)
+            await run_hook('on_processing_coverage_complete', turn_ctx.event, outcome)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):

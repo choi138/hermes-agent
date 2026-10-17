@@ -2623,6 +2623,7 @@ class BasePlatformAdapter(ABC):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
             existing.absorb_reply_expected(event)
+            existing.absorb_processing_event(event)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -3577,6 +3578,11 @@ class BasePlatformAdapter(ABC):
     ) -> None:
         """Silent lifecycle for absorbed or inline inputs; None starts a claim. Default: no-op."""
 
+    async def on_processing_coverage_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome,
+    ) -> None:
+        """Settle only a host's covered inputs at its delivery boundary. Default: no-op."""
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes. Default: opt-in reaction ack — with
         ``_OK_EMOJI``/``_FAIL_EMOJI`` set and ``_add_reaction``/``_remove_reaction`` present, swap
@@ -3917,6 +3923,7 @@ class BasePlatformAdapter(ABC):
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
             state.event.absorb_reply_expected(event)
+            state.event.absorb_processing_event(event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:

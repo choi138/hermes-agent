@@ -1384,6 +1384,8 @@ class TurnRunner:
             agent.stream_delta_callback = None
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
+        agent._gateway_steer_lock = threading.Lock()
+        agent._gateway_steer_closed = False
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
@@ -1839,6 +1841,25 @@ class TurnRunner:
             logger.warning("Native image attachment failed, falling back to text: %s", exc)
         return ctx.message
 
+    @staticmethod
+    def _run_with_steer_admission(agent, message, kwargs):
+        result = None
+        try:
+            result = agent.run_conversation(message, **kwargs)
+            return result
+        finally:
+            gate = getattr(agent, '_gateway_steer_lock', None)
+            if gate is not None:
+                with gate:
+                    agent._gateway_steer_closed = True
+                    drain = getattr(agent, '_drain_pending_steer', None)
+                    if isinstance(result, dict) and callable(drain):
+                        remaining = drain()
+                        if remaining:
+                            result['pending_steer'] = '\n'.join(
+                                text for text in (result.get('pending_steer'), remaining) if text
+                            )
+
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):
         """Run the turn with the per-session gateway approval callback registered: dangerous-command
@@ -1956,7 +1977,7 @@ class TurnRunner:
                             "interrupted": True,
                             "agent_persisted": True,
                         }
-                    result = agent.run_conversation(api_message, **kwargs)
+                    result = self._run_with_steer_admission(agent, api_message, kwargs)
             finally:
                 if followup:
                     record_timings(followup['execution_id'], followup['token'],

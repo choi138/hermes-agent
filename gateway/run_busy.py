@@ -312,8 +312,11 @@ class GatewayBusySessionMixin:
     def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        with getattr(running_agent, '_gateway_steer_lock', contextlib.nullcontext()):
+            if getattr(running_agent, '_gateway_steer_closed', False) is True:
+                return False
+            accepted = bool(running_agent.steer(text))
+            return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →
@@ -604,6 +607,8 @@ class GatewayBusySessionMixin:
         )
         if demoted_for_compression:
             effective_mode = self._demote_interrupt(session_key, "context compression is in flight (#56391)")
+        if getattr(running_agent, '_gateway_steer_closed', False) is True:
+            effective_mode = 'queue'
         steered = redirected = False
         agent_live = running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL
         plain_text = (
@@ -636,6 +641,8 @@ class GatewayBusySessionMixin:
             redirected = self._redirect_active_turn(
                 running_agent, (event.text or "").strip(), session_key, event
             )
+            if not redirected and getattr(running_agent, '_gateway_steer_closed', False) is True:
+                effective_mode = 'queue'
         return self._BusySteerOutcome(
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
@@ -654,7 +661,10 @@ class GatewayBusySessionMixin:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
                 return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+            with getattr(running_agent, '_gateway_steer_lock', contextlib.nullcontext()):
+                if getattr(running_agent, '_gateway_steer_closed', False) is True:
+                    return False
+                return bool(getattr(running_agent, verb)(call_text))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -669,7 +679,8 @@ class GatewayBusySessionMixin:
         """
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
-        turn = self._fold_into_running_turn(running_agent, session_key, event)
+        turn = self._fold_into_running_turn(running_agent, session_key, event,
+            steer_text=self._steer_text_with_origin(text, event))
         if turn is None:
             return True  # a newer turn already owns the slot; never re-anchor it
         anchor = self._reply_anchor_for_event(event)
@@ -1152,6 +1163,8 @@ class GatewayBusySessionMixin:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
+            if getattr(running_agent, '_gateway_steer_closed', False) is True:
+                return _queue_fallback(t("gateway.steer.queued_no_agent"))
             return t("gateway.steer.rejected_empty")
         self._fold_into_running_turn(running_agent, quick_key, event,
             steer_text=self._steer_text_with_origin(steer_text, event))

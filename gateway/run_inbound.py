@@ -656,6 +656,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             if self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
                 logger.debug("PRIORITY redirect for session %s", _quick_key)
                 return
+        if getattr(running_agent, '_gateway_steer_closed', False) is True:
+            self._queue_or_replace_pending_event(_quick_key, event)
+            return
         logger.debug("PRIORITY interrupt for session %s", _quick_key)
         _interrupt_text = event.text
         if self._pending_event_audio_paths(event):

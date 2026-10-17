@@ -169,7 +169,7 @@ async def test_e4_undrained_batch_and_late_steer_keep_own_outcomes(busy):
     for event in (delivered, first, second, late):
         await steer(busy, event)
     accepted = busy.runner._session_state(busy.key).turn.process_steer_events
-    pending_text = '\n'.join(text for text, event in accepted if event is first or event is second)
+    pending_text = '\n'.join(text for text, event in accepted if event is not delivered)
     replay, _ = await busy.runner._run_agent_drain_pending(
         {'pending_steer': pending_text}, busy.adapter, busy.source, busy.key,
     )
@@ -178,8 +178,7 @@ async def test_e4_undrained_batch_and_late_steer_keep_own_outcomes(busy):
     await busy.adapter.on_processing_complete(replay, ProcessingOutcome.FAILURE)
     await finish(busy)
     assert row(busy, delivered)[:2] == ('responded', 1)
-    assert [row(busy, event)[:2] for event in (first, second)] == [('failed', 0)] * 2
-    assert row(busy, late)[:2] == ('cancelled', 0)
+    assert [row(busy, event)[:2] for event in (first, second, late)] == [('failed', 0)] * 3
 
 
 @pytest.mark.asyncio

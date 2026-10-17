@@ -3284,6 +3284,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
+        event._discord_coverage_completion_task = None
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
@@ -3292,11 +3293,27 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         for covered in event.absorbed_events:
             await self._run_processing_hook('on_processing_covered', covered)
 
+    async def on_processing_coverage_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        task = getattr(event, '_discord_coverage_completion_task', None)
+        if task is None:
+            covered_events = tuple(event.absorbed_events)
+
+            async def complete():
+                for covered in covered_events:
+                    await self._run_processing_hook('on_processing_covered', covered, outcome)
+
+            task = asyncio.create_task(complete())
+            event._discord_coverage_completion_task = task
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        await asyncio.shield(task)
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
-        for covered in event.absorbed_events:
-            await self._run_processing_hook('on_processing_covered', covered, outcome)
+        await self.on_processing_coverage_complete(event, outcome)
         if not self._reactions_enabled():
             return
         message = event.raw_message
