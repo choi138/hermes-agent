@@ -175,7 +175,7 @@ async def test_g4_each_stop_reason_reports_exactly_once(enabled, reason, monkeyp
         'cap': lambda: update_payload(session.id, continuation={**session.continuation, 'chain': 10}),
         'reconciliation': require_reconciliation,
         'cancel': lambda: ledger.cancel(session.id),
-        'admission': lambda: monkeypatch.setattr(runner, '_inject_watch_notification', AsyncMock(return_value=False)),
+        'admission': lambda: monkeypatch.setattr(runner, '_inject_watch_notification', AsyncMock(return_value=None)),
         'admission_exception': lambda: monkeypatch.setattr(runner, '_inject_watch_notification',
             AsyncMock(side_effect=RuntimeError('adapter failed'))),
         'report_reconciliation': lambda: abandon_report(runner, session.id),
@@ -317,6 +317,8 @@ async def test_g2_stop_persist_failure_notifies_and_retries(enabled, monkeypatch
         except OSError as error:
             escaped = error
         assert escaped is None, 'stop persistence errors must notify and retry, not escape /stop'
+        from tests.waiting import async_wait_until
+        assert await async_wait_until(lambda: runner.transport.send.await_count == 1, timeout=5)
         warnings = [call for call in runner.transport.send.call_args_list if '멈춤 기록 저장 실패:' in str(call)]
         assert len(warnings) == 1, 'a failed stop write must immediately warn the original chat'
         assert warnings[0].args[0] == '4242'
@@ -740,3 +742,409 @@ async def test_g7_receipt_replay_does_not_revoke_authority(enabled):
     await verify(runner)
     await reconcile(runner)
     assert len(continuations(runner)) == 1, 'receipt preservation must not restore a user-message fence'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_count', [0, 1])
+async def test_c1_adapter_unavailable_retries_until_connected(enabled, monkeypatch, caplog, resume_count):
+    runner = enabled
+    session = armed_session(runner)
+    await verify(runner)
+    update_payload(session.id, continuation_status={'resume_count': resume_count, 'interrupted_at': time.time()})
+    caplog.set_level('INFO', logger='gateway.run')
+    resolve = runner._resolve_injection_adapter
+    clock = [0]
+    monkeypatch.setattr('gateway.process_continuations.time', SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
+    monkeypatch.setattr(runner, '_resolve_injection_adapter', lambda *args: None)
+    for _attempt in range(3):
+        await reconcile(runner)
+    assert continuation_status(session.id)['phase'] == 'ready', 'adapter outage must release, not retire, the claim'
+    assert continuation_status(session.id)['resume_count'] == resume_count
+    assert not continuations(runner) and not notices(runner)
+    warnings = [record for record in caplog.records if record.levelname == 'WARNING' and session.id in record.message]
+    assert len(warnings) <= 1, 'the two-second retry loop must not spam warnings'
+    clock[0] = 299
+    await reconcile(runner)
+    assert len([record for record in caplog.records if record.levelname == 'WARNING' and session.id in record.message]) == 1
+    clock[0] = 300
+    await reconcile(runner)
+    assert len([record for record in caplog.records if record.levelname == 'WARNING' and session.id in record.message]) == 2
+    monkeypatch.setattr(runner, '_resolve_injection_adapter', resolve)
+    with monkeypatch.context() as reconnecting:
+        reconnecting.setattr('gateway.wake.admit_internal_event', AsyncMock(side_effect=RuntimeError('adapter reconnecting')))
+        for _attempt in range(3):
+            await reconcile(runner)
+    with monkeypatch.context() as reconnecting:
+        reconnecting.setattr('gateway.wake.adapter_supports_push', lambda adapter: False)
+        reconnecting.setattr(runner, '_served_api_server_wake_profile', MagicMock(return_value=None))
+        reconnecting.setattr('gateway.wake.deliver_wake', AsyncMock(side_effect=RuntimeError('API reconnecting')))
+        for _attempt in range(3):
+            await reconcile(runner)
+        reconnecting.setattr(runner, '_served_api_server_wake_profile', MagicMock(side_effect=LookupError('route reconnecting')))
+        for _attempt in range(3):
+            await reconcile(runner)
+    assert continuation_status(session.id)['phase'] == 'ready'
+    assert not any(record.name == 'gateway.run' and ('Watch pattern notification' in record.message
+        or 'Watch notification' in record.message) for record in caplog.records)
+    assert len([record for record in caplog.records if record.levelname == 'WARNING' and session.id in record.message]) == 2
+    await reconcile(runner)
+    await reconcile(runner)
+    events = continuations(runner)
+    assert len(events) == 1
+    model = MagicMock(return_value={'final_response': 'done', 'messages': []})
+    run_continuation(runner, events[0], model)
+    run_continuation(runner, events[0], model)
+    model.assert_called_once()
+    assert continuation_status(session.id)['phase'] == 'done'
+    assert continuation_status(session.id)['resume_count'] == resume_count
+    assert not notices(runner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_count', [0, 1])
+async def test_c1_adapter_unavailable_past_bound_notifies_once(enabled, monkeypatch, resume_count):
+    runner = enabled
+    session = armed_session(runner)
+    await verify(runner)
+    now = [time.time()]
+    update_payload(session.id, timings={'completion_observed_at': now[0]},
+        continuation_status={'resume_count': resume_count, 'interrupted_at': now[0]})
+    monkeypatch.setattr(continuation, 'time', SimpleNamespace(time=lambda: now[0]))
+    monkeypatch.setattr('gateway.run._auto_continue_freshness_window', lambda: 60)
+    monkeypatch.setattr(runner, '_resolve_injection_adapter', lambda *args: None)
+    await reconcile(runner)
+    now[0] += 61 if resume_count else 3601
+    await reconcile(runner)
+    await reconcile(runner)
+    assert not continuations(runner)
+    assert len(notices(runner)) == 1
+    assert '게이트웨이가 채팅에 연결되지 않아 이어 가기를 시작하지 못했어' in notices(runner)[0].args[1]
+
+
+@pytest.mark.asyncio
+async def test_c1_no_route_still_skips(enabled, monkeypatch):
+    session = armed_session(enabled)
+    await verify(enabled)
+    admission = AsyncMock(return_value=False)
+    monkeypatch.setattr(enabled, '_inject_watch_notification', admission)
+    await reconcile(enabled)
+    assert continuation_status(session.id)['phase'] == 'ready'
+    admission.return_value = None
+    await reconcile(enabled)
+    await reconcile(enabled)
+    assert continuation_status(session.id)['phase'] == 'skipped'
+    assert len(notices(enabled)) == 1 and not continuations(enabled)
+
+
+@pytest.mark.asyncio
+async def test_c1_retry_release_cannot_reset_newer_or_running_claim(enabled, monkeypatch):
+    session = armed_session(enabled)
+    await verify(enabled)
+    admission = AsyncMock(return_value=False)
+    monkeypatch.setattr(enabled, '_inject_watch_notification', admission)
+    await reconcile(enabled)
+    old_token = admission.call_args.args[1]['process_continuation']['token']
+    assert continuation_status(session.id)['phase'] == 'ready'
+    event = continuation.claim(session.id)
+    token = event['process_continuation']['token']
+    assert token != old_token
+    continuation.admission_failed(session.id, old_token, retryable=True)
+    assert continuation_status(session.id)['token'] == token
+    assert continuation_status(session.id)['phase'] == 'queued'
+    assert continuation.begin(session.id, token, enabled.entry.session_key) is not None
+    continuation.admission_failed(session.id, token, retryable=True)
+    assert continuation_status(session.id)['phase'] == 'running'
+
+
+@pytest.mark.asyncio
+async def test_c1_queued_behind_long_user_turn_still_runs(enabled, monkeypatch):
+    session = armed_session(enabled)
+    await verify(enabled)
+    await reconcile(enabled)
+    event = continuations(enabled)[0]
+    stopped = armed_session(enabled, 'proc_stopped_while_queued')
+    await verify(enabled)
+    await reconcile(enabled)
+    stopped_event = continuations(enabled)[1]
+    clock = time.time() + 3601
+    monkeypatch.setattr(continuation, 'time', SimpleNamespace(time=lambda: clock))
+    model = MagicMock(return_value={'final_response': 'done', 'messages': []})
+    run_continuation(enabled, event, model)
+    model.assert_called_once()
+    await asyncio.to_thread(continuation.record_stop, enabled.entry.session_key)
+    run_continuation(enabled, stopped_event, model)
+    model.assert_called_once()
+    await reconcile(enabled)
+    assert continuation_status(session.id)['phase'] == 'done', 'queue waiting must not expire admission'
+    assert continuation_status(stopped.id)['phase'] == 'skipped', 'explicit stop must still cancel queued work'
+    assert len(notices(enabled)) == 1 and stopped.id in notices(enabled)[0].args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_count', [0, 1])
+async def test_c1_missing_verification_ledger_waits_for_evidence(enabled, resume_count):
+    from gateway.delivery_ledger import record_obligation
+    session = armed_session(enabled)
+    result = await verify(enabled)
+    update_payload(session.id, continuation_status={'resume_count': resume_count, 'interrupted_at': time.time()})
+    with ledger._db() as database:
+        database.execute('DELETE FROM delivery_obligations WHERE turn_id=?', (result['turn_id'],))
+    await reconcile(enabled)
+    await reconcile(enabled)
+    assert not notices(enabled), 'missing report rows can be a transient publication gap'
+    assert not continuations(enabled)
+    record_obligation(obligation_id='late-report', session_key=enabled.entry.session_key,
+        platform='telegram', chat_id='4242', thread_id='topic', content='verified', turn_id=result['turn_id'])
+    await reconcile(enabled)
+    assert len(continuations(enabled)) == 1
+    model = MagicMock(return_value={'final_response': 'done', 'messages': []})
+    run_continuation(enabled, continuations(enabled)[0], model)
+    model.assert_called_once()
+    assert continuation_status(session.id)['phase'] == 'done'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure_site', ['listing', 'state', 'ledger', 'claim'])
+async def test_c2_stop_persist_failure_warns_without_state_db(enabled, monkeypatch, failure_site):
+    from gateway.run import GatewayRunner
+    session = armed_session(enabled)
+    await verify(enabled)
+    enabled._interrupt_and_clear_session = AsyncMock()
+    source = replace(enabled.source, chat_id='stop-chat', thread_id='stop-thread')
+    enabled._thread_metadata_for_target = lambda platform, chat, thread, **kwargs: {'thread_id': thread}
+    monkeypatch.setattr(continuation, 'record_stop', lambda *args: False)
+    monkeypatch.setenv('HERMES_HEALTH_MENTION', '<@12345>')
+    failing = MagicMock(side_effect=sqlite3.OperationalError('read-only state database'))
+    if failure_site == 'listing':
+        monkeypatch.setattr(continuation, '_db', failing)
+    else:
+        method = {'state': 'turn_delivery_state', 'ledger': 'record_obligation', 'claim': 'claim_pending_obligation'}[failure_site]
+        monkeypatch.setattr('gateway.delivery_ledger.' + method, failing)
+    await GatewayRunner._busy_stop_command(enabled, MessageEvent(text='/stop', source=source),
+        enabled.entry.session_key, source)
+    await asyncio.gather(*getattr(enabled, '_background_tasks', set()))
+    warnings = [call for call in enabled.transport.send.call_args_list if '멈춤 기록 저장 실패' in str(call)]
+    assert len(warnings) == 1, 'a broken state DB must not silence the stop persistence warning'
+    assert warnings[0].args[0] == source.chat_id
+    assert warnings[0].kwargs['metadata']['thread_id'] == source.thread_id
+    assert '재시작되면 다시 이어질 수 있어' in warnings[0].args[1]
+    assert warnings[0].args[1].endswith('\n<@12345>')
+    if failure_site != 'listing':
+        assert session.id in warnings[0].args[1]
+    enabled._interrupt_and_clear_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_c2_stop_persist_failure_db_ok_no_duplicate(enabled, monkeypatch):
+    from gateway.run import GatewayRunner
+    session = armed_session(enabled)
+    await verify(enabled)
+    enabled._interrupt_and_clear_session = AsyncMock()
+    monkeypatch.setattr(continuation, 'record_stop', lambda *args: False)
+    release = asyncio.Event()
+    async def send(*args, **kwargs):
+        await release.wait()
+        return SimpleNamespace(success=True)
+    enabled.transport.send = AsyncMock(side_effect=send)
+    command = asyncio.create_task(GatewayRunner._busy_stop_command(enabled,
+        MessageEvent(text='/stop', source=enabled.source), enabled.entry.session_key, enabled.source))
+    try:
+        done, _pending = await asyncio.wait({command}, timeout=2)
+        assert command in done, 'healthy ledger warning delivery must also stay off the interrupt path'
+    finally:
+        release.set()
+        await command
+        while getattr(enabled, '_background_tasks', set()):
+            await asyncio.gather(*enabled._background_tasks)
+    warnings = [call for call in enabled.transport.send.call_args_list if '멈춤 기록 저장 실패:' in str(call)]
+    assert len(warnings) == 1
+    from gateway.delivery_ledger import turn_delivery_state
+    with ledger._db(read_only=True) as database:
+        turn_id = database.execute("SELECT turn_id FROM delivery_obligations WHERE turn_id LIKE 'process-continuation-stop-write:%'").fetchone()[0]
+    assert turn_delivery_state(enabled.entry.session_key, turn_id) == 'delivered'
+    assert session.id in warnings[0].args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler', ['busy', 'idle'])
+async def test_c3_stop_interrupt_not_blocked_by_warning(enabled, monkeypatch, handler):
+    from gateway.run import GatewayRunner
+    armed_session(enabled)
+    await verify(enabled)
+    release, started = asyncio.Event(), asyncio.Event()
+    async def send(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return SimpleNamespace(success=True)
+    enabled.transport.send = AsyncMock(side_effect=send)
+    enabled._interrupt_and_clear_session = AsyncMock()
+    monkeypatch.setattr(continuation, 'record_stop', lambda *args: False)
+    event = MessageEvent(text='/stop', source=enabled.source)
+    if handler == 'idle':
+        enabled._session_key_for_source = lambda source: enabled.entry.session_key
+        enabled.async_session_store = SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=enabled.entry))
+        enabled._running_agents = {enabled.entry.session_key: object()}
+        command = asyncio.create_task(GatewayRunner._handle_stop_command(enabled, event))
+    else:
+        command = asyncio.create_task(GatewayRunner._busy_stop_command(enabled, event,
+            enabled.entry.session_key, enabled.source))
+    try:
+        done, _pending = await asyncio.wait({command}, timeout=2)
+        assert command in done, 'hard interrupt must not wait for the hanging warning send'
+        await command
+        enabled._interrupt_and_clear_session.assert_awaited_once()
+        await asyncio.wait_for(started.wait(), 5)
+        assert not release.is_set(), 'warning delivery remains in the background after interrupt'
+    finally:
+        release.set()
+        await command
+        await asyncio.gather(*getattr(enabled, '_background_tasks', set()))
+
+
+@pytest.mark.asyncio
+async def test_c3_slow_stop_write_does_not_block_interrupt(enabled, monkeypatch):
+    from gateway.run import GatewayRunner
+    armed_session(enabled)
+    await verify(enabled)
+    release, entered = threading.Event(), threading.Event()
+    attempts = []
+    def write(key, received_at):
+        attempts.append(received_at)
+        entered.set()
+        assert release.wait(20)
+        return False
+    monkeypatch.setattr(continuation, 'record_stop', write)
+    enabled._interrupt_and_clear_session = AsyncMock()
+    command = asyncio.create_task(GatewayRunner._busy_stop_command(enabled,
+        MessageEvent(text='/stop', source=enabled.source), enabled.entry.session_key, enabled.source))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert continuation.stopped_after(enabled.entry.session_key, 1)
+        done, _pending = await asyncio.wait({command}, timeout=4)
+        assert command in done, 'stop fsync must stop delaying the interrupt after about two seconds'
+        enabled._interrupt_and_clear_session.assert_awaited_once()
+    finally:
+        release.set()
+        await command
+        while getattr(enabled, '_background_tasks', set()):
+            await asyncio.gather(*enabled._background_tasks)
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert len([call for call in enabled.transport.send.call_args_list if '멈춤 기록 저장 실패:' in str(call)]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('recovery', ['startup', 'reconcile'])
+async def test_c4_long_running_turn_resumes_after_restart(enabled, home, recovery):
+    session = armed_session(enabled)
+    await verify(enabled)
+    await reconcile(enabled)
+    async with interrupted_turn(enabled, continuations(enabled)[0], session.id):
+        update_payload(session.id, timings={'completion_observed_at': time.time() - 7200})
+        restarted = restart_runner(home, 'second-boot')
+        if recovery == 'startup':
+            await startup_continuation(restarted)
+        else:
+            await reconcile(restarted)
+        events = continuations(restarted)
+        assert len(events) == 1, 'fresh interruption, not old process completion, bounds restart resume'
+        model = MagicMock(return_value={'final_response': 'resumed', 'messages': []})
+        run_continuation(restarted, events[0], model)
+        run_continuation(restarted, events[0], model)
+        model.assert_called_once()
+        assert continuation_status(session.id)['resume_count'] == 1
+        assert not notices(restarted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stamp_field', ['failed_at', 'interrupted_at', 'started_at'])
+async def test_c4_stale_interruption_skips_with_notice(enabled, home, monkeypatch, stamp_field):
+    session = armed_session(enabled)
+    await verify(enabled)
+    await reconcile(enabled)
+    async with interrupted_turn(enabled, continuations(enabled)[0], session.id):
+        restarted = restart_runner(home, 'second-boot')
+        record = restarted.entry.active_turn
+        record[stamp_field] = time.time() - 61
+        if stamp_field == 'failed_at':
+            record['interrupted_at'] = time.time()
+        monkeypatch.setattr('gateway.run._auto_continue_freshness_window', lambda: 60)
+        await startup_continuation(restarted)
+        await reconcile(restarted)
+        assert not continuations(restarted), 'a stale gateway interruption must not dispatch a continuation'
+        assert len(notices(restarted)) == 1
+        assert '게이트웨이가 너무 오래 멈춰 있어서 자동 재개를 멈췄어' in notices(restarted)[0].args[1]
+
+
+@pytest.mark.asyncio
+async def test_c4_restart_retry_retains_freshness_and_chain_reservation(enabled, home, monkeypatch):
+    (home / 'config.yaml').write_text('agent:\n  process_continue_on_complete: true\n  process_continue_max_chain: 1\n')
+    session = armed_session(enabled)
+    await verify(enabled)
+    await reconcile(enabled)
+    async with interrupted_turn(enabled, continuations(enabled)[0], session.id):
+        update_payload(session.id, timings={'completion_observed_at': time.time() - 7200})
+        restarted = restart_runner(home, 'second-boot')
+        inject = restarted._inject_watch_notification
+        async def admission(text, event):
+            return False if event.get('process_continuation') else await inject(text, event)
+        monkeypatch.setattr(restarted, '_inject_watch_notification', admission)
+        await startup_continuation(restarted)
+        status = continuation_status(session.id)
+        assert status['phase'] == 'ready' and status['resume_count'] == 1
+        assert status['interrupted_at']
+        sibling = armed_session(restarted, 'proc_sibling')
+        await verify(restarted)
+        await reconcile(restarted)
+        assert continuation_status(sibling.id)['phase'] == 'skipped'
+        assert 'chain cap' in continuation_status(sibling.id)['reason']
+        monkeypatch.setattr(restarted, '_inject_watch_notification', inject)
+        await reconcile(restarted)
+        events = continuations(restarted)
+        assert len(events) == 1
+        assert continuation_status(session.id)['interrupted_at'] == status['interrupted_at']
+        model = MagicMock(return_value={'final_response': 'resumed', 'messages': []})
+        run_continuation(restarted, events[0], model)
+        model.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_c5_stop_warning_ignores_finished_executions(enabled):
+    for phase in ('done', 'skipped', 'uncertain', 'ready', 'running'):
+        session = armed_session(enabled, 'proc_' + phase)
+        update_payload(session.id, continuation_status={'phase': phase})
+    failures = continuation.stop_write_failures(enabled.entry.session_key, time.time())
+    assert {execution for execution, _payload in failures} == {'proc_ready', 'proc_running'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure_site', ['source', 'profile'])
+async def test_c6_one_bad_session_does_not_block_startup_resume(enabled, home, monkeypatch, failure_site):
+    session = armed_session(enabled)
+    await verify(enabled)
+    await reconcile(enabled)
+    async with interrupted_turn(enabled, continuations(enabled)[0], session.id):
+        restarted = restart_runner(home, 'second-boot')
+        bad = restarted.entry
+        good = replace(bad, session_key=bad.session_key + ':healthy', active_turn=None, resume_pending=True)
+        monkeypatch.setattr(restarted, '_resume_pending_candidates', lambda platform: [bad, good])
+        restored = restarted._restored_source
+        seen = []
+        def restore(entry):
+            if entry is bad and failure_site == 'source':
+                raise RuntimeError('invalid stored route')
+            if entry is good:
+                seen.append(entry.session_key)
+            return restored(entry)
+        monkeypatch.setattr(restarted, '_restored_source', restore)
+        if failure_site == 'profile':
+            monkeypatch.setattr(restarted, '_resolve_profile_home_for_source', MagicMock(side_effect=RuntimeError('unserved profile')))
+        monkeypatch.setattr(restarted, '_is_session_running', lambda key: key == good.session_key and bool(seen))
+        monkeypatch.setattr(restarted, '_resume_owner_authorized', lambda *args: False)
+        failure = None
+        try:
+            restarted._schedule_resume_pending_sessions()
+        except RuntimeError as error:
+            failure = error
+        assert failure is None, f'one bad continuation route must not abort startup: {failure}'
+        assert seen == [good.session_key], 'later ordinary user sessions must still reach resume scheduling'
+        assert bad.active_turn is not None, 'failed entry must retain its recovery marker'

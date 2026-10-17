@@ -789,7 +789,11 @@ class GatewayStartupMixin:
         for entry in candidates:
             record = _orphaned_active_turn(entry, getattr(self, "_boot_id", None))
             if record is not None:
-                recovery = recover_orphaned_turn(self, entry, record)
+                try:
+                    recovery = recover_orphaned_turn(self, entry, record)
+                except Exception:
+                    logger.warning('Continuation recovery pending for %s', entry.session_key, exc_info=True)
+                    continue
                 if recovery is not None:
                     scheduled += recovery
                     continue

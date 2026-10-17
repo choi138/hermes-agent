@@ -1065,6 +1065,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
         """
         from gateway.wake import deliver_wake, persist_delegation_delivery
+        log_failure = logger.debug if evt.get('process_continuation') else logger.warning
+        log_attempt = logger.debug if evt.get('process_continuation') else logger.info
         scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
@@ -1077,7 +1079,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             try:
                 served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
             except LookupError as e:
-                logger.warning(fail, raw_sid, e)
+                log_failure(fail, raw_sid, e)
                 return False
             if served:
                 # The wake runs in the OWNING profile's scope, in-process (see ``deliver_wake``):
@@ -1088,12 +1090,12 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             deliver = lambda: deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
                 notification_category="diagnostic" if diagnostic_process_event(evt) else "result")
         try:
-            logger.info(info, raw_sid)
+            log_attempt(info, raw_sid)
             async with scope:
                 await deliver()
             return True
         except Exception as e:
-            logger.warning(fail, raw_sid, e)
+            log_failure(fail, raw_sid, e)
             return False
 
     def _served_api_server_wake_profile(self, evt: dict, raw_sid: str) -> Optional[str]:
@@ -1219,7 +1221,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
             )
-            logger.info(
+            log_injection = logger.debug if evt.get('process_continuation') else logger.info
+            log_injection(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
             )
@@ -1236,7 +1239,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 raise
             return False
         except Exception as e:
-            logger.error("Watch notification injection error: %s", e)
+            log_error = logger.debug if evt.get('process_continuation') else logger.error
+            log_error("Watch notification injection error: %s", e)
             return False
 
     @staticmethod

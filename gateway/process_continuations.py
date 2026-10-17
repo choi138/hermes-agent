@@ -2,25 +2,49 @@
 
 import asyncio
 import logging
+import time
 import uuid
 
 from tools import process_registry_continuation as continuation
 
 
-async def stop_session(key, *, runner):
+async def stop_session(key, *, runner, source):
     from hermes_constants import get_hermes_home
     received_at = continuation.receive_stop(key)
-    if await _persist_stop(key, received_at):
-        return
-    _background_task(runner, _retry_stop(key, received_at, get_hermes_home()))
+    task = _background_task(runner, _store_stop(runner, key, received_at, get_hermes_home(), source))
+    await asyncio.wait({task}, timeout=2)
+
+
+async def _store_stop(runner, key, received_at, home, source):
+    from gateway.run import _async_profile_runtime_scope
+    async with _async_profile_runtime_scope(home):
+        if await _persist_stop(key, received_at):
+            return
+        _background_task(runner, _retry_stop(key, received_at, home))
+        _background_task(runner, _warn_stop_failure(runner, key, received_at, source))
+
+
+def _stop_warning(execution=None):
+    prefix = f'멈춤 기록 저장 실패: {execution}' if execution else '멈춤 기록 저장 실패'
+    return (prefix + ' — 지금 프로세스에서는 멈춰 있지만, '
+        '게이트웨이가 재시작되면 다시 이어질 수 있어. 확실히 멈추려면 /stop 을 한 번 더 보내 줘.')
+
+
+async def _warn_stop_failure(runner, key, received_at, source):
+    execution = None
     try:
         for execution, payload in await asyncio.to_thread(continuation.stop_write_failures, key, received_at):
-            content = (f'멈춤 기록 저장 실패: {execution} — 지금 프로세스에서는 멈춰 있지만, '
-                '게이트웨이가 재시작되면 다시 이어질 수 있어. 확실히 멈추려면 /stop 을 한 번 더 보내 줘.')
             await _deliver_notice(runner, payload,
-                f'process-continuation-stop-write:{execution}:{received_at}', content)
+                f'process-continuation-stop-write:{execution}:{received_at}', _stop_warning(execution))
     except Exception:
         logging.getLogger(__name__).warning('Stop storage warning pending for %s', key, exc_info=True)
+        try:
+            adapter = runner._delivery_adapter_for(source)
+            if adapter is not None:
+                content, metadata = _notice_message(runner, adapter, source, _stop_warning(execution))
+                await adapter.send(source.chat_id, content, metadata=metadata)
+        except Exception:
+            logging.getLogger(__name__).warning('Direct stop storage warning failed for %s', key, exc_info=True)
 
 
 async def _persist_stop(key, received_at):
@@ -80,6 +104,7 @@ async def _recover_orphaned_turn(runner, key, record, home):
         if not (await asyncio.to_thread(continuation.settings))[0]:
             return
         try:
+            await asyncio.to_thread(continuation.remember_interruption, record)
             retired = await asyncio.to_thread(runner.session_store.finish_active_turn,
                 key, record['turn_id'], expected_resume_count=record.get('resume_count'))
             if retired:
@@ -184,7 +209,7 @@ def record_active_turn(runner, ctx, kwargs, followup):
 async def reconcile(runner):
     for row in await asyncio.to_thread(continuation.candidates):
         try:
-            evt = await asyncio.to_thread(continuation.claim, row['execution_id'])
+            evt = await asyncio.to_thread(_claim, runner, row)
         except Exception:
             await asyncio.to_thread(continuation.record_failure, row['execution_id'],
                                     'continuation reconciliation persistence failed')
@@ -208,14 +233,45 @@ async def reconcile(runner):
             await _reject_admission(row['execution_id'], marker['token'], uncertain=True)
             logging.getLogger(__name__).warning('Continuation admission failed for %s', row['execution_id'], exc_info=True)
             continue
-        if accepted is not True:
+        if accepted is False:
+            await _reject_admission(row['execution_id'], marker['token'], retryable=True)
+            _log_admission_retry(runner, row['execution_id'])
+        elif accepted is not True:
             await _reject_admission(row['execution_id'], marker['token'])
     await report_stops(runner)
 
 
-async def _reject_admission(execution, token, *, uncertain=False):
+def _claim(runner, row):
+    import json
+    from tools.process_registry_followups import _owner_alive
+    payload = json.loads(row['payload'])
+    status = payload.get('continuation_status', {})
+    if status.get('phase') == 'running' and status.get('owner') and _owner_alive(status['owner']) is False:
+        entry = runner.session_store.lookup_by_session_key(payload['session_key'])
+        record = getattr(entry, 'active_turn', None) or {}
+        if (record.get('process_continuation') or {}).get('execution_id') == row['execution_id']:
+            continuation.remember_interruption(record)
+    return continuation.claim(row['execution_id'])
+
+
+def _log_admission_retry(runner, execution):
+    from hermes_constants import get_hermes_home
+    warnings = getattr(runner, '_continuation_retry_warnings', None)
+    if warnings is None:
+        warnings = runner._continuation_retry_warnings = {}
+    identity = (str(get_hermes_home()), execution)
+    now = time.monotonic()
+    logger = logging.getLogger(__name__)
+    if identity not in warnings or now - warnings[identity] >= 300:
+        warnings[identity] = now
+        logger.warning('Continuation waiting for gateway admission: %s', execution)
+    else:
+        logger.debug('Continuation waiting for gateway admission: %s', execution)
+
+
+async def _reject_admission(execution, token, *, uncertain=False, retryable=False):
     try:
-        await asyncio.to_thread(continuation.admission_failed, execution, token, uncertain=uncertain)
+        await asyncio.to_thread(continuation.admission_failed, execution, token, uncertain=uncertain, retryable=retryable)
     except Exception:
         await asyncio.to_thread(continuation.record_failure, execution, 'continuation admission persistence failed')
         logging.getLogger(__name__).warning('Continuation admission settlement pending for %s', execution, exc_info=True)
@@ -251,18 +307,7 @@ async def _deliver_notice(runner, payload, turn_id, content):
         return
     profile = getattr(adapter, '_owner_profile', None)
     if state in {None, 'pending'}:
-        from gateway.agent_health import _strip_control
-        from gateway.platforms._shared import get_scoped_secret
-        mention = _strip_control(str(get_scoped_secret('HERMES_HEALTH_MENTION', '') or '')).strip()
-        if mention:
-            content += '\n' + mention
-        metadata = runner._thread_metadata_for_target(source.platform, source.chat_id, source.thread_id,
-            chat_type=source.chat_type, adapter=adapter)
-        metadata = {**(metadata or {}), '_interim_send': True, 'notify': True}
-        prime = getattr(adapter, 'prime_routing_cache', None)
-        if callable(prime):
-            from gateway.platforms.event import MessageEvent
-            prime(MessageEvent(text='', source=source, internal=True))
+        content, metadata = _notice_message(runner, adapter, source, content)
         await asyncio.to_thread(record_obligation, obligation_id=turn_id, session_key=payload['session_key'],
             platform=getattr(source.platform, 'value', source.platform), chat_id=source.chat_id,
             thread_id=source.thread_id, content=content, adapter_profile=profile,
@@ -274,6 +319,22 @@ async def _deliver_notice(runner, payload, turn_id, content):
     schedule = getattr(runner, '_schedule_flood_redelivery', None)
     if callable(schedule):
         schedule(source.platform, profile=profile)
+
+
+def _notice_message(runner, adapter, source, content):
+    from gateway.agent_health import _strip_control
+    from gateway.platforms._shared import get_scoped_secret
+    mention = _strip_control(str(get_scoped_secret('HERMES_HEALTH_MENTION', '') or '')).strip()
+    if mention:
+        content += '\n' + mention
+    metadata = runner._thread_metadata_for_target(source.platform, source.chat_id, source.thread_id,
+        chat_type=source.chat_type, adapter=adapter)
+    metadata = {**(metadata or {}), '_interim_send': True, 'notify': True}
+    prime = getattr(adapter, 'prime_routing_cache', None)
+    if callable(prime):
+        from gateway.platforms.event import MessageEvent
+        prime(MessageEvent(text='', source=source, internal=True))
+    return content, metadata
 
 
 async def _send_stop_notice(adapter, source, content, metadata, turn_id):

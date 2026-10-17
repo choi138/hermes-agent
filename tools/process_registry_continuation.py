@@ -80,7 +80,7 @@ def stop_write_failures(key, received_at):
         rows = db.execute("""SELECT execution_id,payload FROM process_followups
             WHERE json_extract(payload,'$.session_key')=? AND json_extract(payload,'$.continue_on_complete')=1
             AND json_extract(payload,'$.continuation.origin_received_at')<=?
-            AND COALESCE(json_extract(payload,'$.continuation_status.phase'),'ready')!='done'
+            AND COALESCE(json_extract(payload,'$.continuation_status.phase'),'ready') NOT IN ('done','skipped','uncertain')
             AND COALESCE(json_extract(payload,'$.continuation_status.notice_delivered'),0)=0""",
             (key, received_at)).fetchall()
     return [(row['execution_id'], json.loads(row['payload'])) for row in rows]
@@ -188,7 +188,7 @@ def arm_session(session):
 
 
 def _skip_reason(db, row, payload):
-    gate, cap, age = settings()
+    gate, cap, _age = settings()
     auth = payload.get('continuation') or {}
     if not gate:
         return 'config gate disabled'
@@ -203,10 +203,38 @@ def _skip_reason(db, row, payload):
         return 'chain cap reached'
     if chain_count(db, auth.get('chain_id'), excluding=row['execution_id']) >= cap:
         return 'chain cap reached'
-    completed = payload.get('timings', {}).get('completion_observed_at', 0)
-    if time.time() - completed > age:
-        return 'completion too old'
     return ''
+
+
+def _freshness_reason(payload):
+    status = payload.get('continuation_status', {})
+    if status.get('resume_count'):
+        from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
+        fresh = _is_fresh_gateway_interruption(status.get('interrupted_at'), now=time.time(),
+            window_secs=_auto_continue_freshness_window())
+        reason = '게이트웨이가 너무 오래 멈춰 있어서 자동 재개를 멈췄어'
+    else:
+        completed = payload.get('timings', {}).get('completion_observed_at', 0)
+        fresh = time.time() - completed <= settings()[2]
+        reason = 'completion too old'
+    if fresh:
+        return ''
+    return '게이트웨이가 채팅에 연결되지 않아 이어 가기를 시작하지 못했어' if status.get('admission_retry') else reason
+
+
+def remember_interruption(record):
+    marker = record.get('process_continuation') or {}
+    if not marker:
+        return
+    with _db() as db:
+        row = db.execute('SELECT payload FROM process_followups WHERE execution_id=?', (marker['execution_id'],)).fetchone()
+        if not row:
+            return
+        payload = json.loads(row['payload'])
+        status = payload.get('continuation_status', {})
+        if status.get('token') == marker.get('token') and status.get('phase') == 'running':
+            status['interrupted_at'] = record.get('failed_at') or record.get('interrupted_at') or record.get('started_at')
+            _save(db, marker['execution_id'], payload)
 
 
 def _stop_reason(db, payload):
@@ -226,7 +254,7 @@ def chain_count(db, chain_id, *, excluding=''):
         WHERE json_extract(payload,'$.continuation.chain_id')=?
         AND execution_id!=?
         AND (json_extract(payload,'$.continuation_status.phase') IN ('running','done','uncertain')
-            OR (json_extract(payload,'$.continuation_status.phase')='queued'
+            OR (json_extract(payload,'$.continuation_status.phase') IN ('queued','ready')
                 AND json_extract(payload,'$.continuation_status.resume_count')=1))""",
         (chain_id, excluding)).fetchone()[0]
 
@@ -328,32 +356,39 @@ def claim(execution):
             return None
         if row['phase'] in {'pending', 'queued', 'running', 'dispatching'}:
             return None  # verification has not finished
-        reason = _failure_reason(execution) or _skip_reason(db, row, payload)
+        reason = _failure_reason(execution) or _skip_reason(db, row, payload) or _freshness_reason(payload)
         if reason:
-            payload['continuation_status'] = {'phase': 'skipped', 'reason': reason}
+            payload['continuation_status'] = {**status, 'phase': 'skipped', 'reason': reason}
             _save(db, execution, payload)
             return None
         if (payload['session_key'], payload.get('followup_turn_id')) != (
                 observed['session_key'], observed.get('followup_turn_id')):
+            return None
+        if delivery_state is None:
+            status['phase'] = 'ready'
+            _save(db, execution, payload)
             return None
         if delivery_state not in {'pending', 'delivered'}:
             payload['continuation_status'] = {'phase': 'skipped', 'reason': 'verification report needs reconciliation'}
             _save(db, execution, payload)
             return None
         token = uuid.uuid4().hex
-        payload['continuation_status'] = {'phase': 'queued', 'token': token,
+        payload['continuation_status'] = {**status, 'phase': 'queued', 'token': token,
             'owner': _owner_for_pid(os.getpid()), 'resume_count': status.get('resume_count', 0)}
         _save(db, execution, payload)
         return {**payload, 'process_continuation': {'execution_id': execution, 'token': token}}
 
 
-def admission_failed(execution, token, *, uncertain=False):
+def admission_failed(execution, token, *, uncertain=False, retryable=False):
     with _db() as db:
         row = db.execute('SELECT payload FROM process_followups WHERE execution_id=?', (execution,)).fetchone()
         payload = json.loads(row['payload'])
         status = payload.get('continuation_status', {})
         if status.get('token') == token and status.get('phase') == 'queued':
-            status.update(phase='uncertain' if uncertain else 'skipped', reason='continuation admission failed')
+            if retryable:
+                status.update(phase='ready', admission_retry=True)
+            else:
+                status.update(phase='uncertain' if uncertain else 'skipped', reason='continuation admission failed')
             _save(db, execution, payload)
 
 
@@ -367,6 +402,7 @@ def begin(execution, token, key):
         if status.get('token') != token or status.get('phase') != 'queued' or payload.get('session_key') != key:
             return None
         reason = _failure_reason(execution) or _skip_reason(db, row, payload)
+        status.pop('admission_retry', None)
         status.update(phase='skipped' if reason else 'running', reason=reason)
         _save(db, execution, payload)
         if reason:

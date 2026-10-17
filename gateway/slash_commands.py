@@ -428,12 +428,12 @@ class GatewaySlashCommandsMixin(
         # written. Resolving/touching a route first can fail before its fence is saved.
         session_key = self._session_key_for_source(source)
         from gateway.process_continuations import stop_session
-        await stop_session(session_key, runner=self)
+        await stop_session(session_key, runner=self, source=source)
         session_entry = await self.async_session_store.lookup_by_session_key(session_key)
 
         async def _stop(key: str, invalidation_reason: str) -> None:
             if key != session_key:
-                await stop_session(key, runner=self)
+                await stop_session(key, runner=self, source=source)
             await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)

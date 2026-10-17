@@ -742,8 +742,8 @@ async def test_dispatch_rechecks_queued_authorization(home, guard):
     else:
         update_payload(session.id, timings={'completion_observed_at': time.time() - 3601})
     model = MagicMock(return_value={'final_response': 'done', 'messages': []})
-    assert run_continuation(runner, event, model)['final_response'] == ('done' if guard == 'user' else 'NO_REPLY')
-    assert model.call_count == (1 if guard == 'user' else 0)
+    assert run_continuation(runner, event, model)['final_response'] == ('done' if guard in {'user', 'stale'} else 'NO_REPLY')
+    assert model.call_count == (1 if guard in {'user', 'stale'} else 0)
 
 
 @pytest.mark.asyncio
