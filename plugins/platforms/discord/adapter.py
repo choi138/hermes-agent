@@ -3264,7 +3264,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             ))
             covered._discord_absorption_task = task
             self._background_tasks.add(task)
+            self._processing_settlement_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(self._processing_settlement_tasks.discard)
 
     async def on_processing_covered(
         self, event: MessageEvent, outcome: Optional[ProcessingOutcome] = None, *,
@@ -3307,13 +3309,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             task = asyncio.create_task(complete())
             event._discord_coverage_completion_task = task
             self._background_tasks.add(task)
+            self._processing_settlement_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(self._processing_settlement_tasks.discard)
         await asyncio.shield(task)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
-        await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
         await self.on_processing_coverage_complete(event, outcome)
+        await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
         if not self._reactions_enabled():
             return
         message = event.raw_message

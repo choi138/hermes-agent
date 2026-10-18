@@ -3928,6 +3928,10 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         interrupt_event = None
+        leftover_steer = (result.get("pending_steer") or "").strip() if result else None
+        state = self._peek_session_state(session_key) if session_key else None
+        steer_event = await self._detach_undrained_steers(
+            state.turn, adapter, leftover_steer) if state and leftover_steer else None
         if result and adapter and session_key:
             while True:
                 pending_event = _dequeue_pending_event(adapter, session_key)
@@ -3948,6 +3952,11 @@ class GatewayTurnMixin:
                         )]
                         if hasattr(successor, "_gateway_pending_followups"):
                             delattr(successor, "_gateway_pending_followups")
+                    if steer_event is not None:
+                        following = [steer_event, *getattr(pending_event, '_gateway_pending_followups', [])]
+                        pending_event._gateway_pending_followups = sorted(
+                            following, key=lambda event: event._process_user_received_at
+                            or event.timestamp.timestamp())
                     adapter._pending_messages[session_key] = pending_event
                     return None, None
                 # A stale ticket is silent; continue draining its human successor.
@@ -3977,9 +3986,6 @@ class GatewayTurnMixin:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
-        leftover_steer = (result.get("pending_steer") or "").strip() if result else None
-        state = self._peek_session_state(session_key) if session_key else None
-        steer_event = await self._detach_undrained_steers(state.turn, adapter, leftover_steer) if state and leftover_steer else None
         if leftover_steer:
             if not pending and not pending_event:
                 pending = leftover_steer
@@ -4271,6 +4277,7 @@ class GatewayTurnMixin:
                 event=pending_event,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
+                persist_user_timestamp=getattr(pending_event, '_process_user_received_at', None) or None,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
@@ -4682,6 +4689,8 @@ class GatewayTurnMixin:
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
+        worker = None
+        steers_drained = False
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
@@ -4692,14 +4701,30 @@ class GatewayTurnMixin:
             self._run_agent_evict_on_fallback(turn_ctx)
 
             # Interrupted OR queued message (/queue)?
-            result = turn_ctx.result_holder[0]
+            result = turn_runner.close_steer_admission(
+                turn_ctx.agent_holder[0], turn_ctx.result_holder[0])
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            steers_drained = True
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
+        except BaseException:
+            result = turn_runner.close_steer_admission(
+                turn_ctx.agent_holder[0], turn_ctx.result_holder[0])
+            if worker is not None and not worker.executor_task.done():
+                self._evict_cached_agent(session_key)
+            if not steers_drained and result.get('pending_steer'):
+                adapter = self._intake_adapter_for(source)
+                state = self._peek_session_state(session_key) if session_key else None
+                if state is not None:
+                    replay = await self._detach_undrained_steers(
+                        state.turn, adapter, result['pending_steer'])
+                    if replay is not None:
+                        self._enqueue_fifo(session_key, replay, adapter)
+            raise
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,

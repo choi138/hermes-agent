@@ -2031,6 +2031,7 @@ class BasePlatformAdapter(ABC):
         self._text_debounce: dict[str, TextDebounceState] = {}
         # handle_message() tasks; shutdown cancels them so a replaced gateway stops working.
         self._background_tasks: set[asyncio.Task] = set()
+        self._processing_settlement_tasks: set[asyncio.Task] = set()
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
@@ -3658,6 +3659,7 @@ class BasePlatformAdapter(ABC):
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
+            await self._settle_inline_coverage(event, ProcessingOutcome.SUCCESS)
             await self._run_processing_hook('on_processing_covered', event, ProcessingOutcome.SUCCESS)
             return
         if log_cmd is not None:
@@ -3666,8 +3668,31 @@ class BasePlatformAdapter(ABC):
         result = await self._send_with_retry(
             chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
             metadata=_mark_notify_metadata(thread_meta))
+        await self._settle_inline_coverage(
+            event, ProcessingOutcome.SUCCESS if result.success else ProcessingOutcome.FAILURE)
         if eph_ttl > 0 and result.success and result.message_id:
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+    async def _settle_inline_coverage(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        if getattr(event, '_gateway_inline_deferred', False):
+            return
+        coverage_event = getattr(event, '_gateway_inline_coverage_event', None)
+        if coverage_event is not None:
+            await self._run_processing_hook('on_processing_coverage_complete', coverage_event, outcome)
+            return
+        consumed = []
+        for covered in event.absorbed_events:
+            if event.get_command() and (covered.text or '').strip() and not getattr(
+                event, '_gateway_inline_args_consumed', False,
+            ):
+                await self._run_processing_hook('on_processing_covered', covered, ProcessingOutcome.CANCELLED)
+            else:
+                consumed.append(covered)
+        if consumed:
+            coverage_event = event if len(consumed) == len(event.absorbed_events) else dataclasses.replace(
+                event, absorbed_events=consumed)
+            event._gateway_inline_coverage_event = coverage_event
+            await self._run_processing_hook('on_processing_coverage_complete', coverage_event, outcome)
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
@@ -4516,6 +4541,8 @@ class BasePlatformAdapter(ABC):
                 await asyncio.to_thread(mark_uncertain, obligation_id, 'Report transport outcome unknown; inspect conversation before resend')
             raise
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+        if result.success:
+            await self._run_processing_hook('on_processing_coverage_complete', event, ProcessingOutcome.SUCCESS)
         if (getattr(event, '_gateway_response_kind', None) == 'process_verification_report'
                 and not result.success and (self._is_timeout_error(result.error) or self._is_partial_delivery(result))):
             from gateway.delivery_ledger import mark_uncertain
@@ -4774,8 +4801,11 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
-            await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            await self._run_processing_hook(
+                'on_processing_coverage_complete', event,
+                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
+            await self._release_turn_marker(event)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4800,10 +4830,17 @@ class BasePlatformAdapter(ABC):
             processing_cancelled = True
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
+                'on_processing_coverage_complete', event,
+                ProcessingOutcome.SUCCESS if delivery_succeeded else (
+                    ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE))
+            await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            await self._run_processing_hook(
+                'on_processing_coverage_complete', event,
+                ProcessingOutcome.SUCCESS if delivery_succeeded else ProcessingOutcome.FAILURE)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4931,6 +4968,8 @@ class BasePlatformAdapter(ABC):
             if not tasks:
                 break
             for task in tasks:
+                if task in self._processing_settlement_tasks:
+                    continue
                 self._expected_cancelled_tasks.add(task)
                 task.cancel()
             try:
@@ -4951,7 +4990,8 @@ class BasePlatformAdapter(ABC):
             }, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
-        for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
+        for bucket in (self._background_tasks, self._processing_settlement_tasks,
+                       self._expected_cancelled_tasks, self._session_tasks,
                        self._pending_messages, self._active_sessions, self._requeue_counts,
                        self._text_debounce_store()):
             bucket.clear()

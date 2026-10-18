@@ -566,6 +566,7 @@ class GatewayBusySessionMixin:
                     # event.get_command_args(). Always a literal "/": is_command()/get_command_args()
                     # don't recognize per-platform display prefixes ("!" on Slack/Matrix).
                     event.text = f"/{_verb} {_normalized_args}".rstrip()
+                    event._gateway_inline_args_consumed = True
                     _reply = await _approval_handler(event)
                     logger.info(
                         "Approval response via plain text: session=%s verb=%s args=%r",
@@ -574,6 +575,7 @@ class GatewayBusySessionMixin:
                     _adapter = self._delivery_adapter_for(event.source)
                     _run_hook = getattr(_adapter, '_run_processing_hook', None)
                     if callable(_run_hook):
+                        await _run_hook('on_processing_coverage_complete', event, ProcessingOutcome.SUCCESS)
                         await _run_hook(
                             'on_processing_covered', event, ProcessingOutcome.SUCCESS,
                         )
@@ -1023,6 +1025,32 @@ class GatewayBusySessionMixin:
         k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
     }
 
+    @staticmethod
+    def _inline_command_consumes_args(event, name):
+        from gateway.slash_commands import _APPROVE_CHOICE_BY_ARG
+
+        args = event.get_command_args().strip()
+        tokens = args.lower().split()
+        if name in {'pause', 'bg', 'btw', 'busy', 'heartbeat'}:
+            return True
+        predicates = {
+            'approve': lambda: all(token in _APPROVE_CHOICE_BY_ARG or token == 'all' for token in tokens),
+            'deny': lambda: len(args.removeprefix('all').strip() if tokens[:1] == ['all'] else args) <= 280,
+            'commands': lambda: args.isdecimal(),
+            'context': lambda: args.lower() in {'all', 'full', 'details'},
+            'kanban': lambda: not tokens or (
+                tokens[0].strip('\"\'') not in {'help', '?'}
+                and not any(token.strip('\"\'') in {'--help', '-h'} for token in tokens)
+            ),
+            'subgoal': lambda: not tokens or tokens[0] not in {'remove', 'clear'} or (
+                tokens[0] == 'remove' and len(tokens) == 2 and tokens[1].isdecimal()
+            ) or tokens == ['clear'],
+            'loop': lambda: len(tokens) <= 1,
+            'goal': lambda: len(tokens) <= 1 or tokens[0] in {'wait', 'gate'},
+        }
+        predicate = predicates.get(name)
+        return predicate() if predicate is not None else False
+
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
         """Dispatch a recognized slash command while an agent is running.
 
@@ -1043,6 +1071,8 @@ class GatewayBusySessionMixin:
         if handler_key:
             special = self._BUSY_SPECIAL_HANDLERS.get(handler_key)
             if special is not None:
+                event._gateway_inline_deferred = name in {'queue', 'steer'}
+                event._gateway_inline_args_consumed = self._inline_command_consumes_args(event, name)
                 return await getattr(self, special)(event, quick_key, source)
             reject_key = self._BUSY_REJECT_TEXT.get(handler_key)
             if reject_key is not None:
@@ -1050,6 +1080,7 @@ class GatewayBusySessionMixin:
         if policy in ("dispatch", "interrupt_then_dispatch"):
             plain = self._gateway_plain_command_handlers().get(name)
             if plain is not None:
+                event._gateway_inline_args_consumed = self._inline_command_consumes_args(event, name)
                 async with self._async_profile_scope_for_source(source):
                     return await plain(event)
             logger.warning(

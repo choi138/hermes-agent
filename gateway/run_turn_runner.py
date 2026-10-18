@@ -1842,23 +1842,27 @@ class TurnRunner:
         return ctx.message
 
     @staticmethod
-    def _run_with_steer_admission(agent, message, kwargs):
+    def close_steer_admission(agent, result):
+        result = result if isinstance(result, dict) else {}
+        gate = getattr(agent, '_gateway_steer_lock', None)
+        if gate is not None:
+            with gate:
+                agent._gateway_steer_closed = True
+                drain = getattr(agent, '_drain_pending_steer', None)
+                remaining = drain() if callable(drain) else None
+                if remaining:
+                    result['pending_steer'] = '\n'.join(
+                        text for text in (result.get('pending_steer'), remaining) if text
+                    )
+        return result
+
+    def _run_with_steer_admission(self, agent, message, kwargs):
         result = None
         try:
             result = agent.run_conversation(message, **kwargs)
             return result
         finally:
-            gate = getattr(agent, '_gateway_steer_lock', None)
-            if gate is not None:
-                with gate:
-                    agent._gateway_steer_closed = True
-                    drain = getattr(agent, '_drain_pending_steer', None)
-                    if isinstance(result, dict) and callable(drain):
-                        remaining = drain()
-                        if remaining:
-                            result['pending_steer'] = '\n'.join(
-                                text for text in (result.get('pending_steer'), remaining) if text
-                            )
+            self._ctx.result_holder[0] = self.close_steer_admission(agent, result)
 
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):
