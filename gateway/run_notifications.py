@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional, cast
 
 from agent.i18n import t
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata, commit_processing_coverage
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
@@ -295,6 +295,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         from gateway.run import _strip_response_attachments_for_direct_send
         text_content = _strip_response_attachments_for_direct_send(response, adapter)
         if text_already_delivered and text_content:
+            commit_processing_coverage()
             await self._record_queued_final_receipt(adapter, source, text_content, session_key,
                 inbound_message_id, turn_id=turn_id, response_kind=response_kind)
         if not text_already_delivered:
@@ -313,6 +314,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
                         if getattr(_edit_res, "success", False):
+                            commit_processing_coverage()
                             await self._record_queued_final_receipt(adapter, source, text_content, session_key,
                                 inbound_message_id, turn_id=turn_id, response_kind=response_kind)
                             _reconciled = True
@@ -344,6 +346,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
+                    commit_processing_coverage()
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:

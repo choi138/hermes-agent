@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -26,6 +27,37 @@ from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 
 logger = logging.getLogger(__name__)
+
+_coverage_delivery = ContextVar("processing_coverage_delivery", default=None)
+
+
+@contextlib.contextmanager
+def coverage_delivery_scope(selector):
+    """Bind coverage ownership only while delivering a turn's final, never a preview."""
+    token = _coverage_delivery.set(selector)
+    try:
+        yield
+    finally:
+        _coverage_delivery.reset(token)
+
+
+def coverage_delivery_selector(adapter, event, outcome):
+    """Capture the intake event, independently of transport or synthetic ledger events."""
+    def select():
+        hook = getattr(adapter, 'select_processing_coverage', None)
+        if callable(hook) and event is not None:
+            hook(event, outcome)
+    return select
+
+
+def commit_processing_coverage():
+    """Select the immutable outcome synchronously, before any post-acceptance await."""
+    selector = _coverage_delivery.get()
+    if selector is not None:
+        try:
+            selector()
+        except Exception:
+            logger.warning("Processing coverage selection failed", exc_info=True)
 
 
 def _consume_detached_handler_exception(task: asyncio.Task) -> None:
@@ -4533,8 +4565,12 @@ class BasePlatformAdapter(ABC):
                         from gateway.delivery_ledger import mark_failed
                         await asyncio.to_thread(mark_failed, obligation_id, 'Report authorization unavailable; no send admitted')
                     return SendResult(success=False, error='Verification report delivery is fenced'), delivery_adapter
-            result = await delivery_adapter._send_with_retry(
-                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            selector = _coverage_delivery.get() or coverage_delivery_selector(self, event, ProcessingOutcome.SUCCESS)
+            with coverage_delivery_scope(selector):
+                result = await delivery_adapter._send_with_retry(
+                    chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+                if result.success:
+                    commit_processing_coverage()
         except BaseException:
             if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
                 from gateway.delivery_ledger import mark_uncertain
@@ -4730,6 +4766,8 @@ class BasePlatformAdapter(ABC):
                 succeeded = bool(getattr(result, "success", False))
                 delivery_succeeded = delivery_succeeded or succeeded
                 if succeeded:
+                    with coverage_delivery_scope(coverage_delivery_selector(self, event, ProcessingOutcome.SUCCESS)):
+                        commit_processing_coverage()
                     self._notify_content_delivered(
                         session_key, getattr(interrupt_event, "_hermes_run_generation", None))
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.

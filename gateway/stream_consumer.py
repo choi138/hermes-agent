@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
+from gateway.platforms.base import coverage_delivery_scope, commit_processing_coverage
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -129,6 +130,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
         self._on_content_delivered = on_content_delivered
+        self._final_coverage = None
+        self._coverage_final_text = None
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
@@ -304,7 +307,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             acked = acked[: -len(self.cfg.cursor)]
         self._mark_final_delivered(record=acked)
 
-    def _mark_final_delivered(self, record: Optional[str] = None) -> None:
+    def _mark_final_delivered(self, record: Optional[str] = None, *, accepted: bool = True) -> None:
         """Set both turn-final flags; ``record`` also records the delivered payload."""
         self._final_response_sent = True
         # Only claim final delivery if the sealed chunks and final tail actually landed. ``_already_sent``
@@ -316,6 +319,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_content_delivered = True
         if record is not None:
             self._record_turn_final_payload(record)
+        if accepted:
+            with coverage_delivery_scope(self._select_final_coverage):
+                commit_processing_coverage()
+
+    def bind_final_coverage(self, selector, final_text: str) -> None:
+        """Bind only the authoritative completed response, not failed/interrupted previews."""
+        self._coverage_final_text = final_text
+        self._final_coverage = selector
+
+    def _select_final_coverage(self) -> None:
+        payload = self._stream_ledger if self._turn_split_delivery else self._accumulated
+        if (self._final_coverage is not None and self._coverage_final_text is not None
+                and self._display_payload(payload) == self._display_payload(self._coverage_final_text)):
+            self._final_coverage()
 
     def _display_payload(self, text: str) -> str:
         """Normalize like ``_send_or_edit`` output: directive strip + fence close + strip."""

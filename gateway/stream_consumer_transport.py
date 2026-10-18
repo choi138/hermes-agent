@@ -6,6 +6,7 @@ state model and the drain loop that calls into these."""
 from __future__ import annotations
 
 import asyncio
+from gateway.platforms.base import coverage_delivery_scope, commit_processing_coverage
 import inspect
 import logging
 import time
@@ -293,6 +294,8 @@ class StreamTransportMixin:
             return False
         if not getattr(result, "success", False):
             return False
+        if is_turn_final:
+            commit_processing_coverage()
         self._notify_content_delivered()
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
@@ -317,6 +320,12 @@ class StreamTransportMixin:
 
     @stops_reply_clock
     async def _send_or_edit(
+        self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
+        selector = self._select_final_coverage if finalize and is_turn_final else None
+        with coverage_delivery_scope(selector):
+            return await self._send_or_edit_inner(text, finalize=finalize, is_turn_final=is_turn_final)
+
+    async def _send_or_edit_inner(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
         """Send or edit the streaming message; True if delivered.  ``finalize`` marks the
         last edit.  Transport order: native frame → draft frame → edit existing → first
@@ -401,7 +410,7 @@ class StreamTransportMixin:
         # strand final_content_delivered=False and duplicate the send (docs/rca-wecom-
         # stream-final-ack-timeout-duplicate.md).  A definitive failure rolls it back.
         if finalize:
-            self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
+            self._mark_final_delivered(record=text, accepted=False)
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
             self._already_sent = True
@@ -469,6 +478,7 @@ class StreamTransportMixin:
         if not result.success:
             self._edit_supported = False
             return False
+        commit_processing_coverage()
         self._notify_content_delivered()
         self._already_sent = True
         self._last_sent_text = text
@@ -512,6 +522,7 @@ class StreamTransportMixin:
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
             return True
+        commit_processing_coverage()
         self._already_sent = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST

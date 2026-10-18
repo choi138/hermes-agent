@@ -24,7 +24,8 @@ from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, coverage_delivery_selector
+from gateway.platforms.event import ProcessingOutcome
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
@@ -2023,6 +2024,20 @@ class TurnRunner:
                 clear_session(session_key)
             reset_current_session_key(token)
 
+    def _stream_coverage_selector(self, result):
+        ctx = self._ctx
+        select = coverage_delivery_selector(
+            self._runner._intake_adapter_for(ctx.source), ctx.event, ProcessingOutcome.SUCCESS)
+
+        def select_consumed():
+            pending = (result.get('pending_steer') or '').strip()
+            state = self._runner._peek_session_state(ctx.session_key) if pending and ctx.session_key else None
+            if state is not None and state.turn.event is ctx.event:
+                self._runner._exclude_undrained_steers(state.turn, pending)
+            select()
+
+        return select_consumed
+
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
         ctx = self._ctx
         # Canonicalize a model-emitted computer-use screenshot path at the common result boundary so
@@ -2050,6 +2065,9 @@ class TurnRunner:
         if _final_for_stream is None:
             stream_consumer.finish()
             return
+        bind_coverage = getattr(type(stream_consumer), 'bind_final_coverage', None)
+        if callable(bind_coverage):
+            stream_consumer.bind_final_coverage(self._stream_coverage_selector(result), _final_for_stream)
         # Duck-type safe: test doubles / older consumers may expose a zero-arg finish().
         try:
             stream_consumer.finish(_final_for_stream)

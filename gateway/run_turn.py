@@ -24,7 +24,10 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import (
+    BasePlatformAdapter, ProcessingOutcome, coverage_delivery_scope, coverage_delivery_selector,
+    commit_processing_coverage,
+)
 from gateway.platforms.event import MessageEvent, has_unsupported_execution_envelope
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
@@ -3524,6 +3527,8 @@ class GatewayTurnMixin:
             stream_task.cancel()
             with suppress(asyncio.CancelledError):
                 await stream_task
+        if asyncio.current_task().cancelling():
+            raise asyncio.CancelledError
 
     async def _run_agent_track_agent(self, turn_ctx: TurnContext) -> None:
         """Track this agent as running for the session (interrupt support) once it is created — only
@@ -3895,8 +3900,8 @@ class GatewayTurnMixin:
             overflow.clear()
         return pending_event
 
-    async def _detach_undrained_steers(self, turn, adapter, text):
-        matched = turn.leftover_steer_events(text)
+    @staticmethod
+    def _exclude_undrained_steers(turn, text):
         undelivered = []
         for event in turn.leftover_steer_events(text, include_late=True):
             undelivered.extend((event, *event.absorbed_events))
@@ -3905,6 +3910,11 @@ class GatewayTurnMixin:
                 event for event in turn.event.absorbed_events
                 if not any(event is pending for pending in undelivered)
             ]
+        return undelivered
+
+    async def _detach_undrained_steers(self, turn, adapter, text):
+        matched = turn.leftover_steer_events(text)
+        undelivered = self._exclude_undrained_steers(turn, text)
         run_hook = getattr(adapter, '_run_processing_hook', None)
         if callable(run_hook):
             for event in undelivered:
@@ -4066,6 +4076,17 @@ class GatewayTurnMixin:
             return
         session_key = turn_ctx.session_key
         _sc = turn_ctx.stream_consumer_holder[0]
+        _delivery_result = response if isinstance(response, dict) else (result or {})
+        first_response = _delivery_result.get("final_response", "")
+        selector = coverage_delivery_selector(
+            self._intake_adapter_for(turn_ctx.source), turn_ctx.event,
+            ProcessingOutcome.FAILURE if _delivery_result.get('failed') else ProcessingOutcome.SUCCESS)
+        if callable(getattr(type(_sc), 'bind_final_coverage', None)):
+            _sc.bind_final_coverage(selector, first_response)
+        with coverage_delivery_scope(selector):
+            if self._run_agent_stream_confirmed_final_delivery(
+                    _sc, first_response, previewed=bool(_delivery_result.get('response_previewed'))):
+                commit_processing_coverage()
         if _sc and stream_task:
             try:
                 await self._await_stream_task(stream_task)
@@ -4096,6 +4117,9 @@ class GatewayTurnMixin:
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         _text_delivered = _already_streamed or not first_response
+        if _text_delivered:
+            with coverage_delivery_scope(selector):
+                commit_processing_coverage()
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -4104,17 +4128,16 @@ class GatewayTurnMixin:
                 session_key or "?",
             )
             try:
-                _text_delivered = await self._deliver_queued_first_response(
-                    first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
-                    text_already_delivered=_already_streamed,
-                    deliver_media=_deliver_media, stream_consumer=_sc,
-                    # The text send records a delivery-ledger obligation under this key, keyed on
-                    # the raw inbound id (the anchor above is only the reply target).
-                    session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
-                    turn_id=_delivery_result.get('turn_id') or getattr(turn_ctx.event, '_gateway_active_turn_id', None),
-                    response_kind=_delivery_result.get('response_kind') or getattr(turn_ctx.event, '_gateway_response_kind', None),
-                )
+                with coverage_delivery_scope(selector):
+                    _text_delivered = await self._deliver_queued_first_response(
+                        first_response, source=turn_ctx.source, adapter=adapter,
+                        metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                        text_already_delivered=_already_streamed,
+                        deliver_media=_deliver_media, stream_consumer=_sc,
+                        session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                        turn_id=_delivery_result.get('turn_id') or getattr(turn_ctx.event, '_gateway_active_turn_id', None),
+                        response_kind=_delivery_result.get('response_kind') or getattr(turn_ctx.event, '_gateway_response_kind', None),
+                    )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
             else:
@@ -4361,15 +4384,19 @@ class GatewayTurnMixin:
 
     async def _run_agent_edit_streamed_message(
         self, _sc, source, response, content, *, _sk, ok, fail_result: str, fail_exc: str,
+        coverage_selector=None,
     ) -> None:
         """Edit the stream consumer's message in place with ``content``; on success mark
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
         try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
+            with coverage_delivery_scope(coverage_selector):
+                _res = await _sc.adapter.edit_message(
+                    chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+                )
+                if getattr(_res, 'success', True):
+                    commit_processing_coverage()
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
             return
@@ -4418,7 +4445,13 @@ class GatewayTurnMixin:
         if _is_empty_sentinel:
             return
         _sk = session_key or "?"
+        event = getattr(turn_ctx, 'event', None)
+        selector = (coverage_delivery_selector(
+            self._intake_adapter_for(source), event, ProcessingOutcome.SUCCESS)
+            if event is not None else None)
         if not _transformed and (_streamed or _content_delivered):
+            with coverage_delivery_scope(selector):
+                commit_processing_coverage()
             logger.info(
                 "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                 _sk, _streamed, _previewed, _content_delivered,
@@ -4436,6 +4469,7 @@ class GatewayTurnMixin:
             elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
                 await self._run_agent_edit_streamed_message(
                     _sc, source, response, _final, _sk=_sk,
+                    coverage_selector=selector,
                     ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
                     fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
                     fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
@@ -4450,6 +4484,7 @@ class GatewayTurnMixin:
             if _sc.message_id:
                 await self._run_agent_edit_streamed_message(
                     _sc, source, response, response["final_response"], _sk=_sk,
+                    coverage_selector=selector,
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",
                     fail_exc="Failed to edit streamed message for session %s: %s",

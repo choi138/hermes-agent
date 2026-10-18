@@ -307,6 +307,7 @@ from gateway.platforms.helpers import (
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
+    commit_processing_coverage,
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -2955,6 +2956,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self, reply_to, result: SendResult, content: str, final: bool, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Record a send outcome using its visual or internal reply anchor."""
+        if result.success:
+            commit_processing_coverage()
         ledger_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
         await asyncio.to_thread(
             self._record_discord_response, reply_to=ledger_reply_to, result=result, content=content, final=final,
@@ -3295,7 +3298,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         for covered in event.absorbed_events:
             await self._run_processing_hook('on_processing_covered', covered)
 
-    async def on_processing_coverage_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+    def select_processing_coverage(self, event: MessageEvent, outcome: ProcessingOutcome):
         if not self._missed_message_backfill_enabled():
             return
         task = getattr(event, '_discord_coverage_completion_task', None)
@@ -3312,7 +3315,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._processing_settlement_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._processing_settlement_tasks.discard)
-        await asyncio.shield(task)
+        return task
+
+    async def on_processing_coverage_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        task = self.select_processing_coverage(event, outcome)
+        if task is not None:
+            await asyncio.shield(task)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
@@ -3433,6 +3441,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     else:
                         raise
                 message_ids.append(str(msg.id))
+            commit_processing_coverage()
             # Track the last sent message for history backfill (skips the full history scan).
             if message_ids:
                 _target_id = thread_id or chat_id
@@ -3641,6 +3650,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if len(chunks) <= 1:
             # Defensive: pre-flight should guarantee >1 chunk; otherwise edit normally.
             await msg.edit(content=chunks[0] if chunks else formatted)
+            commit_processing_coverage()
             return SendResult(success=True, message_id=message_id)
         try:
             await msg.edit(content=chunks[0])
@@ -3693,6 +3703,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             delivered += 1
             prev_msg = sent
         last_id = continuation_ids[-1] if continuation_ids else message_id
+        commit_processing_coverage()
         # Point the history-backfill fast path at the final visible chunk.
         if not _looks_like_nonconversational_history_message(content):
             self._last_self_message_id[str(channel.id)] = last_id
