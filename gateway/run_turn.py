@@ -4128,16 +4128,16 @@ class GatewayTurnMixin:
                 session_key or "?",
             )
             try:
-                with coverage_delivery_scope(selector):
-                    _text_delivered = await self._deliver_queued_first_response(
-                        first_response, source=turn_ctx.source, adapter=adapter,
-                        metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
-                        text_already_delivered=_already_streamed,
-                        deliver_media=_deliver_media, stream_consumer=_sc,
-                        session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
-                        turn_id=_delivery_result.get('turn_id') or getattr(turn_ctx.event, '_gateway_active_turn_id', None),
-                        response_kind=_delivery_result.get('response_kind') or getattr(turn_ctx.event, '_gateway_response_kind', None),
-                    )
+                _text_delivered = await self._deliver_queued_first_response(
+                    first_response, source=turn_ctx.source, adapter=adapter,
+                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                    text_already_delivered=_already_streamed,
+                    deliver_media=_deliver_media, stream_consumer=_sc,
+                    session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    turn_id=_delivery_result.get('turn_id') or getattr(turn_ctx.event, '_gateway_active_turn_id', None),
+                    response_kind=_delivery_result.get('response_kind') or getattr(turn_ctx.event, '_gateway_response_kind', None),
+                    coverage_selector=selector,
+                )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
             else:
@@ -4395,8 +4395,6 @@ class GatewayTurnMixin:
                 _res = await _sc.adapter.edit_message(
                     chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
                 )
-                if getattr(_res, 'success', True):
-                    commit_processing_coverage()
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
             return

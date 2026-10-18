@@ -29,16 +29,39 @@ from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _sh
 logger = logging.getLogger(__name__)
 
 _coverage_delivery = ContextVar("processing_coverage_delivery", default=None)
+_coverage_media_delivery = ContextVar("processing_coverage_media_delivery", default=None)
+
+
+class _CoverageDeliveryBinding:
+    def __init__(self, selector):
+        self.selector = selector
+        self.active = True
+
+    def __call__(self):
+        if self.active:
+            self.selector()
 
 
 @contextlib.contextmanager
-def coverage_delivery_scope(selector):
+def coverage_delivery_scope(selector, *, media=False):
     """Bind coverage ownership only while delivering a turn's final, never a preview."""
-    token = _coverage_delivery.set(selector)
+    binding = _CoverageDeliveryBinding(selector) if selector is not None else None
+    context = _coverage_media_delivery if media else _coverage_delivery
+    token = context.set(binding)
     try:
         yield
     finally:
-        _coverage_delivery.reset(token)
+        if binding is not None:
+            binding.active = False
+        context.reset(token)
+
+
+def commit_media_coverage():
+    """Arm only the accepted upload, not media validation or failure notices."""
+    selector = _coverage_media_delivery.get()
+    if selector is not None and selector.active:
+        with coverage_delivery_scope(selector):
+            commit_processing_coverage()
 
 
 def coverage_delivery_selector(adapter, event, outcome):
@@ -3697,13 +3720,42 @@ class BasePlatformAdapter(ABC):
         if log_cmd is not None:
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                         len(text), event.source.chat_id)
+        coverage_kwargs = {}
+        if event.absorbed_events or getattr(event, '_gateway_inline_coverage_event', None) is not None:
+            coverage_kwargs['coverage_selector'] = self._inline_coverage_selector(event)
         result = await self._send_with_retry(
             chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
+            metadata=_mark_notify_metadata(thread_meta), **coverage_kwargs)
         await self._settle_inline_coverage(
             event, ProcessingOutcome.SUCCESS if result.success else ProcessingOutcome.FAILURE)
         if eph_ttl > 0 and result.success and result.message_id:
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+    def _inline_coverage_selector(self, event: MessageEvent):
+        def select():
+            if getattr(event, '_gateway_inline_deferred', False):
+                return
+            coverage_event = getattr(event, '_gateway_inline_coverage_event', None)
+            if coverage_event is None:
+                consumed, cancelled = self._inline_coverage_events(event)
+                if cancelled:
+                    coverage_delivery_selector(self, dataclasses.replace(event, absorbed_events=cancelled),
+                                               ProcessingOutcome.CANCELLED)()
+                if consumed:
+                    coverage_event = event if len(consumed) == len(event.absorbed_events) else dataclasses.replace(
+                        event, absorbed_events=consumed)
+                    event._gateway_inline_coverage_event = coverage_event
+            if coverage_event is not None:
+                coverage_delivery_selector(self, coverage_event, ProcessingOutcome.SUCCESS)()
+        return select
+
+    def _inline_coverage_events(self, event: MessageEvent):
+        consumed, cancelled = [], []
+        for covered in event.absorbed_events:
+            target = cancelled if (event.get_command() and (covered.text or '').strip() and not getattr(
+                event, '_gateway_inline_args_consumed', False)) else consumed
+            target.append(covered)
+        return consumed, cancelled
 
     async def _settle_inline_coverage(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         if getattr(event, '_gateway_inline_deferred', False):
@@ -3712,14 +3764,9 @@ class BasePlatformAdapter(ABC):
         if coverage_event is not None:
             await self._run_processing_hook('on_processing_coverage_complete', coverage_event, outcome)
             return
-        consumed = []
-        for covered in event.absorbed_events:
-            if event.get_command() and (covered.text or '').strip() and not getattr(
-                event, '_gateway_inline_args_consumed', False,
-            ):
-                await self._run_processing_hook('on_processing_covered', covered, ProcessingOutcome.CANCELLED)
-            else:
-                consumed.append(covered)
+        consumed, cancelled = self._inline_coverage_events(event)
+        for covered in cancelled:
+            await self._run_processing_hook('on_processing_covered', covered, ProcessingOutcome.CANCELLED)
         if consumed:
             coverage_event = event if len(consumed) == len(event.absorbed_events) else dataclasses.replace(
                 event, absorbed_events=consumed)
@@ -3757,11 +3804,12 @@ class BasePlatformAdapter(ABC):
     @records_delivery
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
-        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        max_retries: int = 2, base_delay: float = 2.0, *, coverage_selector=None) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        async def _send(text: str) -> SendResult:
-            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        async def _send(text: str, *, final: bool = True) -> SendResult:
+            with coverage_delivery_scope(coverage_selector if final else None):
+                return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
         async def _send_again(previous: SendResult) -> Optional[SendResult]:
             """Retry: the whole payload normally; only the undelivered remainder after a partial split
@@ -3769,7 +3817,8 @@ class BasePlatformAdapter(ABC):
             caller then keeps the partial failure rather than re-sending the already-visible head."""
             if not self._is_partial_delivery(previous):
                 return await _send(content)
-            return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+            with coverage_delivery_scope(coverage_selector):
+                return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
         if result.success or self._send_retry_is_final(result):
@@ -3860,7 +3909,7 @@ class BasePlatformAdapter(ABC):
                 # Not a diagnostic: the requested result itself was lost and this is its only signal.
                 notice = t("gateway.notify.delivery_failed_retry")
                 try:
-                    await _send(notice)
+                    await _send(notice, final=False)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
@@ -3872,7 +3921,8 @@ class BasePlatformAdapter(ABC):
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
             return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
+        with coverage_delivery_scope(coverage_selector):
+            fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -4531,6 +4581,7 @@ class BasePlatformAdapter(ABC):
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False,
+        coverage_selector=None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4565,12 +4616,17 @@ class BasePlatformAdapter(ABC):
                         from gateway.delivery_ledger import mark_failed
                         await asyncio.to_thread(mark_failed, obligation_id, 'Report authorization unavailable; no send admitted')
                     return SendResult(success=False, error='Verification report delivery is fenced'), delivery_adapter
-            selector = _coverage_delivery.get() or coverage_delivery_selector(self, event, ProcessingOutcome.SUCCESS)
-            with coverage_delivery_scope(selector):
-                result = await delivery_adapter._send_with_retry(
-                    chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
-                if result.success:
-                    commit_processing_coverage()
+            ambient = _coverage_delivery.get()
+            selector = coverage_selector
+            if selector is None and ambient is not None and ambient.active:
+                selector = ambient
+            if selector is None:
+                selector = coverage_delivery_selector(self, event, ProcessingOutcome.SUCCESS)
+            if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
+                selector = None
+            result = await delivery_adapter._send_with_retry(
+                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata,
+                coverage_selector=selector)
         except BaseException:
             if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
                 from gateway.delivery_ledger import mark_uncertain
@@ -4835,10 +4891,12 @@ class BasePlatformAdapter(ABC):
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
-                await self._deliver_attachments(
-                    event, extracted, _final_thread_metadata,
-                    anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                with coverage_delivery_scope(coverage_delivery_selector(
+                        self, event, ProcessingOutcome.SUCCESS), media=True):
+                    await self._deliver_attachments(
+                        event, extracted, _final_thread_metadata,
+                        anything_sent=delivery_attempted or _tts_caption_delivered,
+                        record_delivery=_record_delivery)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             await self._run_processing_hook(
                 'on_processing_coverage_complete', event,

@@ -307,7 +307,7 @@ from gateway.platforms.helpers import (
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
-    commit_processing_coverage,
+    commit_processing_coverage, commit_media_coverage,
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -3555,6 +3555,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     message_id=message_id or None,
                     raw_response={"thread_id": thread_id},
                 )
+        if file is not None or files:
+            commit_media_coverage()
         return SendResult(
             success=True, message_id=message_id, raw_response={"thread_id": thread_id},
         )
@@ -3688,6 +3690,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                         self.name, delivered, len(chunks), retry_err,
                     )
                     last_id = continuation_ids[-1] if continuation_ids else message_id
+                    commit_processing_coverage()
                     return SendResult(
                         success=True,
                         message_id=last_id,

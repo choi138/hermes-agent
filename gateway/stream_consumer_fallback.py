@@ -131,12 +131,9 @@ class StreamFallbackMixin:
         anchor = self._initial_reply_to_id if continuation == final_text else None
         for index, chunk in enumerate(chunks):
             selector = self._select_final_coverage if index == len(chunks) - 1 else None
-            with coverage_delivery_scope(selector):
-                result = await self._send_with_flood_retry(
-                    content=chunk, reply_to=None if sent_any_chunk else anchor,
-                    retry_log="Flood control on fallback send, retrying in %.1fs")
-                if result and result.success:
-                    commit_processing_coverage()
+            result = await self._send_with_flood_retry(
+                content=chunk, reply_to=None if sent_any_chunk else anchor,
+                retry_log="Flood control on fallback send, retrying in %.1fs", coverage_selector=selector)
             if not result or not result.success:
                 # Partial continuation landed: do NOT set _final_response_sent (the
                 # gateway must still deliver the full answer); _already_sent only
@@ -230,7 +227,8 @@ class StreamFallbackMixin:
                 logger.debug("per-chat limit resolution failed: %s", e)
         return _len_fn, raw_limit
 
-    async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None):
+    async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None,
+                                     coverage_selector=None):
         """adapter.send(final metadata) with ONE bounded flood retry; returns the last
         SendResult.  Exceptions propagate (callers decide whether a raise is "ambiguous")."""
         kwargs = dict(chat_id=self.chat_id, content=content,
@@ -239,7 +237,8 @@ class StreamFallbackMixin:
             kwargs["reply_to"] = reply_to
         result = None
         for attempt in range(2):
-            result = await self.adapter.send(**kwargs)
+            with coverage_delivery_scope(coverage_selector):
+                result = await self.adapter.send(**kwargs)
             if getattr(result, "success", False):
                 self._notify_content_delivered()
                 break
@@ -260,12 +259,10 @@ class StreamFallbackMixin:
         # Segment-scoped only: never delete an earlier finalized preamble.
         stale_ids = self._stale_preview_ids(segment_only=True)
         try:
-            with coverage_delivery_scope(self._select_final_coverage):
-                result = await self._send_with_flood_retry(
-                    content=final_text, reply_to=self._initial_reply_to_id,
-                    retry_log="Flood control on empty fallback final send; retrying in %.1fs")
-                if getattr(result, 'success', False):
-                    commit_processing_coverage()
+            result = await self._send_with_flood_retry(
+                content=final_text, reply_to=self._initial_reply_to_id,
+                retry_log="Flood control on empty fallback final send; retrying in %.1fs",
+                coverage_selector=self._select_final_coverage)
         except Exception as exc:
             logger.debug("Empty fallback final send failed: %s", exc)
             return "ambiguous" if self._send_failure_may_have_delivered(exc) else "failed"

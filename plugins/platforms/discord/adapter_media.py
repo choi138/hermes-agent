@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.i18n import t
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import SendResult, commit_media_coverage
 
 logger = logging.getLogger("plugins.platforms.discord.adapter")
 
@@ -126,6 +126,7 @@ class DiscordMediaMixin:
                 error=f"Discord accepted the message but attached no files ({filename})",
                 message_id=str(getattr(msg, "id", "") or "") or None,
             )
+        commit_media_coverage()
         return SendResult(success=True, message_id=str(msg.id))
 
 
@@ -258,6 +259,7 @@ class DiscordMediaMixin:
                     )
                 else:
                     await channel.send(content=content, files=files)
+                    commit_media_coverage()
                 delivered = True
             except Exception as e:
                 logger.warning(
@@ -329,6 +331,7 @@ class DiscordMediaMixin:
                     discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
                     form=form,
                 )
+                commit_media_coverage()
                 return SendResult(success=True, message_id=str(msg_data["id"]))
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
@@ -340,6 +343,7 @@ class DiscordMediaMixin:
                         msg = await channel.send(file=file, reference=None)
                     else:
                         raise
+                commit_media_coverage()
                 return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio: %s", self.name, e, exc_info=True)
@@ -399,6 +403,7 @@ class DiscordMediaMixin:
                 if self._is_forum_parent(channel):
                     return await self._forum_post_file(channel, content=(caption or "").strip(), file=file)
                 msg = await channel.send(content=caption if caption else None, file=file)
+                commit_media_coverage()
                 return SendResult(success=True, message_id=str(msg.id))
         except ImportError:
             logger.warning("[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp", self.name, exc_info=True)
@@ -456,4 +461,3 @@ class DiscordMediaMixin:
             chat_id, file_path, caption, file_name=file_name, not_found="File not found", kind="document",
             metadata=metadata,
         )
-

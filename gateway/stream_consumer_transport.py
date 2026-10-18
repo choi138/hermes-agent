@@ -6,7 +6,7 @@ state model and the drain loop that calls into these."""
 from __future__ import annotations
 
 import asyncio
-from gateway.platforms.base import coverage_delivery_scope, commit_processing_coverage
+from gateway.platforms.base import coverage_delivery_scope
 import inspect
 import logging
 import time
@@ -68,11 +68,12 @@ class StreamTransportMixin:
                 logger.debug(fail_log, e)
             return False
 
-    async def _send_frame(self, text: str, *, finalize: bool):
+    async def _send_frame(self, text: str, *, finalize: bool, coverage_selector=None):
         """One native-stream frame; every frame carries the same chat/reply/turn routing."""
-        return await self.adapter.send_stream_frame(
-            text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
-            turn_id=self._turn_id)
+        with coverage_delivery_scope(coverage_selector):
+            return await self.adapter.send_stream_frame(
+                text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
+                turn_id=self._turn_id)
 
     def _close_native_state(self) -> None:
         """Mark the native stream closed (next content re-seeds or falls back)."""
@@ -287,15 +288,14 @@ class StreamTransportMixin:
             return False
         stale_ids = self._stale_preview_ids()
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+            with coverage_delivery_scope(self._select_final_coverage if is_turn_final else None):
+                result = await self.adapter.send(
+                    chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
         if not getattr(result, "success", False):
             return False
-        if is_turn_final:
-            commit_processing_coverage()
         self._notify_content_delivered()
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
@@ -321,9 +321,7 @@ class StreamTransportMixin:
     @stops_reply_clock
     async def _send_or_edit(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
-        selector = self._select_final_coverage if finalize and is_turn_final else None
-        with coverage_delivery_scope(selector):
-            return await self._send_or_edit_inner(text, finalize=finalize, is_turn_final=is_turn_final)
+        return await self._send_or_edit_inner(text, finalize=finalize, is_turn_final=is_turn_final)
 
     async def _send_or_edit_inner(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
@@ -377,7 +375,7 @@ class StreamTransportMixin:
                     # A failed send disabled edits: a preview sent now could never be updated and
                     # would stay on screen truncated next to the final reply. Send only the final.
                     return False
-                return await self._first_send(text, finalize=finalize)
+                return await self._first_send(text, finalize=finalize, is_turn_final=is_turn_final)
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -411,7 +409,8 @@ class StreamTransportMixin:
         # stream-final-ack-timeout-duplicate.md).  A definitive failure rolls it back.
         if finalize:
             self._mark_final_delivered(record=text, accepted=False)
-        if await self._try_frame(self._send_frame(text, finalize=finalize),
+        if await self._try_frame(self._send_frame(text, finalize=finalize,
+                                 coverage_selector=self._select_final_coverage if finalize else None),
                                  "send_stream_frame raised, disabling native streaming: %s"):
             self._already_sent = True
             self._last_sent_text = text
@@ -461,7 +460,7 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _first_send(self, text: str, *, finalize: bool) -> bool:
+    async def _first_send(self, text: str, *, finalize: bool, is_turn_final: bool = True) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
@@ -472,13 +471,13 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
-        result = await self.adapter.send(
-            chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+        with coverage_delivery_scope(self._select_final_coverage if finalize and is_turn_final else None):
+            result = await self.adapter.send(
+                chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
+                metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
         if not result.success:
             self._edit_supported = False
             return False
-        commit_processing_coverage()
         self._notify_content_delivered()
         self._already_sent = True
         self._last_sent_text = text
@@ -511,8 +510,9 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
-        result = await self._edit_message(message_id=self._message_id, content=text,
-                                          finalize=finalize)
+        with coverage_delivery_scope(self._select_final_coverage if finalize and is_turn_final else None):
+            result = await self._edit_message(message_id=self._message_id, content=text,
+                                              finalize=finalize)
         if not result.success:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
@@ -522,7 +522,6 @@ class StreamTransportMixin:
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
             return True
-        commit_processing_coverage()
         self._already_sent = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
