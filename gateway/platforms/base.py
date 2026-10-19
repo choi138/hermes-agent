@@ -1853,16 +1853,9 @@ class EphemeralReply(str):
 
 
 def pop_pending_message_event(pending_messages, session_key):
-    """Take one event, promoting the separately queued control/human successor."""
-    event = pending_messages.pop(session_key, None)
-    if event is not None:
-        following = getattr(event, "_gateway_pending_followups", [])
-        if following:
-            successor, *remaining = following
-            successor._gateway_pending_followups = remaining
-            pending_messages[session_key] = successor
-            delattr(event, "_gateway_pending_followups")
-    return event
+    """Take the next event (a queued human turn before internal wakes), promoting the successor."""
+    from gateway.pending_priority import pop_human_first
+    return pop_human_first(pending_messages, session_key)
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,

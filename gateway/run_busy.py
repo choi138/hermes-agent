@@ -132,12 +132,58 @@ class GatewayBusySessionMixin:
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
 
+    def _promote_queued_event_preserving_followups(self, session_key, adapter, pending_event):
+        # Move the overflow into the adapter's drain chain. A stale recovery event can
+        # return before entering the runner, so it must not strand the remaining FIFO.
+        overflow = self._overflow_queue(session_key)
+        slot = getattr(adapter, "_pending_messages", None)
+        if not overflow or slot is None:
+            return pending_event
+        if pending_event is None:
+            pending_event = overflow.pop(0)
+        if overflow:
+            head = slot.get(session_key)
+            if head is None:
+                head = overflow.pop(0)
+                slot[session_key] = head
+            following = list(getattr(head, "_gateway_pending_followups", []))
+            following.extend(overflow)
+            head._gateway_pending_followups = following
+            overflow.clear()
+        return pending_event
+
+    def _prefer_queued_human(self, session_key, adapter, pending_event):
+        from gateway.pending_priority import prefer_queued_human
+        slot = getattr(adapter, "_pending_messages", None)
+        return prefer_queued_human(slot, session_key, pending_event) if isinstance(slot, dict) else pending_event
+
+    def _batch_queued_process_notifications(self, session_key, adapter, pending_event) -> None:
+        from gateway.pending_priority import absorb_process_notifications
+        slot = getattr(adapter, "_pending_messages", None)
+        if pending_event is None or not isinstance(slot, dict):
+            return
+        absorbed = absorb_process_notifications(slot, session_key, pending_event, self._SECURITY_METADATA_KEYS)
+        if absorbed:
+            logger.info("Batched %d queued process notification(s) into one turn for session %s",
+                        absorbed, session_key)
+
+    def _requeue_pending_front(self, session_key, adapter, pending_event) -> None:
+        # Back to the head: a plain merge replaced a queued text successor outright.
+        from gateway.pending_priority import requeue_front
+        requeue_front(adapter._pending_messages, session_key, pending_event)
+
+    def _internal_queue_full(self, session_key: str, adapter: Any) -> bool:
+        from gateway.pending_priority import queued_count
+        internal = queued_count(adapter._pending_messages, session_key, self._overflow_queue(session_key))[1]
+        cap = self._BUSY_QUEUE_MAX_PENDING
+        return internal >= cap - min(self._BUSY_QUEUE_HUMAN_RESERVE, cap // 4)
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Total pending /queue items for a session — slot + overflow."""
-        depth = len(self._overflow_queue(session_key) or ())
-        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
-            depth += 1
-        return depth
+        """Total pending /queue items for a session — slot chain + overflow."""
+        from gateway.pending_priority import queued_count
+        slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        return queued_count(slot if isinstance(slot, dict) else {}, session_key,
+                            self._overflow_queue(session_key))[0]
 
     def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> Optional[MessageEvent]:
         """Pop the oldest orphaned FIFO overflow event for an idle session (None if nothing to rescue).
@@ -369,6 +415,9 @@ class GatewayBusySessionMixin:
             entry = session_store._entries.get(session_key)
         return getattr(entry, "session_id", None) if entry is not None else None
 
+    # Room kept for human follow-ups so a burst of process wakes cannot fill the queue.
+    _BUSY_QUEUE_HUMAN_RESERVE = 8
+
     # Metadata that must match for two pending events to merge into one slot.
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
@@ -424,6 +473,13 @@ class GatewayBusySessionMixin:
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            return
+        from gateway.pending_priority import is_refusable_wake
+        if is_refusable_wake(event) and self._internal_queue_full(session_key, adapter):
+            # Left unaccepted so the producer keeps its claim and retries; the reserve keeps
+            # a wake burst from filling the queue a human message would otherwise be dropped from.
+            logger.debug("Deferring internal wake for session %s — internal share of the queue is full",
+                         session_key)
             return
 
         self._enqueue_fifo(session_key, event, adapter)

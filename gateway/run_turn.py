@@ -3880,26 +3880,6 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
-    def _promote_queued_event_preserving_followups(self, session_key, adapter, pending_event):
-        # Move the overflow into the adapter's drain chain. A stale recovery event can
-        # return before entering the runner, so it must not strand the remaining FIFO.
-        overflow = self._overflow_queue(session_key)
-        slot = getattr(adapter, "_pending_messages", None)
-        if not overflow or slot is None:
-            return pending_event
-        if pending_event is None:
-            pending_event = overflow.pop(0)
-        if overflow:
-            head = slot.get(session_key)
-            if head is None:
-                head = overflow.pop(0)
-                slot[session_key] = head
-            following = list(getattr(head, "_gateway_pending_followups", []))
-            following.extend(overflow)
-            head._gateway_pending_followups = following
-            overflow.clear()
-        return pending_event
-
     @staticmethod
     def _exclude_undrained_steers(turn, text):
         undelivered = []
@@ -3948,6 +3928,7 @@ class GatewayTurnMixin:
                 pending_event = self._promote_queued_event_preserving_followups(
                     session_key, adapter, pending_event,
                 )
+                pending_event = self._prefer_queued_human(session_key, adapter, pending_event)
                 if pending_event is None or not hasattr(pending_event, "_hermes_turn_resume"):
                     break
                 if await self.async_session_store.resume_owner_matches(
@@ -3970,6 +3951,7 @@ class GatewayTurnMixin:
                     adapter._pending_messages[session_key] = pending_event
                     return None, None
                 # A stale ticket is silent; continue draining its human successor.
+            self._batch_queued_process_notifications(session_key, adapter, pending_event)
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -4170,7 +4152,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -4194,7 +4175,7 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                self._requeue_pending_front(session_key, adapter, pending_event)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}

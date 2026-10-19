@@ -620,15 +620,10 @@ class GatewayAgentCacheMixin:
             # promoted out of the overflow FIFO for the same reason. Whether a wake may still run
             # against a session /new just closed is decided where it is processed
             # (_resolve_async_delegation_session fails closed), not here.
-            parked = adapter.get_pending_message(session_key)
-            wake = parked if getattr(parked, "internal", False) else None
-            if wake is None:
-                overflow = self._overflow_queue(session_key) or []
-                wake = next((e for e in overflow if getattr(e, "internal", False)), None)
-                if wake is not None:
-                    overflow.remove(wake)
-            if wake is not None:
-                adapter._pending_messages[session_key] = wake
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if isinstance(pending_slot, dict):
+                from gateway.pending_priority import discard_human_keep_wakes
+                discard_human_keep_wakes(pending_slot, session_key, self._overflow_queue(session_key))
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:
