@@ -10,7 +10,7 @@ import time
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4] / "scripts/ops/review-gate"
 PYTHON = "/usr/bin/python3"
 GATE = ROOT / "review_gate.py"
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -18,10 +18,10 @@ APPROVAL = "1561666040025321615"
 
 
 class GateCase(unittest.TestCase):
-    """All writes and child processes belong to a temporary directory inside this repo."""
+    """All writes and child processes belong to a task-scoped temporary directory."""
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix=".review-gate-test-", dir=str(ROOT))
+        temporary = tempfile.TemporaryDirectory(prefix="review-gate-test-")
         self.addCleanup(temporary.cleanup)
         self.tmp = Path(temporary.name)
         self.home = self.tmp / "home"

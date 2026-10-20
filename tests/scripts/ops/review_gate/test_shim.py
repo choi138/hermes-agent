@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import subprocess
 
+from deploy_support import checkout
+
 from test_review_gate import GateCase, GATE, ROOT
 
 
@@ -21,7 +23,8 @@ class ShimTests(GateCase):
             "pathlib.Path(os.environ['FAKE_MAGI_MARKER']).write_text(json.dumps(data))\n"
             "print(json.dumps(data))\n")
         self.fake.chmod(0o755)
-        self.shim_path = self.tmp / "shim magi"
+        self.shim_path = self.home / ".local/bin/magi"
+        self.install_root = checkout(self.tmp / "checkout")
         self.env["FAKE_MAGI_MARKER"] = str(self.marker)
         self.empty_bin = self.tmp / "empty-bin"
         self.empty_bin.mkdir()
@@ -30,9 +33,9 @@ class ShimTests(GateCase):
 
     def install(self, *flags, code=0):
         result = subprocess.run(
-            ["/bin/sh", str(ROOT / "install.sh"), "--output", str(self.shim_path),
+            ["/bin/sh", str(self.install_root / "install.sh"), "--host", "mac",
              "--magi-real-bin", str(self.fake), "--review-gate", str(GATE), *flags],
-            env=self.env, cwd=str(ROOT), capture_output=True, text=True, timeout=20)
+            env=dict(self.env, PATH=os.defpath), cwd=str(ROOT), capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, code, (result.stdout, result.stderr))
         return result
 
@@ -236,26 +239,32 @@ class ShimTests(GateCase):
 
     def test_install_dry_run_writes_nothing_and_apply_keeps_backup(self):
         output = self.tmp / "new-bin" / "magi"
-        dry = self.install("--output", str(output))
-        self.assertIn("Would write: " + str(output), dry.stdout)
+        dry = self.install()
+        self.assertIn("unchanged  mac:" + str(self.shim_path), dry.stdout)
         self.assertFalse(output.parent.exists())
         original = self.shim_path.read_text()
         self.shim_path.write_text("#!/bin/sh\nexit 91\n")
         self.shim_path.chmod(0o700)
         self.install("--apply")
-        backup = Path(str(self.shim_path) + ".review-gate-backup")
+        backup, = self.shim_path.parent.glob("magi.bak-*")
         self.assertEqual(backup.read_text(), "#!/bin/sh\nexit 91\n")
         self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.shim_path.read_text(), original)
         self.assertEqual(self.shim_path.stat().st_mode & 0o777, 0o755)
         self.install("--apply")
-        self.install("--apply", "--review-gate", str(self.tmp / "different.py"), code=3)
+        # Preserve an earlier backup across a later, differing installation.
+        earlier = backup.with_name("magi.bak-20000101000000")
+        backup.rename(earlier)
+        backup = earlier
+        self.shim_path.write_text("#!/bin/sh\nexit 92\n")
+        self.install("--apply")
         self.assertEqual(backup.read_text(), "#!/bin/sh\nexit 91\n")
         self.assertEqual(self.shim_path.read_text(), original)
 
     def test_install_refuses_symlink_destination(self):
-        output = self.tmp / "symlink-shim"
-        output.symlink_to(self.shim_path)
-        original = self.shim_path.read_text()
-        self.install("--apply", "--output", str(output), code=3)
-        self.assertEqual(self.shim_path.read_text(), original)
+        output = self.tmp / "original-shim"
+        self.shim_path.rename(output)
+        self.shim_path.symlink_to(output)
+        original = output.read_text()
+        self.install("--apply", code=3)
+        self.assertEqual(output.read_text(), original)

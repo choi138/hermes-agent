@@ -424,7 +424,7 @@ def main(argv=None):
         if args.command == "audit" and args.run_context:
             path = Path(os.environ.get(
                 "REVIEW_GATE_DB", "~/.local/state/review-gate/ledger.sqlite")).expanduser().resolve()
-            db = sqlite3.connect(path.as_uri() + "?mode=ro", isolation_level=None)
+            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
             db.row_factory = sqlite3.Row
         else:
             db = connect()

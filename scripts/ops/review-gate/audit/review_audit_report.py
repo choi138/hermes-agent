@@ -4,10 +4,13 @@
 import argparse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
+import re
+import stat
 import subprocess
 import sys
 
@@ -24,6 +27,49 @@ def timestamp(value):
         return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def deploy_state(host):
+    """Read the last install receipt without needing a checkout or sibling modules."""
+    manifest = Path.home() / ".local/state/review-gate/deploy-manifest.json"
+    empty = dict(manifest="missing", source_commit=None, deployed_at=None, targets=[])
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8-sig"))
+        expected = {host[0].upper() + str(i) for i in range(1, 5)}
+        if (not isinstance(raw, dict) or raw.get("version") != 1 or raw.get("host") != host
+                or not isinstance(raw.get("source_commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", raw["source_commit"])
+                or not isinstance(raw.get("deployed_at"), str)
+                or timestamp(raw["deployed_at"]) is None
+                or not isinstance(raw.get("targets"), list)):
+            raise ValueError("invalid manifest")
+        targets = raw["targets"]
+        if len(targets) != 4 or {t["id"] for t in targets} != expected:
+            raise ValueError("incomplete manifest")
+        for target in targets:
+            if (not isinstance(target["path"], str) or not Path(target["path"]).is_absolute()
+                    or not re.fullmatch(r"[0-9a-f]{64}", target["sha256"])
+                    or not re.fullmatch(r"0[0-7]{3}", target["mode"])):
+                raise ValueError("invalid target")
+    except FileNotFoundError:
+        return empty
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(empty, manifest="invalid")
+    rows = []
+    for target in targets:
+        path = Path(target["path"])
+        try:
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+            mode = format(stat.S_IMODE(path.stat().st_mode), "04o")
+            status = "ok" if (not path.is_symlink() and current == target["sha256"]
+                              and mode == target["mode"]) else "modified"
+        except FileNotFoundError:
+            status = "missing"
+        except OSError:
+            status = "modified"
+        rows.append(dict(id=target["id"], path=target["path"], status=status))
+    return dict(manifest="ok", source_commit=raw["source_commit"],
+                deployed_at=raw["deployed_at"], targets=rows)
 
 
 def since_date(value):
@@ -66,7 +112,7 @@ def one_line(value, limit=160):
     return " ".join(str(value).split())[:limit]
 
 
-def format_report(since, records, data=None, mac_error=None, hook_error=None):
+def format_activity(since, records, data=None, mac_error=None, hook_error=None):
     counts = Counter(r.get("decision") for r in records)
     ledger = data.get("ledger", {}) if data else {}
     sessions = data.get("sessions", {}) if data else {}
@@ -105,6 +151,34 @@ def format_report(since, records, data=None, mac_error=None, hook_error=None):
             lines.append("외 {}건".format(len(other) - 10))
         lines.append("미등록 fido: {}건".format(sum(s.get("group") == "fido" for s in unledgered)))
     return "\n".join(lines)
+
+
+def format_deploy(server, mac=None, mac_error=None):
+    lines = ["배포 드리프트"]
+    problems = []
+    for host, state in (("mac", mac), ("server", server)):
+        if host == "mac" and mac_error:
+            problems.append("mac 확인 불가")
+        elif not state or state.get("manifest") != "ok":
+            problems.append(host + " 설치 기록 없음")
+        else:
+            for target in state["targets"]:
+                if target["status"] != "ok":
+                    problems.append("{} {} {}: {}".format(host, target["id"], target["path"],
+                                    "없음" if target["status"] == "missing" else "수정됨"))
+    if problems:
+        lines.extend(problems)
+        lines.append("원본: hermes/all-work scripts/ops → install.sh --check 후 --apply")
+    else:
+        lines.append("배포본 = 마지막 설치본 (mac {}, server {})".format(
+            mac["source_commit"][:7], server["source_commit"][:7]))
+    return "\n".join(lines)
+
+
+def format_report(since, records, data=None, mac_error=None, hook_error=None):
+    activity = format_activity(since, records, data, mac_error, hook_error)
+    deployment = format_deploy(deploy_state("server"), data.get("deploy") if data else None, mac_error)
+    return activity + "\n\n" + deployment
 
 
 def main(argv=None):

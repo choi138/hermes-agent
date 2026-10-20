@@ -56,31 +56,58 @@ Exit codes: **0** success, **2** policy refusal, **3** usage/validation/storage 
 `run` returns the child's exit code instead; signal exits use 128+signal, missing executables
 127, non-executable children 126, timeout 124, keyboard interruption 130.
 
-## Install and rollback (coordinator only)
+## Deploy, check, and rollback
+
+`hermes/all-work` `scripts/ops/` is the only source for review-gate and the background-continue
+hook. Never edit deployed copies in place. Commit changes under `scripts/ops` before applying;
+the installer refuses modified, staged, or untracked ops files and records the checkout's HEAD.
+Run from the Mac checkout:
 
 ```sh
-./install.sh                           # print destination and complete shim; no writes
-./install.sh --apply                   # atomically write; preserve existing shim in a backup
-# Override --output, --magi-real-bin, --review-gate, --python for isolated testing.
+scripts/ops/review-gate/install.sh                       # compare all 8 targets; no writes
+scripts/ops/review-gate/install.sh --check               # 0 = clean, 1 = drift, 3 = error
+scripts/ops/review-gate/install.sh --apply               # install differences and both manifests
+scripts/ops/review-gate/install.sh --host mac --check    # only the 4 Mac targets
+scripts/ops/review-gate/install.sh --host server --apply # only the 4 server targets
 ```
 
-Default output: `~/.local/bin/magi`; real binary:
-`/Users/choegeun-won/.local/share/uv/tools/magi/bin/magi`; Python: `/usr/bin/python3`.
-The rendered shim points to this checkout's `review_gate.py`; keep it at that path.
-Installer refuses symlink destinations and refuses to replace an existing backup. Reapplying
-identical content is a no-op. Roll back an existing installation with
-`cp -p ~/.local/bin/magi.review-gate-backup ~/.local/bin/magi`. If no shim existed before
-installation, remove only the installed shim. Keep the ledger to preserve review counts.
+`--host all` is the default; `--server-host` defaults to `choi138-ri`. Server operations use
+BatchMode SSH with a 15-second connect timeout and `/usr/bin/python3 -`. For isolated tests,
+set `HOME` and `REVIEW_GATE_SSH` (a shlex argv prefix pointing to a fake transport).
+
+The target table in `deploy.py` manages the Mac ledger, Mac audit collector, magi shim and
+review-gate wrapper, plus the server's two hooks, audit report and weekly wrapper. Files are
+0755; missing parent directories are created as 0700. The default shim and wrapper call the
+**deployed** `~/.local/share/review-gate/review_gate.py`. The real magi binary remains
+`/Users/choegeun-won/.local/share/uv/tools/magi/bin/magi`; Python remains `/usr/bin/python3`.
+`--magi-real-bin`, `--review-gate` and `--python` override rendered paths.
+
+Writes use a destination-local temporary file, fsync, chmod and atomic replace. Symlink
+destinations are refused before writing any target on that host. Byte-identical files with the
+correct mode retain their mtime. Before replacing different bytes, the installer uses copy2 to
+preserve the previous file as `<destination>.bak-<UTC YYYYmmddHHMMSS>`; it never overwrites a
+backup. The older `magi.review-gate-backup` is left alone.
+
+Every successful apply writes `~/.local/state/review-gate/deploy-manifest.json` on each selected
+host, even if all targets matched. The 0600 manifest records all four absolute target paths,
+SHA-256 hashes, modes, source commit and UTC deployment time in a 0700 directory. The weekly
+audit compares deployed bytes and modes with these receipts without needing the repository.
+A changed review hook causes `hermes hooks doctor` to warn about mtime drift; hooks keep running.
+Hook registration, shell-hook approval/allowlist and cron definitions are not managed here.
+
+Rollback: copy the desired `.bak-*` file back with `cp -p`, or run `--apply` from a clean older
+commit. Copying a backup back leaves the receipt out of sync until the next installation; the
+audit will report that drift. Preserve the ledger to retain review counts.
 
 ## Tests
 
 ```sh
-/usr/bin/python3 -m unittest discover -s tests -v
-sh -n magi-shim.sh && /opt/homebrew/bin/shellcheck magi-shim.sh
-/usr/bin/python3 review_gate.py --help
+scripts/run_tests.sh tests/scripts/ops/
+sh -n scripts/ops/review-gate/magi-shim.sh
+/usr/bin/python3 scripts/ops/review-gate/review_gate.py --help
 ```
 
-Tests use repository-scoped temporary directories, a temporary HOME/DB, and fake executables;
+Tests in `tests/scripts/ops/` use temporary Git checkouts, isolated HOME/DB paths and fake SSH/executables;
 they clean their fixtures and processes. Test names 01–20 map to the specification's acceptance
 rules; `test_r2_*` covers the revised single-execution, commit and verdict rules, including
 five consume races of eight processes. ShellCheck must be available at the path above.
@@ -89,8 +116,8 @@ five consume races of eight processes. ShellCheck must be available at the path 
 
 `hooks/guard_review_gate.py` is the server-side Hermes `pre_tool_call` hook. It reads one
 JSON object from stdin, allows with exit 0 and empty stdout, or blocks with exit 2 and an
-`{"action":"block","message":"..."}` response. The coordinator registers/deploys it;
-this repository does not change Hermes configuration, cron, or installed commands.
+`{"action":"block","message":"..."}` response. The installer deploys it; hook registration, Hermes configuration and cron definitions remain
+coordinator-managed.
 
 The hook blocks unwrapped `codex review`, read-only `codex exec`/`e` (including the default
 sandbox), Claude print-mode reviews without write tools/permissions, `claude ultrareview`,
@@ -171,11 +198,11 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 geunwon-mac /usr/bin/python3 \
 
 `REVIEW_AUDIT_MAC_CMD` overrides that argv-style command; `{since}` is replaced with the UTC
 date. It is split with `shlex`, without a local shell. The Mac step times out after 120 seconds.
-Deploy the standalone report on the server and the updated ledger plus collector on the Mac.
-The report prints Korean plain text,
+The installer deploys the standalone report on the server and the ledger plus collector on the Mac.
+The report includes a `배포 드리프트` section and prints Korean plain text,
 at most ten newest `other` sessions, one `fido` count, and bounded bypass reasons. Mac failure
 still prints the hook summary and error class/exit code, and exits 0. Cron/Discord delivery
-and installation belong to the coordinator.
+belong to the coordinator.
 
 Known gaps: launches hidden in script files the coordinator did not write through
 `write_file`/`patch` cannot be inspected; other agents' and humans' reviews are seen only by

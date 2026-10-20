@@ -1,15 +1,26 @@
 import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard_background_continue.py")
+HOOK = str(Path(__file__).resolve().parents[4] / "scripts/ops/bg-continue-hook/guard_background_continue.py")
+
+
+_TEMP_DIRS = []
+
+
+def teardown_module():
+    for path in _TEMP_DIRS:
+        shutil.rmtree(path)
 
 
 def run(payload, env_extra=None, raw=None):
     tmp = tempfile.mkdtemp()
+    _TEMP_DIRS.append(tmp)
     log = os.path.join(tmp, "sub", "hook.jsonl")
     env = dict(os.environ, BG_CONTINUE_HOOK_LOG=log)
     env.pop("TERMINAL_MAX_FOREGROUND_TIMEOUT", None)
@@ -108,6 +119,7 @@ class HookTests(unittest.TestCase):
 
     def test_existing_log_is_tightened_to_0600(self):
         tmp = tempfile.mkdtemp()
+        _TEMP_DIRS.append(tmp)
         log = os.path.join(tmp, "h.jsonl")
         with open(log, "w"):
             pass
@@ -125,6 +137,7 @@ class HookTests(unittest.TestCase):
 
     def test_internal_error_fails_open_and_logs(self):
         tmp = tempfile.mkdtemp()
+        _TEMP_DIRS.append(tmp)
         log = os.path.join(tmp, "h.jsonl")
         script = (
             "import importlib.util,sys,io,json\n"

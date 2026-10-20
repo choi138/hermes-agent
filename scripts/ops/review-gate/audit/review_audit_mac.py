@@ -3,9 +3,12 @@
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import stat
 import subprocess
 import sys
 
@@ -21,6 +24,49 @@ def timestamp(value):
         return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def deploy_state(host):
+    """Read the last install receipt without needing a checkout or sibling modules."""
+    manifest = Path.home() / ".local/state/review-gate/deploy-manifest.json"
+    empty = dict(manifest="missing", source_commit=None, deployed_at=None, targets=[])
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8-sig"))
+        expected = {host[0].upper() + str(i) for i in range(1, 5)}
+        if (not isinstance(raw, dict) or raw.get("version") != 1 or raw.get("host") != host
+                or not isinstance(raw.get("source_commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", raw["source_commit"])
+                or not isinstance(raw.get("deployed_at"), str)
+                or timestamp(raw["deployed_at"]) is None
+                or not isinstance(raw.get("targets"), list)):
+            raise ValueError("invalid manifest")
+        targets = raw["targets"]
+        if len(targets) != 4 or {t["id"] for t in targets} != expected:
+            raise ValueError("incomplete manifest")
+        for target in targets:
+            if (not isinstance(target["path"], str) or not Path(target["path"]).is_absolute()
+                    or not re.fullmatch(r"[0-9a-f]{64}", target["sha256"])
+                    or not re.fullmatch(r"0[0-7]{3}", target["mode"])):
+                raise ValueError("invalid target")
+    except FileNotFoundError:
+        return empty
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(empty, manifest="invalid")
+    rows = []
+    for target in targets:
+        path = Path(target["path"])
+        try:
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+            mode = format(stat.S_IMODE(path.stat().st_mode), "04o")
+            status = "ok" if (not path.is_symlink() and current == target["sha256"]
+                              and mode == target["mode"]) else "modified"
+        except FileNotFoundError:
+            status = "missing"
+        except OSError:
+            status = "modified"
+        rows.append(dict(id=target["id"], path=target["path"], status=status))
+    return dict(manifest="ok", source_commit=raw["source_commit"],
+                deployed_at=raw["deployed_at"], targets=rows)
 
 
 def since_date(value):
@@ -191,6 +237,7 @@ def main(argv=None):
     since = args.since.date().isoformat()
     try:
         result = collect(since, load_ledger(since))
+        result["deploy"] = deploy_state("mac")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print("review-audit: " + type(exc).__name__, file=sys.stderr)
         return 1

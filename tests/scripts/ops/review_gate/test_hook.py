@@ -13,7 +13,7 @@ from unittest.mock import patch
 from hooks import guard_review_gate as hook
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4] / "scripts/ops/review-gate"
 HOOK = ROOT / "hooks/guard_review_gate.py"
 
 BLOCK = [

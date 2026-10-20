@@ -16,7 +16,7 @@ from audit import review_audit_report as report
 import review_gate
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4] / "scripts/ops/review-gate"
 NOW = datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
 SINCE = "2026-10-13"
 
@@ -199,7 +199,7 @@ class AuditTests(unittest.TestCase):
 
     def test_report_nothing_notable(self):
         output = report.format_report(SINCE, [dict(decision="wrapped")], self.empty_data())
-        self.assertEqual(output, "이번 주 ledger를 벗어난 리뷰가 없습니다.")
+        self.assertEqual(output.split("\n\n")[0], "이번 주 ledger를 벗어난 리뷰가 없습니다.")
 
     def test_report_counts_bypass_and_ledger(self):
         records = [dict(decision=k, bypass_reason="smoke\nfor auth") for k in ["blocked", "wrapped", "bypass", "error"]]
@@ -223,7 +223,7 @@ class AuditTests(unittest.TestCase):
         self.assertIn("/repo12", output)
         self.assertNotIn("/repo02", output)
         self.assertLess(output.index("/repo12"), output.index("/repo11"))
-        self.assertLessEqual(len(output.splitlines()), 25)
+        self.assertLessEqual(len(output.split("\n\n")[0].splitlines()), 25)
 
     def test_report_mac_failure_still_prints_hook_and_exits_zero(self):
         output = io.StringIO()
@@ -263,7 +263,7 @@ class AuditTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(ROOT / "audit/review_audit_report.py"), "--since", SINCE],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "이번 주 ledger를 벗어난 리뷰가 없습니다.")
+        self.assertEqual(result.stdout.split("\n\n")[0], "이번 주 ledger를 벗어난 리뷰가 없습니다.")
 
     def test_server_report_deploys_as_one_file(self):
         standalone = self.tmp / "review_audit_report.py"
@@ -274,7 +274,7 @@ class AuditTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(standalone), "--since", SINCE], cwd=str(self.tmp),
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "이번 주 ledger를 벗어난 리뷰가 없습니다.")
+        self.assertEqual(result.stdout.split("\n\n")[0], "이번 주 ledger를 벗어난 리뷰가 없습니다.")
 
     def test_report_default_since_is_seven_utc_days(self):
         output = io.StringIO()
