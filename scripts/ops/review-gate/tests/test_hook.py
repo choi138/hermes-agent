@@ -144,7 +144,11 @@ class HookTests(unittest.TestCase):
         if code == 2:
             message = json.loads(out)
             self.assertEqual(message["action"], "block")
-            self.assertIn('review-gate run --ticket "$T"', message["message"])
+            if "unwrapped claude review" in message["message"]:
+                self.assertIn("hermes-delegate review", message["message"])
+                self.assertNotIn('review-gate run --ticket "$T"', message["message"])
+            else:
+                self.assertIn('review-gate run --ticket "$T"', message["message"])
         else:
             self.assertEqual(out, "")
 

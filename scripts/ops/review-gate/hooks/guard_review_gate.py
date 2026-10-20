@@ -32,6 +32,8 @@ CLAUDE_VALUES = {
     "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
     "--tools", "--mcp-config", "--add-dir", "--agents", "--agent", "--betas",
 }
+SCRIPT_SUFFIXES = (".sh", ".zsh", ".bash", ".command")
+CMUX_COMMAND = "--command"
 WRITE_TOOL = re.compile(r"(?:^|[\s,])(Edit|Write|MultiEdit|NotebookEdit)(?=\(|[\s,]|$)")
 
 
@@ -391,13 +393,15 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
         raise ParseFailure("nesting limit")
     assignments = dict(assignments or {})
     inputs = list(inputs or [])
-    argv_words, i = [], 0
+    argv_words, targets, i = [], [], 0
     while i < len(words):
         if words[i].redirection:
             if i + 1 < len(words):
                 if words[i].value in ("<<", "<<-", "<<<"):
                     inputs.append(words[i + 1])
                 else:
+                    if words[i].value.startswith((">", "&>")):
+                        targets.append(words[i + 1].value)
                     yield from scan_substitutions(words[i + 1].substitutions, depth)
             i += 2
         else:
@@ -458,6 +462,26 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
         else:
             yield from scan_inputs(inputs, True, assignments, depth)
         return
+    elif program == "cmux" and any(a == CMUX_COMMAND or a.startswith(CMUX_COMMAND + "=") for a in argv[1:]):
+        # new-workspace/new-pane/new-surface --command runs its text in a shell like `cmux send`.
+        yield from scan_inputs(inputs, False, assignments, depth)
+        for word in words:
+            yield from scan_substitutions(word.substitutions, depth)
+        for i, word in enumerate(words[1:], 1):
+            text = word.evaluated if word.evaluated is not None else word.value
+            if word.value.startswith(CMUX_COMMAND + "="):
+                yield from scan_shell(text[len(CMUX_COMMAND) + 1:], assignments, depth + 1)
+            elif word.value == CMUX_COMMAND and i + 1 < len(words):
+                script = words[i + 1]
+                yield from scan_shell(script.evaluated if script.evaluated is not None else script.value,
+                                      assignments, depth + 1)
+        return
+    elif program in ("cat", "tee") and any(w.heredoc is not None for w in inputs) and (
+            any(t.endswith(SCRIPT_SUFFIXES) for t in targets + (argv[1:] if program == "tee" else []))
+            or any((w.heredoc or "").startswith("#!") for w in inputs)):
+        # A heredoc written to a script file is a later launch; scan it like write_file content.
+        yield from scan_inputs(inputs, True, assignments, depth)
+        return
     elif program == "cmux" and "send" in argv[1:] and len(argv) > 2:
         yield from scan_inputs(inputs, False, assignments, depth)
         for word in words:
@@ -482,6 +506,11 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
             cut += 2 if argv[cut] in value_flags else 1
         if program in ("timeout", "gtimeout"):
             cut += 1
+    elif program == "screen":
+        # screen runs its trailing argv as the window's program; -S/-c/-e/-h/-p/-t/-T take a value.
+        cut = 1
+        while cut < len(argv) and argv[cut].startswith("-"):
+            cut += 2 if argv[cut][-1] in "ScehptT" and argv[cut] != "-" else 1
     elif program in ("nohup", "exec", "command", "builtin"):
         cut = 1
         while cut < len(argv) and argv[cut].startswith("-"):
@@ -670,14 +699,25 @@ def main(stdin=None, stdout=None):
     if blocked:
         kind = blocked["reviewer"]
         reviewer_name = "codex" if kind == "runner" else kind
+        if kind == "claude":
+            route = ('Claude reviews on the Mac go only through hermes-delegate review '
+                     '(after review-gate open --item <id> --goal ... once); do not hand-build '
+                     'claude -p, cmux scripts or review-gate run for them. Claude implementation '
+                     'runs go through hermes-delegate claude. ')
+        else:
+            route = ('Run reviews through the ledger: review-gate open --item <id> --goal ... (once); '
+                     'T=$(review-gate start --item <id> --reviewer {} --commit <sha>); '
+                     'review-gate run --ticket "$T" -- <your command>. ').format(reviewer_name)
+        if kind == "runner":
+            route += ('A read-only Codex delegation is not a review: print it with hermes-delegate codex, '
+                      'which omits --sandbox read-only (the runner default). ')
+        if kind == "codex":
+            route += 'Device/simulator QA is not a review: launch it with hermes-delegate qa. '
         message = (
-            'review-gate: unwrapped {} review launch blocked. Run reviews through the ledger: '
-            'review-gate open --item <id> --goal ... (once); '
-            'T=$(review-gate start --item <id> --reviewer {} --commit <sha>); '
-            'review-gate run --ticket "$T" -- <your command>. '
+            'review-gate: unwrapped {} review launch blocked. {}'
             'Not a review (smoke test/research)? Prefix: '
             'REVIEW_GATE_NOT_REVIEW="<reason>" <command>.'
-        ).format(kind, reviewer_name)
+        ).format(kind, route)
         stdout.write(json.dumps({"action": "block", "message": message}) + "\n")
         return 2
     return 0
