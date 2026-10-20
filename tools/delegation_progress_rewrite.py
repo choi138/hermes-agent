@@ -26,7 +26,13 @@ def _sending_profile_home(runner, adapter):
     homes = getattr(runner, '_served_profile_homes', None) or {}
     if owner in homes:
         return homes[owner]
-    return get_profile_dir(owner) if owner else get_process_hermes_home()
+    if owner:
+        return get_profile_dir(owner)
+    # The unowned primary adapter belongs to the default root while multiplexing, even when the
+    # gateway was launched from a named profile (same rule as gateway/run.py's primary config load).
+    from agent.secret_scope import is_multiplex_active
+    from hermes_constants import get_default_hermes_root
+    return get_default_hermes_root() if is_multiplex_active() else get_process_hermes_home()
 
 
 def _path_tokens(text):
@@ -47,7 +53,10 @@ def validation_error(text, facts):
         return 'forbidden_marker'
     if not set(re.findall(r'\d+', text)) <= set(re.findall(r'\d+', facts)):
         return 'invented_digits'
-    if not _path_tokens(text) <= _path_tokens(facts):
+    known = _path_tokens(facts)
+    # Korean particles attach directly to names ("foo.py는"); fact-sheet names are ASCII-only.
+    if any(token not in known and re.sub(r'[\uac00-\ud7a3]+$', '', token).rstrip('.') not in known
+           for token in _path_tokens(text)):
         return 'invented_path'
     return None
 

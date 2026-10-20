@@ -155,7 +155,8 @@ async def test_total_timeout_does_not_wait_for_provider_cancellation(progress, m
     ('src/new_file.py 변경', 'invented_path'), ('new_file.py 변경', 'invented_path'),
     ('new_file.PY를 확인', 'invented_path'), ('/unknown 변경', 'invented_path'),
     ('invented.3 확인', 'invented_path'), ('invented.한글 확인', 'invented_path'),
-    ('.env 확인', 'invented_path'), ('@everyone', 'forbidden_marker'),
+    ('.env 확인', 'invented_path'), ('src/other.py는 변경', 'invented_path'),
+    ('src/my_file.pyc는 변경', 'invented_path'), ('@everyone', 'forbidden_marker'),
     ('<@123>', 'forbidden_marker'), ('<#123>', 'forbidden_marker'), ('<@&123>', 'forbidden_marker'),
     ('http://example.com', 'forbidden_marker'), ('https://example.com', 'forbidden_marker'),
     ('www.example.com', 'forbidden_marker'), ('HTTPS://EXAMPLE.COM', 'forbidden_marker'),
@@ -173,10 +174,28 @@ async def test_rejects_invalid_output_with_unchanged_fallback(progress, caplog, 
 @pytest.mark.parametrize('output', [
     'src/my_file.py: 변경 확인, 테스트 3개. 미확인.',
     r'`src/my\_file.py` 변경 확인. 미확인.',
+    # Korean particles attached to a known name (observed live with gpt-6.1-sol).
+    'src/my_file.py는 내용이 바뀌었고 테스트 3개야. 미확인.',
+    r'src/my\_file.py를 확인했어. 미확인.',
     '가' * 1200,
 ])
 def test_validator_accepts_known_numbers_paths_and_limit(output):
     assert rewrite.validation_error(output, FACTS) is None
+
+
+@pytest.mark.parametrize('multiplex', [True, False])
+def test_unowned_primary_adapter_uses_default_root_only_when_multiplexing(tmp_path, monkeypatch, multiplex):
+    import hermes_constants
+    from agent import secret_scope
+    launch, root = tmp_path / 'root' / 'profiles' / 'named', tmp_path / 'root'
+    monkeypatch.setattr(hermes_constants, 'get_process_hermes_home', lambda: launch)
+    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda **kw: root)
+    monkeypatch.setattr(secret_scope, 'is_multiplex_active', lambda: multiplex)
+    runner = SimpleNamespace(_served_profile_homes={'koharu': tmp_path / 'koharu'})
+    home = rewrite._sending_profile_home(runner, SimpleNamespace(_owner_profile=None))
+    assert home == (root if multiplex else launch)
+    owned = rewrite._sending_profile_home(runner, SimpleNamespace(_owner_profile='koharu'))
+    assert owned == tmp_path / 'koharu'
 
 
 @pytest.mark.asyncio
