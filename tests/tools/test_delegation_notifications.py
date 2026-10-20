@@ -13,6 +13,14 @@ from tools import delegation_notifications as notifications
 from tools.process_registry import ProcessSession
 
 
+@pytest.fixture(autouse=True)
+def fixed_progress_text(monkeypatch):
+    # Transport contracts stay independent of model availability; rewrite contracts have their own suite.
+    from tools import delegation_progress_rewrite
+    monkeypatch.setattr(delegation_progress_rewrite, 'rewrite_progress',
+        AsyncMock(side_effect=lambda facts, event, **kwargs: facts))
+
+
 @pytest.fixture
 def multiplexed_progress(monkeypatch, tmp_path):
     from hermes_constants import (

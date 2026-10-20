@@ -3,8 +3,6 @@
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
 docs of config.yaml.
 """
-
-
 #: Image every container terminal backend (docker/modal/daytona/singularity) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
 #: (the 3.14 pin shipped between the two without a migration); a saved config still holding one
@@ -761,6 +759,8 @@ DEFAULT_CONFIG = {
         "compression": _aux(120, no_progress_timeout=None),
         "skills_hub": _aux(30),
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
+        # Gateway progress: bounded rewrite of the fixed fact sheet; false keeps the fixed text.
+        "delegation_progress": _aux(15, enabled=True, style_prompt=""),
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
         # delegation.provider pins. "auto" + "" = main agent's model. api_mode forces transport:
         # chat_completions | anthropic_messages | codex_responses.

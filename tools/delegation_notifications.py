@@ -147,7 +147,7 @@ def _cancelled(db, session):
 
 
 def _record_progress(*, obligation_id, session_key, platform, chat_id, thread_id,
-                     content, adapter_profile=None):
+                     content, adapter_profile=None, preserve_existing=False):
     from gateway import delivery_ledger as ledger
     from tools.process_registry_followups import _db
     now, (pid, started) = time.time(), ledger._owner_stamp()
@@ -160,15 +160,30 @@ def _record_progress(*, obligation_id, session_key, platform, chat_id, thread_id
             'SELECT session_key,platform,chat_id,thread_id,content,adapter_profile,response_kind '
             'FROM delivery_obligations WHERE obligation_id=?', (obligation_id,)).fetchone()
         if existing is not None:
+            if preserve_existing:
+                expected = (*expected[:4], existing[4], *expected[5:])
             if tuple(existing) != expected:
                 raise ValueError('Delivery obligation payload conflict')
-            return
+            return existing[4], False
         db.execute('''INSERT INTO delivery_obligations
             (obligation_id,session_key,platform,chat_id,thread_id,content,adapter_profile,
              response_kind,state,attempts,created_at,updated_at,owner_pid,owner_started_at)
             VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?)''',
             (obligation_id, *expected, now, now, pid, started))
         ledger._prune_unlocked(db, now)
+        return content, True
+
+
+def _store_progress_content(obligation_id, content):
+    """Persist the final body under the send claim before any transport side effect."""
+    from gateway import delivery_ledger as ledger
+    from tools.process_registry_followups import _db
+    pid, started = ledger._owner_stamp()
+    with _db() as db:
+        return db.execute('''UPDATE delivery_obligations SET content=?,updated_at=?
+            WHERE obligation_id=? AND state='attempting'
+              AND owner_pid IS ? AND owner_started_at IS ?''',
+            (content, time.time(), obligation_id, pid, started)).rowcount == 1
 
 
 def _release_progress_claim(obligation_id, error=''):
@@ -337,11 +352,11 @@ async def send_progress(runner, session, message):
             raise ValueError('progress_sender_identity')
     oid = f"delegation-progress:{session.id}:{message['id']}"
     content = scrub_payload(message['content'])
-    # Fixed renderer, but do not allow worker-controlled paths to notify Discord users.
+    # Reserve a durable fallback before rewriting so concurrent/recovered calls never rewrite again.
     content = content.replace('@', '@\u200b')
-    await asyncio.to_thread(_record_progress, obligation_id=oid, session_key=session.session_key,
+    content, created = await asyncio.to_thread(_record_progress, obligation_id=oid, session_key=session.session_key,
         platform=evt['platform'], chat_id=source.chat_id, thread_id=source.thread_id,
-        content=content, adapter_profile=getattr(adapter, '_owner_profile', None))
+        content=content, adapter_profile=getattr(adapter, '_owner_profile', None), preserve_existing=True)
     with _db(read_only=True) as db:
         state = db.execute('SELECT state FROM delivery_obligations WHERE obligation_id=?', (oid,)).fetchone()[0]
     if state == 'attempting':
@@ -369,6 +384,16 @@ async def send_progress(runner, session, message):
         return
     sending = False
     try:
+        if created:
+            from tools.delegation_progress_rewrite import rewrite_progress
+            content = await rewrite_progress(content, message.get('event', ''),
+                runner=runner, adapter=adapter)
+            content = re.sub('@(?!\u200b)', '@\u200b', scrub_payload(content))
+            if not await asyncio.to_thread(_store_progress_content, oid, content):
+                return
+        # A concurrent first sender may have rewritten and released its claim since our reservation.
+        with _db(read_only=True) as db:
+            content = db.execute('SELECT content FROM delivery_obligations WHERE obligation_id=?', (oid,)).fetchone()[0]
         admission = await asyncio.to_thread(remote_observe, session, admit=message['id'])
         if admission.get('message', {}).get('id') != message['id']:
             await asyncio.to_thread(_release_progress_claim, oid, 'progress_head_superseded_unsent')
