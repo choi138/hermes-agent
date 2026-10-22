@@ -628,3 +628,107 @@ def test_remote_admission_and_allowlisted_diagnostics(monkeypatch, tmp_path, rem
     else:
         assert notifications.remote_observe(session, admit='run:1') == remote_value
     assert '--admit run:1' in commands[0]
+
+
+def _observed_registry(monkeypatch, tmp_path, session_id):
+    from tools.process_registry import ProcessRegistry
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    registry = ProcessRegistry()
+    registry._running[session_id] = ProcessSession(id=session_id, command='', session_key='owner',
+        remote_connection={'profile_home': str(tmp_path)}, delegation_progress={'thread': '123'})
+    clock = [1000.0]
+    import time
+    monkeypatch.setattr(notifications, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    monkeypatch.setattr(notifications, '_last_poll', {})
+    monkeypatch.setattr(notifications, '_observe_failures', {})
+    return registry, clock
+
+
+def _observation_warnings(caplog, session_id):
+    return [record for record in caplog.records
+            if record.levelname == 'WARNING' and session_id in record.getMessage()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['running', 'completed', 'failed'])
+async def test_finished_session_stop_failure_is_not_retried(monkeypatch, tmp_path, caplog, phase):
+    registry, clock = _observed_registry(monkeypatch, tmp_path, 'proc_done')
+    monkeypatch.setattr(followups, 'get_state', lambda session_id: {'phase': phase})
+    calls = []
+    def observe(session, **kwargs):
+        calls.append(kwargs)
+        raise ValueError('progress_remote_observation_unavailable')
+    monkeypatch.setattr(notifications, 'remote_observe', observe)
+    for _ in range(20):
+        await notifications.reconcile_progress(SimpleNamespace(), registry)
+        clock[0] += 61
+    assert calls == [{'stop': True}]
+    warnings = _observation_warnings(caplog, 'proc_done')
+    assert len(warnings) == 1
+    assert 'progress_remote_observation_unavailable' in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_stop_failure_is_not_retried(monkeypatch, tmp_path, caplog):
+    registry, clock = _observed_registry(monkeypatch, tmp_path, 'proc_cancelled')
+    monkeypatch.setattr(followups, 'get_state', lambda session_id: {'phase': 'pending'})
+    monkeypatch.setattr(notifications, '_cancelled', lambda db, session: True)
+    observe = Mock(side_effect=TimeoutExpired('ssh', 20))
+    monkeypatch.setattr(notifications, 'remote_observe', observe)
+    for _ in range(5):
+        await notifications.reconcile_progress(SimpleNamespace(), registry)
+        clock[0] += 61
+    observe.assert_called_once()
+    assert observe.call_args.kwargs == {'stop': True}
+    assert len(_observation_warnings(caplog, 'proc_cancelled')) == 1
+
+
+@pytest.mark.asyncio
+async def test_finished_session_successful_stop_is_not_retried(monkeypatch, tmp_path, caplog):
+    registry, clock = _observed_registry(monkeypatch, tmp_path, 'proc_stopped')
+    monkeypatch.setattr(followups, 'get_state', lambda session_id: {'phase': 'completed'})
+    observe = Mock(return_value={'status': 'stopped'})
+    monkeypatch.setattr(notifications, 'remote_observe', observe)
+    for _ in range(5):
+        await notifications.reconcile_progress(SimpleNamespace(), registry)
+        clock[0] += 61
+    observe.assert_called_once()
+    assert not _observation_warnings(caplog, 'proc_stopped')
+
+
+@pytest.mark.asyncio
+async def test_running_session_failures_back_off_and_warn_on_state_change(monkeypatch, tmp_path, caplog):
+    caplog.set_level('INFO', logger=notifications.logger.name)
+    registry, clock = _observed_registry(monkeypatch, tmp_path, 'proc_live')
+    monkeypatch.setattr(followups, 'get_state', lambda session_id: {'phase': 'queued'})
+    outcome = {'error': ValueError('progress_remote_observation_unavailable')}
+    polled = []
+    def observe(session, **kwargs):
+        assert 'stop' not in kwargs
+        polled.append(clock[0] - 1000)
+        if outcome['error']:
+            raise outcome['error']
+        return {'message': None}
+    monkeypatch.setattr(notifications, 'remote_observe', observe)
+    async def tick_until(end):
+        while clock[0] - 1000 <= end:
+            await notifications.reconcile_progress(SimpleNamespace(), registry)
+            clock[0] += 1
+    await tick_until(400)
+    assert polled == [0, 10, 30, 70, 130, 190, 250, 310, 370]
+    assert len(_observation_warnings(caplog, 'proc_live')) == 1
+
+    outcome['error'] = None
+    polled.clear()
+    await tick_until(441)
+    assert polled == [430, 435, 440]
+    assert 'Delegation observation recovered for proc_live' in caplog.text
+
+    outcome['error'] = TimeoutExpired('ssh', 20)
+    polled.clear()
+    await tick_until(500)
+    assert polled == [445, 455, 475]
+    warnings = _observation_warnings(caplog, 'proc_live')
+    assert len(warnings) == 2
+    assert 'TimeoutExpired' in warnings[1].getMessage()
+    assert notifications._last_poll[(str(tmp_path), 'proc_live')] != float('inf')

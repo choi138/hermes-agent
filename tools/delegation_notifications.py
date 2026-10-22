@@ -15,6 +15,7 @@ def _cause(exc):
     return value if re.fullmatch(r'progress_[a-z_]+', value) else type(exc).__name__
 
 _last_poll = {}
+_observe_failures = {}
 _sends = set()
 _poll_tasks = {}
 
@@ -276,12 +277,29 @@ async def reconcile_progress(runner, registry):
                 sessions[record['id']] = ProcessSession(**{k: v for k, v in record.items() if k in ProcessSession.__dataclass_fields__}, exited=True)
         except (OSError, ValueError, TypeError, KeyError):
             continue
+    async def observe_running(session):
+        observation = await asyncio.to_thread(remote_observe, session)
+        message = observation.get('message')
+        if not message:
+            return
+        binding = session.delegation_progress
+        if (message.get('run_id') != observation['run_id'] or message.get('thread_id') != binding['thread']
+                or type(message.get('sequence')) is not int
+                or message.get('id') != f"{observation['run_id']}:{message['sequence']}"):
+            raise ValueError('progress_outbox_binding')
+        # Successful worker exit feeds the durable verification path, not a second completion sender.
+        if message['event'] in {'cli_completed', 'final_verified', 'stopped'}:
+            await asyncio.to_thread(remote_observe, session, ack=message['id'])
+            return
+        await send_progress(runner, session, message)
+
     async def observe_session(session):
         if not session.delegation_progress or session.remote_connection.get('profile_home') != str(get_hermes_home()):
             return
         key = (str(get_hermes_home()), session.id)
         now = time.monotonic()
-        if now - _last_poll.get(key, -100) < 5:
+        failures = _observe_failures.get(key, (0, None))[0]
+        if now - _last_poll.get(key, -100) < min(5 * 2 ** failures, 60):
             return
         _last_poll[key] = now
         try:
@@ -290,27 +308,28 @@ async def reconcile_progress(runner, registry):
             with _db(read_only=True) as db:
                 cancelled = _cancelled(db, session)
             state = await asyncio.to_thread(get_state, session.id)
-            if cancelled or (state and state['phase'] not in {'pending', 'queued'}):
-                await asyncio.to_thread(remote_observe, session, stop=True)
-                _last_poll[key] = float('inf')
-                return
-            observation = await asyncio.to_thread(remote_observe, session)
-            message = observation.get('message')
-            if not message:
-                return
-            binding = session.delegation_progress
-            if (message.get('run_id') != observation['run_id'] or message.get('thread_id') != binding['thread']
-                    or type(message.get('sequence')) is not int
-                    or message.get('id') != f"{observation['run_id']}:{message['sequence']}"):
-                raise ValueError('progress_outbox_binding')
-            # Successful worker exit feeds the durable verification path, not a second completion sender.
-            if message['event'] in {'cli_completed', 'final_verified', 'stopped'}:
-                await asyncio.to_thread(remote_observe, session, ack=message['id'])
-                return
-            await send_progress(runner, session, message)
+            finished = cancelled or (state and state['phase'] not in {'pending', 'queued'})
+            if not finished:
+                await observe_running(session)
         except Exception as exc:
             # Never expose raw remote stderr/logs or infer worker failure from SSH loss.
-            logger.warning('Delegation observation unavailable for %s: %s', session.id, _cause(exc))
+            cause = _cause(exc)
+            previous = _observe_failures.get(key, (0, None))[1]
+            _observe_failures[key] = (failures + 1, cause)
+            if cause != previous:
+                logger.warning('Delegation observation unavailable for %s: %s', session.id, cause)
+            return
+        if not finished:
+            if _observe_failures.pop(key, None):
+                logger.info('Delegation observation recovered for %s', session.id)
+            return
+        # Marked before the stop attempt so a failing or hanging stop can never re-arm polling.
+        _last_poll[key] = float('inf')
+        _observe_failures.pop(key, None)
+        try:
+            await asyncio.to_thread(remote_observe, session, stop=True)
+        except Exception as exc:
+            logger.warning('Delegation observation stop failed for %s: %s', session.id, _cause(exc))
 
     # An unrelated SSH timeout must not hold up terminal reconciliation.
     semaphore = asyncio.Semaphore(4)
