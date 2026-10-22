@@ -206,8 +206,11 @@ class LedgerTests(GateCase):
         for flags in ((), ("--owner-approval", APPROVAL)):
             with self.subTest(flags=flags):
                 result = self.start(flags=flags, code=2)
-                self.assertIn("verdict", result.stderr.lower())
-                self.assertIn("first", result.stderr.lower())
+                self.assertIn("reproduce each pending verdict, record it with review-gate close, "
+                              "then retry", result.stderr)
+                self.assertIn("Report to the user only if a verdict cannot be reproduced",
+                              result.stderr)
+                self.assertNotIn("owner must record", result.stderr)
         self.assertEqual(len(self.item_status()["tickets"]), 2)
         self.close(second)
         third = self.start()
@@ -298,7 +301,9 @@ class LedgerTests(GateCase):
         # Close in reverse issue order to distinguish latest close from latest issue.
         self.close(joined, "UNREVIEWED", "--reason", "unavailable")
         self.close(first)
-        self.start(reviewer="codex", flags=("--fallback",), code=2)
+        result = self.start(reviewer="codex", flags=("--fallback",), code=2)
+        self.assertIn("record the failed review with review-gate close --verdict UNREVIEWED "
+                      "first, then retry", result.stderr)
 
     def test_05_join_same_round_maximum_three_and_not_after_closed(self):
         self.open()

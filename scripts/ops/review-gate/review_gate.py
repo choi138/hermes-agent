@@ -169,8 +169,9 @@ def start(db, args):
             if any(t["fallback"] for t in tickets):
                 refuse("Fallback already used; the owner must resolve this round or approve another.")
             if latest is None or latest["verdict"] != "UNREVIEWED":
-                refuse("Fallback requires the latest closed ticket to be UNREVIEWED; "
-                       "the owner must record the failed review first.")
+                refuse("Fallback requires the latest closed ticket to be UNREVIEWED; record "
+                       "the failed review with review-gate close --verdict UNREVIEWED first, "
+                       "then retry.")
             if latest["reviewer"] == args.reviewer:
                 refuse("Fallback requires a different reviewer CLI; the owner must select one.")
             if not same_commit(args.commit, latest["reviewed_commit"]):
@@ -180,8 +181,9 @@ def start(db, args):
         else:
             if db.execute("""SELECT 1 FROM tickets WHERE item = ? AND
                     (status != 'closed' OR verdict IS NULL)""", (args.item,)).fetchone():
-                refuse("Previous tickets must be fully closed; the owner must record "
-                       "each pending verdict first.")
+                refuse("Previous tickets must be fully closed; reproduce each pending verdict, "
+                       "record it with review-gate close, then retry. Report to the user only "
+                       "if a verdict cannot be reproduced.")
             round_number += 1
             if (round_number > 2 or item["status"] in ("cap-reached", "stopped-unreviewed")) \
                     and not args.owner_approval:
