@@ -144,11 +144,15 @@ class HookTests(unittest.TestCase):
         if code == 2:
             message = json.loads(out)
             self.assertEqual(message["action"], "block")
-            if "unwrapped claude review" in message["message"]:
-                self.assertIn("hermes-delegate review", message["message"])
+            kind = next(r["reviewer"] for r in records if r["decision"] == "blocked")
+            route = {"claude": "hermes-delegate review --reviewer claude",
+                     "codex": "hermes-delegate review --reviewer codex",
+                     "runner": "hermes-delegate codex",
+                     "magi": 'review-gate run --ticket "$T"'}[kind]
+            self.assertIn(route, message["message"])
+            self.assertIn("hermes-delegate smoke", message["message"])
+            if kind != "magi":
                 self.assertNotIn('review-gate run --ticket "$T"', message["message"])
-            else:
-                self.assertIn('review-gate run --ticket "$T"', message["message"])
         else:
             self.assertEqual(out, "")
 

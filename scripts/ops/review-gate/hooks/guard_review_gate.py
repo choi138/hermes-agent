@@ -4,6 +4,7 @@
 import ast
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import gc
 import json
 import os
 from pathlib import Path
@@ -33,7 +34,16 @@ CLAUDE_VALUES = {
     "--tools", "--mcp-config", "--add-dir", "--agents", "--agent", "--betas",
 }
 SCRIPT_SUFFIXES = (".sh", ".zsh", ".bash", ".command")
+TMUX_LAUNCH = {"new-session", "new", "new-window", "neww", "split-window", "splitw",
+               "respawn-pane", "respawnp", "respawn-window", "respawnw"}
+NPX_PACKAGES = {"@openai/codex": "codex", "@anthropic-ai/claude-code": "claude"}
+DYNAMIC_REVIEWER = re.compile(r"(?i)codex|claude|magi")
+DECLARATIONS = {"export", "local", "typeset", "declare", "readonly"}
 CMUX_COMMAND = "--command"
+REDIRECT = re.compile(r"(?:<<<|<<-|&>>?|[<>](?:[<>]|&|\|)?)")
+# Runs that need no per-character decision; the tokenizer otherwise costs one Python step per byte.
+PLAIN_RUN = re.compile(r"[^\s\\$`'\"#;&|()<>{}]+")
+DOUBLE_QUOTED_RUN = re.compile(r'[^"\\$`]+')
 WRITE_TOOL = re.compile(r"(?:^|[\s,])(Edit|Write|MultiEdit|NotebookEdit)(?=\(|[\s,]|$)")
 
 
@@ -198,9 +208,16 @@ def tokenize(text):
         if quote:
             if c == quote:
                 quote = None
+                i += 1
             else:
-                append(c)
-            i += 1
+                if quote == "'":
+                    end = text.find("'", i)
+                    end = len(text) if end < 0 else end
+                else:
+                    run = DOUBLE_QUOTED_RUN.match(text, i)
+                    end = run.end() if run else i + 1
+                append(text[i:end])
+                i = end
             continue
         if c in "'\"":
             quote, active = c, True
@@ -222,7 +239,7 @@ def tokenize(text):
                 subs.clear()
                 active = False
             word()
-            operator = re.match(r"(?:<<<|<<-|&>>?|[<>](?:[<>]|&|\|)?)", text[i:])[0]
+            operator = REDIRECT.match(text, i)[0]
             command.append(Word(operator, redirection=True))
             if operator in ("<<", "<<-"):
                 operand, strip_tabs, i = heredoc_start(text, i)
@@ -239,8 +256,11 @@ def tokenize(text):
         elif c.isspace():
             word()
         else:
-            append(c)
-            active = True
+            end = PLAIN_RUN.match(text, i)
+            end = end.end() if end else i + 1
+            append(text[i:end])
+            active, i = True, end
+            continue
         i += 1
     if quote:
         raise ParseFailure("unterminated quote")
@@ -302,6 +322,8 @@ def reviewer(argv):
         return None
     program, args = os.path.basename(argv[0]), argv[1:]
     if program == "codex":
+        if any(arg in ("-h", "--help", "-V", "--version") for arg in args):
+            return None
         sub, index = subcommand(args, CODEX_VALUES)
         if sub == "review":
             return "codex"
@@ -343,11 +365,13 @@ def reviewer(argv):
             return None
         return "claude"
     if program == "magi":
-        # Exactly the shim's scan: help anywhere; first non-option is subcommand.
-        if any(arg in ("--help", "-h") for arg in args):
+        # Exactly the shim's scan: help-like options anywhere; first non-option is subcommand.
+        if any(arg in ("--help", "-h", "--version", "--schema", "--examples")
+               or arg.startswith("--examples=") for arg in args):
             return None
         sub = next((arg for arg in args if not arg.startswith("-")), None)
-        if sub is None or sub in {"lanes", "doctor", "report", "report-plan", "plan", "publish"}:
+        if sub is None or sub in {"lanes", "doctor", "report", "report-plan", "plan", "publish",
+                                  "sample", "quality"}:
             return None
         return "magi"
     if program.startswith("python"):
@@ -388,11 +412,122 @@ def wrapped(argv):
     return None
 
 
-def scan_command(words, assignments=None, depth=0, inputs=None):
+def short_options(argv, start, values, long_values=()):
+    """Return the first operand index after getopt-style options; values take an argument."""
+    i = start
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        arg = argv[i]
+        if arg == "--":
+            return i + 1
+        if arg.startswith("--"):
+            i += 2 if arg in long_values else 1
+            continue
+        letters = arg[1:]
+        taking = next((j for j, letter in enumerate(letters) if letter in values), None)
+        i += 2 if taking == len(letters) - 1 else 1
+    return i
+
+
+def option_value(argv, start, end, short, long):
+    """Return the value of -X/--long (or a cluster ending in X) within argv[start:end]."""
+    for i in range(start, end):
+        arg = argv[i]
+        if arg.startswith(long + "="):
+            return arg[len(long) + 1:]
+        if arg == long or (arg.startswith("-") and not arg.startswith("--") and arg.endswith(short)):
+            return argv[i + 1] if i + 1 < len(argv) else None
+    return None
+
+
+def tmux_targets(words, argv):
+    """tmux runs its new-session/new-window/split-window command and types send-keys text."""
+    shell = option_value(argv, 1, short_options(argv, 1, "LSfTc"), "c", "-c")
+    targets = [shell] if shell else []
+    start = short_options(argv, 1, "LSfTc")
+    while start < len(argv):
+        end = next((j for j in range(start, len(argv)) if argv[j] in (";", "\\;")), len(argv))
+        sub = argv[start]
+        if sub in TMUX_LAUNCH:
+            first = short_options(argv[:end], start + 1, "cefFlnpstxy")
+            rest = words[first:end]
+            if len(rest) == 1:
+                targets.append(text_of(rest[0]))
+            elif rest:
+                targets.append(rest)
+        elif sub in ("send-keys", "send"):
+            first = short_options(argv[:end], start + 1, "cNt")
+            targets.append(" ".join(text_of(w) for w in words[first:end]))
+        start = end + 1
+    return targets
+
+
+def script_targets(words, argv):
+    """util-linux script runs -c/--command; BSD script runs the argv after its file operand."""
+    end = short_options(argv, 1, "cIOBTmEot", ("--command", "--log-in", "--log-out", "--log-io",
+                                                "--log-timing", "--logging-format", "--echo",
+                                                "--output-limit"))
+    command = option_value(argv, 1, end, "c", "--command")
+    if command is not None:
+        return [command]
+    first = short_options(argv, 1, "t")
+    return [words[first + 1:]] if first + 1 < len(words) else []
+
+
+def npx_targets(words, argv):
+    command = option_value(argv, 1, short_options(argv, 1, "cpw", ("--package", "--workspace", "--call")),
+                           "c", "--call")
+    if command is not None:
+        return [command]
+    first = short_options(argv, 1, "cpw", ("--package", "--workspace", "--call"))
+    if first >= len(words):
+        return []
+    package = re.sub(r"(?<=.)@[^/]*$", "", argv[first])
+    if package in NPX_PACKAGES:
+        return [[Word(NPX_PACKAGES[package])] + words[first + 1:]]
+    return [words[first:]]
+
+
+def launch_targets(program, words):
+    """Shell text (str) or argv (list of Word) that a launcher program runs, or None."""
+    argv = [w.value for w in words]
+    if program == "eval":
+        return [" ".join(text_of(w) for w in words[1:])]
+    if program == "xargs":
+        return [words[short_options(argv, 1, "adEIJLnPRSs", (
+            "--arg-file", "--delimiter", "--eof", "--replace", "--max-lines", "--max-args",
+            "--max-procs", "--max-chars", "--process-slot-var")):]]
+    if program == "stdbuf":
+        return [words[short_options(argv, 1, "ioe", ("--input", "--output", "--error")):]]
+    if program == "script":
+        return script_targets(words, argv)
+    if program == "tmux":
+        return tmux_targets(words, argv)
+    if program == "npx":
+        return npx_targets(words, argv)
+    return None
+
+
+def text_of(word):
+    return word.evaluated if word.evaluated is not None else word.value
+
+
+def dynamic_reviewer(value, variables):
+    """A variable or substituted program is matched by the name or value it expands from."""
+    name = os.path.basename(value)
+    if "$" not in name and "`" not in name:
+        return None
+    variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z_0-9]*)\}?", name)
+    hits = DYNAMIC_REVIEWER.findall(name + " " + variables.get(variable[1], "") if variable else name)
+    return hits[-1].lower() if hits else None
+
+
+def scan_command(words, assignments=None, depth=0, inputs=None, variables=None):
     if depth > 80:
         raise ParseFailure("nesting limit")
     assignments = dict(assignments or {})
     inputs = list(inputs or [])
+    variables = {} if variables is None else variables
+    local = {}
     argv_words, targets, i = [], [], 0
     while i < len(words):
         if words[i].redirection:
@@ -411,7 +546,7 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
     while words:
         match = ASSIGNMENT.match(words[0].value)
         if match:
-            assignments[match[1]] = match[2]
+            assignments[match[1]] = local[match[1]] = match[2]
             # Assignment substitutions execute even without a following program.
             prefix = words[0].substitutions
             words = words[1:]
@@ -421,10 +556,13 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
         else:
             break
     if not words:
+        variables.update(local)
         yield from scan_inputs(inputs, False, assignments, depth)
         return
     argv = [w.value for w in words]
     program = os.path.basename(argv[0])
+    if program in DECLARATIONS:
+        variables.update((m[1], m[2]) for m in map(ASSIGNMENT.match, argv[1:]) if m)
     wrap = wrapped(argv)
     if wrap:
         ticket, end = wrap
@@ -434,6 +572,7 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
         return
     # Wrappers are removed before scanning their arguments for substitutions.
     cut = None
+    launched = launch_targets(program, words)
     if program in ("sh", "bash", "zsh", "dash"):
         for i, arg in enumerate(argv[1:], 1):
             if arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
@@ -490,6 +629,18 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
         yield from scan_shell(script.evaluated if script.evaluated is not None else script.value,
                               assignments, depth + 1)
         return
+    elif launched is not None:
+        yield from scan_inputs(inputs, False, assignments, depth)
+        passed = {id(w) for target in launched if not isinstance(target, str) for w in target}
+        for word in words:
+            if id(word) not in passed:
+                yield from scan_substitutions(word.substitutions, depth)
+        for target in launched:
+            if isinstance(target, str):
+                yield from scan_shell(target, assignments, depth + 1)
+            else:
+                yield from scan_command(target, assignments, depth + 1, None, variables)
+        return
     elif program == "env":
         cut = 1
         while cut < len(argv) and argv[cut] in ("-i", "--ignore-environment", "--"):
@@ -518,14 +669,15 @@ def scan_command(words, assignments=None, depth=0, inputs=None):
     if cut is not None:
         for word in words[:cut]:
             yield from scan_substitutions(word.substitutions, depth)
-        yield from scan_command(words[cut:], assignments, depth + 1, inputs)
+        yield from scan_command(words[cut:], assignments, depth + 1, inputs, variables)
         return
     yield from scan_inputs(inputs, False, assignments, depth)
     for word in words:
         yield from scan_substitutions(word.substitutions, depth)
     if program in BOUNDARIES:
         return
-    kind = reviewer(argv)
+    dynamic = dynamic_reviewer(argv[0], variables)
+    kind = reviewer([dynamic] + argv[1:] if dynamic else argv)
     if kind:
         reason = assignments.get("REVIEW_GATE_NOT_REVIEW")
         yield event(kind, "bypass" if reason else "blocked", reason=reason)
@@ -568,8 +720,9 @@ def scan_inputs(inputs, shell, assignments, depth):
 def scan_shell(text, assignments=None, depth=0):
     if depth > 80:
         raise ParseFailure("nesting limit")
+    variables = {}
     for words in tokenize(text):
-        yield from scan_command(words, assignments, depth)
+        yield from scan_command(words, assignments, depth, variables=variables)
 
 
 # Conservative recovery only: exemptions must directly cover this same match.
@@ -603,7 +756,9 @@ def fallback(text):
                 yield event(kind, "blocked", parse="fallback")
 
 
-def string_command(node):
+def string_command(node, constants):
+    if isinstance(node, ast.Name) and node.id in constants:
+        return constants[node.id]
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.JoinedStr):
@@ -612,27 +767,63 @@ def string_command(node):
     return None
 
 
+EXECUTION_CALLS = {"terminal", "subprocess.run", "subprocess.call", "subprocess.check_call",
+                   "subprocess.check_output", "subprocess.Popen", "os.system", "os.popen"}
+
+
+def python_names(tree):
+    """Import aliases of the execution calls, and names bound once to a constant string."""
+    modules, functions, constants, rebound = {}, {}, {}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                full = "terminal" if alias.name == "terminal" else node.module + "." + alias.name
+                if full in EXECUTION_CALLS:
+                    functions[alias.asname or alias.name] = full
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in constants or not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                rebound.add(name)
+            constants[name] = getattr(node.value, "value", None)
+    return modules, functions, {k: v for k, v in constants.items() if k not in rebound}
+
+
+def call_name(fn, modules, functions):
+    if isinstance(fn, ast.Name):
+        return functions.get(fn.id, fn.id)
+    if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+        return modules.get(fn.value.id, fn.value.id) + "." + fn.attr
+    return ""
+
+
+def argv_word(node, constants, program=False):
+    value = string_command(node, constants)
+    if value is not None and "__dynamic__" not in value:
+        return Word(value)
+    # A variable program is shown as shell would show it, so dynamic_reviewer can match its name.
+    if program and isinstance(node, (ast.Name, ast.Attribute)):
+        return Word("$" + (node.id if isinstance(node, ast.Name) else node.attr))
+    return Word("__dynamic__")
+
+
 def execution_calls(code):
     tree = ast.parse(code)
-    calls = {"terminal", "subprocess.run", "subprocess.call", "subprocess.check_call",
-             "subprocess.check_output", "subprocess.Popen", "os.system", "os.popen"}
+    modules, functions, constants = python_names(tree)
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        name = fn.id if isinstance(fn, ast.Name) else (
-            fn.value.id + "." + fn.attr if isinstance(fn, ast.Attribute)
-            and isinstance(fn.value, ast.Name) else "")
-        if name not in calls:
+        if not isinstance(node, ast.Call) or call_name(node.func, modules, functions) not in EXECUTION_CALLS:
             continue
         arg = node.args[0] if node.args else next(
             (k.value for k in node.keywords if k.arg == "command"), None)
         if isinstance(arg, (ast.List, ast.Tuple)):
-            if arg.elts and isinstance(arg.elts[0], ast.Constant) and isinstance(arg.elts[0].value, str):
-                yield [Word(n.value if isinstance(n, ast.Constant) and isinstance(n.value, str)
-                            else "__dynamic__") for n in arg.elts]
+            first = arg.elts[0] if arg.elts else None
+            if isinstance(first, (ast.Name, ast.Attribute)) or (
+                    isinstance(first, ast.Constant) and isinstance(first.value, str)):
+                yield [argv_word(first, constants, True)] + [argv_word(n, constants) for n in arg.elts[1:]]
         else:
-            value = string_command(arg)
+            value = string_command(arg, constants)
             if value is not None:
                 yield value
 
@@ -680,6 +871,34 @@ def log_events(payload, records):
         pass
 
 
+REVIEW_ENTRY = ("hermes-delegate review --reviewer {} --item <id> --commit <sha> --prompt <file> "
+                "--workdir <dir> [--base <sha>]")
+CLOSE_RULE = ("When it finishes, reproduce the findings yourself and record the verdict with "
+              "review-gate close (PASS: --blockers 0 or omitted; BLOCK: --blockers N). ")
+ROUTES = {
+    "claude": ("Claude reviews go only through " + REVIEW_ENTRY.format("claude") + ", after "
+               "review-gate open --item <id> --goal ... once; do not hand-build claude -p, "
+               "cmux/tmux/screen scripts or review-gate run for them. " + CLOSE_RULE +
+               "Claude implementation runs go through hermes-delegate claude. "),
+    "codex": ("Codex reviews go only through " + REVIEW_ENTRY.format("codex") + ", after "
+              "review-gate open --item <id> --goal ... once; it fixes the model, read-only sandbox "
+              "and ledger ticket. " + CLOSE_RULE +
+              "Device/simulator QA is not a review: launch it with hermes-delegate qa. "),
+    "runner": ("A read-only Codex delegation is not a review: print it with hermes-delegate codex, "
+               "which omits --sandbox read-only (the runner default). Codex reviews go through " +
+               REVIEW_ENTRY.format("codex") + ". "),
+    "magi": ("Run magi reviews through the ledger: review-gate open --item <id> --goal ... (once); "
+             'T=$(review-gate start --item <id> --reviewer magi --commit <sha>); '
+             'review-gate run --ticket "$T" -- magi ... ' + CLOSE_RULE),
+}
+
+
+def block_message(kind):
+    return ('review-gate: unwrapped {} review launch blocked. {}'
+            'Auth/exec check only? Use hermes-delegate smoke codex|claude. Other non-review '
+            '(research)? Prefix: REVIEW_GATE_NOT_REVIEW="<reason>" <command>.').format(kind, ROUTES[kind])
+
+
 def main(stdin=None, stdout=None):
     stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
     try:
@@ -697,31 +916,14 @@ def main(stdin=None, stdout=None):
     log_events(payload, records)
     blocked = next((r for r in records if r["decision"] == "blocked"), None)
     if blocked:
-        kind = blocked["reviewer"]
-        reviewer_name = "codex" if kind == "runner" else kind
-        if kind == "claude":
-            route = ('Claude reviews on the Mac go only through hermes-delegate review '
-                     '(after review-gate open --item <id> --goal ... once); do not hand-build '
-                     'claude -p, cmux scripts or review-gate run for them. Claude implementation '
-                     'runs go through hermes-delegate claude. ')
-        else:
-            route = ('Run reviews through the ledger: review-gate open --item <id> --goal ... (once); '
-                     'T=$(review-gate start --item <id> --reviewer {} --commit <sha>); '
-                     'review-gate run --ticket "$T" -- <your command>. ').format(reviewer_name)
-        if kind == "runner":
-            route += ('A read-only Codex delegation is not a review: print it with hermes-delegate codex, '
-                      'which omits --sandbox read-only (the runner default). ')
-        if kind == "codex":
-            route += 'Device/simulator QA is not a review: launch it with hermes-delegate qa. '
-        message = (
-            'review-gate: unwrapped {} review launch blocked. {}'
-            'Not a review (smoke test/research)? Prefix: '
-            'REVIEW_GATE_NOT_REVIEW="<reason>" <command>.'
-        ).format(kind, route)
+        message = block_message(blocked["reviewer"])
         stdout.write(json.dumps({"action": "block", "message": message}) + "\n")
         return 2
     return 0
 
 
 if __name__ == "__main__":
+    # A one-shot process: cyclic collection over the parser's many small objects only
+    # adds time (about half of it on a large script) and frees nothing before exit.
+    gc.disable()
     sys.exit(main())

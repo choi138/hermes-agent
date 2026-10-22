@@ -155,7 +155,9 @@ class ShimTests(GateCase):
         cases = [("lanes", "list"), ("doctor",), ("report",), ("report-plan",),
                  ("plan",), ("publish",), (), ("--help",), ("--version",),
                  ("review", "--help"), ("review", "-h"),
-                 ("--verbose", "lanes", "list"), ("--quiet", "frobnicate", "--help")]
+                 ("--verbose", "lanes", "list"), ("--quiet", "frobnicate", "--help"),
+                 ("--examples", "review"), ("--examples=review",), ("--schema",),
+                 ("sample", "--lane", "l", "--fixture", "f"), ("quality", "assess")]
         for argv in cases:
             with self.subTest(argv=argv):
                 data = json.loads(self.shim(*argv).stdout)
@@ -164,7 +166,7 @@ class ShimTests(GateCase):
 
     def test_16_default_deny_unknown_and_all_model_commands(self):
         commands = ("", "frobnicate", "review", "review-plan", "run", "auto", "gate", "stack",
-                    "adjudicate", "quality", "sample")
+                    "adjudicate")
         for command in commands:
             with self.subTest(command=command):
                 self.shim("--verbose", command, code=2)

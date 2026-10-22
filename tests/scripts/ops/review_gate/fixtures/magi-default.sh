@@ -18,7 +18,7 @@ subcommand_found=
 help_requested=
 for arg do
     case "$arg" in
-        --help|-h) help_requested=yes ;;
+        --help|-h|--version|--schema|--examples|--examples=*) help_requested=yes ;;
     esac
     if [ -z "$subcommand_found" ]; then
         case "$arg" in
@@ -32,7 +32,7 @@ if [ -n "$help_requested" ] || [ -z "$subcommand_found" ]; then
     exec "$MAGI_REAL_BIN" "$@"
 fi
 case "$subcommand" in
-    lanes|doctor|report|report-plan|plan|publish) exec "$MAGI_REAL_BIN" "$@" ;;
+    lanes|doctor|report|report-plan|plan|publish|sample|quality) exec "$MAGI_REAL_BIN" "$@" ;;
 esac
 
 log_event() {
