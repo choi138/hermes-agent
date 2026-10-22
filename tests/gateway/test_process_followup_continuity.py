@@ -220,6 +220,41 @@ async def test_media_queued_after_verification(home, mode):
     agent.interrupt.assert_not_called()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['steer', 'interrupt', 'queue'])
+async def test_authority_preempt_leaves_verification_turn_alone(home, mode):
+    runner, source, key, agent, adapter = busy_runner(mode)
+    runner._resolve_busy_steer_or_redirect = AsyncMock()
+    runner._busy_interrupt_and_ack = AsyncMock()
+    event = MessageEvent(text='run the approved tests', source=source, message_id='new-user')
+    assert await runner._hm_busy_preempt(event, source, key) is False
+    runner._resolve_busy_steer_or_redirect.assert_not_awaited()
+    runner._busy_interrupt_and_ack.assert_not_awaited()
+    agent.steer.assert_not_called()
+    agent.redirect.assert_not_called()
+    agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('leftover_steer', [None, 'use the short answer'])
+async def test_compression_exhaustion_keeps_the_whole_pending_chain(home, leftover_steer):
+    from gateway.pending_priority import pending_chain, pop_human_first
+    runner, source, key, agent, adapter = busy_runner('queue', followup=False)
+    runner._detach_undrained_steers = AsyncMock(return_value=None)
+    adapter.get_pending_message = lambda k: pop_human_first(adapter._pending_messages, k)
+    first = MessageEvent(text='first', source=source, message_id='m1')
+    second = MessageEvent(text='second', source=source, message_id='m2')
+    first._gateway_pending_followups = [second]
+    adapter._pending_messages[key] = first
+    result = {'final_response': '', 'compression_exhausted': True, 'pending_steer': leftover_steer}
+    assert await runner._run_agent_drain_pending(result, adapter, source, key) == (None, None)
+    chain = pending_chain(adapter._pending_messages, key)
+    if leftover_steer:
+        assert chain[0].text == leftover_steer
+        chain = chain[1:]
+    assert chain == [first, second]
+
+
 def update_payload(execution, **changes):
     with ledger._db() as db:
         row = db.execute('SELECT payload FROM process_followups WHERE execution_id=?', (execution,)).fetchone()

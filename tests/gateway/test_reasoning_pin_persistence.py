@@ -11,7 +11,7 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 
 
 def _source():
-    return SessionSource(platform=Platform.LOCAL, chat_id="reasoning-pin", user_id="owner")
+    return SessionSource(platform=Platform.TELEGRAM, chat_id="reasoning-pin", chat_type="dm", user_id="owner")
 
 
 def _runner(store):

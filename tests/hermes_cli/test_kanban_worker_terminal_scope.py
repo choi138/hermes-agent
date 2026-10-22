@@ -7,6 +7,9 @@ The authority test is "does this worker act for a ROUTED home", exactly as ``ser
 decides it. The secret scope bound around the env build is what supplies B's OWN values for the
 dispatcher's declared ``terminal.env_passthrough`` names.
 """
+import os
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db_dispatch
@@ -41,6 +44,12 @@ def test_worker_profile_scope_installs_the_assigned_profiles_terminal_policy(pro
         f"worker inherited the launch profile's terminal policy: {scope}")
 
 
+def _workspace(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir(exist_ok=True)  # bind_local_worker_execution refuses a missing local workspace
+    return workspace
+
+
 def _spawn_env_for_profile_b(monkeypatch, tmp_path):
     """Run ``_default_spawn`` far enough to capture the worker env, never spawning anything."""
     from hermes_cli.kanban_db import Task
@@ -60,7 +69,7 @@ def _spawn_env_for_profile_b(monkeypatch, tmp_path):
         workspace_kind="dir", workspace_path=None, claim_lock=None, claim_expires=None,
         tenant=None)
     with pytest.raises(_StopSpawn):
-        kanban_db_dispatch._default_spawn(task, str(tmp_path / "ws"))
+        kanban_db_dispatch._default_spawn(task, str(_workspace(tmp_path)))
     assert captured, "_default_spawn never built a worker env"
     return captured[0]
 
@@ -98,6 +107,16 @@ def test_launch_profiles_own_worker_keeps_its_credentials(tmp_path, monkeypatch)
         workspace_kind="dir", workspace_path=None, claim_lock=None, claim_expires=None,
         tenant=None)
     with pytest.raises(_StopSpawn):
-        kanban_db_dispatch._default_spawn(task, str(tmp_path / "ws"))
+        kanban_db_dispatch._default_spawn(task, str(_workspace(tmp_path)))
 
     assert captured and captured[0].get("OPENAI_API_KEY") == "dispatcher-launch-key"
+
+
+def test_worker_for_another_profile_can_still_import_hermes(profile_b, tmp_path, monkeypatch):
+    """The routed-profile scrub strips Hermes-owned PYTHONPATH entries, but the worker IS Hermes
+    (`-m hermes_cli.kanban_worker_client`): a PYTHONPATH-launched dispatcher must hand it a tree
+    it can import, or it dies on `No module named 'hermes_cli'` before reaching the owner."""
+    repo_root = Path(kanban_db_dispatch.__file__).resolve().parent.parent
+    monkeypatch.setenv("PYTHONPATH", str(repo_root))
+    env = _spawn_env_for_profile_b(monkeypatch, tmp_path)
+    assert str(repo_root) in env.get("PYTHONPATH", "").split(os.pathsep)

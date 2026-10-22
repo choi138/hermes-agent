@@ -8,14 +8,18 @@ cannot send local workspace paths to another machine.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import MutableMapping, Optional
+from typing import Mapping, MutableMapping, Optional
 
 
 KANBAN_EXECUTION_BACKEND_ENV = "_HERMES_KANBAN_EXECUTION_BACKEND"
 KANBAN_LOCAL_EXECUTION_BACKEND = "local"
+# The launch env's TERMINAL_* values the pin removed or overwrote (JSON): the worker client hands
+# them back to an owner it auto-starts, whose backend may be env-only (systemd / ``op run``).
+KANBAN_PREPIN_TERMINAL_ENV = "HERMES_KANBAN_PREPIN_TERMINAL"
 
 _REMOTE_TERMINAL_PREFIXES = (
     "TERMINAL_CONTAINER_",
@@ -85,9 +89,112 @@ def bind_local_worker_execution(
             "kanban workspace/backend mismatch: worker task identity is missing"
         )
     normalized_workspace = _validated_local_workspace(workspace)
+    prepin = {
+        key: value for key, value in env.items()
+        if key in ("TERMINAL_ENV", "TERMINAL_CWD") or key in _REMOTE_TERMINAL_KEYS
+        or key.startswith(_REMOTE_TERMINAL_PREFIXES)
+    }
+    if prepin:
+        env[KANBAN_PREPIN_TERMINAL_ENV] = json.dumps(prepin, sort_keys=True)
+    else:
+        env.pop(KANBAN_PREPIN_TERMINAL_ENV, None)
     env["HERMES_KANBAN_WORKSPACE"] = normalized_workspace
     env[KANBAN_EXECUTION_BACKEND_ENV] = KANBAN_LOCAL_EXECUTION_BACKEND
     _pin_local_environment(env, normalized_workspace)
+    return KanbanExecutionContract(
+        backend=KANBAN_LOCAL_EXECUTION_BACKEND, workspace=normalized_workspace
+    )
+
+
+def pin_local_terminal_scope(
+    terminal: MutableMapping[str, object], workspace: object
+) -> KanbanExecutionContract:
+    """Pin an owner session's frozen terminal policy to local execution in *workspace*."""
+    normalized_workspace = _validated_local_workspace(workspace)
+    _pin_local_environment(terminal, normalized_workspace)
+    return KanbanExecutionContract(
+        backend=KANBAN_LOCAL_EXECUTION_BACKEND, workspace=normalized_workspace
+    )
+
+
+def verify_local_terminal_scope(
+    terminal: Mapping[str, object], workspace: object
+) -> KanbanExecutionContract:
+    """Refuse an owner-run Kanban turn whose terminal policy is not pinned local."""
+    normalized_workspace = _validated_local_workspace(workspace)
+    backend = str(terminal.get("TERMINAL_ENV") or "").strip().lower()
+    if backend != KANBAN_LOCAL_EXECUTION_BACKEND:
+        raise KanbanExecutionContractError(
+            "kanban workspace/backend mismatch: dispatcher-managed workspaces "
+            f"require local execution, got {backend or 'unset'!r}"
+        )
+    if terminal.get("TERMINAL_CWD") != normalized_workspace:
+        raise KanbanExecutionContractError(
+            "kanban workspace/backend mismatch: terminal cwd and trusted workspace "
+            f"differ ({terminal.get('TERMINAL_CWD')!r} != {normalized_workspace})"
+        )
+    remote = sorted(
+        key for key in terminal
+        if key in _REMOTE_TERMINAL_KEYS or key.startswith(_REMOTE_TERMINAL_PREFIXES)
+    )
+    if remote:
+        raise KanbanExecutionContractError(
+            "kanban workspace/backend mismatch: local terminal policy still carries "
+            f"remote settings {remote}"
+        )
+    return KanbanExecutionContract(
+        backend=KANBAN_LOCAL_EXECUTION_BACKEND, workspace=normalized_workspace
+    )
+
+
+def _remote_terminal_config_keys(section: Mapping[str, object]) -> list[str]:
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+
+    return sorted(
+        key for key in section
+        if (env := TERMINAL_CONFIG_ENV_MAP.get(key, f"TERMINAL_{str(key).upper()}")) in _REMOTE_TERMINAL_KEYS
+        or env.startswith(_REMOTE_TERMINAL_PREFIXES)
+    )
+
+
+def pin_local_terminal_config(
+    section: MutableMapping[str, object], workspace: object
+) -> KanbanExecutionContract:
+    """Pin a session's frozen ``terminal:`` config section to local execution in *workspace*.
+
+    The managed worker binds the whole frozen config, so config readers (and its env bridge)
+    would otherwise still see the profile's ssh backend and hosts.
+    """
+    normalized_workspace = _validated_local_workspace(workspace)
+    for key in _remote_terminal_config_keys(section):
+        section.pop(key, None)
+    _pin_local_environment({}, normalized_workspace, terminal_config=section)  # type: ignore[arg-type]
+    return KanbanExecutionContract(
+        backend=KANBAN_LOCAL_EXECUTION_BACKEND, workspace=normalized_workspace
+    )
+
+
+def verify_local_terminal_config(
+    section: object, workspace: object
+) -> KanbanExecutionContract:
+    """Refuse an owner-run Kanban turn whose frozen ``terminal:`` config is not pinned local."""
+    normalized_workspace = _validated_local_workspace(workspace)
+    if not isinstance(section, Mapping):
+        raise KanbanExecutionContractError(
+            "kanban workspace/backend mismatch: frozen config has no local terminal section"
+        )
+    backend = str(section.get("backend") or "").strip().lower()
+    if backend != KANBAN_LOCAL_EXECUTION_BACKEND or section.get("cwd") != normalized_workspace:
+        raise KanbanExecutionContractError(
+            "kanban workspace/backend mismatch: frozen terminal config is "
+            f"{backend or 'unset'!r} in {section.get('cwd')!r}, not local in {normalized_workspace}"
+        )
+    remote = _remote_terminal_config_keys(section)
+    if remote:
+        raise KanbanExecutionContractError(
+            "kanban workspace/backend mismatch: frozen terminal config still carries "
+            f"remote settings {remote}"
+        )
     return KanbanExecutionContract(
         backend=KANBAN_LOCAL_EXECUTION_BACKEND, workspace=normalized_workspace
     )

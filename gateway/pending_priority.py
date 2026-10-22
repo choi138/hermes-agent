@@ -152,3 +152,55 @@ def absorb_process_notifications(
     for event in absorbed:
         head.absorb_processing_event(event)
     return len(absorbed)
+
+
+def authority_human_ahead(runner: Any, session_key: str, *, include_executing: bool = False) -> bool:
+    """The session authority's live drain holds a queued chat-user turn for this route (or, with
+    ``include_executing``, runs one of its admissions there now).
+
+    Humans enter the authority's durable FIFO while adapter-slot wakes do not, so the slot's
+    human-first pick cannot see them; a wake drained or dispatched meanwhile takes the route first.
+    Fails open (False): a read error must not park wakes.
+    """
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    store = getattr(runner, "session_store", None)
+    if authority is None or store is None or not session_key:
+        return False
+    try:
+        session_id = authority.logical_owner(store.peek_session_id(session_key))
+        if not session_id or session_id not in authority.sessions:
+            return False
+        if include_executing and session_id in authority.executing:
+            return True
+        drain = authority.sessions[session_id].task
+        if drain is None or drain.done():
+            return False  # a paused FIFO (unknown turn, busy worker) must not hold wakes until it resumes
+        from hermes_state_runtime import list_session_admissions
+        rows = list_session_admissions(authority.db, session_id=session_id)
+    except Exception:
+        return False
+    # A chat user's message only: API, hosted and cron rows do not hold slot wakes back.
+    return any(row["status"] == "queued" and str(row.get("principal_id") or "").startswith("messaging:")
+               for row in rows)
+
+
+def redispatch_parked_wake(runner: Any, source: Any, session_key: str) -> None:
+    """Start a wake left parked in the adapter slot once the authority's drain for the route exits.
+
+    A wake yielded or parked behind an authority human turn otherwise waits for that turn's own
+    end-of-turn drain, which a plugin-consumed, failed or /stop-cancelled turn never reaches.
+    A live adapter owner task or classic turn drains the slot itself and is left alone.
+    """
+    if getattr(runner, "_draining", False):
+        return
+    adapter = runner._delivery_adapter_for(source)
+    slot = getattr(adapter, "_pending_messages", None)
+    if not isinstance(slot, dict) or not is_deferrable_internal(slot.get(session_key)):
+        return
+    if session_key in adapter._active_sessions and not adapter._heal_stale_session_lock(session_key):
+        return
+    if runner._is_session_running(session_key):
+        return
+    from gateway.platforms.base import pop_pending_message_event
+    adapter._spawn_drain_task(pop_pending_message_event(slot, session_key), session_key)
