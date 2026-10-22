@@ -160,10 +160,17 @@ Block messages route Codex and Claude reviews to `hermes-delegate review --revie
 auth checks to `hermes-delegate smoke codex|claude`, and magi reviews to the ledger commands below.
 
 The tokenizer consumes plain and quoted runs with precompiled patterns, never slices the
-remaining text, and the hook process runs without cyclic GC. A 0.9 MB script dense with
-redirections took 2.4 s before this (8.4 s at 2 MB; 20 s for 0.5 MB on the server) and takes
-about 0.5 s now on the Mac, so large `write_file` scripts no longer approach the 10-second hook
-timeout that fails open. The cost is still linear in input size.
+remaining text, and the hook process runs without cyclic GC. A 0.5 MB script dense with
+redirections took 15.8-20 s on the server before this and failed open at the 10-second hook
+timeout. The server parses about 7x slower than the Mac, so the parse is also bounded: a shell
+text over 256 KiB, or a parse still running after 0.25 s, goes to the line fallback instead.
+The fallback blocks any unwrapped reviewer launch on a single line, keeps the same-line
+`review-gate run --ticket` and `REVIEW_GATE_NOT_REVIEW=` forms, and logs `parse: "budget"`.
+With these limits the whole hook process takes about 0.2-0.55 s on the server for any input
+up to 1.1 MB. Typical scripts, which are well under 64 KB, still get the full parse. The fallback
+differs from the full parse in both directions: it blocks a launch whose wrapper sits on an
+earlier line, and it misses launches that only the parser sees, such as a program held in a
+variable or a name split across a line continuation.
 
 Open the item once, start a ticket for each authorized review, and wrap the whole launch:
 

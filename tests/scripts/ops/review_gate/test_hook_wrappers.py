@@ -130,15 +130,42 @@ class WrapperTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn(route, json.loads(out)["message"])
 
-    def test_dense_redirections_in_a_large_script_finish_under_one_second(self):
-        content = "echo a>b<c>d 2>&1\n" * 50000 + "codex review\n"
+    def run_hook(self, content):
         payload = json.dumps(dict(tool_name="write_file", tool_input=dict(path="/r/x.sh", content=content)))
         begin = time.perf_counter()
         result = subprocess.run([sys.executable, str(HOOK)], input=payload, capture_output=True,
                                 text=True, timeout=30, check=False, env=dict(os.environ, REVIEW_GATE_HOOK_LOG=str(self.log)))
-        elapsed = time.perf_counter() - begin
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertLess(elapsed, 1.0)
+        return result, time.perf_counter() - begin
+
+    def test_large_scripts_finish_under_one_second_on_any_host(self):
+        # 551KB took 15.8-20s on the server and failed open at the 10s hook timeout.
+        for line, count in (("echo a>b<c>d 2>&1\n", 29000), ("echo a>b<c>d 2>&1\n", 60000),
+                            ('if [ -n "$X" ]; then printf "%s\\n" "$X" | grep -v f > o; fi\n', 16000)):
+            with self.subTest(line=line, count=count):
+                result, elapsed = self.run_hook(line * count + "codex review\n")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertLess(elapsed, 1.0)
+
+    def test_parse_budget_hands_over_to_the_conservative_fallback(self):
+        script = "echo a>b 2>&1\n" * 20 + "codex review\n" + "review-gate run --ticket T -- codex review\n"
+        payload = dict(tool_name="write_file", tool_input=dict(path="/r/x.sh", content=script))
+        with patch.object(hook, "PARSE_BUDGET_SECONDS", -1):
+            records = hook.detect(payload)
+        self.assertEqual([(r["decision"], r["parse"]) for r in records],
+                         [("blocked", "budget"), ("wrapped", "budget")])
+        self.assertEqual(hook.PARSE_DEADLINE[0], float("inf"))
+        self.assertEqual([r["parse"] for r in hook.detect(payload)], ["ok", "ok"])
+
+    def test_scripts_over_the_size_limit_skip_the_parser(self):
+        filler = "echo ok\n" * (hook.PARSE_SIZE_LIMIT // 8 + 1)
+        for content, decision in ((filler + "codex review\n", "blocked"),
+                                  (filler + 'REVIEW_GATE_NOT_REVIEW="docs" codex --help\n', None)):
+            with self.subTest(decision=decision):
+                payload = dict(tool_name="write_file", tool_input=dict(path="/r/x.sh", content=content))
+                with patch.object(hook, "scan_shell", side_effect=AssertionError("parsed")):
+                    records = hook.detect(payload)
+                self.assertEqual([r["decision"] for r in records if r["decision"] == "blocked"],
+                                 [decision] if decision else [])
 
 
 if __name__ == "__main__":

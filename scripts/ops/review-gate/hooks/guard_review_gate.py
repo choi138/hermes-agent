@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 
 
 DEFAULT_LOG = "~/.hermes/profiles/koharu/logs/review-gate-hook.jsonl"
@@ -44,6 +45,11 @@ REDIRECT = re.compile(r"(?:<<<|<<-|&>>?|[<>](?:[<>]|&|\|)?)")
 # Runs that need no per-character decision; the tokenizer otherwise costs one Python step per byte.
 PLAIN_RUN = re.compile(r"[^\s\\$`'\"#;&|()<>{}]+")
 DOUBLE_QUOTED_RUN = re.compile(r'[^"\\$`]+')
+# The server parses about 7x slower than the Mac (551KB took 15.8-20s, past the 10s fail-open
+# timeout). Beyond these limits the conservative line fallback decides, keeping the hook under 1s.
+PARSE_BUDGET_SECONDS = 0.25
+PARSE_SIZE_LIMIT = 256 * 1024
+PARSE_DEADLINE = [float("inf")]
 WRITE_TOOL = re.compile(r"(?:^|[\s,])(Edit|Write|MultiEdit|NotebookEdit)(?=\(|[\s,]|$)")
 
 
@@ -181,6 +187,8 @@ def tokenize(text):
 
     def word():
         nonlocal value, subs, active, evaluated
+        if time.perf_counter() > PARSE_DEADLINE[0]:
+            raise ParseFailure("budget")
         if active:
             command.append(Word("".join(value), subs, "".join(evaluated)))
         value, subs, active, evaluated = [], [], False, []
@@ -743,6 +751,8 @@ def scan_shell(text, assignments=None, depth=0):
         raise ParseFailure("nesting limit")
     variables = {}
     for words in tokenize(text):
+        if time.perf_counter() > PARSE_DEADLINE[0]:
+            raise ParseFailure("budget")
         yield from scan_command(words, assignments, depth, variables=variables)
 
 
@@ -755,8 +765,23 @@ FALLBACK_BYPASS = re.compile(
     r"REVIEW_GATE_NOT_REVIEW=(?:\"[^\"\n]+\"|'[^'\n]+'|[^\s;|&]+)\s*$")
 
 
-def fallback(text):
-    for line in text.splitlines():
+FALLBACK_NAME = re.compile(r"codex|claude|magi|python")
+
+
+def fallback_lines(text):
+    # Cutting at newlines first gives the same lines as splitlines(); only lines naming a program can match.
+    end = -1
+    for name in FALLBACK_NAME.finditer(text):
+        if name.start() < end:
+            continue
+        begin = text.rfind("\n", 0, name.start()) + 1
+        end = text.find("\n", name.end())
+        end = len(text) if end < 0 else end
+        yield from (line for line in text[begin:end].splitlines() if FALLBACK_NAME.search(line))
+
+
+def fallback(text, parse="fallback"):
+    for line in fallback_lines(text):
         for match in FALLBACK.finditer(line):
             program = match.group("program")
             args = re.split(r"[;|&]", line[match.end():], maxsplit=1)[0]
@@ -769,12 +794,12 @@ def fallback(text):
             before = re.split(r"[;|&]", line[:match.start()])[-1]
             if FALLBACK_WRAP.search(before):
                 ticket = re.search(r"--ticket(?:=|\s+)(\S+)", before)
-                yield event(kind, "wrapped", ticket=ticket[1].strip("\"'"), parse="fallback")
+                yield event(kind, "wrapped", ticket=ticket[1].strip("\"'"), parse=parse)
             elif FALLBACK_BYPASS.search(before):
                 reason = FALLBACK_BYPASS.search(before)[0].split("=", 1)[1].strip().strip("\"'")
-                yield event(kind, "bypass", reason=reason, parse="fallback")
+                yield event(kind, "bypass", reason=reason, parse=parse)
             else:
-                yield event(kind, "blocked", parse="fallback")
+                yield event(kind, "blocked", parse=parse)
 
 
 def string_command(node, constants):
@@ -865,12 +890,19 @@ def detect(payload):
                 path.endswith((".sh", ".zsh", ".bash", ".command")) or content.startswith("#!")):
             commands = [content]
     results = []
-    for command in commands:
-        try:
-            results.extend(list(scan_shell(command) if isinstance(command, str)
-                                else scan_command(command)))
-        except ParseFailure:
-            results.extend(fallback(command if isinstance(command, str) else " ".join(w.value for w in command)))
+    PARSE_DEADLINE[0] = time.perf_counter() + PARSE_BUDGET_SECONDS
+    try:
+        for command in commands:
+            try:
+                if isinstance(command, str) and len(command) > PARSE_SIZE_LIMIT:
+                    raise ParseFailure("budget")
+                results.extend(list(scan_shell(command) if isinstance(command, str)
+                                    else scan_command(command)))
+            except ParseFailure as exc:
+                text = command if isinstance(command, str) else " ".join(w.value for w in command)
+                results.extend(fallback(text, "budget" if str(exc) == "budget" else "fallback"))
+    finally:
+        PARSE_DEADLINE[0] = float("inf")
     return results
 
 
