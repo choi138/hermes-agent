@@ -153,6 +153,14 @@ def format_activity(since, records, data=None, mac_error=None, hook_error=None):
     return "\n".join(lines)
 
 
+def format_bypass_trend(records, previous):
+    """The REVIEW_GATE_NOT_REVIEW count is the weekly target metric (plan 2-C: halve it)."""
+    current = [r for r in records if r.get("decision") == "bypass"]
+    smoke = sum(bool(re.search(r"smoke|auth", str(r.get("bypass_reason") or ""), re.I)) for r in current)
+    return "우회 주간 지표 (REVIEW_GATE_NOT_REVIEW): 이번 주 {}건 (smoke/auth 사유 {}건) / 직전 7일 {}건".format(
+        len(current), smoke, sum(r.get("decision") == "bypass" for r in previous))
+
+
 def format_deploy(server, mac=None, mac_error=None):
     lines = ["배포 드리프트"]
     problems = []
@@ -175,10 +183,10 @@ def format_deploy(server, mac=None, mac_error=None):
     return "\n".join(lines)
 
 
-def format_report(since, records, data=None, mac_error=None, hook_error=None):
+def format_report(since, records, data=None, mac_error=None, hook_error=None, previous=()):
     activity = format_activity(since, records, data, mac_error, hook_error)
     deployment = format_deploy(deploy_state("server"), data.get("deploy") if data else None, mac_error)
-    return activity + "\n\n" + deployment
+    return "\n\n".join((activity, format_bypass_trend(records, previous), deployment))
 
 
 def main(argv=None):
@@ -186,18 +194,21 @@ def main(argv=None):
     parser.add_argument("--since", type=since_date, default=datetime.now(timezone.utc) - timedelta(days=7))
     args = parser.parse_args(argv)
     since = args.since.date().isoformat()
-    records, data, mac_error, hook_error = [], None, None, None
+    records, previous, data, mac_error, hook_error = [], [], None, None, None
     try:
-        records = hook_records(since)
+        records = hook_records((args.since - timedelta(days=7)).date().isoformat())
     except OSError as exc:
         hook_error = type(exc).__name__
+    cutoff = since_date(since)
+    previous = [r for r in records if timestamp(r["ts"]) < cutoff]
+    records = [r for r in records if timestamp(r["ts"]) >= cutoff]
     try:
         data = mac_json(since)
     except Exception as exc:
         mac_error = type(exc).__name__
         if isinstance(exc, subprocess.CalledProcessError):
             mac_error += " (exit {})".format(exc.returncode)
-    print(format_report(since, records, data, mac_error, hook_error))
+    print(format_report(since, records, data, mac_error, hook_error, previous))
     return 0
 
 
