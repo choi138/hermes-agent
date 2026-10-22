@@ -225,6 +225,21 @@ class AuditTests(unittest.TestCase):
         self.assertLess(output.index("/repo12"), output.index("/repo11"))
         self.assertLessEqual(len(output.split("\n\n")[0].splitlines()), 25)
 
+    def test_report_weekly_bypass_metric_compares_previous_week(self):
+        path = Path(os.environ["REVIEW_GATE_HOOK_LOG"])
+        self.jsonl(path, [dict(ts="2026-10-05T00:00:00Z", decision="bypass", bypass_reason="too old"),
+                          dict(ts="2026-10-06T00:00:00Z", decision="bypass", bypass_reason="auth smoke"),
+                          dict(ts="2026-10-12T23:59:59Z", decision="bypass", bypass_reason="research"),
+                          dict(ts="2026-10-13T00:00:00Z", decision="bypass", bypass_reason="Codex AUTH check"),
+                          dict(ts="2026-10-14T00:00:00Z", decision="blocked")])
+        output = io.StringIO()
+        with patch.object(report, "mac_json", return_value=self.empty_data()), redirect_stdout(output):
+            self.assertEqual(report.main(["--since", SINCE]), 0)
+        sections = output.getvalue().split("\n\n")
+        self.assertIn("차단 1 / wrapped 0 / bypass 1 / 오류 0", sections[0])
+        self.assertEqual(sections[1], "우회 주간 지표 (REVIEW_GATE_NOT_REVIEW): 이번 주 1건 "
+                                      "(smoke/auth 사유 1건) / 직전 7일 2건")
+
     def test_report_mac_failure_still_prints_hook_and_exits_zero(self):
         output = io.StringIO()
         with patch.object(report, "mac_json", side_effect=subprocess.CalledProcessError(255, ["ssh"])), redirect_stdout(output):

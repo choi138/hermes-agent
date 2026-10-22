@@ -69,10 +69,33 @@ class HookTests(unittest.TestCase):
         self.assertModified(term(background=True, notify=True, persist_on_release=False),
                             {"continue_on_complete": True})
 
+    def assertOptedOut(self, payload):
+        proc, lines, _ = run(payload)
+        self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)
+        self.assertEqual([x["decision"] for x in lines], ["opted-out"])
+
     def test_explicit_continue_true_or_false_is_respected(self):
         self.assertUntouched(term(background=True, notify=True, continue_on_complete=True))
-        self.assertUntouched(term(background=True, notify=True, continue_on_complete=False))
-        self.assertUntouched(term(timeout=900, continue_on_complete=False))
+        self.assertOptedOut(term(background=True, notify=True, continue_on_complete=False))
+        self.assertOptedOut(term(timeout=900, continue_on_complete=False))
+
+    def test_only_boolean_false_is_an_opt_out(self):
+        for value in (None, "false", 0):
+            with self.subTest(value=value):
+                self.assertUntouched(term(background=True, notify=True, continue_on_complete=value))
+                proc, lines, _ = run(term(timeout=900, continue_on_complete=value))
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual([x["decision"] for x in lines], ["blocked"])
+        proc, _, _ = run(term(timeout=900, continue_on_complete=True))
+        self.assertEqual(proc.returncode, 2)
+
+    def test_explicit_notify_wins_over_notify_on_complete(self):
+        self.assertUntouched(term(background=True, notify=False, notify_on_complete=True))
+        self.assertUntouched(term(background=True, notify=["ready"], notify_on_complete=True))
+        self.assertUntouched(term(background=True, notify=False, continue_on_complete=False))
+        self.assertModified(term(background=True, notify=["ready"], heartbeat=60),
+                            {"continue_on_complete": True, "persist_on_release": True})
+        self.assertUntouched(term(background=True, heartbeat=True))
 
     def test_background_without_exit_notification_untouched(self):
         self.assertUntouched(term(background=True))  # server/daemon

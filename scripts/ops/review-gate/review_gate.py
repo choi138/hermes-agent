@@ -45,6 +45,10 @@ class GateError(Exception):
         self.code = code
 
 
+class Interrupted(BaseException):
+    pass
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         raise GateError(3, message)
@@ -165,8 +169,9 @@ def start(db, args):
             if any(t["fallback"] for t in tickets):
                 refuse("Fallback already used; the owner must resolve this round or approve another.")
             if latest is None or latest["verdict"] != "UNREVIEWED":
-                refuse("Fallback requires the latest closed ticket to be UNREVIEWED; "
-                       "the owner must record the failed review first.")
+                refuse("Fallback requires the latest closed ticket to be UNREVIEWED; record "
+                       "the failed review with review-gate close --verdict UNREVIEWED first, "
+                       "then retry.")
             if latest["reviewer"] == args.reviewer:
                 refuse("Fallback requires a different reviewer CLI; the owner must select one.")
             if not same_commit(args.commit, latest["reviewed_commit"]):
@@ -176,13 +181,18 @@ def start(db, args):
         else:
             if db.execute("""SELECT 1 FROM tickets WHERE item = ? AND
                     (status != 'closed' OR verdict IS NULL)""", (args.item,)).fetchone():
-                refuse("Previous tickets must be fully closed; the owner must record "
-                       "each pending verdict first.")
+                refuse("Previous tickets must be fully closed; reproduce each pending verdict, "
+                       "record it with review-gate close, then retry. Report to the user only "
+                       "if a verdict cannot be reproduced.")
             round_number += 1
             if (round_number > 2 or item["status"] in ("cap-reached", "stopped-unreviewed")) \
                     and not args.owner_approval:
                 refuse("Item {} stopped at round {}; the owner must supply --owner-approval "
                        "<Discord message ID> for a further round.".format(args.item, round_number - 1))
+        if args.owner_approval and db.execute(
+                "SELECT 1 FROM tickets WHERE owner_approval = ?", (args.owner_approval,)).fetchone():
+            refuse(f"Owner approval {args.owner_approval} was already used; each further round "
+                   "needs a new owner approval message ID.")
         ticket = uuid.uuid4().hex
         db.execute("""INSERT INTO tickets
             (id, item, round, reviewer, reviewed_commit, status, issued_at,
@@ -215,26 +225,52 @@ def run(db, args):
                    (stamp(), json.dumps(args.argv), args.ticket))
     env = os.environ.copy()
     env["MAGI_REVIEW_TICKET"] = args.ticket
+    received, armed = [], [False]
+
+    # The handler raises only while waiting: a signal inside Popen would orphan the
+    # child, and one during the final write would leave the ticket running.
+    def on_signal(signum, frame):
+        received.append(signum)
+        if armed[0]:
+            armed[0] = False
+            raise Interrupted()
+
+    previous = {s: signal.signal(s, on_signal)
+                for s in (signal.SIGHUP, signal.SIGTERM)}  # windows-footgun: ok — macOS-only ledger
     try:
-        child = subprocess.Popen(args.argv, env=env, start_new_session=True)
-    except OSError as exc:
-        print("review-gate: cannot execute child: {}".format(exc), file=sys.stderr)
-        code = 127 if isinstance(exc, FileNotFoundError) else 126
-    else:
         try:
-            code = child.wait(timeout=args.timeout)
-            if code < 0:
-                code = 128 - code
-        except subprocess.TimeoutExpired:
-            kill_group(child)
-            code = 124
-        except KeyboardInterrupt:
-            kill_group(child)
-            code = 130
-    with transaction(db):
-        # A concurrent close must never be undone by completion of the child.
-        db.execute("""UPDATE tickets SET status=CASE WHEN status='running' THEN 'ran' ELSE status END,
-            ended_at=?, exit_code=? WHERE id=?""", (stamp(), code, args.ticket))
+            child = subprocess.Popen(args.argv, env=env, start_new_session=True)
+        except OSError as exc:
+            print("review-gate: cannot execute child: {}".format(exc), file=sys.stderr)
+            code = 127 if isinstance(exc, FileNotFoundError) else 126
+        else:
+            try:
+                try:
+                    armed[0] = True
+                    if received:
+                        armed[0] = False
+                        raise Interrupted()
+                    code = child.wait(timeout=args.timeout)
+                finally:
+                    armed[0] = False
+                if code < 0:
+                    code = 128 - code
+            except subprocess.TimeoutExpired:
+                kill_group(child)
+                code = 124
+            except KeyboardInterrupt:
+                kill_group(child)
+                code = 130
+            except Interrupted:
+                kill_group(child)
+                code = 128 + received[0]
+        with transaction(db):
+            # A concurrent close must never be undone by completion of the child.
+            db.execute("""UPDATE tickets SET status=CASE WHEN status='running' THEN 'ran' ELSE status END,
+                ended_at=?, exit_code=? WHERE id=?""", (stamp(), code, args.ticket))
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
     return code
 
 
@@ -396,9 +432,11 @@ def validate(args):
         if args.owner_approval is not None:
             pattern("owner approval ID", args.owner_approval, r"[0-9]{15,22}")
     if args.command == "close":
-        if args.blockers is not None and args.blockers < 1:
-            raise GateError(3, "--blockers must be >= 1")
-        if args.verdict == "BLOCK" and args.blockers is None:
+        if args.blockers is not None and args.blockers < 0:
+            raise GateError(3, "--blockers must be >= 0")
+        if args.verdict == "PASS" and args.blockers:
+            raise GateError(3, "PASS takes --blockers 0 or no --blockers; use BLOCK for P0/P1 findings")
+        if args.verdict == "BLOCK" and not args.blockers:
             raise GateError(3, "BLOCK requires --blockers N (>= 1)")
         if args.verdict == "UNREVIEWED" and not (args.reason and args.reason.strip()):
             raise GateError(3, "UNREVIEWED requires --reason")

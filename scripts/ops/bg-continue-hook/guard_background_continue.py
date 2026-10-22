@@ -6,14 +6,16 @@ opens a read-only verification turn when it exits, so the approved work stalls u
 sends a message. The rule lived in a skill and was forgotten repeatedly (2026-10-19..20).
 
 Rules (terminal tool only; Hermes semantics verified in tools/terminal_tool.py of the live tree):
-  A. background=true, completion notification on (notify is True, or notify_on_complete is True,
-     or heartbeat > 0), and the caller did NOT pass continue_on_complete at all
+  Exit notification is decided first, exactly as Hermes does: an explicit boolean notify wins over
+  notify_on_complete, a notify pattern list (watch_patterns) means no exit notification, and an
+  integer heartbeat > 0 turns it on.
+  A. background, exit notification on, and continue_on_complete not passed
      -> modify: continue_on_complete=true, plus persist_on_release=true when not passed.
   B. foreground (background falsy), numeric timeout above the foreground cap (600 s, or
-     $TERMINAL_MAX_FOREGROUND_TIMEOUT), and continue_on_complete not passed
+     $TERMINAL_MAX_FOREGROUND_TIMEOUT), and continue_on_complete not exactly false
      -> block: Hermes would silently promote it to an unarmed background run.
-  An explicit continue_on_complete (true or false) is always respected: that is the opt-out.
-  notify as a pattern list (watch_patterns) is never touched: it does not notify on exit.
+  Only continue_on_complete=false (a boolean) is the opt-out; it is respected and logged as
+  "opted-out". true is already armed. Any other value is left for Hermes to refuse.
 
 Exit 0 = allow (stdout empty, or a modify directive). Exit 2 = block. Any internal error or
 malformed stdin = allow (fail open). The log never contains the command text.
@@ -41,8 +43,18 @@ def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _notifies_on_exit(args):
+    notify = args.get("notify")
+    if isinstance(notify, bool):
+        on_exit = notify
+    else:
+        on_exit = notify is None and args.get("notify_on_complete") is True
+    heartbeat = args.get("heartbeat")
+    return on_exit or (isinstance(heartbeat, int) and not isinstance(heartbeat, bool) and heartbeat > 0)
+
+
 def decide(payload):
-    """Return (decision, directive) where decision is None, 'modified' or 'blocked'."""
+    """Return (decision, directive): decision is None, 'modified', 'opted-out' or 'blocked'."""
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "pre_tool_call":
         return None, None
     if payload.get("tool_name") != "terminal":
@@ -50,17 +62,14 @@ def decide(payload):
     args = payload.get("tool_input")  # Hermes sends tool args only here (None when not a dict)
     if not isinstance(args, dict):
         return None, None
-    if "continue_on_complete" in args:
-        return None, None
+    opted_out = args.get("continue_on_complete") is False
 
-    if args.get("background") is True:
-        heartbeat = args.get("heartbeat")
-        notify_on_exit = (
-            args.get("notify") is True
-            or args.get("notify_on_complete") is True
-            or (_is_number(heartbeat) and heartbeat > 0)
-        )
-        if not notify_on_exit:
+    if args.get("background"):
+        if not _notifies_on_exit(args):
+            return None, None
+        if opted_out:
+            return "opted-out", None
+        if "continue_on_complete" in args:
             return None, None
         patch = {"continue_on_complete": True}
         if "persist_on_release" not in args:
@@ -69,6 +78,8 @@ def decide(payload):
 
     if not args.get("background"):
         timeout = args.get("timeout")
+        if _is_number(timeout) and timeout > _cap() and opted_out:
+            return "opted-out", None
         if _is_number(timeout) and timeout > _cap():
             message = (
                 "bg-continue hook: foreground timeout %ss exceeds the %ss cap, so Hermes would promote "
@@ -112,6 +123,8 @@ def main():
     if decision is None:
         return 0
     _log(decision, payload)
+    if directive is None:
+        return 0
     sys.stdout.write(json.dumps(directive))
     return 2 if decision == "blocked" else 0
 

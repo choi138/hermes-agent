@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -205,8 +206,11 @@ class LedgerTests(GateCase):
         for flags in ((), ("--owner-approval", APPROVAL)):
             with self.subTest(flags=flags):
                 result = self.start(flags=flags, code=2)
-                self.assertIn("verdict", result.stderr.lower())
-                self.assertIn("first", result.stderr.lower())
+                self.assertIn("reproduce each pending verdict, record it with review-gate close, "
+                              "then retry", result.stderr)
+                self.assertIn("Report to the user only if a verdict cannot be reproduced",
+                              result.stderr)
+                self.assertNotIn("owner must record", result.stderr)
         self.assertEqual(len(self.item_status()["tickets"]), 2)
         self.close(second)
         third = self.start()
@@ -297,7 +301,9 @@ class LedgerTests(GateCase):
         # Close in reverse issue order to distinguish latest close from latest issue.
         self.close(joined, "UNREVIEWED", "--reason", "unavailable")
         self.close(first)
-        self.start(reviewer="codex", flags=("--fallback",), code=2)
+        result = self.start(reviewer="codex", flags=("--fallback",), code=2)
+        self.assertIn("record the failed review with review-gate close --verdict UNREVIEWED "
+                      "first, then retry", result.stderr)
 
     def test_05_join_same_round_maximum_three_and_not_after_closed(self):
         self.open()
@@ -546,6 +552,59 @@ class LedgerTests(GateCase):
         self.assertEqual(self.ticket(ticket)["status"], "ran")
         self.assertEqual(self.ticket(ticket)["exit_code"], 127)
         self.assertIsNone(self.ticket(ticket)["verdict"])
+
+    def test_close_blocker_counts_follow_the_verdict(self):
+        self.open()
+        ticket = self.start()
+        for argv in (("--verdict", "PASS", "--blockers", "1"), ("--verdict", "PASS", "--blockers", "-1"),
+                     ("--verdict", "BLOCK", "--blockers", "0")):
+            with self.subTest(argv=argv):
+                self.cli("close", "--ticket", ticket, *argv, code=3)
+                self.assertEqual(self.ticket(ticket)["status"], "open")
+        self.close(ticket, "PASS", "--blockers", "0")
+        self.assertEqual(self.ticket(ticket)["blockers"], 0)
+        self.assertEqual(self.item_status()["item"]["status"], "passed")
+
+    def test_owner_approval_id_cannot_be_reused(self):
+        self.open()
+        for _ in range(2):
+            self.close(self.start(), "BLOCK", "--blockers", "1")
+        self.close(self.start(flags=("--owner-approval", APPROVAL)), "BLOCK", "--blockers", "1")
+        result = self.start(flags=("--owner-approval", APPROVAL), code=2)
+        self.assertIn("already used", result.stderr)
+        self.open("other-item")
+        self.start(item="other-item", flags=("--owner-approval", APPROVAL), code=2)
+        fourth = self.start(flags=("--owner-approval", "1561666040025321616"))
+        self.assertEqual(self.ticket(fourth)["round"], 4)
+
+    def test_hangup_or_terminate_kills_reviewer_group_and_records_ran(self):
+        script = ("import os,pathlib,subprocess,sys,time\n"
+                  "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                  "pathlib.Path(sys.argv[1]).write_text('%d %d' % (os.getpid(), grandchild.pid))\n"
+                  "time.sleep(60)\n")
+        for number, name in ((signal.SIGHUP, "hup"), (signal.SIGTERM, "term")):
+            with self.subTest(signal=name):
+                item = "signal-" + name
+                self.open(item)
+                ticket = self.start(item)
+                pids = self.tmp / (name + ".pids")
+                runner = subprocess.Popen([PYTHON, str(GATE), "run", "--ticket", ticket, "--",
+                                           PYTHON, "-c", script, str(pids)], env=self.env,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.addCleanup(self.stop_child, runner)
+                deadline = time.monotonic() + 10
+                while not (pids.exists() and pids.read_text()) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                reviewer, grandchild = map(int, pids.read_text().split())
+                runner.send_signal(number)
+                runner.communicate(timeout=10)
+                self.assertEqual(runner.returncode, 128 + number)
+                row = self.ticket(ticket)
+                self.assertEqual((row["status"], row["exit_code"]), ("ran", 128 + number))
+                self.assertIsNotNone(row["ended_at"])
+                for pid in (reviewer, grandchild):
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
 
 
 if __name__ == "__main__":

@@ -19,26 +19,34 @@ ticket IDs, timestamps, execution details, and recorded evidence/reasons.
 
 - Two rounds **per item across pre/post-PR**, processes, CLIs and bot passes. Reopening an ID
   is refused. Every further round requires `start --owner-approval <15–22 digit Discord ID>`.
-  Approval is recorded on that ticket and authorizes that round only.
+  Approval is recorded on that ticket and authorizes that round only; an approval ID already
+  recorded on any ticket in the ledger is refused, so each round needs a new owner message.
 - `start --join` adds a parallel reviewer only while the current round has an `open` or
   `running` ticket, up to three total tickets. Its commit must match the round's first ticket.
   `start --fallback` retries the latest closed UNREVIEWED ticket once, using a different CLI
   and the failed ticket's commit. For both flags, one commit SHA must be a prefix of the other.
   These flags are mutually exclusive. A fallback PASS resolves only its linked UNREVIEWED
   ticket. Other unresolved failures prevent PASS; a BLOCK always wins within its round.
+- `close` blocker counts follow the verdict: PASS takes `--blockers 0` or no `--blockers`,
+  BLOCK requires `--blockers N` (N >= 1), UNREVIEWED requires `--reason`. The coordinator
+  records the verdict after reproducing the reviewer's findings; the owner only supplies
+  `--owner-approval` for round 3 and later.
 - `close --verdict UNREVIEWED --reason 'auth failed'` records a failed review, never a PASS.
   A fallback UNREVIEWED stops the item. Round 2+ BLOCK reaches the cap. Both print an owner
   notice and require approval for another round. Old-round closes preserve the current round.
 - `run` claims an open ticket atomically, streams the child without a shell, and records
   execution separately from verdict. Nonzero exits and timeouts still require `close`.
-  Timeout kills the child's process group and returns 124. Every ticket must be `closed`
+  Timeout kills the child's process group and returns 124. SIGHUP or SIGTERM to `run` kills
+  the child's process group, records the ticket as `ran` with exit 128+signal, and returns
+  that code, so a cancelled launcher never leaves a `running` ticket. Every ticket must be `closed`
   with a verdict before a new round can start, including `ran` tickets and approved rounds.
 - One ticket authorizes one guarded magi execution, only while `running` inside `run`.
   The shim uses `check-ticket --consume T` to claim it atomically; simultaneous claims have
   exactly one winner. A hand-exported `open` ticket or any repeated claim is refused (exit 2).
   `check-ticket T` remains read-only validation of an unexpired `open`/`running` ticket,
   without consuming it. Refused claims are logged as `rejected`; reuse details say `ticket-reuse`.
-- The shim allows help/version and `lanes`, `doctor`, `report`, `report-plan`, `plan`, `publish`.
+- The shim allows help/version/`--schema`/`--examples` and `lanes`, `doctor`, `report`,
+  `report-plan`, `plan`, `publish`, `sample`, `quality`.
   Everything else needs an unconsumed running ticket issued less than six hours ago, a bypass
   reason of at least eight characters, or a resolved `--repo-dir` strictly below
   `$HOME/.fido-automation/`. Exemptions are logged; only explicit development bypasses may
@@ -54,7 +62,8 @@ Reuse refusals appear in both plain and JSON audit output with `ticket-reuse` in
 Exit codes: **0** success, **2** policy refusal, **3** usage/validation/storage error,
 **4** item/ticket not found (`check-ticket` returns **2** for unknown tickets).
 `run` returns the child's exit code instead; signal exits use 128+signal, missing executables
-127, non-executable children 126, timeout 124, keyboard interruption 130.
+127, non-executable children 126, timeout 124, keyboard interruption 130, SIGHUP/SIGTERM to
+`run` itself 129/143.
 
 ## Deploy, check, and rollback
 
@@ -124,18 +133,44 @@ sandbox), Claude print-mode reviews without write tools/permissions, `claude ult
 review commands gated by the magi shim, and Python `run_codex_task.py --sandbox read-only`.
 It inspects terminal commands, execution-call arguments in Python `execute_code`, and shell
 files written through `write_file`/`patch`. Quoted mentions, docstrings, ordinary file writes,
-and write-capable implementation sessions are allowed. Shell/ssh/utility wrappers, cmux
-send text, evaluated command substitutions, groups, and control-flow prefixes are parsed.
+and write-capable implementation sessions are allowed, as are help/version-only calls
+(`codex exec --help`, `magi --examples VERB`, `magi --schema`) and the non-review `magi sample`
+and `magi quality`. Shell/ssh/utility wrappers (`env`, `sudo`, `nice`, `timeout`, `nohup`,
+`screen`, `eval`, `xargs`, `stdbuf`, BSD and util-linux `script`, `tmux` new-session/new-window/
+split-window/respawn and send-keys, `npx @openai/codex` and `npx -c`), cmux send/--command text,
+evaluated command substitutions, groups, and control-flow prefixes are parsed. A program given
+as a variable or substitution (`$CODEX exec`, `"$(command -v claude)" -p`) is matched by its
+name and by a value assigned earlier in the same script.
 Heredocs (`<<`, `<<-`, including quoted delimiters and multiple bodies) are attached to
 their receiving command. Bodies are data unless an unquoted delimiter permits command
 substitutions, or the receiver is a shell without `-c` (including through ssh). Here-strings
 (`<<<`) follow the same receiver rule. A ticket-wrapped command's own bodies are exempt;
 commands after the bodies are checked independently. Missing delimiters or excessive nesting
-use the existing scoped fallback. In Python argv lists/tuples, a constant string program is
-required; dynamic arguments, including starred elements, become `__dynamic__` placeholders.
+use the existing scoped fallback. In Python argv lists/tuples, the program must be a constant string, a name bound once to one,
+or a variable/attribute whose name matches a reviewer; other dynamic arguments, including
+starred elements, become `__dynamic__` placeholders. `import subprocess as sp`, `from
+subprocess import run`, `import os as o` and `from hermes_tools import terminal as t` aliases
+are followed.
 Local `codex --help`, `codex exec --help`, and `claude --help` were checked; compatibility
 spellings required by the policy (`--full-auto`, `--yolo`, `--oss-provider`, and
 `--ask-for-approval`) remain recognized alongside current options.
+
+Block messages route Codex and Claude reviews to `hermes-delegate review --reviewer codex|claude`
+(which issues the ticket and wraps the launch), Claude implementation to `hermes-delegate claude`,
+auth checks to `hermes-delegate smoke codex|claude`, and magi reviews to the ledger commands below.
+
+The tokenizer consumes plain and quoted runs with precompiled patterns, never slices the
+remaining text, and the hook process runs without cyclic GC. A 0.5 MB script dense with
+redirections took 15.8-20 s on the server before this and failed open at the 10-second hook
+timeout. The server parses about 7x slower than the Mac, so the parse is also bounded: a shell
+text over 256 KiB, or a parse still running after 0.25 s, goes to the line fallback instead.
+The fallback blocks any unwrapped reviewer launch on a single line, keeps the same-line
+`review-gate run --ticket` and `REVIEW_GATE_NOT_REVIEW=` forms, and logs `parse: "budget"`.
+With these limits the whole hook process takes about 0.2-0.55 s on the server for any input
+up to 1.1 MB. Typical scripts, which are well under 64 KB, still get the full parse. The fallback
+differs from the full parse in both directions: it blocks a launch whose wrapper sits on an
+earlier line, and it misses launches that only the parser sees, such as a program held in a
+variable or a name split across a line continuation.
 
 Open the item once, start a ticket for each authorized review, and wrap the whole launch:
 
@@ -200,15 +235,17 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 geunwon-mac /usr/bin/python3 \
 date. It is split with `shlex`, without a local shell. The Mac step times out after 120 seconds.
 The installer deploys the standalone report on the server and the ledger plus collector on the Mac.
 The report includes a `배포 드리프트` section and prints Korean plain text,
-at most ten newest `other` sessions, one `fido` count, and bounded bypass reasons. Mac failure
+at most ten newest `other` sessions, one `fido` count, bounded bypass reasons, and a weekly
+`REVIEW_GATE_NOT_REVIEW` bypass metric (this week, of which smoke/auth reasons, and the previous
+seven days) that tracks the goal of halving bypasses once `hermes-delegate smoke` exists. Mac failure
 still prints the hook summary and error class/exit code, and exits 0. Cron/Discord delivery
 belong to the coordinator.
 
 Known gaps: launches hidden in script files the coordinator did not write through
 `write_file`/`patch` cannot be inspected; other agents' and humans' reviews are seen only by
 the audit. Codex `--ephemeral` leaves no session file, so it is visible only in the hook log.
-Dynamic command construction, aliases, and imported Python execution aliases are outside
-the static parser. The hook is a policy guard, not a shell interpreter or security boundary.
+Shell aliases and functions, command text assembled at run time, and Python programs computed
+by calls (`shutil.which("codex")`) or f-strings are outside the static parser. The hook is a policy guard, not a shell interpreter or security boundary.
 
 ## Limitations
 
@@ -219,6 +256,6 @@ the static parser. The hook is a policy guard, not a shell interpreter or securi
 - Verdicts, reviewer names, failure reasons and bot passes are supplied by the caller. There
   is no automatic reviewer selection, fallback execution, verdict interpretation or owner
   notification transport. Owner notices go to stderr; `audit` is the recovery view.
-- Killing the ledger process externally can leave a running ticket; inspect and close it
-  explicitly. Tickets expire for shim entry, not for recording a verdict. Use one shared DB
+- SIGKILL of the ledger process (or a crash) can still leave a running ticket; inspect and
+  close it explicitly. Tickets expire for shim entry, not for recording a verdict. Use one shared DB
   to retain counts across sessions; changing/deleting the DB loses that history.
