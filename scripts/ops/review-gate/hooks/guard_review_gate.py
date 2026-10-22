@@ -164,6 +164,15 @@ def substitution(text, start, backtick=False, nesting=0):
     raise ParseFailure("unterminated substitution")
 
 
+def run_end(text, i, quote=None):
+    """End of the run at i that needs no per-character decision (at least one character)."""
+    if quote == "'":
+        end = text.find("'", i)
+        return len(text) if end < 0 else end
+    run = (DOUBLE_QUOTED_RUN if quote else PLAIN_RUN).match(text, i)
+    return run.end() if run else i + 1
+
+
 def tokenize(text):
     """Split simple commands without discarding substitution evaluation context."""
     commands, command, value, subs, evaluated = [], [], [], [], []
@@ -210,12 +219,7 @@ def tokenize(text):
                 quote = None
                 i += 1
             else:
-                if quote == "'":
-                    end = text.find("'", i)
-                    end = len(text) if end < 0 else end
-                else:
-                    run = DOUBLE_QUOTED_RUN.match(text, i)
-                    end = run.end() if run else i + 1
+                end = run_end(text, i, quote)
                 append(text[i:end])
                 i = end
             continue
@@ -256,8 +260,7 @@ def tokenize(text):
         elif c.isspace():
             word()
         else:
-            end = PLAIN_RUN.match(text, i)
-            end = end.end() if end else i + 1
+            end = run_end(text, i)
             append(text[i:end])
             active, i = True, end
             continue
@@ -317,6 +320,18 @@ def python_script(argv):
     return None
 
 
+MAGI_INFO = {"--help", "-h", "--version", "--schema", "--examples"}
+MAGI_UNGATED = {"lanes", "doctor", "report", "report-plan", "plan", "publish", "sample", "quality"}
+
+
+def magi_reviewer(args):
+    # Exactly the shim's scan: help-like options anywhere; first non-option is subcommand.
+    if any(arg.split("=", 1)[0] in MAGI_INFO for arg in args):
+        return None
+    sub = next((arg for arg in args if not arg.startswith("-")), None)
+    return None if sub is None or sub in MAGI_UNGATED else "magi"
+
+
 def reviewer(argv):
     if not argv:
         return None
@@ -365,15 +380,7 @@ def reviewer(argv):
             return None
         return "claude"
     if program == "magi":
-        # Exactly the shim's scan: help-like options anywhere; first non-option is subcommand.
-        if any(arg in ("--help", "-h", "--version", "--schema", "--examples")
-               or arg.startswith("--examples=") for arg in args):
-            return None
-        sub = next((arg for arg in args if not arg.startswith("-")), None)
-        if sub is None or sub in {"lanes", "doctor", "report", "report-plan", "plan", "publish",
-                                  "sample", "quality"}:
-            return None
-        return "magi"
+        return magi_reviewer(args)
     if program.startswith("python"):
         index = python_script(argv)
         if index is not None and argv[index].endswith("run_codex_task.py") and any(
@@ -507,6 +514,23 @@ def launch_targets(program, words):
     return None
 
 
+TIMEOUT_VALUES = frozenset({"-k", "--kill-after", "-s", "--signal", "-o", "--output", "-f", "--format"})
+UTILITY_VALUES = {"nice": {"-n"}, "caffeinate": {"-t", "-w"},
+                  "timeout": TIMEOUT_VALUES, "gtimeout": TIMEOUT_VALUES, "time": TIMEOUT_VALUES}
+
+
+def utility_cut(program, argv):
+    cut = 1
+    while cut < len(argv) and argv[cut].startswith("-"):
+        cut += 2 if argv[cut] in UTILITY_VALUES[program] else 1
+    return cut + (program in ("timeout", "gtimeout"))
+
+
+def declare(variables, args):
+    for match in filter(None, map(ASSIGNMENT.match, args)):
+        variables[match[1]] = match[2]
+
+
 def text_of(word):
     return word.evaluated if word.evaluated is not None else word.value
 
@@ -526,7 +550,7 @@ def scan_command(words, assignments=None, depth=0, inputs=None, variables=None):
         raise ParseFailure("nesting limit")
     assignments = dict(assignments or {})
     inputs = list(inputs or [])
-    variables = {} if variables is None else variables
+    variables = variables if variables is not None else {}
     local = {}
     argv_words, targets, i = [], [], 0
     while i < len(words):
@@ -562,7 +586,7 @@ def scan_command(words, assignments=None, depth=0, inputs=None, variables=None):
     argv = [w.value for w in words]
     program = os.path.basename(argv[0])
     if program in DECLARATIONS:
-        variables.update((m[1], m[2]) for m in map(ASSIGNMENT.match, argv[1:]) if m)
+        declare(variables, argv[1:])
     wrap = wrapped(argv)
     if wrap:
         ticket, end = wrap
@@ -631,15 +655,7 @@ def scan_command(words, assignments=None, depth=0, inputs=None, variables=None):
         return
     elif launched is not None:
         yield from scan_inputs(inputs, False, assignments, depth)
-        passed = {id(w) for target in launched if not isinstance(target, str) for w in target}
-        for word in words:
-            if id(word) not in passed:
-                yield from scan_substitutions(word.substitutions, depth)
-        for target in launched:
-            if isinstance(target, str):
-                yield from scan_shell(target, assignments, depth + 1)
-            else:
-                yield from scan_command(target, assignments, depth + 1, None, variables)
+        yield from scan_launched(launched, words, assignments, depth, variables)
         return
     elif program == "env":
         cut = 1
@@ -649,14 +665,8 @@ def scan_command(words, assignments=None, depth=0, inputs=None, variables=None):
         cut = 1
         while cut < len(argv) and argv[cut].startswith("-"):
             cut += 2 if argv[cut] in ("-u", "-g") else 1
-    elif program in ("nice", "caffeinate", "timeout", "gtimeout", "time"):
-        cut = 1
-        value_flags = {"-n"} if program == "nice" else {"-t", "-w"} if program == "caffeinate" else {
-            "-k", "--kill-after", "-s", "--signal", "-o", "--output", "-f", "--format"}
-        while cut < len(argv) and argv[cut].startswith("-"):
-            cut += 2 if argv[cut] in value_flags else 1
-        if program in ("timeout", "gtimeout"):
-            cut += 1
+    elif program in UTILITY_VALUES:
+        cut = utility_cut(program, argv)
     elif program == "screen":
         # screen runs its trailing argv as the window's program; -S/-c/-e/-h/-p/-t/-T take a value.
         cut = 1
@@ -676,11 +686,22 @@ def scan_command(words, assignments=None, depth=0, inputs=None, variables=None):
         yield from scan_substitutions(word.substitutions, depth)
     if program in BOUNDARIES:
         return
-    dynamic = dynamic_reviewer(argv[0], variables)
-    kind = reviewer([dynamic] + argv[1:] if dynamic else argv)
+    kind = reviewer([dynamic_reviewer(argv[0], variables) or argv[0]] + argv[1:])
     if kind:
         reason = assignments.get("REVIEW_GATE_NOT_REVIEW")
         yield event(kind, "bypass" if reason else "blocked", reason=reason)
+
+
+def scan_launched(launched, words, assignments, depth, variables):
+    passed = {id(w) for target in launched if not isinstance(target, str) for w in target}
+    for word in words:
+        if id(word) not in passed:
+            yield from scan_substitutions(word.substitutions, depth)
+    for target in launched:
+        if isinstance(target, str):
+            yield from scan_shell(target, assignments, depth + 1)
+        else:
+            yield from scan_command(target, assignments, depth + 1, None, variables)
 
 
 def scan_substitutions(subs, depth):

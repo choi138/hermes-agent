@@ -135,7 +135,7 @@ class WrapperTests(unittest.TestCase):
         payload = json.dumps(dict(tool_name="write_file", tool_input=dict(path="/r/x.sh", content=content)))
         begin = time.perf_counter()
         result = subprocess.run([sys.executable, str(HOOK)], input=payload, capture_output=True,
-                                text=True, timeout=30, env=dict(os.environ, REVIEW_GATE_HOOK_LOG=str(self.log)))
+                                text=True, timeout=30, check=False, env=dict(os.environ, REVIEW_GATE_HOOK_LOG=str(self.log)))
         elapsed = time.perf_counter() - begin
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertLess(elapsed, 1.0)

@@ -156,7 +156,7 @@ def format_activity(since, records, data=None, mac_error=None, hook_error=None):
 def format_bypass_trend(records, previous):
     """The REVIEW_GATE_NOT_REVIEW count is the weekly target metric (plan 2-C: halve it)."""
     current = [r for r in records if r.get("decision") == "bypass"]
-    smoke = sum(bool(re.search(r"smoke|auth", str(r.get("bypass_reason") or ""), re.I)) for r in current)
+    smoke = sum(bool(re.search(r"smoke|auth", str(r.get("bypass_reason") or ""), re.IGNORECASE)) for r in current)
     return "우회 주간 지표 (REVIEW_GATE_NOT_REVIEW): 이번 주 {}건 (smoke/auth 사유 {}건) / 직전 7일 {}건".format(
         len(current), smoke, sum(r.get("decision") == "bypass" for r in previous))
 

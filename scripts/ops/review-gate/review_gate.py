@@ -189,8 +189,8 @@ def start(db, args):
                        "<Discord message ID> for a further round.".format(args.item, round_number - 1))
         if args.owner_approval and db.execute(
                 "SELECT 1 FROM tickets WHERE owner_approval = ?", (args.owner_approval,)).fetchone():
-            refuse("Owner approval {} was already used; each further round needs a new owner "
-                   "approval message ID.".format(args.owner_approval))
+            refuse(f"Owner approval {args.owner_approval} was already used; each further round "
+                   "needs a new owner approval message ID.")
         ticket = uuid.uuid4().hex
         db.execute("""INSERT INTO tickets
             (id, item, round, reviewer, reviewed_commit, status, issued_at,
@@ -233,7 +233,8 @@ def run(db, args):
             armed[0] = False
             raise Interrupted()
 
-    previous = {s: signal.signal(s, on_signal) for s in (signal.SIGHUP, signal.SIGTERM)}
+    previous = {s: signal.signal(s, on_signal)
+                for s in (signal.SIGHUP, signal.SIGTERM)}  # windows-footgun: ok — macOS-only ledger
     try:
         try:
             child = subprocess.Popen(args.argv, env=env, start_new_session=True)
