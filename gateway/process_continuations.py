@@ -234,11 +234,13 @@ async def reconcile(runner):
             await _reject_admission(row['execution_id'], marker['token'], uncertain=True)
             logging.getLogger(__name__).warning('Continuation admission failed for %s', row['execution_id'], exc_info=True)
             continue
-        if accepted is False:
+        if accepted is False and not refused_for_good(runner, row['execution_id'], evt):
             await _reject_admission(row['execution_id'], marker['token'], retryable=True)
             _log_admission_retry(runner, row['execution_id'])
         elif accepted is not True:
             await _reject_admission(row['execution_id'], marker['token'])
+        else:
+            admission_settled(runner, row['execution_id'])
     await report_stops(runner)
 
 
@@ -253,6 +255,36 @@ def _claim(runner, row):
         if (record.get('process_continuation') or {}).get('execution_id') == row['execution_id']:
             continuation.remember_interruption(record)
     return continuation.claim(row['execution_id'])
+
+
+def _refusal_counts(runner):
+    counts = getattr(runner, '_ledger_permanent_refusals', None)
+    if counts is None:
+        counts = runner._ledger_permanent_refusals = {}
+    return counts
+
+
+def refused_for_good(runner, execution, evt):
+    """Count a refusal ``_inject_watch_notification`` proved permanent (``WakeNotAccepted.permanent``);
+    True once the count reaches the watch drain's cap, where the drain drops the same notice, so the
+    ledger stops retrying an admission that cannot succeed."""
+    if not evt.get('_refusal_permanent'):
+        return False
+    from gateway.run_notifications import _MAX_COMPLETION_INJECTION_ATTEMPTS
+    from hermes_constants import get_hermes_home
+    counts, identity = _refusal_counts(runner), (str(get_hermes_home()), execution)
+    counts[identity] = counts.get(identity, 0) + 1
+    if counts[identity] < _MAX_COMPLETION_INJECTION_ATTEMPTS:
+        return False
+    counts.pop(identity)
+    logging.getLogger(__name__).warning('Gateway refused the admission of %s %d times (%s); giving it up',
+                                        execution, _MAX_COMPLETION_INJECTION_ATTEMPTS, evt.get('_refusal_reason'))
+    return True
+
+
+def admission_settled(runner, execution):
+    from hermes_constants import get_hermes_home
+    _refusal_counts(runner).pop((str(get_hermes_home()), execution), None)
 
 
 def _log_admission_retry(runner, execution):

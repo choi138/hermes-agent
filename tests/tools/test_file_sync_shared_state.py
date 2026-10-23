@@ -252,3 +252,19 @@ def test_timestamp_preserving_replace_is_uploaded(host_files):
 
     assert remote.uploads == ["/Users/me/.hermes/a.py"]
     assert remote.files["/Users/me/.hermes/a.py"] == b"content of b.py"
+
+
+def test_racy_upload_is_adopted_after_its_key_settles(host_files):
+    remote = FakeRemote()
+    _manager(remote, host_files).sync(force=True)
+    for host in host_files.values():
+        stat = os.stat(host)
+        os.utime(host, ns=(stat.st_atime_ns, stat.st_mtime_ns - 60 * 10**9))
+
+    remote.uploads.clear()
+    fresh = _manager(remote, host_files)
+    fresh.sync(force=True)
+
+    assert remote.uploads == []
+    stored = json.loads(_state_files()[0].read_text())["files"]
+    assert all(entry["key"][0] >= 0 for entry in stored.values())

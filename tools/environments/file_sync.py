@@ -32,6 +32,7 @@ import psutil
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import _file_mtime_key
+from utils import mtime_is_racy
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +46,11 @@ _monotonic = time.monotonic
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
 _SHARED_STATE_DIR = "sync-state"
-_SHARED_STATE_VERSION = 3
+# 4: keys are file_signature (mtime, size, inode, ctime), no longer (mtime, size).
+_SHARED_STATE_VERSION = 4
 _REMOTE_VERIFY_TIMEOUT = 20.0
+# Synced-state key no stat result equals (see _plan_sync): forces a content check next sync.
+_RACY_SYNC_KEY = (-1, -1, -1, -1)
 
 # Transport callbacks provided by each backend
 UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
@@ -240,7 +244,7 @@ class FileSyncManager:
         self._sync_back_deadline: float | None = None
         self._delete_fn = delete_fn
         self._transaction_lock = threading.Lock()
-        self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
+        self._synced_files: dict[str, tuple[int, int, int, int]] = {}  # remote_path -> file_signature
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
@@ -277,21 +281,28 @@ class FileSyncManager:
 
         current_files = self._get_files_fn()
         self._upload_only_host_paths.update(_credential_host_paths())
-        to_upload, new_files, to_delete = self._plan_sync(current_files)
         state_path = self._shared_state_path() if shared else None
-        adopted: dict[str, str] = {}
-        if state_path is not None and to_upload:
-            to_upload, adopted = self._adopt_shared_copies(state_path, to_upload, new_files)
-
-        if not to_upload and not to_delete:
-            self._pushed_hashes.update(adopted)
-            self._synced_files = new_files
-            self._last_sync_time = _monotonic()
-            return
-
         prev_files = dict(self._synced_files)
         prev_hashes = dict(self._pushed_hashes)
         try:
+            # Planning reads files too (content check against the pushed hash): a file removed
+            # or unreadable after its stat fails the cycle here like a staging read, so the
+            # caller's command still runs and the next cycle retries.
+            to_upload, new_files, to_delete = self._plan_sync(current_files)
+            adopted: dict[str, str] = {}
+            if state_path is not None and to_upload:
+                to_upload, adopted = self._adopt_shared_copies(state_path, to_upload, new_files)
+
+            if not to_upload and not to_delete:
+                self._pushed_hashes.update(adopted)
+                self._synced_files = new_files  # content-confirmed keys, nothing to push
+                self._last_sync_time = _monotonic()
+                if state_path is not None:
+                    confirmed = self._confirmed_shared_updates(current_files, prev_files, new_files, ())
+                    if confirmed:
+                        self._store_shared_state(state_path, confirmed, [])
+                return
+
             # Hash and upload the same bytes: the original may be saved while
             # the transport is reading it or waiting for remote acknowledgement.
             with tempfile.TemporaryDirectory(prefix="hermes-sync-push-") as staging:
@@ -312,11 +323,11 @@ class FileSyncManager:
             self._synced_files = new_files
             self._last_sync_time = _monotonic()
             if state_path is not None:
-                self._store_shared_state(
-                    state_path, {remote: (_resolve_host_path_str(host), self._shared_key(host, new_files[remote]),
-                                          pushed_hashes[remote])
-                                 for host, remote in to_upload},
-                    to_delete)
+                updates = self._confirmed_shared_updates(current_files, prev_files, new_files, to_upload)
+                updates.update({remote: (_resolve_host_path_str(host), self._shared_key(host, new_files[remote]),
+                                         pushed_hashes[remote])
+                                for host, remote in to_upload})
+                self._store_shared_state(state_path, updates, to_delete)
         except Exception as exc:
             self._synced_files = prev_files
             self._pushed_hashes = prev_hashes
@@ -372,6 +383,31 @@ class FileSyncManager:
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("file_sync: could not record shared sync state %s: %s", path, exc)
 
+    def _confirmed_shared_updates(
+        self, current_files, prev_files: dict, new_files: dict, uploaded,
+    ) -> dict[str, tuple[str, tuple, str]]:
+        """Stable keys whose bytes this cycle confirmed against the pushed hash without an upload,
+        so a racy key recorded earlier is replaced in the shared state once it settles."""
+        skip = {remote for _, remote in uploaded}
+        updates = {}
+        for host, remote in current_files:
+            key = new_files.get(remote)
+            digest = self._pushed_hashes.get(remote)
+            if (remote in skip or key is None or key == _RACY_SYNC_KEY or key == prev_files.get(remote)
+                    or digest is None):
+                continue
+            updates[remote] = (_resolve_host_path_str(host), self._shared_key(host, key), digest)
+        return updates
+
+    def _shared_entry_matches(self, entry: tuple[str, tuple, str], host: str, file_key: tuple) -> bool:
+        if entry[0] != _resolve_host_path_str(host):
+            return False
+        key = self._shared_key(host, file_key)
+        # A racy key never settles in the shared state on its own; the digest checks still decide.
+        if key is not None and tuple(entry[1][:-1]) == _RACY_SYNC_KEY:
+            return entry[1][-1] == key[-1]
+        return entry[1] == key
+
     @staticmethod
     def _shared_key(host_path: str, file_key: tuple) -> tuple | None:
         try:
@@ -395,7 +431,7 @@ class FileSyncManager:
         # chmod changes neither mtime nor size but must still reach the remote via tar.
         candidates = {remote: shared[remote][2] for host, remote in to_upload
                       if remote in shared
-                      and shared[remote][:2] == (_resolve_host_path_str(host), self._shared_key(host, new_files[remote]))}
+                      and self._shared_entry_matches(shared[remote], host, new_files[remote])}
         hosts = {remote: host for host, remote in to_upload}
         # A timestamp-preserving replace (cp -p, rsync -t) keeps the key; confirm the host bytes too.
         candidates = {remote: digest for remote, digest in candidates.items()
@@ -415,7 +451,7 @@ class FileSyncManager:
 
     def _plan_sync(
         self, current_files: list[tuple[str, str]]
-    ) -> tuple[list[tuple[str, str]], dict[str, tuple[float, int]], list[str]]:
+    ) -> tuple[list[tuple[str, str]], dict[str, tuple[int, int, int, int]], list[str]]:
         """Diff *current_files* against synced state -> ``(to_upload, new_synced_state, to_delete)``."""
         to_upload: list[tuple[str, str]] = []
         new_files = dict(self._synced_files)
@@ -423,8 +459,15 @@ class FileSyncManager:
             file_key = _file_mtime_key(host_path)
             if file_key is None or self._synced_files.get(remote_path) == file_key:
                 continue
+            # A key whose mtime is still inside the racy window is recorded as never-matching: a
+            # same-size rewrite in the same coarse tick would keep every stat field (ctime ticks
+            # just as coarsely). The next sync then confirms the bytes against the pushed hash.
+            recorded_key = _RACY_SYNC_KEY if mtime_is_racy(file_key[0]) else file_key
+            new_files[remote_path] = recorded_key
+            pushed_hash = self._pushed_hashes.get(remote_path)
+            if pushed_hash is not None and _sha256_file(host_path) == pushed_hash:
+                continue  # the remote already holds these bytes
             to_upload.append((host_path, remote_path))
-            new_files[remote_path] = file_key
         current_remote_paths = {remote for _, remote in current_files}
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
         return to_upload, new_files, to_delete
