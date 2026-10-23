@@ -294,9 +294,11 @@ def restore_native(payload, runner=None):
             event._heartbeat_session_id = envelope['automation']['heartbeat']
         event.metadata = {'gateway_session_key': envelope['route'],
                           'gateway_session_id': envelope['automation']['owner']}
-        from gateway.session_automation import automation_display_metadata, automation_notification_metadata
+        from gateway.session_automation import (
+            automation_display_metadata, automation_notification_metadata, automation_process_metadata)
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+        event.metadata.update(automation_process_metadata(envelope['automation']))
     return event
 
 

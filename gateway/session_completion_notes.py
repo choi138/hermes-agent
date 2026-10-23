@@ -29,7 +29,10 @@ def _producer(identity):
 def noted_completion(row):
     """*row* is a local completion admission: a note when it runs with no viewer attached."""
     descriptor = (row or {}).get('payload', {}).get('local_automation_v1')
-    return descriptor is not None and _producer(descriptor['identity']) in _NOTED_PRODUCERS
+    # A verification follow-up or approved continuation must run: a note never begins its fenced
+    # ledger attempt, which then stays queued.
+    return (descriptor is not None and _producer(descriptor['identity']) in _NOTED_PRODUCERS
+            and not any(key in descriptor for key in ('process_followup', 'process_continuation')))
 
 
 async def note_if_unviewed(authority, ref, row):

@@ -493,8 +493,11 @@ def test_begin_rechecks_progress_after_automatic_admission(monkeypatch, tmp_path
     delivery.mark_delivered(oid, message_id='progress-receipt')
     with followups._db() as db:
         db.execute('UPDATE process_followups SET next_attempt=0 WHERE execution_id=?', (session.id,))
-    assert followups.admission(session.id, row['token'])
-    assert followups.begin(session.id, row['token'])
+    # The deferred attempt's token is retired: the session authority would replay its settled admission.
+    token = followups.pending()[0]['token']
+    assert token != row['token'] and not followups.admission(session.id, row['token'])
+    assert followups.admission(session.id, token)
+    assert followups.begin(session.id, token)
 
 
 @pytest.mark.parametrize('fence', ['````text', '~~~markdown'])

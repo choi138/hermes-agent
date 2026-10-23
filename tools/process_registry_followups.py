@@ -376,7 +376,9 @@ def begin(execution, token):
         return False
     with _db() as db:
         if progress_inflight(db, execution):
-            db.execute("UPDATE process_followups SET phase='pending',owner='',next_attempt=?,updated_at=? WHERE execution_id=? AND token=? AND phase='queued'", (time.time()+5, time.time(), execution, token))
+            # A fresh token: under the session authority this attempt's admission is already settled, and
+            # a same-token readmission replays it instead of running the verification.
+            db.execute("UPDATE process_followups SET phase='pending',owner='',token=?,next_attempt=?,updated_at=? WHERE execution_id=? AND token=? AND phase='queued'", (uuid.uuid4().hex, time.time()+5, time.time(), execution, token))
             return False
         return db.execute('''UPDATE process_followups SET phase='running',version=version+1,reason='Verification turn started; reconcile uncertain outcomes before retry',owner=?,updated_at=?
             WHERE execution_id=? AND token=? AND phase='queued' ''',

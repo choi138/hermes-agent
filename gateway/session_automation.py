@@ -20,6 +20,12 @@ def producer_identity(runner, event):
     identity = runner._completion_delivery_identity(event)
     if identity is None:
         raise RuntimeStoreError('invalid_params')
+    from gateway.process_continuations import event_metadata
+    # A ledger-bound notice is one fenced attempt of its process's completion: its token names it, so a
+    # retry of the same attempt replays it while a re-verification or a continuation (a new token) is a
+    # new admission instead of an ``admission_conflict`` with the earlier one.
+    for key, marker in automation_process_metadata(event_metadata(event)).items():
+        identity = (*identity, key, marker['execution_id'], marker['token'])
     return json.dumps(identity, separators=(',', ':'))
 
 
@@ -83,6 +89,11 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
     """Admit a process notice. A completion and the withdrawal of its process's waiting ticks hold
     the heartbeat lock together; a tick already holds it (``deliver_heartbeat``)."""
     identity = producer_identity(runner, evt)
+    if automation_process_metadata(event.metadata):
+        # The process's own completion identity rides the descriptor, as a batch sibling's does: a late
+        # tick of the process then finds it (``_process_completed``) and is dropped.
+        completion = json.dumps(runner._completion_delivery_identity(evt), separators=(',', ':'))
+        event.metadata['automation_identities'] = [*(event.metadata.get('automation_identities') or ()), completion]
     if evt.get('type') == 'heartbeat':
         # The tick's raw output rides its stored admission: a later tick folds from the ledger.
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),
@@ -298,17 +309,42 @@ def automation_display_metadata(metadata):
         raise RuntimeStoreError('invalid_params')
     return {'display_kind': kind, 'display_text': text}
 
+
+_PROCESS_MARKERS = ('process_followup', 'process_continuation')
+_PROCESS_MARKER_FIELD_LIMIT = 256
+
+
+def automation_process_metadata(metadata):
+    """Validate a ledger-bound process notice's fence: a verification follow-up's or an approved
+    continuation's ``{execution_id, token}`` (``process_followups.reconcile``,
+    ``process_registry_continuation.claim``), which the executed turn begins and finishes."""
+    markers = {}
+    for key in _PROCESS_MARKERS:
+        if metadata.get(key) is None:
+            continue
+        marker = metadata[key]
+        if (not isinstance(marker, dict) or set(marker) != {'execution_id', 'token'}
+                or not all(isinstance(value, str) and value.strip() and len(value) <= _PROCESS_MARKER_FIELD_LIMIT
+                           for value in marker.values())):
+            raise RuntimeStoreError('invalid_params')
+        markers[key] = dict(marker)
+    return markers
+
+
 # notification_origin / original_trigger_message_id are producer debug context (#52694) and are not
 # persisted; notification_category="diagnostic" rides the snapshot so the replayed wake still mutes,
 # and display_kind/display_text so the persisted row is the card the producer named; heartbeat_tick is
 # a liveness tick's own output, persisted so a later tick of its process folds from the ledger.
+# process_followup / process_continuation are the fork's ledger fences, persisted (and part of the
+# producer identity) so the executed turn begins and finishes the same attempt the classic path did.
 # gateway_proven_session_id / gateway_completion_ids are main's delivery-time ownership proof for the
 # classic resolver (802fd5782f3, fd4e277c849). They are accepted and not persisted (a sibling set in the
 # fingerprint would make the same completion's retry a new identity); execute_admission re-stamps the
 # proof at execution from the target the pre-claim check validated, and the turn's resolver reads it.
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
-    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick'})
+    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+    *_PROCESS_MARKERS})
 
 
 def admission_display(payload):
@@ -350,7 +386,7 @@ def snapshot_automation(authority, adapter, event, identity):
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | _tick_metadata(event.metadata) | automation_process_metadata(event.metadata))
     entry = _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
         return snapshot_local_automation(authority, adapter, event, identity, entry)
@@ -417,6 +453,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
+    descriptor.update(automation_process_metadata(event.metadata))
     if event.metadata.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
         descriptor['turn_author'] = parse_turn_author(event.metadata['turn_author'])
@@ -455,6 +492,7 @@ def restore_local_automation(authority, ref, row):
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
     event.metadata.update(automation_display_metadata(descriptor))
+    event.metadata.update(automation_process_metadata(descriptor))
     if descriptor.get('turn_author') is not None:
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):
