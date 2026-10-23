@@ -169,7 +169,14 @@ async def reconcile(runner):
                  'Do not claim verification merely because the process exited successfully.')
         try:
             accepted = await runner._inject_watch_notification(text, evt)
-            if accepted is not True:
+            from gateway.process_continuations import admission_settled, refused_for_good
+            if accepted is True:
+                admission_settled(runner, execution)
+            elif refused_for_good(runner, execution, evt):
+                await asyncio.to_thread(reject_admission, execution, token,
+                    f"gateway refused the verification turn for good ({evt.get('_refusal_reason') or 'route gone'}); "
+                    'no verification ran', uncertain=True)
+            else:
                 await asyncio.to_thread(reject_admission, execution, token, 'gateway admission unavailable; retry scheduled')
         except Exception as exc:
             await asyncio.to_thread(reject_admission, execution, token,

@@ -165,3 +165,87 @@ def test_well_formed_fence_is_copied():
     assert validated == _MARKERS
     assert all(validated[key] is not metadata[key] for key in _MARKERS)
     assert automation_process_metadata({'notification_category': 'result'}) == {}
+
+
+@pytest.mark.asyncio
+async def test_follow_up_admits_on_a_renamed_auto_thread(tmp_path, monkeypatch):
+    """The route's origin keeps the auto-thread creation stamp and first name; the committed human
+    turns carry the renamed thread and no stamp. Display labels must not refuse the wake
+    (``admission_conflict`` every 30 s on koharu's renamed threads)."""
+    from gateway.session_identity import replace_source
+    runner, authority, _adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human')
+    try:
+        route, parent = metadata['gateway_session_key'], metadata['gateway_session_id']
+        runner.session_store._entries[route].origin = replace_source(
+            source, chat_name='first question', auto_thread_created=True, auto_thread_initial_name='first question')
+        evt = _evt(route, parent, 'process_followup', platform='discord', chat_id='42', chat_type='dm')
+        assert await runner._inject_watch_notification('[verify]', evt, raise_not_accepted=True) is True
+        runner.session_store._entries[route].origin = replace_source(source, user_name='someone else')
+        evt = _evt(route, parent, 'process_continuation', platform='discord', chat_id='42', chat_type='dm')
+        with pytest.raises(Exception, match='admission_conflict'):
+            await runner._inject_watch_notification('[verify]', evt, raise_not_accepted=True)
+    finally:
+        authority.db.close()
+
+
+async def _refusing_ledger(tmp_path, monkeypatch, permanent):
+    from tests.gateway.test_durable_process_followups import Runner
+    from tools import process_registry_followups as ledger
+    from tools.process_registry import ProcessSession
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner = Runner(tmp_path)
+    refusals = []
+
+    async def refuse(text, evt, **kwargs):
+        refusals.append(evt['process_followup']['token'])
+        evt['_refusal_permanent'], evt['_refusal_reason'] = permanent, 'not_found' if permanent else 'queue_full'
+        return False
+    runner._inject_watch_notification = refuse
+    session = ProcessSession(id='proc_refused', command='true', session_key=runner.entry.session_key,
+                             parent_session_id=runner.entry.session_id)
+    ledger.reserve(session)
+    return runner, ledger, session, refusals
+
+
+async def _reconcile_rounds(runner, ledger, rounds):
+    from gateway.process_followups import reconcile
+    for _ in range(rounds):
+        with ledger._db() as db:
+            db.execute('UPDATE process_followups SET next_attempt=0')
+        await reconcile(runner)
+
+
+@pytest.mark.asyncio
+async def test_permanently_refused_follow_up_stops_retrying(tmp_path, monkeypatch):
+    from gateway.run_notifications import _MAX_COMPLETION_INJECTION_ATTEMPTS
+    runner, ledger, session, refusals = await _refusing_ledger(tmp_path, monkeypatch, permanent=True)
+    await _reconcile_rounds(runner, ledger, _MAX_COMPLETION_INJECTION_ATTEMPTS - 1)
+    assert ledger.get_state(session.id)['phase'] == 'pending'
+    await _reconcile_rounds(runner, ledger, 1)
+    state = ledger.get_state(session.id)
+    assert state['phase'] == 'needs_reconciliation'
+    assert 'not_found' in state['reason']
+    await _reconcile_rounds(runner, ledger, 3)
+    assert len(refusals) == _MAX_COMPLETION_INJECTION_ATTEMPTS, 'no admission is retried after giving up'
+
+
+@pytest.mark.asyncio
+async def test_transiently_refused_follow_up_keeps_retrying(tmp_path, monkeypatch):
+    from gateway.run_notifications import _MAX_COMPLETION_INJECTION_ATTEMPTS
+    runner, ledger, session, refusals = await _refusing_ledger(tmp_path, monkeypatch, permanent=False)
+    await _reconcile_rounds(runner, ledger, _MAX_COMPLETION_INJECTION_ATTEMPTS + 2)
+    assert ledger.get_state(session.id)['phase'] == 'pending'
+    assert len(refusals) == _MAX_COMPLETION_INJECTION_ATTEMPTS + 2
+
+
+def test_refusal_count_resets_on_admission(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from gateway.process_continuations import admission_settled, refused_for_good
+    from gateway.run_notifications import _MAX_COMPLETION_INJECTION_ATTEMPTS
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    runner, refused = SimpleNamespace(), {'_refusal_permanent': True}
+    for _ in range(_MAX_COMPLETION_INJECTION_ATTEMPTS - 1):
+        assert not refused_for_good(runner, 'proc', refused)
+    admission_settled(runner, 'proc')
+    assert not refused_for_good(runner, 'proc', refused)
+    assert not refused_for_good(runner, 'proc', {'_refusal_permanent': False})

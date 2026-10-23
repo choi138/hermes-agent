@@ -362,8 +362,14 @@ def admission_display(payload):
     return card
 
 
+# Display labels, not routing: a renamed thread or channel, or the auto-thread creation stamp the route's
+# origin keeps while later human turns in the thread carry none, must not refuse the route's wakes.
+_DISPLAY_ONLY_SOURCE_KEYS = frozenset({'message_id', 'chat_name', 'chat_topic', 'auto_thread_created',
+                                       'auto_thread_initial_name'})
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    return {key: value for key, value in source.to_dict().items() if key not in _DISPLAY_ONLY_SOURCE_KEYS}
 
 
 def committed_route_envelope(authority, entry):
