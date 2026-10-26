@@ -184,6 +184,15 @@ def start(db, args):
                 refuse("Previous tickets must be fully closed; reproduce each pending verdict, "
                        "record it with review-gate close, then retry. Report to the user only "
                        "if a verdict cannot be reproduced.")
+            closed = [t for t in tickets if t["status"] == "closed"]
+            latest = max(closed, key=lambda t: (t["closed_at"], t["rowid"])) if closed else None
+            if (latest is not None and latest["verdict"] == "UNREVIEWED" and not args.owner_approval
+                    and not any(t["verdict"] == "BLOCK" or t["fallback"] for t in tickets)):
+                # Only while start --fallback would be accepted, so this never strands an item.
+                refuse("Round {} has an UNREVIEWED ticket; a failed review is retried in the "
+                       "same round with start --fallback (different reviewer, failed ticket's "
+                       "commit), not a new round. A new round instead needs "
+                       "--owner-approval.".format(round_number))
             round_number += 1
             if (round_number > 2 or item["status"] in ("cap-reached", "stopped-unreviewed")) \
                     and not args.owner_approval:

@@ -278,6 +278,46 @@ class LedgerTests(GateCase):
         second = self.start(flags=("--owner-approval", APPROVAL))
         self.assertEqual(self.ticket(second)["round"], 2)
 
+    def test_04_failed_review_retries_in_same_round_not_a_new_round(self):
+        self.open()
+        first = self.start()
+        self.close(first, "UNREVIEWED", "--reason", "reviewer stalled")
+        result = self.start(code=2)
+        self.assertIn("start --fallback", result.stderr)
+        self.assertIn("--owner-approval", result.stderr)
+        self.assertEqual(self.item_status()["rounds_used"], 1)
+        # A joined PASS closed before the failure: the fallback is still the route.
+        self.open("joined-pass")
+        first = self.start("joined-pass")
+        joined = self.start("joined-pass", "claude", ("--join",))
+        self.close(joined)
+        self.close(first, "UNREVIEWED", "--reason", "crash")
+        self.start("joined-pass", "codex", code=2)
+        fallback = self.start("joined-pass", "codex", ("--fallback",))
+        self.assertEqual(self.ticket(fallback)["round"], 1)
+        # A PASS closed after the failure makes the fallback unavailable; the new round must
+        # not be refused too, or the item is stranded.
+        self.open("pass-last")
+        first = self.start("pass-last")
+        joined = self.start("pass-last", "claude", ("--join",))
+        self.close(first, "UNREVIEWED", "--reason", "crash")
+        self.close(joined)
+        self.start("pass-last", "codex", ("--fallback",), code=2)
+        self.assertEqual(self.ticket(self.start("pass-last", "codex"))["round"], 2)
+        # A BLOCK in the round still allows the normal second round.
+        self.open("blocked")
+        first = self.start("blocked")
+        joined = self.start("blocked", "claude", ("--join",))
+        self.close(first, "UNREVIEWED", "--reason", "crash")
+        self.close(joined, "BLOCK", "--blockers", "1")
+        self.assertEqual(self.ticket(self.start("blocked", "codex"))["round"], 2)
+        # The owner can still approve a new round instead of the fallback.
+        self.open("approved")
+        first = self.start("approved")
+        self.close(first, "UNREVIEWED", "--reason", "crash")
+        second = self.start("approved", flags=("--owner-approval", APPROVAL))
+        self.assertEqual(self.ticket(second)["round"], 2)
+
     def test_04_fallback_pass_resolves_only_the_failed_ticket(self):
         self.open()
         first = self.start()
