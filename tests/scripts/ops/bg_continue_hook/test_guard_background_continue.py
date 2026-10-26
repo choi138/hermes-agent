@@ -197,26 +197,13 @@ PEEK_COMMANDS = [
     "ssh mac 'sleep 20; ls %s/codex/x'" % STATE,
 ]
 CI_POLL_COMMANDS = [
-    "sleep 60; cd ~/Documents/fido-dashboard && export PATH=/opt/homebrew/bin:$PATH; gh pr checks 1 --repo r",
-    "cd ~/Documents/company/sora && export PATH=/opt/homebrew/bin:$PATH && sleep 20; gh pr checks 162 2>&1 | head -15",
-    "sleep 45; gh run view 39967795161 --repo r --json status,jobs",
-    "sleep 20; gh pr view 6 -R r --json state,statusCheckRollup",
-    "sleep 20; gh api repos/o/r/actions/runs?branch=x",
-    "sleep 45; gh run list -R r --branch b --limit 4",
-    "for i in $(seq 1 16); do S=$(gh pr checks 3 --repo r | grep server); "
-    "echo \"$S\" | grep -qE pending || break; sleep 20; done",
-    "for i in $(seq 1 14); do S=$(gh run list --branch main --limit 1 --json status); "
+    "for i in $(seq 1 14); do S=$(gh run list --repo r --branch main --limit 1 --json status --jq '.[0].status'); "
     "[ \"$S\" = completed ] && break; sleep 20; done",
-    "gh run watch 1 --exit-status; for i in $(seq 1 30); do s=$(gh pr checks 8 | awk '{print $2}'); "
-    "case \"$s\" in pending*) sleep 20;; *) break;; esac; done",
-    "gh workflow run x.yaml && sleep 45; gh run view 2 --json status",
-]
-FILE_WAIT_COMMANDS = [
-    "for i in $(seq 1 55); do [ -f /private/tmp/b2b1648-job/install.rc ] && break; sleep 10; done; "
-    "echo RC=$(cat /private/tmp/b2b1648-job/install.rc)",
-    "for i in $(seq 1 18); do grep -q DONE_RC ~/hermes-workspaces/x/mutation.log && break; sleep 30; done",
-    "while [ ! -f $Q/WAITING_FOR_OTP ] && [ ! -f /tmp/r/qa.rc ]; do sleep 20; done",
-    "timeout 120 bash -c 'until [ -f /tmp/a.done ]; do sleep 5; done'",
+    "gh pr comment 37 --body x; for i in $(seq 1 12); do sleep 10; R=$(gh run list --limit 1); "
+    "case \"$R\" in *completed*) break;; esac; done",
+    "until gh pr checks 5 --repo r; do sleep 30; done",
+    "while true; do gh run view 1 --json conclusion -q .conclusion | grep -q success && break; sleep 20; done",
+    "for i in 1 2 3 4 5; do gh api repos/o/r/actions/runs/9 -q .conclusion; sleep 15; done",
 ]
 ALLOWED_COMMANDS = [
     "hermes-delegate wait %s/codex/run --timeout 3600" % STATE,
@@ -252,13 +239,29 @@ ALLOWED_COMMANDS = [
     "pkill -f idb; sleep 2; xcrun simctl shutdown X; gh run list --repo r --limit 30",
     "for n in 27 30; do for i in 1 2 3; do st=$(gh pr view $n --json mergeStateStatus); "
     "[ \"$st\" != UNKNOWN ] && break; sleep 10; done; gh pr checks $n; done",
-    # readiness loops and same-call launches are not result-file polls
+    # one-shot sleep + CI check is allowed (only polling loops are CI polls)
+    "sleep 60; cd ~/Documents/fido-dashboard && export PATH=/opt/homebrew/bin:$PATH; gh pr checks 1 --repo r",
+    "sleep 45; gh run view 39967795161 --repo r --json status,jobs",
+    "sleep 20; gh pr view 6 -R r --json state,statusCheckRollup",
+    # approval-gated deploys (10-26 08:46, 10:26, 10:39): gh run watch would not return before approval
+    "R=silviahealth/silviahealth; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do s=$(gh run view 40246265688 -R $R "
+    "--json jobs -q '.jobs[]|.name+\"=\"+.status' | tr '\\n' ' '); echo \"$s\" | "
+    "grep -q \"Check Production Deploy=in_progress\" && break; sleep 10; done; echo \"$s\"",
+    "sleep 40; R=silviahealth/silviahealth; gh run view 40254185920 -R $R --json jobs,inputs; "
+    "gh issue list -R $R -L 3 --search \"40254185920 in:body\" --json number,title,state",
+    "sleep 30; gh run view 40255282659 -R silviahealth/sora --json status,jobs; "
+    "gh issue list -R silviahealth/sora -L 2 --search \"40255282659 in:title\" --json number,state",
+    "for i in $(seq 1 20); do gh api repos/o/r/actions/runs/9/pending_deployments -q length; sleep 15; done",
+    "for i in $(seq 1 18); do s=$(gh pr checks 25 | grep CodeRabbit); case \"$s\" in *pending*) sleep 15;; "
+    "*) break;; esac; done",
+    # result-file waits for cmux jobs launched in an earlier call (no notification, Keychain/GUI)
+    "for i in $(seq 1 55); do [ -f /private/tmp/b2b1648-job/install.rc ] && break; sleep 10; done; "
+    "echo RC=$(cat /private/tmp/b2b1648-job/install.rc)",
+    "D=$HOME/.cache/fido-cake-probe; for i in $(seq 1 45); do [ -f $D/job.rc ] && break; sleep 2; done",
+    "for i in $(seq 1 18); do grep -q DONE_RC ~/hermes-workspaces/x/mutation.log && break; sleep 30; done",
+    "timeout 120 bash -c 'until [ -f /tmp/a.done ]; do sleep 5; done'",
     "for i in $(seq 1 30); do curl -sf localhost:8080/healthz && break; sleep 2; done",
     "until adb shell getprop sys.boot_completed | grep -q 1; do sleep 3; done",
-    "J=/tmp/j; cmux new-workspace --command \"zsh -ic 'x; echo $? > $J/a.rc'\"; "
-    "for i in $(seq 1 30); do [ -f $J/a.rc ] && break; sleep 5; done; cat $J/a.rc",
-    "for f in a b; do [ -f $f.done ] || echo missing; sleep 3; done",
-    "[ -f /tmp/x.rc ] && cat /tmp/x.rc; sleep 5",
 ]
 # P1-1 (10-23 11:34, 18:25, 18:44, 18:51, 19:05, 19:17): background notify watchers required by
 # native-app-runtime-verification must never be blocked by the sleep rules.
@@ -296,12 +299,7 @@ class SleepPollTests(unittest.TestCase):
                 message = self.assertSleepBlocked(peek(command), "blocked_ci_poll")
                 self.assertIn("gh pr checks <PR> --watch --fail-fast", message)
                 self.assertIn("notify_on_complete=true", message)
-
-    def test_foreground_file_wait_loops_are_blocked(self):
-        for command in FILE_WAIT_COMMANDS:
-            with self.subTest(command=command):
-                message = self.assertSleepBlocked(peek(command), "blocked_file_wait_loop")
-                self.assertIn("foreground with a timeout", message)
+                self.assertIn("approval gate, a single check is fine", message)
 
     def test_official_checks_and_unrelated_sleeps_are_allowed(self):
         for command in ALLOWED_COMMANDS:
@@ -309,7 +307,7 @@ class SleepPollTests(unittest.TestCase):
                 self.assertAllowed(peek(command))
 
     def test_background_watchers_are_never_sleep_blocked(self):
-        for command in [OTP_WATCHER] + PEEK_COMMANDS[:3] + CI_POLL_COMMANDS[:2] + FILE_WAIT_COMMANDS[:2]:
+        for command in [OTP_WATCHER] + PEEK_COMMANDS[:3] + CI_POLL_COMMANDS[:2]:
             with self.subTest(command=command):
                 proc, lines, _ = run(peek(command, background=True, notify_on_complete=True))
                 self.assertEqual(proc.returncode, 0)
@@ -332,8 +330,7 @@ class SleepPollTests(unittest.TestCase):
         alone = os.path.join(tmp, "guard_background_continue.py")
         shutil.copy(HOOK, alone)
         for command, decision in [(c, "blocked_peek") for c in PEEK_COMMANDS] + [
-                (c, "blocked_ci_poll") for c in CI_POLL_COMMANDS] + [
-                (c, "blocked_file_wait_loop") for c in FILE_WAIT_COMMANDS]:
+                (c, "blocked_ci_poll") for c in CI_POLL_COMMANDS]:
             with self.subTest(command=command):
                 self.assertSleepBlocked(peek(command), decision, hook=alone)
         for command in ALLOWED_COMMANDS:

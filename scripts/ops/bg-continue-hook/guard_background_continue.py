@@ -17,23 +17,23 @@ Rules (terminal tool only; Hermes semantics verified in tools/terminal_tool.py o
   Only continue_on_complete=false (a boolean) is the opt-out; it is respected and logged as
   "opted-out". true is already armed. Any other value is left for Hermes to refuse.
   Sleep-poll rules (foreground only; a background watcher costs no turns and is never blocked).
-  A sleep (N >= 2) pairs with a check inside the same polling loop (while/until, or for over
-  $(seq ..) / {1..N} / 1 2 3), or when the check follows the sleep in the same command list with
-  only neutral commands (cd, export, echo, text filters, reads) in between. A sleep inside a loop
-  never pairs with checks after the loop, and nested ssh '...' / bash -c '...' bodies are judged
-  on their own.
-  C. check = delegation peek: pgrep/ps|grep/pkill -0 for codex exec, claude -p, run_codex_task or
-     hermes-delegate, or ls/cat/tail/head/wc/find/stat/test/grep on ~/.local/state/hermes-delegate
-     -> block "blocked_peek". hermes-delegate wait/status/cancel are the official paths.
-  D. check = gh pr checks / gh run view / gh pr view statusCheckRollup / gh api .../actions/runs,
-     or gh run list after a sleep over 30 s or in a polling loop -> block "blocked_ci_poll".
-     Not polls: gh pr checks --watch and gh run watch (and the run-id lookup or startup delay
-     feeding them), or a sleep <= 30 s right after a trigger (push, rerun, workflow run, merge).
-  E. a polling loop with a sleep and a file wait ([ -f X ], test -e, grep -q on a .rc/.done/.log/
-     marker) -> block "blocked_file_wait_loop". Allowed: readiness loops (curl/lsof/nc/adb/simctl/
-     healthz) without a marker file, and a wait for a job the same call launched (cmux/tmux/nohup).
+  A polling loop is while/until, or for over $(seq ..) / {1..N} / 1 2 3 (not for n in 27 30).
+  C. a sleep (N >= 2) paired with a delegation peek: pgrep/ps|grep/pkill -0 for codex exec,
+     claude -p, run_codex_task or hermes-delegate, or ls/cat/tail/head/wc/find/stat/test/grep on
+     ~/.local/state/hermes-delegate -> block "blocked_peek". They pair inside the same polling
+     loop, or when the peek follows the sleep in the same command list with only neutral commands
+     (cd, export, echo, text filters, reads) in between. hermes-delegate wait/status/cancel are the
+     official paths.
+  D. a polling loop with a sleep that polls CI: gh pr checks / gh run view / gh run list /
+     gh pr view statusCheckRollup / gh api .../actions/runs -> block "blocked_ci_poll".
+     One-shot sleep+check is allowed, and so are loops that feed a later gh run watch /
+     gh pr checks --watch (run-id lookup) or wait for an approval gate or other intermediate state
+     (in_progress, waiting, queued, pending, requested, approval; gh issue list/view;
+     .../pending_deployments): gh run watch would not return before the approval.
+  A sleep inside a loop never pairs with checks after the loop, and nested ssh '...' /
+  bash -c '...' bodies are judged on their own.
   Why: completion already arrives through the watcher or notify; sleep-polling burned turns
-  (2026-10-22..26 replay: 69 delegation peeks, 31 CI polls, 8 file-wait loops in 5591 calls).
+  (2026-10-22..26).
 
 Exit 0 = allow (stdout empty, or a modify directive). Exit 2 = block. Any internal error or
 malformed stdin = allow (fail open). The log never contains the command text.
@@ -57,8 +57,6 @@ PEEK_NEEDLES = ("codex exec", "claude -p", "run_codex_task", "hermes-delegate")
 PEEK_NAMES = {"codex", "claude"}
 PROCESS_GREPS = {"grep", "egrep", "rg", "awk"}
 FILE_PEEKS = {"ls", "cat", "tail", "head", "wc", "find", "stat", "test", "[", "[["}
-FILE_TESTS = {"test", "[", "[["}
-READINESS = {"curl", "wget", "lsof", "nc", "adb", "xcrun", "simctl", "ping", "pg_isready", "redis-cli"}
 NESTED_SHELLS = {"bash", "sh", "zsh", "ssh"}
 WRAPPERS = {"nohup", "command", "exec", "time", "builtin"}
 SKIP_WORDS = {"if", "then", "elif", "else", "!", "fi", "esac"}
@@ -68,25 +66,22 @@ SINGLE_QUOTED = re.compile(r"'[^']*'")
 DOUBLE_QUOTED = re.compile(r'"[^"]*"')
 SUBSTITUTION = re.compile(r"\$\(([^()]*)\)")
 COUNTER = re.compile(r"seq|\{\d+\.\.")
-LAUNCHERS = {"cmux", "tmux", "screen", "nohup", "setsid", "systemd-run"}
 NEUTRAL = {"cd", "pushd", "popd", "export", "echo", "printf", "true", ":", "set", "unset", "wc", "head",
            "tail", "grep", "egrep", "rg", "awk", "sed", "cut", "tr", "sort", "uniq", "jq", "xargs", "tee",
            "cat", "column", "date", "basename", "dirname", "ls", "find", "stat", "test", "[", "[[", "ps",
            "pgrep", "du", "md5", "md5sum", "shasum", "realpath", "readlink", "break", "continue"}
-CHECKS = {"peek", "ci", "ci_lookup", "file_wait", "sleep", "watch"}
-STARTUP_DELAY = 30
+CHECKS = {"peek", "ci", "sleep", "watch"}
+INTERMEDIATE = re.compile(r"in_progress|waiting|queued|pending|requested|approval", re.I)
 DECLARATIONS = {"export", "local", "typeset", "declare", "readonly"}
 ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z_0-9]*)=(.*)$", re.S)
 SLEEP_ARG = re.compile(r"^(\d+(?:\.\d*)?|\.\d+)([smhd]?)$")
 SLEEP_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
-MARKER_FILE = re.compile(
-    r"(?:\.(?:rc|done|exit|status|log|out|end|finished|complete)|(?:^|/)(?:done|[A-Z][A-Z0-9_]{2,}))[\"']?$")
-PREFILTER = re.compile(r"odex|laude|hermes-delegate|\bgh\b|\b(?:for|while|until)\b")  # odex: [c]odex trick
+PREFILTER = re.compile(r"odex|laude|hermes-delegate|\bgh\b")  # odex: the [c]odex grep trick
 PEEK_BUDGET_SECONDS = 0.1
 PEEK_SIZE_LIMIT = 64 * 1024
 NEST_LIMIT = 8
 SLEEP_RULES = (  # (check kind, decision); the first match wins
-    ("peek", "blocked_peek"), ("ci", "blocked_ci_poll"), ("file_wait", "blocked_file_wait_loop"))
+    ("peek", "blocked_peek"), ("ci", "blocked_ci_poll"))
 MESSAGES = {
     "blocked_peek": (
         "bg-continue hook: delegation sleep-poll blocked / 위임 작업을 sleep으로 폴링하지 마세요. "
@@ -95,14 +90,11 @@ MESSAGES = {
         "Completion arrives via the hermes-delegate watcher / gateway notification "
         "(완료는 watcher·게이트웨이 알림으로 옵니다); end the turn instead of sleeping."),
     "blocked_ci_poll": (
-        "bg-continue hook: CI sleep-poll blocked / CI를 sleep으로 폴링하지 마세요. Run "
-        "`gh pr checks <PR> --watch --fail-fast` or `gh run watch <ID> --exit-status` as ONE "
-        "background terminal call with notify_on_complete=true (백그라운드 한 번 + 완료 알림)."),
-    "blocked_file_wait_loop": (
-        "bg-continue hook: foreground file-wait loop blocked / 결과 파일을 sleep 루프로 기다리지 마세요. "
-        "If the result is needed this turn, run that command in the foreground with a timeout "
-        "instead of backgrounding it and polling (이번 턴에 필요하면 foreground+timeout으로 직접 실행); "
-        "otherwise wait for its completion notification (아니면 완료 알림을 기다리세요)."),
+        "bg-continue hook: CI sleep-poll loop blocked / CI 완료를 sleep 루프로 기다리지 마세요. "
+        "For completion run `gh pr checks <PR> --watch --fail-fast` or `gh run watch <ID> "
+        "--exit-status` as ONE background terminal call with notify_on_complete=true "
+        "(완료 대기는 백그라운드 watch 한 번 + 완료 알림). If you are waiting for an approval gate, "
+        "a single check is fine (승인 게이트 대기라면 한 번 확인은 괜찮습니다)."),
 }
 _TOKENIZER = []
 
@@ -233,7 +225,6 @@ class _Script:
 
     def _command(self, argv):
         program = os.path.basename(argv[0])
-        launch = program in LAUNCHERS
         while program in WRAPPERS or program in ("timeout", "env"):
             argv = argv[1:]
             while argv and (argv[0].startswith("-") or (program == "env" and ASSIGNMENT.match(argv[0]))):
@@ -241,7 +232,7 @@ class _Script:
             if program == "timeout":
                 argv = argv[1:]
             if not argv:
-                return {"program": None, "args": [], "launch": launch}
+                return {"program": None, "args": []}
             program = os.path.basename(argv[0])
         args = argv[1:]
         if program in DECLARATIONS:
@@ -255,13 +246,11 @@ class _Script:
             self.cancel = True
         elif program in NESTED_SHELLS and self.depth < NEST_LIMIT:
             self.nested.extend(_Script(a, self.depth + 1) for a in args if " " in a or ";" in a)
-        return {"program": program, "args": args, "launch": launch}
+        return {"program": program, "args": args}
 
     def kinds(self, command, tainted):
         program, args = command.get("program"), command.get("args", [])
         kinds = set()
-        if command.get("launch"):
-            kinds.add("launch")
         if program == "sleep" and _sleep_seconds(args) >= 2:
             kinds.add("sleep")
         if program in ("pgrep", "pkill") and (program == "pgrep" or "-0" in args) and _names_delegation(args):
@@ -273,18 +262,8 @@ class _Script:
                 kinds.add("peek")
         if program == "gh":
             kinds.add(_gh_kind(args))
-        elif program == "git" and args[:1] == ["push"]:
-            kinds.add("trigger")
-        if program in FILE_TESTS:
-            for i, arg in enumerate(args[:-1]):
-                if arg in ("-f", "-e", "-s"):
-                    kinds.add("file_wait")
-                    if MARKER_FILE.search(args[i + 1]):
-                        kinds.add("marker_wait")
-        if program in PROCESS_GREPS and "-q" in args and args and MARKER_FILE.search(args[-1]):
-            kinds.update(("file_wait", "marker_wait"))
-        if program in READINESS or any("healthz" in a for a in args):
-            kinds.add("ready")
+        if any(INTERMEDIATE.search(a) for a in args):
+            kinds.add("gate")
         if program is None or program in NEUTRAL or kinds & CHECKS:
             kinds.add("neutral")
         return kinds
@@ -293,27 +272,23 @@ class _Script:
         found = set()
         for script in self.nested:
             found |= script.hits(_state_tainted(script.vars, tainted))
-        found |= self._walk(self.root, tainted, False)[0]
+        found |= self._walk(self.root, tainted)[0]
         if self.cancel:  # cancel-then-confirm is a one-shot check, not a poll
             found.discard("peek")
         return found
 
-    def _walk(self, items, tainted, launched):
+    def _walk(self, items, tainted):
         """Return (hits, kinds seen, whether the list ran a non-neutral command)."""
         found, all_kinds, closes = set(), set(), False
-        window, startup, triggered, ci = 0, False, False, False
+        window, ci = False, False
         for item in items:
             if isinstance(item, _Loop):
-                sub_found, kinds, item_closes = self._walk(item, tainted, launched)
+                sub_found, kinds, item_closes = self._walk(item, tainted)
                 ci |= "ci" in sub_found
                 found |= sub_found - {"ci"}
                 if item.polling and "sleep" in kinds:
                     found |= kinds & {"peek"}
-                    ci |= bool(kinds & {"ci", "ci_lookup"})
-                    waits = "marker_wait" in kinds or ("file_wait" in kinds and "ready" not in kinds)
-                    # A job launched earlier in this same call and awaited here is a foreground run.
-                    if waits and not launched:
-                        found.add("file_wait")
+                    ci |= "ci" in kinds and "gate" not in kinds
                 slept = False
             else:
                 kinds = self.kinds(item, tainted)
@@ -321,18 +296,12 @@ class _Script:
                 slept = "sleep" in kinds
             if window:
                 found |= kinds & {"peek"}
-                # A short delay after a trigger (or a watcher), or before a run-id lookup, is not a poll.
-                ci |= not startup and ("ci" in kinds or ("ci_lookup" in kinds and window > STARTUP_DELAY))
             if "watch" in kinds:
-                # Lookups and startup delays that feed a watcher are not polls.
-                ci, window, triggered = False, 0, True
+                ci, window = False, False  # run-id lookups that feed a watcher are not polls
             elif slept:
-                window = _sleep_seconds(item["args"])
-                startup = triggered and window <= STARTUP_DELAY
+                window = True
             elif item_closes:
-                window = 0
-            triggered |= "trigger" in kinds
-            launched |= "launch" in kinds
+                window = False
             closes |= item_closes
             all_kinds |= kinds
         if ci:
@@ -361,11 +330,9 @@ def _sleep_seconds(args):
 def _gh_kind(args):
     if args[:2] == ["run", "watch"] or (args[:2] == ["pr", "checks"] and "--watch" in args):
         return "watch"
-    if args[:2] in (["run", "rerun"], ["workflow", "run"], ["pr", "create"], ["pr", "merge"],
-                    ["pr", "comment"], ["pr", "ready"]):
-        return "trigger"
-    if args[:2] == ["run", "list"]:
-        return "ci_lookup"
+    if args[:2] in (["issue", "list"], ["issue", "view"]) or (
+            args[:1] == ["api"] and any("pending_deployments" in a for a in args)):
+        return "gate"
     if _is_ci_check(args):
         return "ci"
     return "neutral" if args[:2] == ["pr", "view"] else "other"
@@ -374,7 +341,7 @@ def _gh_kind(args):
 def _is_ci_check(args):
     if "--watch" in args:
         return False
-    if args[:2] in (["pr", "checks"], ["run", "view"]):
+    if args[:2] in (["pr", "checks"], ["run", "view"], ["run", "list"]):
         return True
     if args[:2] == ["pr", "view"] and any("statusCheckRollup" in a for a in args):
         return True
