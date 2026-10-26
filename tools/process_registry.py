@@ -1387,7 +1387,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 raise
             bg_command = launch_command(temp_dir, session.id, cwd or env.cwd)
         try:
-            result = execute(bg_command, timeout=timeout, rewrite_compound_background=False, **launch_options)
+            # SSH launch_command applies cwd itself (relative paths resolved once, invalid workdir
+            # reported in the receipt); a wrapper cd would apply it twice or drop the launch ack.
+            launch_cwd = "" if session.remote_root else cwd or ""
+            result = execute(bg_command, cwd=launch_cwd, timeout=timeout, rewrite_compound_background=False, **launch_options)
+        except Exception as e:
+            if not session.remote_root:
+                raise
+            session.observation_state = "unavailable"
+            from tools.environments.ssh_process import safe_error
+            session.observation_operation = "dispatch"
+            session.observation_error = safe_error(e)
+            logger.warning("SSH launch outcome unconfirmed: %s: %s", session.id, session.observation_error)
+        else:
             output = result.get("output", "").strip()
             if session.remote_root:
                 marker = 'HERMES_PROCESS_LAUNCH_V1:'
@@ -1402,27 +1414,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     logger.warning('SSH launch outcome unconfirmed: %s: %s', session.id, session.observation_error)
             else:
                 session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
-            # No PID from the wrapper (syntax error, broken redirect): a failed launch,
-            # not a fake running session.
-            if session.pid is None and not session.remote_root:
-                session.mark_exited(int(result.get("returncode", -1)) or -1, "failed_start", "failed_start")
-                session.output_buffer = output
-        except Exception as e:
-            if session.remote_root:
-                session.observation_state = "unavailable"
-                from tools.environments.ssh_process import safe_error
-                session.observation_operation = "dispatch"
-                session.observation_error = safe_error(e)
-                logger.warning("SSH launch outcome unconfirmed: %s: %s", session.id, session.observation_error)
-            else:
-                session.mark_exited(-1, "failed_start", "failed_start")
-                session.output_buffer = f"Failed to start: {e}"
-        if session.exited:
-            with self._lock:
-                self._prune_if_needed()
-        else:
-            self._track_started(
-                session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+                # No PID from the wrapper (no bash in the image, sandbox gone, broken redirect): the
+                # command never started, so raise like a failed Popen instead of returning a session.
+                if session.pid is None:
+                    raise RuntimeError(f"launch wrapper exited {result.get('returncode')} without a PID: "
+                                       f"{output or '(no output)'}")
+        self._track_started(
+            session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
         return session
 
     # ----- Reader / Poller Threads -----
