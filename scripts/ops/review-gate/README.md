@@ -27,6 +27,9 @@ ticket IDs, timestamps, execution details, and recorded evidence/reasons.
   and the failed ticket's commit. For both flags, one commit SHA must be a prefix of the other.
   These flags are mutually exclusive. A fallback PASS resolves only its linked UNREVIEWED
   ticket. Other unresolved failures prevent PASS; a BLOCK always wins within its round.
+- A plain `start` is refused while `--fallback` would be accepted (the round's latest closed
+  ticket is UNREVIEWED, no BLOCK, no fallback yet): a failed review is retried in its own round,
+  never by spending the next one. `--owner-approval` overrides.
 - `close` blocker counts follow the verdict: PASS takes `--blockers 0` or no `--blockers`,
   BLOCK requires `--blockers N` (N >= 1), UNREVIEWED requires `--reason`. The coordinator
   records the verdict after reproducing the reviewer's findings; the owner only supplies
