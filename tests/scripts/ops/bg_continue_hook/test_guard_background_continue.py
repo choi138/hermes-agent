@@ -18,7 +18,7 @@ def teardown_module():
         shutil.rmtree(path)
 
 
-def run(payload, env_extra=None, raw=None):
+def run(payload, env_extra=None, raw=None, hook=HOOK):
     tmp = tempfile.mkdtemp()
     _TEMP_DIRS.append(tmp)
     log = os.path.join(tmp, "sub", "hook.jsonl")
@@ -26,7 +26,7 @@ def run(payload, env_extra=None, raw=None):
     env.pop("TERMINAL_MAX_FOREGROUND_TIMEOUT", None)
     env.update(env_extra or {})
     data = raw if raw is not None else json.dumps(payload)
-    proc = subprocess.run([sys.executable, HOOK], input=data, capture_output=True, text=True, env=env)
+    proc = subprocess.run([sys.executable, "-B", hook], input=data, capture_output=True, text=True, env=env)
     lines = []
     if os.path.exists(log):
         with open(log, encoding="utf-8") as handle:
@@ -176,6 +176,93 @@ class HookTests(unittest.TestCase):
         with open(log, encoding="utf-8") as handle:
             rec = json.loads(handle.readline())
         self.assertEqual((rec["decision"], rec["error"]), ("error", "RuntimeError"))
+
+
+STATE = "/Users/choegeun-won/.local/state/hermes-delegate"
+# Production koharu commands (2026-10-23..26) that sleep-polled a running delegation.
+PEEK_COMMANDS = [
+    "sleep 20; pgrep -f run_codex_task.py | wc -l; pgrep -x codex | wc -l",
+    "sleep 45; R=%s/claude/x; ls $R" % STATE,
+    "sleep 20; pgrep -f 'codex exec' | wc -l; ls %s/codex/20261023T081606-81cef" % STATE,
+    "R=%s/qa/ios-r3; for i in $(seq 1 40); do [ -f $R/qa.rc ] && break; sleep 13; done; cat $R/qa.rc" % STATE,
+    "until test -f $HOME/.local/state/hermes-delegate/qa/x/qa.rc; do sleep 10; done",
+    "sleep 40; D=%s/qa/archive-8dbc22; ls $D; cat $D/started_at 2>&1; head -c 600 $D/qa.out" % STATE,
+    'sleep 25; ps -axo pid=,etime=,command= | grep -E "[c]odex exec|[c]laude -p --model" | cut -c1-60',
+    'sleep 20; for d in ~/.local/state/hermes-delegate/claude/a ~/.local/state/hermes-delegate/claude/b; '
+    'do echo "$(basename $d) $(wc -c < $d/claude.out 2>/dev/null)"; done',
+    "sleep 1m; pkill -0 -f 'claude -p'",
+    "bash -lc 'sleep 30; pgrep -f hermes-delegate'",
+]
+ALLOWED_COMMANDS = [
+    "hermes-delegate wait %s/codex/run --timeout 3600" % STATE,
+    "hermes-delegate status %s/codex/run" % STATE,
+    "sleep 30; hermes-delegate status %s/codex/run" % STATE,
+    "sleep 1; curl -s localhost:4789/api/threads",
+    "pgrep -f 'codex exec' | wc -l",
+    "ls %s/codex/20261023T081606-81cef" % STATE,
+    "sleep 20 && gh pr checks 18 --watch --fail-fast",
+    "sleep 1; pgrep -f 'codex exec'",
+    "until curl -sf localhost:3000; do sleep 2; done; echo codex claude",
+    # cancel-then-confirm is a one-shot check, not a poll
+    "R=%s/review/x; hermes-delegate cancel $R | tail -3; sleep 3; P=$(cat $R/inner.pid); kill -0 $P" % STATE,
+    "echo 'sleep 20; ls %s/x'" % STATE,
+    "cat > /tmp/w.sh <<'EOF'\nsleep 20\nls %s/x\nEOF\n" % STATE,
+]
+
+
+def peek(command, **args):
+    return {"hook_event_name": "pre_tool_call", "tool_name": "terminal",
+            "tool_input": dict(command=command, **args), "session_id": "s1"}
+
+
+class PeekTests(unittest.TestCase):
+    def assertPeekBlocked(self, payload, hook=HOOK):
+        proc, lines, _ = run(payload, hook=hook)
+        self.assertEqual(proc.returncode, 2, payload["tool_input"]["command"])
+        body = json.loads(proc.stdout)
+        self.assertEqual(body["action"], "block")
+        self.assertIn("hermes-delegate status PATH", body["message"])
+        self.assertEqual([x["decision"] for x in lines], ["blocked_peek"])
+
+    def test_production_sleep_polls_are_blocked(self):
+        for command in PEEK_COMMANDS:
+            with self.subTest(command=command):
+                self.assertPeekBlocked(peek(command))
+
+    def test_background_sleep_poll_is_blocked_before_arming(self):
+        self.assertPeekBlocked(peek(PEEK_COMMANDS[0], background=True, notify=True))
+
+    def test_official_checks_and_unrelated_sleeps_are_allowed(self):
+        for command in ALLOWED_COMMANDS:
+            with self.subTest(command=command):
+                proc, lines, _ = run(peek(command))
+                self.assertEqual((proc.returncode, proc.stdout, lines), (0, "", []))
+
+    def test_short_or_unknown_sleep_is_not_a_poll(self):
+        for command in ("sleep 1.5; pgrep -f 'codex exec'", "sleep $N; pgrep -f 'codex exec'"):
+            proc, _, _ = run(peek(command))
+            self.assertEqual(proc.returncode, 0, command)
+        proc, _, _ = run(peek("sleep 2; pgrep -f 'codex exec'"))
+        self.assertEqual(proc.returncode, 2)
+
+    def test_without_shared_tokenizer_the_fallback_still_decides(self):
+        tmp = tempfile.mkdtemp()
+        _TEMP_DIRS.append(tmp)
+        alone = os.path.join(tmp, "guard_background_continue.py")
+        shutil.copy(HOOK, alone)
+        for command in PEEK_COMMANDS[:4]:
+            with self.subTest(command=command):
+                self.assertPeekBlocked(peek(command), hook=alone)
+        for command in ALLOWED_COMMANDS[:9]:
+            with self.subTest(command=command):
+                proc, _, _ = run(peek(command), hook=alone)
+                self.assertEqual(proc.returncode, 0)
+
+    def test_oversized_command_uses_fallback(self):
+        filler = "; ".join("echo %d" % i for i in range(12000))
+        self.assertPeekBlocked(peek(filler + "; sleep 20; ls %s/x" % STATE))
+        proc, _, _ = run(peek(filler + "; sleep 20; echo done"))
+        self.assertEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":
