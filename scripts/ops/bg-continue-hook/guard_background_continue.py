@@ -16,11 +16,24 @@ Rules (terminal tool only; Hermes semantics verified in tools/terminal_tool.py o
      -> block: Hermes would silently promote it to an unarmed background run.
   Only continue_on_complete=false (a boolean) is the opt-out; it is respected and logged as
   "opted-out". true is already armed. Any other value is left for Hermes to refuse.
-  C. any terminal command that both sleeps (sleep N, N >= 2) and peeks at a delegation (pgrep/ps/
-     pkill -0 for codex exec, claude -p, run_codex_task or hermes-delegate, or ls/cat/tail/head/wc/
-     find/stat/test on ~/.local/state/hermes-delegate) -> block, logged as "blocked_peek".
-     Completion already arrives through the hermes-delegate watcher; sleep-polling burned turns
-     (2026-10-23..26). hermes-delegate wait/status/cancel are the official paths and never peeks.
+  Sleep-poll rules (foreground only; a background watcher costs no turns and is never blocked).
+  A sleep (N >= 2) pairs with a check inside the same polling loop (while/until, or for over
+  $(seq ..) / {1..N} / 1 2 3), or when the check follows the sleep in the same command list with
+  only neutral commands (cd, export, echo, text filters, reads) in between. A sleep inside a loop
+  never pairs with checks after the loop, and nested ssh '...' / bash -c '...' bodies are judged
+  on their own.
+  C. check = delegation peek: pgrep/ps|grep/pkill -0 for codex exec, claude -p, run_codex_task or
+     hermes-delegate, or ls/cat/tail/head/wc/find/stat/test/grep on ~/.local/state/hermes-delegate
+     -> block "blocked_peek". hermes-delegate wait/status/cancel are the official paths.
+  D. check = gh pr checks / gh run view / gh pr view statusCheckRollup / gh api .../actions/runs,
+     or gh run list after a sleep over 30 s or in a polling loop -> block "blocked_ci_poll".
+     Not polls: gh pr checks --watch and gh run watch (and the run-id lookup or startup delay
+     feeding them), or a sleep <= 30 s right after a trigger (push, rerun, workflow run, merge).
+  E. a polling loop with a sleep and a file wait ([ -f X ], test -e, grep -q on a .rc/.done/.log/
+     marker) -> block "blocked_file_wait_loop". Allowed: readiness loops (curl/lsof/nc/adb/simctl/
+     healthz) without a marker file, and a wait for a job the same call launched (cmux/tmux/nohup).
+  Why: completion already arrives through the watcher or notify; sleep-polling burned turns
+  (2026-10-22..26 replay: 69 delegation peeks, 31 CI polls, 8 file-wait loops in 5591 calls).
 
 Exit 0 = allow (stdout empty, or a modify directive). Exit 2 = block. Any internal error or
 malformed stdin = allow (fail open). The log never contains the command text.
@@ -44,22 +57,53 @@ PEEK_NEEDLES = ("codex exec", "claude -p", "run_codex_task", "hermes-delegate")
 PEEK_NAMES = {"codex", "claude"}
 PROCESS_GREPS = {"grep", "egrep", "rg", "awk"}
 FILE_PEEKS = {"ls", "cat", "tail", "head", "wc", "find", "stat", "test", "[", "[["}
+FILE_TESTS = {"test", "[", "[["}
+READINESS = {"curl", "wget", "lsof", "nc", "adb", "xcrun", "simctl", "ping", "pg_isready", "redis-cli"}
 NESTED_SHELLS = {"bash", "sh", "zsh", "ssh"}
-SKIP_WORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "time", "command", "exec"}
+WRAPPERS = {"nohup", "command", "exec", "time", "builtin"}
+SKIP_WORDS = {"if", "then", "elif", "else", "!", "fi", "esac"}
+LOOPS = {"for", "while", "until", "select"}
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?^\s*\2[ \t]*$", re.S | re.M)
+SINGLE_QUOTED = re.compile(r"'[^']*'")
+DOUBLE_QUOTED = re.compile(r'"[^"]*"')
+SUBSTITUTION = re.compile(r"\$\(([^()]*)\)")
+COUNTER = re.compile(r"seq|\{\d+\.\.")
+LAUNCHERS = {"cmux", "tmux", "screen", "nohup", "setsid", "systemd-run"}
+NEUTRAL = {"cd", "pushd", "popd", "export", "echo", "printf", "true", ":", "set", "unset", "wc", "head",
+           "tail", "grep", "egrep", "rg", "awk", "sed", "cut", "tr", "sort", "uniq", "jq", "xargs", "tee",
+           "cat", "column", "date", "basename", "dirname", "ls", "find", "stat", "test", "[", "[[", "ps",
+           "pgrep", "du", "md5", "md5sum", "shasum", "realpath", "readlink", "break", "continue"}
+CHECKS = {"peek", "ci", "ci_lookup", "file_wait", "sleep", "watch"}
+STARTUP_DELAY = 30
 DECLARATIONS = {"export", "local", "typeset", "declare", "readonly"}
 ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z_0-9]*)=(.*)$", re.S)
 SLEEP_ARG = re.compile(r"^(\d+(?:\.\d*)?|\.\d+)([smhd]?)$")
 SLEEP_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
-PREFILTER = re.compile(r"odex|laude|hermes-delegate")  # also matches the [c]odex grep trick
+MARKER_FILE = re.compile(
+    r"(?:\.(?:rc|done|exit|status|log|out|end|finished|complete)|(?:^|/)(?:done|[A-Z][A-Z0-9_]{2,}))[\"']?$")
+PREFILTER = re.compile(r"odex|laude|hermes-delegate|\bgh\b|\b(?:for|while|until)\b")  # odex: [c]odex trick
 PEEK_BUDGET_SECONDS = 0.1
 PEEK_SIZE_LIMIT = 64 * 1024
-PEEK_MESSAGE = (
-    "bg-continue hook: delegation sleep-poll blocked / 위임 작업을 sleep으로 폴링하지 마세요. "
-    "After launched=yes or a printed codex argv, check at most once with "
-    "`hermes-delegate status PATH` (launched=yes 또는 codex argv 출력 뒤 확인은 이것 한 번만). "
-    "Completion arrives via the hermes-delegate watcher / gateway notification "
-    "(완료는 watcher·게이트웨이 알림으로 옵니다); end the turn instead of sleeping."
-)
+NEST_LIMIT = 8
+SLEEP_RULES = (  # (check kind, decision); the first match wins
+    ("peek", "blocked_peek"), ("ci", "blocked_ci_poll"), ("file_wait", "blocked_file_wait_loop"))
+MESSAGES = {
+    "blocked_peek": (
+        "bg-continue hook: delegation sleep-poll blocked / 위임 작업을 sleep으로 폴링하지 마세요. "
+        "After launched=yes or a printed codex argv, check at most once with "
+        "`hermes-delegate status PATH` (launched=yes 또는 codex argv 출력 뒤 확인은 이것 한 번만). "
+        "Completion arrives via the hermes-delegate watcher / gateway notification "
+        "(완료는 watcher·게이트웨이 알림으로 옵니다); end the turn instead of sleeping."),
+    "blocked_ci_poll": (
+        "bg-continue hook: CI sleep-poll blocked / CI를 sleep으로 폴링하지 마세요. Run "
+        "`gh pr checks <PR> --watch --fail-fast` or `gh run watch <ID> --exit-status` as ONE "
+        "background terminal call with notify_on_complete=true (백그라운드 한 번 + 완료 알림)."),
+    "blocked_file_wait_loop": (
+        "bg-continue hook: foreground file-wait loop blocked / 결과 파일을 sleep 루프로 기다리지 마세요. "
+        "If the result is needed this turn, run that command in the foreground with a timeout "
+        "instead of backgrounding it and polling (이번 턴에 필요하면 foreground+timeout으로 직접 실행); "
+        "otherwise wait for its completion notification (아니면 완료 알림을 기다리세요)."),
+}
 _TOKENIZER = []
 
 
@@ -85,14 +129,38 @@ def _tokenizer():
 
 
 def _fallback_commands(text):
-    for segment in re.split(r"\$\(|[;&|\n()`]", text):
-        argv = [w.strip("\"'") for w in segment.split()]
+    """Rough split for when the shared tokenizer is unavailable or gives up."""
+    bodies, quoted = [], []
+
+    def quote(match):
+        quoted.append(match[0][1:-1])
+        return "\x01%d\x01" % (len(quoted) - 1)
+
+    def hide(match):
+        bodies.append(re.sub(r"\$<(\d+)_\w*>", lambda m: "$(%s)" % bodies[int(m[1])], match[1]))
+        # Keep a hint of the body (for example "seq") so loop headers stay recognizable.
+        return "$<%d_%s>" % (len(bodies) - 1, re.sub(r"\W", "_", match[1])[:40])
+
+    text = SINGLE_QUOTED.sub(quote, HEREDOC.sub("", text))
+    while True:
+        hidden = SUBSTITUTION.sub(hide, text)
+        if hidden == text:
+            break
+        text = hidden
+    text = DOUBLE_QUOTED.sub(quote, text)
+
+    def restore(word):
+        return re.sub("\x01(\\d+)\x01", lambda m: quoted[int(m[1])], word)
+
+    for segment in re.split(r"[;&|\n()`]", text):
+        argv = [restore(w) for w in segment.split()]
+        subs = [restore(bodies[int(n)]) for n in re.findall(r"\$<(\d+)_", restore(segment))]
         if argv:
-            yield argv, []
+            yield argv, subs
 
 
 def _commands(text):
-    """Yield (argv, nested scripts) per simple command; nested = substitutions and -c/ssh bodies."""
+    """Yield (argv, substitution bodies) per simple command, in source order."""
     module = _tokenizer()
     if module is None or len(text) > PEEK_SIZE_LIMIT:
         yield from _fallback_commands(text)
@@ -111,12 +179,206 @@ def _commands(text):
         yield [w.value for w in words if not w.redirection], [s for w in words for s in w.substitutions]
 
 
-def _is_sleep(argv):
-    for arg in argv[1:]:
+class _Loop(list):
+    def __init__(self, polling):
+        super().__init__()
+        self.polling = polling
+
+
+class _Script:
+    """One shell scope. Nested shell bodies (ssh '...', bash -c '...') get their own _Script."""
+
+    def __init__(self, text, depth=0):
+        self.depth, self.vars, self.ps, self.cancel, self.nested = depth, {}, False, False, []
+        self.root = []
+        stack = [self.root]
+        for argv, subs in _commands(text):
+            self._add(stack, argv, subs)
+
+    def _add(self, stack, argv, subs):
+        for body in subs:  # a substitution runs at its command's position
+            if self.depth < NEST_LIMIT:
+                for sub_argv, sub_subs in _commands(body):
+                    self._add(stack, sub_argv, sub_subs)
+        while argv:
+            head = argv[0]
+            if head in SKIP_WORDS:
+                argv = argv[1:]
+            elif head in LOOPS:
+                if head in ("for", "select"):
+                    items = argv[3:] if len(argv) >= 3 and argv[2] == "in" else []
+                    loop = _Loop(_is_counter(items))
+                    if items:
+                        self.vars[argv[1]] = " ".join(items)
+                    argv = []
+                else:
+                    loop = _Loop(True)
+                    argv = argv[1:]
+                stack[-1].append(loop)
+                stack.append(loop)
+            elif head == "do":
+                argv = argv[1:]
+            elif head == "done":
+                if len(stack) > 1:
+                    stack.pop()
+                return
+            elif ASSIGNMENT.match(head):
+                match = ASSIGNMENT.match(head)
+                self.vars[match[1]] = match[2]
+                argv = argv[1:]
+            else:
+                break
+        if argv:
+            stack[-1].append(self._command(argv))
+
+    def _command(self, argv):
+        program = os.path.basename(argv[0])
+        launch = program in LAUNCHERS
+        while program in WRAPPERS or program in ("timeout", "env"):
+            argv = argv[1:]
+            while argv and (argv[0].startswith("-") or (program == "env" and ASSIGNMENT.match(argv[0]))):
+                argv = argv[2:] if program == "timeout" and argv[0] in ("-k", "-s") else argv[1:]
+            if program == "timeout":
+                argv = argv[1:]
+            if not argv:
+                return {"program": None, "args": [], "launch": launch}
+            program = os.path.basename(argv[0])
+        args = argv[1:]
+        if program in DECLARATIONS:
+            for arg in args:
+                match = ASSIGNMENT.match(arg)
+                if match:
+                    self.vars[match[1]] = match[2]
+        elif program == "ps":
+            self.ps = True
+        elif program == "hermes-delegate" and args[:1] == ["cancel"]:
+            self.cancel = True
+        elif program in NESTED_SHELLS and self.depth < NEST_LIMIT:
+            self.nested.extend(_Script(a, self.depth + 1) for a in args if " " in a or ";" in a)
+        return {"program": program, "args": args, "launch": launch}
+
+    def kinds(self, command, tainted):
+        program, args = command.get("program"), command.get("args", [])
+        kinds = set()
+        if command.get("launch"):
+            kinds.add("launch")
+        if program == "sleep" and _sleep_seconds(args) >= 2:
+            kinds.add("sleep")
+        if program in ("pgrep", "pkill") and (program == "pgrep" or "-0" in args) and _names_delegation(args):
+            kinds.add("peek")
+        if program in PROCESS_GREPS and self.ps and _names_delegation(args):
+            kinds.add("peek")
+        if program in FILE_PEEKS or program in PROCESS_GREPS:
+            if any(_references_state(a, tainted) for a in args):
+                kinds.add("peek")
+        if program == "gh":
+            kinds.add(_gh_kind(args))
+        elif program == "git" and args[:1] == ["push"]:
+            kinds.add("trigger")
+        if program in FILE_TESTS:
+            for i, arg in enumerate(args[:-1]):
+                if arg in ("-f", "-e", "-s"):
+                    kinds.add("file_wait")
+                    if MARKER_FILE.search(args[i + 1]):
+                        kinds.add("marker_wait")
+        if program in PROCESS_GREPS and "-q" in args and args and MARKER_FILE.search(args[-1]):
+            kinds.update(("file_wait", "marker_wait"))
+        if program in READINESS or any("healthz" in a for a in args):
+            kinds.add("ready")
+        if program is None or program in NEUTRAL or kinds & CHECKS:
+            kinds.add("neutral")
+        return kinds
+
+    def hits(self, tainted):
+        found = set()
+        for script in self.nested:
+            found |= script.hits(_state_tainted(script.vars, tainted))
+        found |= self._walk(self.root, tainted, False)[0]
+        if self.cancel:  # cancel-then-confirm is a one-shot check, not a poll
+            found.discard("peek")
+        return found
+
+    def _walk(self, items, tainted, launched):
+        """Return (hits, kinds seen, whether the list ran a non-neutral command)."""
+        found, all_kinds, closes = set(), set(), False
+        window, startup, triggered, ci = 0, False, False, False
+        for item in items:
+            if isinstance(item, _Loop):
+                sub_found, kinds, item_closes = self._walk(item, tainted, launched)
+                ci |= "ci" in sub_found
+                found |= sub_found - {"ci"}
+                if item.polling and "sleep" in kinds:
+                    found |= kinds & {"peek"}
+                    ci |= bool(kinds & {"ci", "ci_lookup"})
+                    waits = "marker_wait" in kinds or ("file_wait" in kinds and "ready" not in kinds)
+                    # A job launched earlier in this same call and awaited here is a foreground run.
+                    if waits and not launched:
+                        found.add("file_wait")
+                slept = False
+            else:
+                kinds = self.kinds(item, tainted)
+                item_closes = "neutral" not in kinds
+                slept = "sleep" in kinds
+            if window:
+                found |= kinds & {"peek"}
+                # A short delay after a trigger (or a watcher), or before a run-id lookup, is not a poll.
+                ci |= not startup and ("ci" in kinds or ("ci_lookup" in kinds and window > STARTUP_DELAY))
+            if "watch" in kinds:
+                # Lookups and startup delays that feed a watcher are not polls.
+                ci, window, triggered = False, 0, True
+            elif slept:
+                window = _sleep_seconds(item["args"])
+                startup = triggered and window <= STARTUP_DELAY
+            elif item_closes:
+                window = 0
+            triggered |= "trigger" in kinds
+            launched |= "launch" in kinds
+            closes |= item_closes
+            all_kinds |= kinds
+        if ci:
+            found.add("ci")
+        return found, all_kinds, closes
+
+
+def _is_counter(items):
+    """for i in $(seq ..) / {1..9} / 1 2 3 counts attempts; for n in 27 30 iterates over items."""
+    if any(COUNTER.search(i) for i in items):
+        return True
+    if len(items) < 2 or items[0] not in ("0", "1"):
+        return False
+    return items == [str(n) for n in range(int(items[0]), int(items[0]) + len(items))]
+
+
+def _sleep_seconds(args):
+    best = 0
+    for arg in args:
         match = SLEEP_ARG.match(arg)
-        if match and float(match[1]) * SLEEP_UNITS[match[2]] >= 2:
-            return True
-    return False
+        if match:
+            best = max(best, float(match[1]) * SLEEP_UNITS[match[2]])
+    return best
+
+
+def _gh_kind(args):
+    if args[:2] == ["run", "watch"] or (args[:2] == ["pr", "checks"] and "--watch" in args):
+        return "watch"
+    if args[:2] in (["run", "rerun"], ["workflow", "run"], ["pr", "create"], ["pr", "merge"],
+                    ["pr", "comment"], ["pr", "ready"]):
+        return "trigger"
+    if args[:2] == ["run", "list"]:
+        return "ci_lookup"
+    if _is_ci_check(args):
+        return "ci"
+    return "neutral" if args[:2] == ["pr", "view"] else "other"
+
+
+def _is_ci_check(args):
+    if "--watch" in args:
+        return False
+    if args[:2] in (["pr", "checks"], ["run", "view"]):
+        return True
+    if args[:2] == ["pr", "view"] and any("statusCheckRollup" in a for a in args):
+        return True
+    return args[:1] == ["api"] and any("actions/runs" in a for a in args)
 
 
 def _normalized(args):
@@ -130,50 +392,8 @@ def _names_delegation(args):
         a in PEEK_NAMES for a in args if not a.startswith("-"))
 
 
-def _scan(text, facts, depth=0):
-    if depth > 8:
-        return
-    for argv, nested in _commands(text):
-        for body in nested:
-            _scan(body, facts, depth + 1)
-        while argv and (argv[0] in SKIP_WORDS or ASSIGNMENT.match(argv[0])):
-            match = ASSIGNMENT.match(argv[0])
-            if match:
-                facts["vars"][match[1]] = match[2]
-            argv = argv[1:]
-        if not argv:
-            continue
-        program, args = os.path.basename(argv[0]), argv[1:]
-        if program in DECLARATIONS:
-            for arg in args:
-                match = ASSIGNMENT.match(arg)
-                if match:
-                    facts["vars"][match[1]] = match[2]
-        elif program == "for" and len(args) >= 2 and args[1] == "in":
-            facts["vars"][args[0]] = " ".join(args[2:])
-        elif program == "sleep" and _is_sleep(argv):
-            facts["sleep"] = True
-        elif program == "hermes-delegate" and args[:1] == ["cancel"]:
-            facts["cancel"] = True
-        elif program in ("pgrep", "pkill"):
-            if (program == "pgrep" or "-0" in args) and _names_delegation(args):
-                facts["process_peek"] = True
-        elif program == "ps":
-            facts["ps"] = True
-            facts["ps_match"] |= _names_delegation(args)
-        elif program in PROCESS_GREPS:
-            facts["ps_match"] |= _names_delegation(args)
-            facts["file_args"].extend(args)
-        elif program in FILE_PEEKS:
-            facts["file_args"].extend(args)
-        elif program in NESTED_SHELLS:
-            for arg in args:
-                if " " in arg or ";" in arg:
-                    _scan(arg, facts, depth + 1)
-
-
-def _state_tainted(variables):
-    tainted = {k for k, v in variables.items() if STATE_MARKER in v}
+def _state_tainted(variables, inherited=frozenset()):
+    tainted = {k for k, v in variables.items() if STATE_MARKER in v} | set(inherited)
     for _ in range(4):
         grown = {k for k, v in variables.items()
                  if any(re.search(r"\$\{?%s\b" % re.escape(t), v) for t in tainted)} | tainted
@@ -189,18 +409,13 @@ def _references_state(arg, tainted):
     return any(name in tainted for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z_0-9]*)", arg))
 
 
-def is_delegation_peek(command):
+def sleep_poll_decision(command):
+    """SLEEP_RULES decision for a foreground command (pairing rules in the module docstring)."""
     if not isinstance(command, str) or "sleep" not in command or not PREFILTER.search(command):
-        return False
-    facts = {"vars": {}, "sleep": False, "cancel": False, "process_peek": False,
-             "ps": False, "ps_match": False, "file_args": []}
-    _scan(command, facts)
-    if not facts["sleep"] or facts["cancel"]:
-        return False
-    if facts["process_peek"] or (facts["ps"] and facts["ps_match"]):
-        return True
-    tainted = _state_tainted(facts["vars"])
-    return any(_references_state(arg, tainted) for arg in facts["file_args"])
+        return None
+    script = _Script(command)
+    found = script.hits(_state_tainted(script.vars))
+    return next((decision for kind, decision in SLEEP_RULES if kind in found), None)
 
 
 def _cap():
@@ -227,7 +442,7 @@ def _notifies_on_exit(args):
 
 
 def decide(payload):
-    """Return (decision, directive): None, 'modified', 'opted-out', 'blocked' or 'blocked_peek'."""
+    """Return (decision, directive): None, 'modified', 'opted-out', 'blocked' or a SLEEP_RULES decision."""
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "pre_tool_call":
         return None, None
     if payload.get("tool_name") != "terminal":
@@ -235,8 +450,6 @@ def decide(payload):
     args = payload.get("tool_input")  # Hermes sends tool args only here (None when not a dict)
     if not isinstance(args, dict):
         return None, None
-    if is_delegation_peek(args.get("command")):
-        return "blocked_peek", {"action": "block", "message": PEEK_MESSAGE}
     opted_out = args.get("continue_on_complete") is False
 
     if args.get("background"):
@@ -264,6 +477,9 @@ def decide(payload):
                 "purpose, pass continue_on_complete=false explicitly." % (timeout, _cap(), _cap())
             )
             return "blocked", {"action": "block", "message": message}
+        decision = sleep_poll_decision(args.get("command"))
+        if decision:
+            return decision, {"action": "block", "message": MESSAGES[decision]}
     return None, None
 
 
@@ -301,7 +517,7 @@ def main():
     if directive is None:
         return 0
     sys.stdout.write(json.dumps(directive))
-    return 2 if decision in ("blocked", "blocked_peek") else 0
+    return 2 if decision.startswith("blocked") else 0
 
 
 if __name__ == "__main__":
