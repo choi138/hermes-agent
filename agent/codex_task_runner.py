@@ -335,6 +335,8 @@ def _report_snapshot(request, *, bounded=False):
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             return "report_not_regular", None, 0
+        if bounded:
+            return "report_unreadable", None, 0
         raise
 
 

@@ -645,7 +645,8 @@ def _events(manifest, state, now, *, limit=1024 * 1024):
 
 
 TERMINAL = {"cli_completed", "cli_failed", "timed_out", "cancelled", "launch_failed",
-            "output_limit", "artifact_or_transport_failed", "registration_failed", "cleanup_failed"}
+            "output_limit", "artifact_or_transport_failed", "registration_failed", "cleanup_failed",
+            "report_rejected"}
 
 
 def _receipt(manifest, state):

@@ -109,6 +109,19 @@ def test_report_missing_rejected(inputs, tmp_path):
     assert_report_rejected(result, "report_missing")
 
 
+@pytest.mark.parametrize("target", ["reports/IMPLEMENTER.md", "reports"])
+def test_report_unreadable_rejected(inputs, tmp_path, target):
+    body = ("import os, sys\nfrom pathlib import Path\nsys.stdin.read()\nPath('reports').mkdir()\n"
+            f"Path('reports/IMPLEMENTER.md').write_text('report')\nos.chmod({target!r}, 0)\n")
+    try:
+        result = report_run(inputs, tmp_path, body)
+    finally:
+        os.chmod(tmp_path / "reports", 0o700)
+        os.chmod(tmp_path / "reports/IMPLEMENTER.md", 0o600)
+    assert_report_rejected(result, "report_unreadable")
+    assert result["process_returncode"] == 0
+
+
 @pytest.mark.parametrize("kind", ["directory", "symlink", "parent_symlink", "dangling_symlink", "fifo"])
 def test_report_not_regular_rejected(inputs, tmp_path, kind):
     bodies = {

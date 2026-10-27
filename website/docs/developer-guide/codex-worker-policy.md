@@ -35,6 +35,20 @@ resolved `complex` or `frontier` implementation phase to `general`; select
 `--implementation-class bounded` only when the remaining scope is narrow. A short
 task need not be split into phases.
 
+## Report guard
+
+`--report REL` names an implementer report, relative to the workdir, that the
+worker must write. It requires `--sandbox workspace-write`. Before spawn, any
+symlink or non-regular file on the path is refused. After a CLI exit of 0, the
+runner opens each path component with `O_NOFOLLOW` and rejects the run with
+status `report_rejected`, exit 76 and `acceptance.status=failed` when the report
+is missing, not a regular file, unreadable, empty, over 1 MiB, or byte-identical
+to the pre-run content. The reasons are `report_missing`, `report_not_regular`,
+`report_unreadable`, `report_empty`, `report_too_large` and `report_unchanged`.
+An accepted report adds `acceptance.report` with its path, SHA-256 and size;
+it is not independent validation. The progress tracker treats
+`report_rejected` as a terminal receipt.
+
 ## Normal and dry-run dispatch
 
 All path and authority arguments remain required. `--dry-run` validates them,

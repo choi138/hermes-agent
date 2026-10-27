@@ -76,7 +76,7 @@ def test_actual_v3_cli_preserves_policy_and_owned_progress(tmp_path, cli):
             time.sleep(.01)
         argv = json.loads(recorded.read_text())
         if cli == 'codex':
-            assert argv[argv.index('-m') + 1] == 'gpt-6-luna'
+            assert argv[argv.index('-m') + 1] == 'gpt-6.1-terra'
             assert 'model_reasoning_effort="low"' in argv
         else:
             assert argv[argv.index('--advisor') + 1] == 'opus'
@@ -108,7 +108,7 @@ def test_actual_v3_cli_preserves_policy_and_owned_progress(tmp_path, cli):
         output, error = process.communicate(timeout=1)
         receipt = json.loads(output.decode().splitlines()[-1])
         if cli == 'codex':
-            assert receipt['policy']['selected'] == {'model': 'gpt-6-luna', 'effort': 'low'}
+            assert receipt['policy']['selected'] == {'model': 'gpt-6.1-terra', 'effort': 'low'}
         else:
             assert receipt['configuration']['requested']['model'] == 'sonnet'
     finally:
@@ -263,7 +263,7 @@ def test_terminal_supersedes_unadmitted_head_without_hidden_stale_queue(tmp_path
 @pytest.mark.parametrize('status,code', [
     ('cli_completed',0),('cli_failed',1),('timed_out',124),('cancelled',130),
     ('launch_failed',127),('output_limit',75),('artifact_or_transport_failed',74),
-    ('registration_failed',74),('cleanup_failed',74),
+    ('registration_failed',74),('cleanup_failed',74),('report_rejected',76),
 ])
 def test_gateway_terminal_receipts_preserve_failure_and_verification_pending(tmp_path,status,code):
     manifest,_,progress=owned_progress_case(tmp_path)

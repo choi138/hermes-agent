@@ -58,7 +58,7 @@ def test_dry_run_ignores_login_reexec_and_preserves_policy(monkeypatch, capsys, 
     monkeypatch.setattr(launcher.os, 'execvpe', lambda *args: pytest.fail('must not reexec dry run'))
     assert launcher.main() == 0
     receipt = json.loads(capsys.readouterr().out)
-    assert receipt['policy']['selected'] == {'model': 'gpt-6-luna', 'effort': 'low'}
+    assert receipt['policy']['selected'] == {'model': 'gpt-6.1-terra', 'effort': 'low'}
     assert list(output.iterdir()) == []
 
 
