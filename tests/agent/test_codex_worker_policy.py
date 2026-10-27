@@ -329,3 +329,96 @@ def test_advisor_is_validated_and_survives_lifecycle_round_trip(tmp_path):
         TaskRequest(spec, tmp_path, tmp_path, out, advisor="opus")
     with pytest.raises(ValueError):
         TaskRequest(spec, tmp_path, tmp_path, out, cli="claude", model="sonnet", advisor="haiku")
+
+
+@pytest.mark.parametrize(
+    "task_class,expected",
+    [
+        ("mechanical", ("gpt-6-luna", "low")),
+        ("bounded", ("gpt-6-luna", "medium")),
+        ("general", ("gpt-6.1-sol", "medium")),
+        ("integration", ("gpt-6.1-sol", "high")),
+        ("complex", ("gpt-6.1-sol", "high")),
+        ("frontier", ("gpt-6.1-sol", "xhigh")),
+        ("canary-terra-low", ("gpt-6.1-terra", "low")),
+        ("canary-terra-medium", ("gpt-6.1-terra", "medium")),
+    ],
+)
+def test_canary_policy_preserves_all_class_selections(task_class, expected):
+    decision = decide_worker(PolicyInput(
+        task_class=task_class, deeper_analysis_evidence="recorded failure analysis",
+    ))
+    assert decision.action == "spawn"
+    assert (decision.model, decision.effort) == expected
+
+
+@pytest.mark.parametrize("task_class", ["canary-terra-low", "canary-terra-medium"])
+@pytest.mark.parametrize(
+    "floors,expected_effort",
+    [
+        ({"risk": "high"}, "high"),
+        ({"ambiguity": "unknown"}, "medium"),
+        ({"ambiguity": "ambiguous"}, "high"),
+    ],
+)
+def test_canary_classes_obey_risk_and_ambiguity_floors(task_class, floors, expected_effort):
+    decision = decide_worker(PolicyInput(task_class=task_class, **floors))
+    assert decision.action == "spawn"
+    assert (decision.model, decision.effort) == ("gpt-6.1-sol", expected_effort)
+
+
+@pytest.mark.parametrize("prior_model", ["gpt-6-luna", "gpt-6.1-terra"])
+@pytest.mark.parametrize("prior_effort", ["low", "medium", "xhigh"])
+@pytest.mark.parametrize(
+    "failure_kind", ["approach_failure", "misunderstanding", "repeated_same_defect"],
+)
+def test_model_escalation_skips_canary_and_preserves_effort(prior_model, prior_effort, failure_kind):
+    decision = decide_worker(PolicyInput(
+        failure_kind=failure_kind, attempt=2,
+        prior_model=prior_model, prior_effort=prior_effort,
+        correction_evidence="new failing invariant and revised hypothesis",
+        deeper_analysis_evidence="recorded failure analysis",
+    ))
+    assert decision.action == "spawn"
+    assert (decision.model, decision.effort) == (
+        "gpt-6.1-sol", "xhigh" if prior_effort == "xhigh" else "high",
+    )
+    assert decision.escalated
+
+
+def test_shallow_reasoning_keeps_terra_and_increases_effort():
+    decision = decide_worker(PolicyInput(
+        failure_kind="shallow_reasoning", attempt=2,
+        prior_model="gpt-6.1-terra", prior_effort="low",
+    ))
+    assert decision.action == "spawn"
+    assert (decision.model, decision.effort) == ("gpt-6.1-terra", "medium")
+    assert decision.escalated
+
+
+def test_terra_canary_policy_version():
+    from agent.codex_worker_policy import POLICY_VERSION
+
+    assert POLICY_VERSION == "2026-10-27.1"
+    assert decide_worker(PolicyInput()).receipt()["policy_version"] == POLICY_VERSION
+
+
+def test_unapproved_terra_canary_class_is_rejected():
+    with pytest.raises(ValueError, match="^Unsupported task class$"):
+        PolicyInput(task_class="canary-terra-high")
+
+
+@pytest.mark.parametrize(
+    "mechanical_pair", [("gpt-6-luna", "low"), ("gpt-6.1-sol", "high")],
+)
+def test_legacy_low_override_floor_is_independent_of_mechanical_class(monkeypatch, mechanical_pair):
+    from agent.codex_worker_policy import CLASS_SELECTIONS
+
+    monkeypatch.setitem(CLASS_SELECTIONS, "mechanical", mechanical_pair)
+    decision = decide_worker(PolicyInput(
+        model_override="gpt-6-luna", effort_override="low",
+        override_source="legacy_override", risk="normal", ambiguity="resolved",
+    ))
+    assert decision.action == "spawn"
+    assert (decision.model, decision.effort) == ("gpt-6-luna", "low")
+    assert decision.override_source == "legacy_override"

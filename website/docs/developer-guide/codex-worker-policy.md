@@ -11,7 +11,7 @@ metadata; the worker does not classify task prose and does not infer authority
 from the SPEC. The policy never changes the approved root, working directory,
 sandbox, timeout, or output bounds.
 
-Policy version `2026-09-30.1` starts with these pairs:
+Policy version `2026-10-27.1` starts with these pairs:
 
 | `--task-class` | Model | Effort | Intended use |
 | --- | --- | --- | --- |
@@ -21,6 +21,12 @@ Policy version `2026-09-30.1` starts with these pairs:
 | `integration` | `gpt-6.1-sol` | `high` | Known direction with multi-layer verification |
 | `complex` | `gpt-6.1-sol` | `high` | Ambiguous design, judgment, or polish |
 | `frontier` | `gpt-6.1-sol` | `xhigh` | Hardest multi-system end-to-end work; requires `--deeper-analysis-evidence` |
+| `canary-terra-low` | `gpt-6.1-terra` | `low` | Explicit canary runs with low effort |
+| `canary-terra-medium` | `gpt-6.1-terra` | `medium` | Explicit canary runs with medium effort |
+
+The coordinator explicitly chooses the canary classes only for canary runs.
+Model escalation from Luna or Terra goes directly to Sol. Risk and ambiguity
+floors also apply to the canary classes.
 
 `--risk high` and `--ambiguity ambiguous` floor a selection at Sol/high.
 `--ambiguity unknown` floors cheap ordinary work at Sol/medium. These floors
@@ -52,7 +58,7 @@ Use `--model` and `--effort` for audited caller overrides. A caller-selected
 model is recorded as `caller_override`, never as a user pin. The approved
 Codex values are:
 
-- Models: `gpt-6-luna`, `gpt-6.1-sol` (`gpt-6-astra` and the `gpt-5.6-*` models were removed on 2026-09-30)
+- Models: `gpt-6-luna`, `gpt-6.1-terra`, `gpt-6.1-sol` (`gpt-6-astra` and the `gpt-5.6-*` models were removed on 2026-09-30)
 - Efforts: `low`, `medium`, `high`, `xhigh`, `max`
 
 An xhigh selection (including the `frontier` class) requires `--deeper-analysis-evidence`. A direct max

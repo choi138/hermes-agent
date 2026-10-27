@@ -215,3 +215,56 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     argv = events[0]["argv"]
     assert argv[argv.index("-m") + 1] == "gpt-6.1-sol"
     assert 'model_reasoning_effort="medium"' in argv
+
+
+@pytest.mark.parametrize(
+    "task_class,effort", [("canary-terra-low", "low"), ("canary-terra-medium", "medium")],
+)
+def test_terra_canary_classes_reach_real_dry_run(cli_case, task_class, effort):
+    _, output, args = cli_case
+    result = run_cli(args, "--dry-run", "--task-class", task_class)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["status"] == "planned"
+    assert receipt["policy"]["task_class"] == task_class
+    assert receipt["policy"]["selected"] == {"model": "gpt-6.1-terra", "effort": effort}
+    assert receipt["argv"][receipt["argv"].index("-m") + 1] == "gpt-6.1-terra"
+    assert f'model_reasoning_effort="{effort}"' in receipt["argv"]
+    assert list(output.iterdir()) == []
+
+
+def test_unapproved_terra_canary_class_exits_at_argparse(cli_case):
+    _, output, args = cli_case
+    result = run_cli(args, "--dry-run", "--task-class", "canary-terra-high")
+    assert result.returncode == 2
+    assert "invalid choice: 'canary-terra-high'" in result.stderr
+    assert list(output.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "option,policy_choices",
+    [("--task-class", "TASK_CLASSES"), ("--pinned-model", "MODELS"), ("--prior-model", "MODELS")],
+)
+def test_runner_argparse_choices_match_policy(option, policy_choices):
+    import re
+    from agent import codex_worker_policy
+
+    result = run_cli([], "--help")
+    assert result.returncode == 0, result.stderr
+    choices = re.search(rf"{option} \{{([^}}]+)\}}", result.stdout)
+    assert choices is not None, result.stdout
+    assert tuple(choices.group(1).split(",")) == getattr(codex_worker_policy, policy_choices)
+
+
+def test_terra_prior_model_is_accepted_for_retry(cli_case):
+    _, _, args = cli_case
+    result = run_cli(
+        args, "--dry-run", "--failure-kind", "approach_failure", "--attempt", "2",
+        "--prior-model", "gpt-6.1-terra", "--prior-effort", "low",
+    )
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["status"] == "planned"
+    assert receipt["policy"]["prior_configuration"] == {"model": "gpt-6.1-terra", "effort": "low"}
+    assert receipt["policy"]["selected"] == {"model": "gpt-6.1-sol", "effort": "high"}
+    assert receipt["policy"]["escalated"]

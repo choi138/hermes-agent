@@ -8,11 +8,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-POLICY_VERSION = "2026-09-30.1"
+POLICY_VERSION = "2026-10-27.1"
 
-MODELS = ("gpt-6-luna", "gpt-6.1-sol")
+MODELS = ("gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-TASK_CLASSES = ("mechanical", "bounded", "general", "integration", "complex", "frontier")
+TASK_CLASSES = (
+    "mechanical", "bounded", "general", "integration", "complex", "frontier",
+    "canary-terra-low", "canary-terra-medium",
+)
 FAILURE_KINDS = (
     "missing_information", "environment", "shallow_reasoning",
     "misunderstanding", "approach_failure", "repeated_same_defect",
@@ -25,12 +28,16 @@ CLASS_SELECTIONS = {
     "integration": ("gpt-6.1-sol", "high"),
     "complex": ("gpt-6.1-sol", "high"),
     "frontier": ("gpt-6.1-sol", "xhigh"),
+    "canary-terra-low": ("gpt-6.1-terra", "low"),
+    "canary-terra-medium": ("gpt-6.1-terra", "medium"),
 }
 
+_FLOOR_BASELINE = ("gpt-6-luna", "low")
 _MODEL_RANK = {value: index for index, value in enumerate(MODELS)}
 _EFFORT_RANK = {value: index for index, value in enumerate(EFFORTS)}
 _MODEL_BASE_EFFORT = {
     "gpt-6-luna": "medium",
+    "gpt-6.1-terra": "medium",
     "gpt-6.1-sol": "high",
 }
 
@@ -271,7 +278,7 @@ def decide_worker(values: PolicyInput) -> WorkerDecision:
                                  model=model, effort=effort,
                                  reason="No higher approved model remains; replan instead of blind retry",
                                  source=source, next_action="replan_or_stop")
-            model = MODELS[_MODEL_RANK[model] + 1]
+            model = "gpt-6.1-sol"
             effort = EFFORTS[max(_EFFORT_RANK[effort], _EFFORT_RANK[_MODEL_BASE_EFFORT[model]])]
             reasons = ["Misunderstanding or approach failure upgrades the model"]
         else:
@@ -285,7 +292,7 @@ def decide_worker(values: PolicyInput) -> WorkerDecision:
                                  model=model, effort=effort,
                                  reason="The corrected attempt has no higher approved model",
                                  source=source, next_action="replan_or_stop")
-            model = MODELS[_MODEL_RANK[model] + 1]
+            model = "gpt-6.1-sol"
             effort = EFFORTS[max(_EFFORT_RANK[effort], _EFFORT_RANK[_MODEL_BASE_EFFORT[model]])]
             reasons = ["Evidence-informed correction permits one model escalation"]
 
@@ -307,7 +314,7 @@ def decide_worker(values: PolicyInput) -> WorkerDecision:
 
     # Task classes choose defaults; only risk/ambiguity are mandatory floors.
     # This keeps explicit, audited legacy overrides exact.
-    floor_model, floor_effort = CLASS_SELECTIONS["mechanical"]
+    floor_model, floor_effort = _FLOOR_BASELINE
     if values.ambiguity == "unknown":
         floor_model, floor_effort = _at_least(floor_model, floor_effort, "gpt-6.1-sol", "medium")
     if values.ambiguity == "ambiguous" or values.risk == "high":
