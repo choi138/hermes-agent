@@ -16,8 +16,11 @@ PROTECTED = ("node_modules/", ".env")
 
 
 def git(repo, *args):
-    result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", repo, *args], check=False,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", repo, *args], check=False,
+                                capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise ValueError("git command timed out after 120s")
     if result.returncode:
         lines = os.fsdecode(result.stderr).splitlines()
         raise ValueError(lines[0] if lines else "git command failed")
@@ -109,8 +112,8 @@ def report(changed, violations):
     for path in sorted(changed):
         print("changed=" + path)
     for path, reason in violations:
-        print("violation={} reason={}".format(path, reason))
-    print("scope=violation count={}".format(len(violations)) if violations else "scope=ok")
+        print(f"violation={path} reason={reason}")
+    print(f"scope=violation count={len(violations)}" if violations else "scope=ok")
     return 1 if violations else 0
 
 
@@ -143,7 +146,7 @@ def snapshot(args, repo):
 
 
 def check(args, repo):
-    with open(args.snapshot, encoding="utf-8") as stream:
+    with open(args.snapshot, encoding="utf-8-sig") as stream:
         saved = json.load(stream)
     if saved["repo"] != repo:
         root(repo)

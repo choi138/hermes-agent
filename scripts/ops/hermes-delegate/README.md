@@ -4,6 +4,8 @@ koharu가 Mac에 일을 넘길 때 쓰는 진입점이다. 실행 파이썬은 `
 venv가 사라져도(2026-10-19 `hermes-agent/.venv` 전례) 이 도구는 살아남아 "runner python missing"을 한 줄로 알려준다.
 러너 쪽 판정(코드 범위 분류, dry-run)은 러너가 실제로 쓰는 `hermes-agent-upstream/.venv/bin/python`(psutil 포함)으로 돌린다.
 
+이 저장소 트리는 원본 배포 스냅샷을 조상으로 둔 리팩터링이며, 설치된 진입점과 바이트 단위로 같지 않다. 배포되지 않았고 설치된 진입점은 변경하지 않았다. 출처와 모듈별 소유권은 [SOURCE.md](SOURCE.md)에 기록한다.
+
 ## SPEC 사전 검사
 
 ```sh
@@ -27,7 +29,7 @@ hermes-delegate spec-check --spec SPEC.md [--workdir DIR] [--kind codex|claude|q
 hermes-delegate codex --spec SPEC --workdir DIR --class general --timeout 3600 [--risk high] [--code-scope src ...] [--report REL]
 ```
 
-- 모든 경로를 realpath로 확인한다(심볼릭 링크, `..`, `/tmp` 같은 비정규 경로는 거절).
+- 모든 경로를 realpath로 확인한다(심볼릭 링크, `..`, 임시 디렉터리의 심볼릭 링크 별칭 같은 비정규 경로는 거절).
 - `--workdir`는 git 작업 트리 루트여야 한다. 하위 디렉터리나 비-git 디렉터리는 실제 실행에서 `registration_baseline_unavailable`(exit 74)로 막히므로 미리 거절한다.
 - dry-run 뒤에 러너의 `collect()`를 같은 manifest 조건으로 한 번 더 돌려, 실제 등록 baseline이 통과할 때만 줄을 출력한다.
 - `--timeout`은 필수다(러너 기본값 600초는 보통 작업에 너무 짧다).
@@ -124,9 +126,9 @@ hermes-delegate qa --spec QA-SPEC --workdir DIR --timeout 5400 [--label L] [--no
 
 지금은 바꾸지 않는다(Wave 3, 따로 진행). 바꿀 때 코드 쪽에서 기본값을 말하는 곳은 아래가 전부이고 한 번에 같이 고친다.
 
-- `hermes_delegate.py` `REVIEW_POLICY["claude"]["via"]`: claude 리뷰 기본값이자 `smoke claude` 기본값(`cmd_smoke`가 이 값을 쓴다).
-- `hermes_delegate.py` `worker_parser`의 `--via` `default="cmux"`와 help `"cmux (default) or direct"`, description `"cmux workspace by default"`.
-- `hermes_delegate.py` 모듈 docstring(`Claude: cmux by default`, `claude ... (cmux by default)`), `review_parser`의 `--via` help(`default: claude cmux`), `cmd_smoke`의 `--via` help(`default: codex direct, claude cmux`).
+- `hermes_delegate_common.py` `REVIEW_POLICY["claude"]["via"]`: claude 리뷰 기본값이자 `smoke claude` 기본값(`cmd_smoke`가 이 값을 쓴다).
+- `hermes_delegate_worker.py` `worker_parser`의 `--via` `default="cmux"`와 help `"cmux (default) or direct"`, description `"cmux workspace by default"`.
+- `hermes_delegate.py` 모듈 docstring(`Claude: cmux by default`, `claude ... (cmux by default)`), `hermes_delegate_review.py`의 `review_parser` help(`default: claude cmux`), `hermes_delegate_smoke.py`의 `cmd_smoke` help(`default: codex direct, claude cmux`).
 - `hermes_delegate.py` `USAGE`: review의 `claude: ... --via cmux (default)`, claude의 `--via cmux (default) runs in a new cmux workspace`, smoke의 `Default via: codex direct, claude cmux`.
 - 이 README: 2절 `claude` 기본 `--via cmux`, 3절 "기본은 cmux 워크스페이스", 공통 절 smoke "기본 via는 codex direct, claude cmux".
 - 테스트: `test_default_via_per_reviewer`, `SmokeTests.test_claude_default_is_cmux_and_needs_it`, `DefaultViaTests`(코드 안 기본값들이 서로 같은지 본다).
@@ -136,7 +138,7 @@ SOUL·스킬·cleanup 문서 쪽 목록은 staging `core/APPLY.md` 4절에 있�
 ## 테스트
 
 ```
-cd /private/tmp && /usr/bin/python3 -W error::ResourceWarning -m unittest discover -s ~/.local/share/hermes-delegate/tests -v
+PYTHONDONTWRITEBYTECODE=1 RUFF_NO_CACHE=1 /usr/bin/python3 -m unittest discover -s tests -q
 ```
 
-테스트는 `--no-launch`와 stub(`HERMES_DELEGATE_CLAUDE_BIN`, `HERMES_DELEGATE_CODEX_BIN`, `HERMES_DELEGATE_CMUX`, `HERMES_DELEGATE_REVIEW_GATE`, 가짜 토큰 파일 `HERMES_DELEGATE_CLAUDE_TOKEN_FILE`)만 쓰고 실제 Claude·Codex·cmux는 띄우지 않는다. direct 분리 실행 테스트 1개는 stub claude를 `zsh -ic`로 실제 분리 실행한다.
+위 명령은 이 디렉터리에서 실행한다. 테스트는 `--no-launch`와 stub(`HERMES_DELEGATE_CLAUDE_BIN`, `HERMES_DELEGATE_CODEX_BIN`, `HERMES_DELEGATE_CMUX`, `HERMES_DELEGATE_REVIEW_GATE`, 가짜 토큰 파일 `HERMES_DELEGATE_CLAUDE_TOKEN_FILE`)만 쓰고 실제 Claude·Codex·cmux는 띄우지 않는다. direct 분리 실행 테스트 1개는 stub claude를 `zsh -ic`로 실제 분리 실행한다.

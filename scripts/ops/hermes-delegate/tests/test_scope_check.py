@@ -44,7 +44,7 @@ class ScopeCheckTests(unittest.TestCase):
 
     def git(self, *args):
         result = subprocess.run(["git", "-C", str(self.repo), *args],
-                                check=False, capture_output=True, text=True)
+                                check=False, capture_output=True, text=True, timeout=120, encoding="utf-8-sig")
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -55,7 +55,7 @@ class ScopeCheckTests(unittest.TestCase):
 
     def cli(self, *args):
         return subprocess.run([PYTHON, str(SCRIPT), *map(str, args)],
-                              check=False, capture_output=True, text=True)
+                              check=False, capture_output=True, text=True, timeout=120, encoding="utf-8-sig")
 
     def take_snapshot(self):
         result = self.cli("snapshot", "--repo", self.repo, "--out", self.snapshot)
@@ -81,9 +81,9 @@ class ScopeCheckTests(unittest.TestCase):
         self.assertEqual(lines, ["changed=" + path for path in sorted(expected)]
                          + violations + [lines[-1]])
         self.assertEqual(lines[-1], "scope=ok" if code == 0 else
-                         "scope=violation count={}".format(len(violations)))
+                         f"scope=violation count={len(violations)}")
         if reasons is not None:
-            self.assertEqual(violations, ["violation={} reason={}".format(path, reason)
+            self.assertEqual(violations, [f"violation={path} reason={reason}"
                                           for path, reason in sorted(reasons.items())])
         return result
 
@@ -203,7 +203,7 @@ class ScopeCheckTests(unittest.TestCase):
         other = self.temporary / "other"
         other.mkdir()
         init = subprocess.run(["git", "-C", str(other), "init", "-q"],
-                              check=False, capture_output=True, text=True)
+                              check=False, capture_output=True, text=True, timeout=120, encoding="utf-8-sig")
         self.assertEqual(init.returncode, 0, init.stderr)
         results.append(self.cli("check", "--repo", other, "--snapshot", self.snapshot))
         for result in results:
@@ -215,7 +215,7 @@ class ScopeCheckTests(unittest.TestCase):
 
     def test_snapshot_schema_and_atomic_success(self):
         result = self.take_snapshot()
-        data = json.loads(self.snapshot.read_text(encoding="utf-8"))
+        data = json.loads(self.snapshot.read_text(encoding="utf-8-sig"))
         self.assertEqual(set(data), {"repo", "base", "files", "git_dirs",
                                      "git_state", "index_flags"})
         self.assertEqual(data["repo"], str(self.repo.resolve()))
@@ -236,15 +236,14 @@ class ScopeCheckTests(unittest.TestCase):
                          {"type": "dir", "mode": (self.repo / "notes").stat().st_mode & 0o7777,
                           "target": None, "sha256": None})
         self.assertEqual(data["git_state"][str(self.repo.resolve() / ".git")]["type"], "dir")
-        self.assertEqual(result.stdout, "snapshot={} base={} files=14\n".format(
-            self.snapshot, self.base))
+        self.assertEqual(result.stdout, f"snapshot={self.snapshot} base={self.base} files=14\n")
         self.assertFalse(Path(str(self.snapshot) + ".tmp").exists())
 
     def test_git_failure(self):
         directory = self.temporary / "not-git"
         directory.mkdir()
         expected = subprocess.run(["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
-                                  check=False, capture_output=True, text=True)
+                                  check=False, capture_output=True, text=True, timeout=120, encoding="utf-8-sig")
         for command, option, path in (("snapshot", "--out", self.temporary / "bad.json"),
                                       ("check", "--snapshot", self.snapshot)):
             result = self.cli(command, "--repo", directory, option, path)
@@ -341,7 +340,7 @@ class ScopeCheckTests(unittest.TestCase):
         environment = dict(os.environ, PATH=str(self.temporary / "no-git"))
         result = subprocess.run([PYTHON, str(SCRIPT), "check", "--repo", str(self.repo),
                                  "--snapshot", str(self.snapshot)], check=False,
-                                capture_output=True, text=True, env=environment)
+                                capture_output=True, text=True, env=environment, timeout=120, encoding="utf-8-sig")
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertEqual(result.stdout.splitlines(), ["changed=" + path,
                          "violation=" + path + " reason=git_state", "scope=violation count=1"])
@@ -365,7 +364,7 @@ class ScopeCheckTests(unittest.TestCase):
                  "-c", "core.hooksPath=" + str(self.temporary / "no-hooks"),
                  "commit", "-qm", "nested fixture")
         self.take_snapshot()
-        data = json.loads(self.snapshot.read_text(encoding="utf-8"))
+        data = json.loads(self.snapshot.read_text(encoding="utf-8-sig"))
         self.assertNotIn(".worktrees/x/", data["files"])
         self.assertIn(".worktrees/x/.git", data["files"])
         self.assertIn(".worktrees/x/.git/config", data["files"])
@@ -440,7 +439,7 @@ class ScopeCheckTests(unittest.TestCase):
         self.linked_worktree()
         alternate = self.temporary / "alternate"
         alternate.mkdir()
-        self.write(".git", "gitdir: {}\n".format(alternate))
+        self.write(".git", f"gitdir: {alternate}\n")
         path = str(self.repo.resolve() / ".git")
         self.check({path}, 1, reasons={path: "git_state"})
 
