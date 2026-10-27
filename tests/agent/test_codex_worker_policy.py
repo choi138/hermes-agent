@@ -20,8 +20,8 @@ def test_removed_models_are_rejected():
 @pytest.mark.parametrize(
     "task_class,expected",
     [
-        ("mechanical", ("gpt-6-luna", "low")),
-        ("bounded", ("gpt-6-luna", "medium")),
+        ("mechanical", ("gpt-6.1-terra", "low")),
+        ("bounded", ("gpt-6.1-terra", "medium")),
         ("general", ("gpt-6.1-sol", "medium")),
         ("integration", ("gpt-6.1-sol", "high")),
         ("complex", ("gpt-6.1-sol", "high")),
@@ -334,8 +334,8 @@ def test_advisor_is_validated_and_survives_lifecycle_round_trip(tmp_path):
 @pytest.mark.parametrize(
     "task_class,expected",
     [
-        ("mechanical", ("gpt-6-luna", "low")),
-        ("bounded", ("gpt-6-luna", "medium")),
+        ("mechanical", ("gpt-6.1-terra", "low")),
+        ("bounded", ("gpt-6.1-terra", "medium")),
         ("general", ("gpt-6.1-sol", "medium")),
         ("integration", ("gpt-6.1-sol", "high")),
         ("complex", ("gpt-6.1-sol", "high")),
@@ -399,7 +399,7 @@ def test_shallow_reasoning_keeps_terra_and_increases_effort():
 def test_terra_canary_policy_version():
     from agent.codex_worker_policy import POLICY_VERSION
 
-    assert POLICY_VERSION == "2026-10-27.1"
+    assert POLICY_VERSION == "2026-10-27.2"
     assert decide_worker(PolicyInput()).receipt()["policy_version"] == POLICY_VERSION
 
 

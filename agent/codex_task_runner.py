@@ -6,7 +6,9 @@ records CLI completion only; acceptance testing remains the caller's job.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
+import errno
 import hashlib
 import json
 import math
@@ -26,6 +28,7 @@ TIER_EFFORTS = {
 }
 MAX_SPEC_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_REPORT_BYTES = 1048576
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ class TaskRequest:
     cli: str = "codex"
     policy_input: dict | None = None
     advisor: str | None = None
+    report: str | None = None
 
     def __post_init__(self):
         if os.name != "posix":
@@ -102,6 +106,15 @@ class TaskRequest:
             raise ValueError("Advisor is supported only for the Claude CLI with an approved advisor model")
         if self.cli == "claude" and self.sandbox != "read-only":
             raise ValueError("Claude currently supports read-only tasks only")
+        if self.report is not None:
+            if (not isinstance(self.report, str) or not self.report or len(self.report) > 256
+                    or any(char in self.report for char in ("\0", "\n", "\r"))):
+                raise ValueError("Report must be a nonempty single-line path of at most 256 characters")
+            report = Path(self.report)
+            if report.is_absolute() or ".." in report.parts or report == Path("."):
+                raise ValueError("Report must be a relative file path without parent traversal")
+            if self.cli != "codex" or self.sandbox != "workspace-write":
+                raise ValueError("Report requires Codex with workspace-write sandbox")
         if (isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float))
                 or not math.isfinite(self.timeout) or not 0 < self.timeout <= 86400):
             raise ValueError("Timeout must be finite and between 0 and 86400 seconds")
@@ -138,7 +151,7 @@ class TaskRequest:
 
     def inspect(self, policy_receipt=None):
         effort = self.selection.metadata()["effort"]
-        return {"status": "planned", "argv": self.argv(), "selection": self.selection.metadata(),
+        result = {"status": "planned", "argv": self.argv(), "selection": self.selection.metadata(),
                 "sandbox": self.sandbox, "timeout_seconds": self.timeout,
                 "policy": _checked_policy_receipt(policy_receipt, self),
                 "configuration": {
@@ -147,6 +160,9 @@ class TaskRequest:
                     "observed": {"model": None, "effort": None},
                 },
                 "acceptance": {"status": "unknown", "independent_validation": False}}
+        if self.report is not None:
+            result["report"] = self.report
+        return result
 
 
 def _checked_policy_receipt(receipt, request):
@@ -278,6 +294,74 @@ def _stop_group(process):
     process.wait(timeout=2)
 
 
+def _report_content(stream, bounded):
+    metadata = os.fstat(stream.fileno())
+    if not stat.S_ISREG(metadata.st_mode):
+        return "report_not_regular", None, 0
+    if bounded and metadata.st_size == 0:
+        return "report_empty", None, 0
+    if bounded and metadata.st_size > MAX_REPORT_BYTES:
+        return "report_too_large", None, metadata.st_size
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in iter(lambda: stream.read(65536), b""):
+        size += len(chunk)
+        if bounded and size > MAX_REPORT_BYTES:
+            return "report_too_large", None, size
+        digest.update(chunk)
+    if bounded and size == 0:
+        return "report_empty", None, 0
+    return None, digest.hexdigest(), size
+
+
+def _report_snapshot(request, *, bounded=False):
+    parts = Path(request.report).parts
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        with ExitStack() as stack:
+            directory = os.open(request.workdir, flags | os.O_DIRECTORY)
+            stack.callback(os.close, directory)
+            for part in parts[:-1]:
+                directory = os.open(part, flags | os.O_DIRECTORY, dir_fd=directory)
+                stack.callback(os.close, directory)
+            metadata = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                return "report_not_regular", None, 0
+            fd = os.open(parts[-1], flags, dir_fd=directory)
+            with os.fdopen(fd, "rb") as stream:
+                return _report_content(stream, bounded)
+    except FileNotFoundError:
+        return "report_missing", None, 0
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return "report_not_regular", None, 0
+        raise
+
+
+def _report_baseline(request):
+    if request.report is None:
+        return "missing"
+    reason, digest, _ = _report_snapshot(request)
+    if reason not in (None, "report_missing"):
+        raise ValueError("Report path must contain no symlinks and end in a regular file")
+    return digest if reason is None else "missing"
+
+
+def _check_report(request, baseline, result):
+    if request.report is None or result["status"] != "cli_completed":
+        return
+    reason, digest, size = _report_snapshot(request, bounded=True)
+    if reason is None and digest == baseline:
+        reason = "report_unchanged"
+    if reason is not None:
+        result.update(status="report_rejected", exit_code=76)
+        result["acceptance"] = {
+            "status": "failed", "independent_validation": False, "reason": reason,
+        }
+    else:
+        result["acceptance"]["report"] = {"path": request.report, "sha256": digest, "bytes": size}
+
+
 def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
              output_limit=MAX_OUTPUT_BYTES, before_spawn=None, after_spawn=None, prompt_bytes=None,
              policy_receipt=None):
@@ -310,6 +394,7 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
     prompt.decode("utf-8")  # Reject malformed text; no guessing or replacement.
     effort = request.selection.metadata()["effort"]
     policy = _checked_policy_receipt(policy_receipt, request)
+    baseline = _report_baseline(request)
     run_dir = Path(tempfile.mkdtemp(prefix="codex-task-", dir=request.output_dir))
     result = {"status": "launch_failed", "exit_code": 127, "process_returncode": None,
               "selection": request.selection.metadata(), "sandbox": request.sandbox,
@@ -430,6 +515,7 @@ def run_task(request: TaskRequest, *, popen=subprocess.Popen, cancel=None,
         "status": result["status"],
         "cli_exit_code": result["process_returncode"],
     }
+    _check_report(request, baseline, result)
     # If this write/flush fails, propagate it: the CLI must exit nonzero.
     with _private_file(run_dir / "status.json") as status_file:
         status_file.write((json.dumps(result, ensure_ascii=True) + "\n").encode())

@@ -82,6 +82,7 @@ def main():
     parser.add_argument("--attempt", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--sandbox", choices=("read-only", "workspace-write"), default="read-only")
+    parser.add_argument("--report", metavar="REL")
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--model")
     parser.add_argument("--cli", choices=("codex", "claude"), default="codex")
@@ -200,6 +201,7 @@ def main():
             request = TaskRequest(spec=args.spec, workdir=args.workdir, allowed_root=args.allowed_root,
                                   output_dir=args.output_dir, sandbox=args.sandbox, timeout=args.timeout,
                                   model=selected_model, cli=args.cli, selection=selection, advisor=args.advisor,
+                                  report=args.report,
                                   policy_input=asdict(policy_input) if args.cli == "codex" else None)
         options = (args.progress_manifest, args.progress_state_dir, args.progress_thread, args.progress_label)
         identity = dict(sender_profile=args.progress_sender_profile, expected_bot_id=args.progress_expected_bot_id)

@@ -55,8 +55,8 @@ def test_default_and_all_task_classes_reach_real_dry_run(cli_case):
     assert list(output.iterdir()) == []
 
     expected = {
-        "mechanical": ("gpt-6-luna", "low"),
-        "bounded": ("gpt-6-luna", "medium"),
+        "mechanical": ("gpt-6.1-terra", "low"),
+        "bounded": ("gpt-6.1-terra", "medium"),
         "general": ("gpt-6.1-sol", "medium"),
         "integration": ("gpt-6.1-sol", "high"),
         "complex": ("gpt-6.1-sol", "high"),
@@ -71,6 +71,21 @@ def test_default_and_all_task_classes_reach_real_dry_run(cli_case):
         assert completed.returncode == 0, completed.stderr
         selected = json.loads(completed.stdout)["policy"]["selected"]
         assert (selected["model"], selected["effort"]) == pair
+
+
+def test_report_flag_dry_run_and_terra_mapping(cli_case):
+    _, output, args = cli_case
+    for task_class, effort in (("mechanical", "low"), ("bounded", "medium")):
+        result = run_cli(args, "--dry-run", "--task-class", task_class,
+                         "--sandbox", "workspace-write", "--report", "reports/IMPLEMENTER.md")
+        assert result.returncode == 0, result.stderr
+        receipt = json.loads(result.stdout)
+        assert receipt["report"] == "reports/IMPLEMENTER.md"
+        assert receipt["policy"]["selected"] == {"model": "gpt-6.1-terra", "effort": effort}
+        assert receipt["policy"]["policy_version"] == "2026-10-27.2"
+        assert receipt["argv"][receipt["argv"].index("-m") + 1] == "gpt-6.1-terra"
+        assert f'model_reasoning_effort="{effort}"' in receipt["argv"]
+    assert list(output.iterdir()) == []
 
 
 def test_legacy_flags_are_exact_audited_overrides_and_pin_is_distinct(cli_case):

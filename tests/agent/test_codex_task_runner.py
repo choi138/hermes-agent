@@ -1,4 +1,5 @@
 """FAKE subprocess contract tests: these never execute the installed Codex."""
+import hashlib
 import importlib
 import json
 import os
@@ -86,6 +87,134 @@ def test_tiers_real_subprocess_serialization(inputs, tmp_path, tier, effort):
     assert "Literal" not in (run / "status.json").read_text()
     assert (run.stat().st_mode & 0o777) == 0o700
     assert all((p.stat().st_mode & 0o777) == 0o600 for p in run.iterdir())
+
+
+def report_run(inputs, tmp_path, body, report="reports/IMPLEMENTER.md"):
+    result = run_stub(inputs, tmp_path, body,
+        extra_args=("--report", report, "--sandbox", "workspace-write"))
+    assert json.loads(Path(result["artifact_dir"], "status.json").read_text()) == result
+    return result
+
+
+def assert_report_rejected(result, reason):
+    assert (result["status"], result["exit_code"]) == ("report_rejected", 76)
+    assert result["execution"] == {"status": "cli_completed", "cli_exit_code": 0}
+    assert result["acceptance"] == {
+        "status": "failed", "independent_validation": False, "reason": reason,
+    }
+
+
+def test_report_missing_rejected(inputs, tmp_path):
+    result = report_run(inputs, tmp_path, ECHO)
+    assert_report_rejected(result, "report_missing")
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "parent_symlink", "dangling_symlink", "fifo"])
+def test_report_not_regular_rejected(inputs, tmp_path, kind):
+    bodies = {
+        "directory": "Path('reports/IMPLEMENTER.md').mkdir(parents=True)",
+        "symlink": "Path('target').write_text('report'); Path('reports/IMPLEMENTER.md').symlink_to('../target')",
+        "parent_symlink": "Path('target').mkdir(); Path('target/IMPLEMENTER.md').write_text('report'); Path('reports').rmdir(); Path('reports').symlink_to('target')",
+        "dangling_symlink": "Path('reports/IMPLEMENTER.md').symlink_to('../absent')",
+        "fifo": "os.mkfifo('reports/IMPLEMENTER.md')",
+    }
+    body = "import os, sys\nfrom pathlib import Path\nsys.stdin.read()\nPath('reports').mkdir()\n" + bodies[kind]
+    result = report_run(inputs, tmp_path, body)
+    assert_report_rejected(result, "report_not_regular")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "parent_symlink", "dangling_symlink", "directory", "fifo"])
+def test_report_symlink_before_spawn_refused(inputs, tmp_path, kind):
+    report = tmp_path / "reports/IMPLEMENTER.md"
+    report.parent.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "IMPLEMENTER.md").write_text("previous report")
+    if kind == "parent_symlink":
+        report.parent.rmdir()
+        report.parent.symlink_to(target, target_is_directory=True)
+    elif kind == "directory":
+        report.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(report)
+    else:
+        report.symlink_to(target / ("absent" if kind == "dangling_symlink" else "IMPLEMENTER.md"))
+    request = module().TaskRequest(**{**inputs, "sandbox": "workspace-write"}, report="reports/IMPLEMENTER.md")
+    spawned = []
+    with pytest.raises(ValueError):
+        module().run_task(request, popen=lambda *a, **kw: spawned.append(a))
+    assert spawned == []
+    assert list(inputs["output_dir"].iterdir()) == []
+
+
+@pytest.mark.parametrize("size,reason", [(0, "report_empty"), (1048577, "report_too_large")])
+def test_report_empty_and_too_large_rejected(inputs, tmp_path, size, reason):
+    body = "import sys\nfrom pathlib import Path\nsys.stdin.read()\nPath('reports').mkdir()\n"
+    body += f"Path('reports/IMPLEMENTER.md').write_bytes(b'x' * {size})\n"
+    assert_report_rejected(report_run(inputs, tmp_path, body), reason)
+
+
+def test_report_unchanged_rejected(inputs, tmp_path):
+    report = tmp_path / "reports/IMPLEMENTER.md"
+    report.parent.mkdir()
+    report.write_text("old report")
+    body = "import sys\nfrom pathlib import Path\nsys.stdin.read()\nPath('reports/IMPLEMENTER.md').write_text('new report')\n"
+    first = report_run(inputs, tmp_path, body)
+    assert first["status"] == "cli_completed"
+    second = report_run(inputs, tmp_path, body)
+    assert_report_rejected(second, "report_unchanged")
+    assert first["artifact_dir"] != second["artifact_dir"]
+
+
+@pytest.mark.parametrize("size", [25, 1048576])
+def test_report_written_accepted_with_digest(inputs, tmp_path, size):
+    body = "import sys\nfrom pathlib import Path\nsys.stdin.read()\nPath('reports').mkdir()\n"
+    body += f"Path('reports/IMPLEMENTER.md').write_bytes(b'x' * {size})\n"
+    result = report_run(inputs, tmp_path, body)
+    assert (result["status"], result["exit_code"]) == ("cli_completed", 0)
+    assert result["execution"] == {"status": "cli_completed", "cli_exit_code": 0}
+    assert result["acceptance"] == {
+        "status": "unknown", "independent_validation": False,
+        "report": {"path": "reports/IMPLEMENTER.md",
+                   "sha256": hashlib.sha256(b'x' * size).hexdigest(), "bytes": size},
+    }
+
+
+def test_report_skipped_when_cli_fails(inputs, tmp_path):
+    result = report_run(inputs, tmp_path, ECHO + "sys.exit(23)\n")
+    assert (result["status"], result["exit_code"]) == ("cli_failed", 23)
+    assert result["execution"] == {"status": "cli_failed", "cli_exit_code": 23}
+    assert result["acceptance"] == {"status": "unknown", "independent_validation": False}
+
+
+def test_report_requires_relative_codex_workspace_write(inputs):
+    values = {**inputs, "sandbox": "workspace-write"}
+    assert module().TaskRequest(**values, report="a/./IMPLEMENTER.md").report == "a/./IMPLEMENTER.md"
+    assert module().TaskRequest(**values, report="x" * 256).report == "x" * 256
+    for report in (False, 1, [], Path('report'), "", "x" * 257, "a\0b", "a\nb", "a\rb",
+                   "/report", "../report", "a/../report", "a/..", ".", "./", "././"):
+        with pytest.raises(ValueError):
+            module().TaskRequest(**values, report=report)
+    for overrides in ({"cli": "claude", "sandbox": "read-only"}, {"sandbox": "read-only"}):
+        with pytest.raises(ValueError):
+            module().TaskRequest(**{**values, **overrides}, report="report.md")
+
+
+def test_no_report_keeps_legacy_result(inputs, tmp_path):
+    request = module().TaskRequest(**inputs, report=None)
+    planned = request.inspect()
+    assert set(planned) == {"status", "argv", "selection", "sandbox", "timeout_seconds",
+                            "policy", "configuration", "acceptance"}
+    result = run_stub(inputs, tmp_path, ECHO)
+    assert set(result) == {"status", "exit_code", "process_returncode", "selection", "sandbox",
+                           "model", "cli", "timeout_seconds", "artifact_dir", "policy",
+                           "configuration", "execution", "acceptance", "metrics", "input_receipt"}
+    assert (result["status"], result["exit_code"]) == ("cli_completed", 0)
+    assert result["execution"] == {"status": "cli_completed", "cli_exit_code": 0}
+    assert result["acceptance"] == planned["acceptance"] == {
+        "status": "unknown", "independent_validation": False,
+    }
+    assert json.loads(Path(result["artifact_dir"], "status.json").read_text()) == result
 
 
 def test_pin_precedence_and_strict_values():

@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-POLICY_VERSION = "2026-10-27.1"
+POLICY_VERSION = "2026-10-27.2"
 
 MODELS = ("gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -22,8 +22,8 @@ FAILURE_KINDS = (
 )
 
 CLASS_SELECTIONS = {
-    "mechanical": ("gpt-6-luna", "low"),
-    "bounded": ("gpt-6-luna", "medium"),
+    "mechanical": ("gpt-6.1-terra", "low"),
+    "bounded": ("gpt-6.1-terra", "medium"),
     "general": ("gpt-6.1-sol", "medium"),
     "integration": ("gpt-6.1-sol", "high"),
     "complex": ("gpt-6.1-sol", "high"),

@@ -11,12 +11,12 @@ metadata; the worker does not classify task prose and does not infer authority
 from the SPEC. The policy never changes the approved root, working directory,
 sandbox, timeout, or output bounds.
 
-Policy version `2026-10-27.1` starts with these pairs:
+Policy version `2026-10-27.2` starts with these pairs:
 
 | `--task-class` | Model | Effort | Intended use |
 | --- | --- | --- | --- |
-| `mechanical` | `gpt-6-luna` | `low` | Exact repeat changes |
-| `bounded` | `gpt-6-luna` | `medium` | Fixed narrow work or a known cause |
+| `mechanical` | `gpt-6.1-terra` | `low` | Exact repeat changes |
+| `bounded` | `gpt-6.1-terra` | `medium` | Fixed narrow work or a known cause |
 | `general` | `gpt-6.1-sol` | `medium` | Ordinary development; the default |
 | `integration` | `gpt-6.1-sol` | `high` | Known direction with multi-layer verification |
 | `complex` | `gpt-6.1-sol` | `high` | Ambiguous design, judgment, or polish |
