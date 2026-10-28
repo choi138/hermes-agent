@@ -271,8 +271,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 "chat_id": source.chat_id or "",
                 "thread_id": str(source.thread_id) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
-                "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "session_id": session_entry.session_id, "session_key": session_key,
+                "profile": source.profile or "default", "source_message_id": str(event.message_id or ""), "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -2109,7 +2109,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
                     turn_id=_delivery_result.get('turn_id') or getattr(turn_ctx.event, '_gateway_active_turn_id', None),
                     response_kind=_delivery_result.get('response_kind') or getattr(turn_ctx.event, '_gateway_response_kind', None),
-                    coverage_selector=selector,
+                    coverage_selector=selector, completion_decision=getattr(turn_ctx.event, '_completion_decision', None),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)

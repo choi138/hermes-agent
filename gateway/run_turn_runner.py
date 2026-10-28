@@ -1231,12 +1231,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     if stream is not None:
                         stream.defer_publication_sync()
                 request_scope = task_request_scope(ctx.message or '', observed=observed_results, publication_barrier=barrier) if not followup else nullcontext()
+                from gateway.task_completion import completion_scope, finalize_result
                 from tools.process_registry_continuation import turn_scope
                 from gateway.session_results import execution_result
                 captured = execution_result.get()
                 before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                           getattr(agent, 'session_completion_tokens', 0) or 0)
-                with lease, request_scope, turn_scope(ctx.event, session_key, continuation_authority), notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+                with lease, request_scope, completion_scope(ctx, barrier) as parent_scope, turn_scope(ctx.event, session_key, continuation_authority), notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                     if resume_marker and not (
                         self._runner.session_store.resume_owner_matches(
                             session_key, resume_marker, phase="executing",
@@ -1253,7 +1254,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                             "interrupted": True,
                             "agent_persisted": True,
                         }
+                    from gateway.task_completion_managed import managed_context
+                    api_message = managed_context(parent_scope, api_message)
                     result = self._run_with_steer_admission(agent, api_message, kwargs)
+                    result = finalize_result(parent_scope, result)
                 if captured is not None:
                     incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                     outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
@@ -1695,6 +1699,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "process_report_disposition": result.get("process_report_disposition"),
             "process_report_obligation_id": result.get("process_report_obligation_id"),
             "response_kind": result.get("response_kind"),
+            **({"task_completion": result["task_completion"]} if "task_completion" in result else {}),
             "current_turn_user_idx": result.get("current_turn_user_idx"),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "failure_retryable": result.get("failure_retryable"),

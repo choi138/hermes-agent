@@ -17,6 +17,12 @@ def attention_inflight(turn_id):
     return (str(get_hermes_home()), turn_id) in _attention_inflight
 
 
+def _with_current_parent_status(ctx, report):
+    """A saved process report certifies only its execution, never parent completion."""
+    from gateway.task_completion_delivery import execution_report
+    return execution_report(report)
+
+
 def prepare_report(runner, ctx, result, turn_id):
     """Persist a sanitized report obligation before any user-facing delivery."""
     from tools.process_registry_followups import verification_report, reserve_report
@@ -29,6 +35,7 @@ def prepare_report(runner, ctx, result, turn_id):
     adapter = resolve(ctx.source) if callable(resolve) else None
     report = _sanitize_gateway_final_response(ctx.source.platform, verification_report(result, language_hint=ctx.message))
     report = _strip_response_attachments_for_direct_send(report, adapter or BasePlatformAdapter)
+    report = _with_current_parent_status(ctx, report)
     followup = ctx.event.metadata['process_followup']
     if not reserve_report(followup['execution_id'], followup['token'], turn_id):
         return report, None  # Cancellation or reconciliation already owns this turn.
@@ -65,6 +72,7 @@ def prepare_foreground_report(runner, ctx, result, turn_id, observed):
         report_turn = turn_id + ':process:' + execution
         text = _strip_response_attachments_for_direct_send(
             _sanitize_gateway_final_response(ctx.source.platform, text), adapter or BasePlatformAdapter)
+        text = _with_current_parent_status(ctx, text)
         if not text or not claim_foreground_report(execution, ctx.session_key, report_turn, assessment, text):
             continue
         kind = 'process_verification_report'
@@ -92,7 +100,8 @@ async def deliver_foreground_report(runner, evt):
     event._gateway_active_turn_id = evt['followup_turn_id']
     event._gateway_response_kind = 'process_verification_report'
     event._gateway_session_key = evt['session_key']
-    await adapter.send_final_ledgered(event, evt['session_key'], evt['report_text'],
+    from gateway.task_completion_delivery import execution_report
+    await adapter.send_final_ledgered(event, evt['session_key'], execution_report(evt['report_text']),
         {'thread_id': source.thread_id, 'non_conversational': True}, reply_to=None)
     return True
 

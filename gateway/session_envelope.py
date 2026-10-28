@@ -65,7 +65,12 @@ def _adapter_event(event, **changes):
     """An adapter's event at the envelope boundary: an absent media list (``None``) is no media.
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
-    return replace(event, **changes) if changes else event
+    if not changes:
+        return event
+    frozen = replace(event, **changes)
+    from gateway.task_completion import restore_request, snapshot_request
+    restore_request(frozen, snapshot_request(event))
+    return frozen
 
 
 def _refuse(event, reason, clause):
@@ -232,6 +237,11 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                               if getattr(event, name) is not None})
     if event.inherit_channel_pin is True:  # synthetic goal/resume turn reuses the session's pins (#126109)
         envelope['event']['inherit_channel_pin'] = True
+    from gateway.task_completion import capture_request, admit_request, snapshot_request
+    if snapshot_request(event) is None:
+        admit_request(event, capture_request(event))
+    if request := snapshot_request(event):
+        envelope['completion_request_v1'] = request
     if metadata := _native_metadata(event):
         envelope['event']['metadata'] = metadata
     # COMMAND that passed admission is path text (``/Users/x is broken``): replay it as text.
@@ -299,6 +309,8 @@ def restore_native(payload, runner=None):
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
         event.metadata.update(automation_process_metadata(envelope['automation']))
+    from gateway.task_completion import restore_request
+    restore_request(event, envelope.get('completion_request_v1'))
     return event
 
 

@@ -519,6 +519,10 @@ def apply_llm_output_transform(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
+    from gateway.task_completion import transform_output
+    guarded_response = transform_output(final_response)
+    if guarded_response != final_response:
+        pre_transform, final_response, transformed = final_response, guarded_response, True
     agent._llm_output_transform = (turn_id, transformed, pre_transform)
     return final_response, transformed, pre_transform
 

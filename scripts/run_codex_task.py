@@ -100,7 +100,9 @@ def main():
                         help="Gateway-only: load audited interactive zsh credentials before worker launch")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from agent.codex_task_runner import TaskRequest, WorkerSelection, run_task
+    from agent.codex_task_runner import TaskRequest, WorkerSelection
+    from agent.task_lifecycle.launcher import run_legacy_task as run_task
+    from agent.task_lifecycle.types import LifecycleError
     from agent.codex_worker_policy import PolicyInput, decide_worker
 
     if args.advisor is not None and args.cli != "claude":
@@ -244,7 +246,7 @@ def main():
                       else run_task(request, policy_receipt=policy_receipt))
         print(json.dumps(result, ensure_ascii=True))
         return result.get("exit_code", 0)
-    except ValueError as exc:
+    except (LifecycleError, ValueError) as exc:
         print(json.dumps({"status": "invalid_request_or_artifact_error", "exit_code": 74,
                           "reason": str(exc)}), file=sys.stderr)
         return 74
@@ -261,6 +263,7 @@ def main():
 def lifecycle_main(argv):
     parser = argparse.ArgumentParser(description="Opt-in durable lifecycle; active HERMES_HOME owns state")
     sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("capabilities", help="Report schema and child-only acceptance support")
     sub.add_parser("import-request", help="Trusted authenticated SSH intake from gateway; reads stdin")
     sub.add_parser("export-result", help="Return verified result/attachment to source gateway over SSH").add_argument("run_id")
     prepare = sub.add_parser("prepare", help="Trusted operator intake; config must be private and outside the workdir")
@@ -279,6 +282,10 @@ def lifecycle_main(argv):
     from agent.task_lifecycle import workflow
     from agent.task_lifecycle.types import LifecycleError
     try:
+        if args.action == "capabilities":
+            from agent.task_lifecycle.capabilities import capabilities
+            print(json.dumps(capabilities(), ensure_ascii=False))
+            return 0
         if args.action == "_worker":
             return workflow.worker(args.run_id)
         if args.action == "export-result":

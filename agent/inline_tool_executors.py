@@ -330,6 +330,8 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
 
 def _coerced(name: str, executor: InlineToolExecutor) -> InlineToolExecutor:
     def _exec(agent, args: dict, ctx: InlineToolContext) -> Any:
+        from gateway.task_completion import record_tool_execution
+        record_tool_execution(name)
         return executor(agent, coerce_tool_args(name, args), ctx)
     return _exec
 

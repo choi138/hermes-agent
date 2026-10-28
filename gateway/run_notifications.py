@@ -293,7 +293,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
         turn_id: Optional[str] = None, response_kind: Optional[str] = None,
-        coverage_selector=None,
+        coverage_selector=None, completion_decision=None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -309,11 +309,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
         text_content = _strip_response_attachments_for_direct_send(response, adapter)
+        from gateway.task_completion_delivery import preflight_queued
+        certified_sent = await preflight_queued(adapter, source, text_content, session_key,
+            inbound_message_id, completion_decision, metadata, event_message_id, coverage_selector)
+        if certified_sent is not None:
+            return certified_sent
         if text_already_delivered and text_content:
             with coverage_delivery_scope(coverage_selector):
                 commit_processing_coverage()
             await self._record_queued_final_receipt(adapter, source, text_content, session_key,
-                inbound_message_id, turn_id=turn_id, response_kind=response_kind)
+                inbound_message_id, turn_id=turn_id, response_kind=response_kind,
+                completion_decision=completion_decision)
         if not text_already_delivered:
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
@@ -332,7 +338,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                             )
                         if getattr(_edit_res, "success", False):
                             await self._record_queued_final_receipt(adapter, source, text_content, session_key,
-                                inbound_message_id, turn_id=turn_id, response_kind=response_kind)
+                                inbound_message_id, turn_id=turn_id, response_kind=response_kind,
+                                completion_decision=completion_decision)
                             _reconciled = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
@@ -357,7 +364,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     _sent = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
                         inbound_message_id, turn_id=turn_id, response_kind=response_kind,
-                        coverage_selector=coverage_selector)
+                        coverage_selector=coverage_selector, completion_decision=completion_decision)
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -376,11 +383,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
     async def _record_queued_final_receipt(
         self, adapter, source, content, session_key, inbound_message_id, *, turn_id, response_kind,
+        completion_decision=None,
     ):
         """Retain exact-turn evidence for an already confirmed stream or final edit."""
         if not session_key or not isinstance(adapter, BasePlatformAdapter):
             return
         event = MessageEvent(text='', source=source, ledger_message_id=inbound_message_id)
+        event._completion_decision = completion_decision
         event._gateway_active_turn_id = turn_id
         event._gateway_response_kind = response_kind
         try:
@@ -398,7 +407,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         event_message_id: Optional[str], session_key: Optional[str],
         inbound_message_id: Optional[str] = None,
         *, turn_id: Optional[str] = None, response_kind: Optional[str] = None,
-        coverage_selector=None,
+        coverage_selector=None, completion_decision=None,
     ):
         """Send a queued-lane final through the same ledger bracket as the normal final
         (``send_final_ledgered``). This lane used to call ``adapter.send`` bare and discard the
@@ -410,6 +419,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         the base contract and sends without a session key keep the plain send."""
         if session_key and isinstance(adapter, BasePlatformAdapter):
             event = MessageEvent(text="", source=source, ledger_message_id=inbound_message_id)
+            event._completion_decision = completion_decision
             event._gateway_active_turn_id = turn_id
             event._gateway_response_kind = response_kind
             result, _ = await adapter.send_final_ledgered(

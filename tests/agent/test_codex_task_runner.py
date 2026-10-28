@@ -310,8 +310,25 @@ def test_timeout_reaps_owned_child_and_sigterm_cancels_cli(inputs, tmp_path):
     pid = int(Path(result["artifact_dir"], "events.jsonl").read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)  # Liveness only; no test guard disabled.
-    result = run_stub(inputs, tmp_path, body,
-        setup="import signal, threading\nthreading.Timer(.5, lambda: signal.raise_signal(signal.SIGTERM)).start()")
+    # Signal only after this invocation's child has flushed its PID. Launcher
+    # audit/import work can exceed a fixed timer before cancellation is armed.
+    ready = tmp_path / "cancel-child-ready"
+    cancel_body = ("import os, time\nfrom pathlib import Path\n"
+                   "print(os.getpid(), flush=True)\n"
+                   f"Path({str(ready)!r}).touch()\ntime.sleep(30)\n")
+    setup = f'''import signal, threading, time
+from pathlib import Path
+ready = Path({str(ready)!r})
+def cancel_started_child():
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if ready.exists():
+            signal.raise_signal(signal.SIGTERM)
+            return
+        time.sleep(.01)
+threading.Thread(target=cancel_started_child, daemon=True).start()
+'''
+    result = run_stub(inputs, tmp_path, cancel_body, setup=setup)
     assert result["status"] == "cancelled" and result["exit_code"] == 130
     pid = int(Path(result["artifact_dir"], "events.jsonl").read_text())
     with pytest.raises(ProcessLookupError):
@@ -379,7 +396,7 @@ for p in Path('artifacts').glob('codex-task-*'):
     result = run_stub(inputs, tmp_path, body, expect_status=False)
     assert result.returncode == 74
     assert result.stdout == ""
-    assert json.loads(result.stderr)["status"] == "invalid_request_or_artifact_error"
+    assert json.loads(result.stderr.splitlines()[-1])["status"] == "invalid_request_or_artifact_error"
     assert next(inputs["output_dir"].glob("*/status.json")).read_text() == "existing"
 
 

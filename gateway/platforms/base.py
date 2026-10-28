@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import safe_url_for_log
+from gateway.platforms.base_values import _or_default, _platform_name
 
 from utils import normalize_proxy_url
 from agent.i18n import t
@@ -149,20 +150,6 @@ _HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS = 5.0
 # can't exhaust the shared executor.
 _HISTORY_MEDIA_LOOKUP_MAX_WORKERS = 2
 _HISTORY_MEDIA_LOOKUP_ADMISSION = threading.BoundedSemaphore(_HISTORY_MEDIA_LOOKUP_MAX_WORKERS)
-
-
-def _platform_name(platform) -> str:
-    """Normalize a Platform enum / raw string into a lowercase name."""
-    value = getattr(platform, "value", platform)
-    return str(value or "").lower()
-
-
-def _or_default(thunk, default, exc=(TypeError, ValueError)):
-    """``thunk()``, or ``default`` when it raises one of ``exc`` (numeric config/env coercion)."""
-    try:
-        return thunk()
-    except exc:
-        return default
 
 
 DEFAULT_BUSY_TEXT_DEBOUNCE_SECONDS = 0.35
@@ -4428,6 +4415,8 @@ class BasePlatformAdapter(ABC):
             obligation_id = (
                 'process-report:' + compute_obligation_id(session_key, event._gateway_active_turn_id, response_kind)
                 if process_report else compute_obligation_id(session_key, str(_ledger_id or ""), text_content))
+            from gateway.task_completion_delivery import prepare_obligation, certified
+            obligation_id = await asyncio.to_thread(prepare_obligation, event, obligation_id, text_content, session_key)
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
@@ -4435,12 +4424,14 @@ class BasePlatformAdapter(ABC):
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 turn_id=getattr(event, "_gateway_active_turn_id", None),
-                response_kind=response_kind, preserve_existing=process_report)
+                response_kind=response_kind, preserve_existing=process_report or certified(event))
             event._gateway_delivery_obligation_id = obligation_id
-            if not process_report:
+            if not process_report and not certified(event):
                 await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
+            if getattr(event, '_completion_decision', None) or '[Hermes task: verified' in text_content:
+                raise  # certified finals never fall back to an unledgered send
             if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
                 raise  # never send a verification report without its durable obligation
             logger.debug("delivery ledger record failed", exc_info=True)
@@ -4564,15 +4555,18 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
-            from gateway.delivery_ledger import claim_pending_obligation, turn_delivery_state
+        if getattr(event, '_completion_decision', None) or getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
+            from gateway.delivery_ledger import claim_pending_obligation
             if obligation_id is None:
                 raise RuntimeError('Verification report has no durable delivery obligation')
             if not await asyncio.to_thread(claim_pending_obligation, obligation_id):
-                delivered = await asyncio.to_thread(turn_delivery_state, session_key, event._gateway_active_turn_id)
+                from gateway.task_completion_delivery import existing_delivery
+                delivered = await asyncio.to_thread(existing_delivery, event, session_key, obligation_id)
                 return SendResult(success=delivered == 'delivered', error=None if delivered == 'delivered'
                     else 'Existing delivery ledger owns verification report recovery'), delivery_adapter
         try:
+            from gateway.task_completion_delivery import validate_obligation
+            await asyncio.to_thread(validate_obligation, obligation_id, text_content)
             if getattr(event, '_gateway_response_kind', None) == 'process_verification_report':
                 from gateway.delivery_ledger import process_attention_authorized, abandon_obligation
                 allowed = await asyncio.to_thread(process_attention_authorized, obligation_id)

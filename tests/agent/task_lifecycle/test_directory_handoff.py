@@ -4,6 +4,7 @@ Independent probes can reuse fixture ``case`` and ``harmless_argv``. The
 injected Popen sees bootstrap argv and safe cwd='/', not the original -C path.
 """
 from dataclasses import replace
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -20,8 +21,85 @@ from agent.task_lifecycle.executor import MacExecutor, _process_lookup
 from agent.task_lifecycle.registry import Registry
 from agent.task_lifecycle.types import LifecycleError, Phase
 
-pytestmark = [pytest.mark.skipif(sys.platform != "darwin", reason="Mac kqueue exec handoff"),
+pytestmark = [pytest.mark.platforms('macos'),
               pytest.mark.live_system_guard_bypass]  # Only this test's own temporary children.
+
+
+def descriptor_objects():
+    """Observe live kernel objects; descriptor numbers may be reused by SQLite."""
+    objects = {}
+    for text in os.listdir('/dev/fd'):
+        fd = int(text)
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            continue  # listdir's own descriptor has already closed.
+        try:
+            path = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b'\0', 1)[0].decode()
+        except OSError:
+            path = None  # Pipes and sockets have no filesystem path.
+        objects[fd] = (info.st_dev, info.st_ino, info.st_mode, path)
+    return objects
+
+
+def descriptor_identity(fd):
+    info = os.fstat(fd)
+    return fd, info.st_dev, info.st_ino, info.st_mode
+
+
+def assert_descriptors_closed(opened, closed):
+    live_objects = {value[:3] for value in descriptor_objects().values()}
+    for descriptor in opened:
+        assert descriptor in closed, 'the acquired handle must actually close'
+        assert descriptor[1:] not in live_objects, 'no alias of an acquired object may leak'
+
+
+@pytest.fixture
+def closed_descriptors(monkeypatch):
+    closed = []
+    real_close = os.close
+    def close(fd):
+        identity = descriptor_identity(fd)
+        real_close(fd)
+        closed.append(identity)
+    monkeypatch.setattr(os, 'close', close)
+    return closed
+
+
+def test_cleanup_proof_rejects_an_open_handle_and_a_surviving_alias(tmp_path, closed_descriptors):
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    identity = descriptor_identity(fd)
+    duplicate = os.dup(fd)
+    try:
+        with pytest.raises(AssertionError, match='actually close'):
+            assert_descriptors_closed([identity], closed_descriptors)
+        os.close(fd)
+        fd = None
+        with pytest.raises(AssertionError, match='alias'):
+            assert_descriptors_closed([identity], closed_descriptors)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(duplicate)
+    assert_descriptors_closed([identity], closed_descriptors)
+
+
+def test_cleanup_proof_accepts_a_number_reused_for_a_different_object(tmp_path, closed_descriptors):
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    identity = descriptor_identity(fd)
+    os.close(fd)
+    regular = tmp_path / 'other-object'
+    regular.write_text('descriptor reuse is not a leaked directory')
+    replacement = os.open(regular, os.O_RDONLY)
+    try:
+        if replacement != fd:
+            os.dup2(replacement, fd)
+        assert descriptor_identity(fd)[1:] != identity[1:]
+        assert_descriptors_closed([identity], closed_descriptors)
+    finally:
+        os.close(replacement)
+        if replacement != fd:
+            os.close(fd)
 
 
 @pytest.fixture
@@ -120,12 +198,14 @@ def test_real_after_final_check_never_uses_outside(case, target, restore_at_spaw
 
 
 @pytest.mark.parametrize("sandbox", ["read-only", "workspace-write"])
-def test_real_stable_handoff_preserves_runner_contract(case, sandbox):
+def test_real_stable_handoff_preserves_runner_contract(case, closed_descriptors, sandbox):
     registry, task, request, authority, _ = case
     request = replace(request, sandbox=sandbox)
     calls = []
+    descriptors = []
     def spawn(argv, **kwargs):
         calls.append((argv, kwargs))
+        descriptors.extend(descriptor_identity(fd) for fd in kwargs['pass_fds'])
         return subprocess.Popen(harmless_argv(argv), **kwargs)
     adapter = MacExecutor(registry, authority=authority, popen=spawn)
     run_id = adapter.submit(task, request)
@@ -137,9 +217,7 @@ def test_real_stable_handoff_preserves_runner_contract(case, sandbox):
     assert kwargs["cwd"] == "/"
     assert kwargs["shell"] is False and kwargs["start_new_session"] is True
     assert "preexec_fn" not in kwargs
-    for fd in kwargs["pass_fds"]:
-        with pytest.raises(OSError):
-            os.fstat(fd)
+    assert_descriptors_closed(descriptors, closed_descriptors)
     artifacts, = request.output_dir.iterdir()
     data = json.loads((artifacts / "events.jsonl").read_text())
     assert data["prompt"] == request.spec.read_text()
@@ -170,7 +248,7 @@ def test_real_directory_replacement_before_submission_has_zero_effects(case, tar
 
 
 @pytest.mark.parametrize("target,when", [("repo", "before"), ("work", "before"), ("repo", "after")])
-def test_acquisition_rename_and_restore_uses_checked_objects(case, monkeypatch, target, when):
+def test_acquisition_rename_and_restore_uses_checked_objects(case, monkeypatch, closed_descriptors, target, when):
     registry, task, request, authority, outside = case
     original = request.allowed_root if target == "repo" else request.workdir
     saved = original.with_name(original.name + "-saved")
@@ -192,7 +270,7 @@ def test_acquisition_rename_and_restore_uses_checked_objects(case, monkeypatch, 
             if when == "before":
                 swap()
             fd = real_open(path, *args, **kwargs)
-            opened.append(fd)
+            opened.append(descriptor_identity(fd))
             if when == "after":
                 swap()
             restore()  # Before production fstat: path checks alone see no change.
@@ -217,9 +295,7 @@ def test_acquisition_rename_and_restore_uses_checked_objects(case, monkeypatch, 
         assert len(calls) == 1
     assert fired == [target]
     assert not list(outside.rglob("*.json"))
-    for fd in opened:
-        with pytest.raises(OSError):
-            os.fstat(fd)
+    assert_descriptors_closed(opened, closed_descriptors)
 
 
 @pytest.mark.parametrize("when", ["before", "after"])
@@ -296,12 +372,12 @@ original.symlink_to(outside,target_is_directory=True)
 
 
 @pytest.mark.parametrize("failure", ["exec_missing", "bootstrap_exit_zero", "bootstrap_timeout"])
-def test_bootstrap_is_not_workload_evidence_and_closes_resources(case, failure):
+def test_bootstrap_is_not_workload_evidence_and_closes_resources(case, closed_descriptors, failure):
     registry, task, request, authority, _ = case
     request = replace(request, timeout=.4)
     children, descriptors = [], []
     def spawn(argv, **kwargs):
-        descriptors.extend(kwargs["pass_fds"])
+        descriptors.extend(descriptor_identity(fd) for fd in kwargs['pass_fds'])
         command = list(argv)
         if failure == "exec_missing":
             command[command.index("--") + 1] = "/nonexistent-lifecycle-probe-binary"
@@ -318,9 +394,7 @@ def test_bootstrap_is_not_workload_evidence_and_closes_resources(case, failure):
     assert registry.lookup(run_id).exit_code is None
     assert children[0].poll() is not None
     assert all(stream.closed for stream in (children[0].stdin, children[0].stdout, children[0].stderr))
-    for fd in descriptors:
-        with pytest.raises(OSError):
-            os.fstat(fd)
+    assert_descriptors_closed(descriptors, closed_descriptors)
 
 
 def test_real_evidence_failure_reaps_child_and_closes_pipes(case):
@@ -340,7 +414,11 @@ def test_real_evidence_failure_reaps_child_and_closes_pipes(case):
 
 def test_handoff_has_no_parent_or_workload_descriptor_leaks(case):
     registry, task, request, authority, _ = case
-    before = set(os.listdir("/dev/fd"))
+    # Registry and its idempotency store are separate SQLite connections to the
+    # same DB. The registry opens its WAL descriptor lazily on its first read.
+    # Open that legitimate connection resource before measuring handoff leaks.
+    registry._conn.execute('SELECT count(*) FROM lifecycle_events').fetchone()
+    before = descriptor_objects()
     code = """
 import os,sys,json
 sys.stdin.buffer.read()
@@ -359,7 +437,7 @@ print(json.dumps(fds))
     for i in range(8):
         adapter.authority = replace(authority, request_revision=str(i))
         assert registry.lookup(adapter.submit(replace(task, request_revision=str(i)), request)).exit_code == 0
-    assert set(os.listdir("/dev/fd")) == before
+        assert descriptor_objects() == before
     for artifact in request.output_dir.iterdir():
         assert json.loads((artifact / "events.jsonl").read_text()) == []
 

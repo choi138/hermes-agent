@@ -40,6 +40,14 @@ def validate_checks(checks):
             raise LifecycleError('Review must name an independent reviewer')
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def check_files(checks, worker_root):
     """Bind executables/scripts outside the implementation's writable root."""
     files = {}
@@ -50,7 +58,7 @@ def check_files(checks, worker_root):
                 path = path.resolve(strict=True)
                 if path.is_relative_to(Path(worker_root)):
                     raise LifecycleError('Acceptance executable/script must be outside worker-writable scope')
-                files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+                files[str(path)] = _file_sha256(path)
     return files
 
 
@@ -205,8 +213,8 @@ def _execute(check, root, revision, log_dir, directory_identity):
     result = dict(name=check['name'], kind=check['kind'], argv=check['argv'],
                   revision=revision, passed=passed, exit_code=code,
                   started_at=started, finished_at=time.time(),
-                  stdout_sha256=hashlib.sha256(stdout_path.read_bytes()).hexdigest(),
-                  stderr_sha256=hashlib.sha256(stderr_path.read_bytes()).hexdigest(), logs=str(log_dir))
+                  stdout_sha256=_file_sha256(stdout_path),
+                  stderr_sha256=_file_sha256(stderr_path), logs=str(log_dir))
     write_private(log_dir / 'receipt.json', result)
     return result
 

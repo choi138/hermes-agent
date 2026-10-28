@@ -177,6 +177,15 @@ class HomeIOGuard:
         )
 
     def install(self, monkeypatch):
+        def preserve_capabilities(original, guarded):
+            # Python advertises these capabilities by callable identity. A guard
+            # must preserve that contract without bypassing the guarded callable.
+            for name in ("supports_dir_fd", "supports_fd", "supports_follow_symlinks",
+                         "supports_effective_ids"):
+                supported = getattr(os, name, set())
+                if original in supported:
+                    monkeypatch.setattr(os, name, supported | {guarded})
+
         def wrap(module, name, parameters, *, metadata=False, destructive=False):
             original = getattr(module, name)
 
@@ -188,6 +197,7 @@ class HomeIOGuard:
                                destructive=destructive(args, kwargs) if callable(destructive) else destructive)
                 return original(*args, **kwargs)
 
+            preserve_capabilities(original, guarded)
             monkeypatch.setattr(module, name, guarded)
 
         def open_writes(args, kwargs):
@@ -208,6 +218,14 @@ class HomeIOGuard:
         wrap(sqlite3, "connect", (("database", None),))
 
         original_open, original_close = os.open, os.close
+        original_dup = os.dup
+
+        @wraps(original_dup)
+        def guarded_dup(fd):
+            duplicate = original_dup(fd)
+            if fd in self.directories:
+                self.directories[duplicate] = self.directories[fd]
+            return duplicate
 
         @wraps(original_open)
         def guarded_open(path, flags, *args, **kwargs):
@@ -226,5 +244,7 @@ class HomeIOGuard:
             self.directories.pop(fd, None)
             return original_close(fd)
 
+        preserve_capabilities(original_open, guarded_open)
         monkeypatch.setattr(os, "open", guarded_open)
         monkeypatch.setattr(os, "close", guarded_close)
+        monkeypatch.setattr(os, "dup", guarded_dup)

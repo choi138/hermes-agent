@@ -113,6 +113,8 @@ class GatewayProfileReconcileMixin:
             if not self._running:
                 return
             try:
+                from gateway.task_completion_recovery import schedule_recovery
+                schedule_recovery(self)
                 await self._sync_hooks_on_consent_change()
                 # A standalone gateway never runs a profile reconcile from the watcher, unless it is the
                 # single-profile boot that starts multiplexing in place for a newly created profile.

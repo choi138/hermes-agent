@@ -29,6 +29,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
 )
 from gateway.run_shutdown import _log_suppressed, _send_error
+from gateway.run_startup_restore import _orphaned_active_turn
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -39,20 +40,6 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("gateway.run")
 
 _MAX_SAME_TURN_RESUMES = 2
-
-
-def _orphaned_active_turn(entry, boot_id: Optional[str]) -> Optional[dict]:
-    """Return a turn eligible for bounded resume on this boot."""
-    record = getattr(entry, "active_turn", None)
-    if not isinstance(record, dict):
-        return None
-    if record.get("status") == "retry_wait":
-        return record
-    if record.get("status") == "interrupted":
-        return record
-    if record.get("status") in {"running", "resuming"} and record.get("boot_id") != boot_id:
-        return record
-    return None
 
 
 def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> None:
@@ -502,24 +489,14 @@ class GatewayStartupMixin:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
-        for row in claimed:
-            if row.get("adopted"):
-                # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
-                # the timer armed below sends it once the platform's deadline has passed.
-                continue
-            adapter = await self._obligation_adapter(row)
-            if adapter is None:
-                continue
+        from gateway.task_completion_delivery import available_obligations, recover_lifecycle
+        async for row, adapter in available_obligations(self, claimed):
             # Lifecycle results require exact content and attachment readback.
             # The generic marker/split send path could duplicate an ACK-lost
             # result, so a failed lookup or busy finalizer never falls through.
             try:
-                from agent.task_lifecycle.handoff import lifecycle_obligation, deliver_result
-                if await asyncio.to_thread(lifecycle_obligation, row["obligation_id"]):
-                    confirmed = await deliver_result(
-                        row["obligation_id"], adapter,
-                        adapter_profile=row.get("profile") or "default",
-                    )
+                confirmed = await recover_lifecycle(row, adapter)
+                if confirmed is not None:
                     redelivered += int(confirmed)
                     continue
             except Exception:
@@ -533,7 +510,10 @@ class GatewayStartupMixin:
                     logger.debug("lifecycle claim deferral failed", exc_info=True)
                 continue
             from gateway.process_followups import AttentionSendPending
-            content = row["content"]
+            from gateway.task_completion_delivery import recover_content
+            content = await recover_content(row)
+            if content is None:
+                continue
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None

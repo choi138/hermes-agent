@@ -128,31 +128,30 @@ def gateway_envelope(*, source, session_key, request_revision, request_text, dec
 
     `request` contains operator-configured Mac paths/limits, never a model's
     arbitrary command. The approved immutable SPEC hash is rechecked on Mac.
-    `decision` must come from the existing deterministic policy router.
+    `decision` comes from trusted operator configuration, bound to the current authenticated turn.
     """
     from gateway.session import SessionSource
-    from agent.direct_agent_policy import ExecutionDecision
+    from gateway.session_identity import identity_of
+    from gateway.task_completion_policy import GatewayExecutionPolicy, authenticated_scope
     from tools.approval import get_current_session_key, request_tool_approval
     from .verification import validate_checks
     validate_checks(checks)
-    if not isinstance(source, SessionSource) or not isinstance(decision, ExecutionDecision):
+    if not isinstance(source, SessionSource) or not isinstance(decision, GatewayExecutionPolicy):
         raise LifecycleError('Trusted original source and resolved execution policy required')
-    if (get_current_session_key(default='') != session_key or not source.user_id
-            or not source.message_id or source.is_bot):
-        raise LifecycleError('Active authenticated original user turn required')
-    if (decision.lane not in {'codex','claude'} or decision.host != 'mac' or decision.refusal_reason
-            or request['cli'] != decision.lane or request['workdir'] != decision.workdir
-            or request['timeout'] > decision.timeout_seconds
-            or request['sandbox'] != ('read-only' if decision.permissions=='read_only' else 'workspace-write')):
-        raise LifecycleError('Request exceeds deterministic execution policy')
+    if get_current_session_key(default='') != session_key:
+        raise LifecycleError('Active approval session required')
+    scope = authenticated_scope(source, session_key, request_text)
+    decision.validate(request)
     if not isinstance(spec_sha256,str) or len(spec_sha256)!=64:
         raise LifecycleError('Approved SPEC digest is required')
-    envelope=dict(version=1,owner=source.user_id,origin=f'{session_key}:message:{source.message_id}',
+    identity = identity_of(source)
+    adapter_profile = identity.transport_profile if identity else (source.profile or 'default')
+    envelope=dict(version=1,owner=source.user_id,origin=scope.request.origin,
         request_revision=request_revision,profile=source.profile or 'default',request_text=request_text,
         objective=objective,request=request,checks=checks,artifacts=artifacts,spec_sha256=spec_sha256,
         forbidden_actions=list(forbidden_actions),context=context,
         destination=dict(session_key=session_key,platform=source.platform.value,channel_id=source.chat_id,
-                         thread_id=source.thread_id,adapter_profile=source.profile or 'default'))
+                         thread_id=source.thread_id,adapter_profile=adapter_profile))
     scope_digest=_digest(envelope)
     if decision.approval=='required':
         ref='lifecycle:'+scope_digest

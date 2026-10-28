@@ -15,6 +15,12 @@ from .contract import TaskContract
 from .types import ALLOWED_TRANSITIONS, LifecycleError, Phase
 
 
+_EXIT_COMMITTED_PHASES = frozenset({
+    Phase.EXECUTION_FINISHED, Phase.VERIFYING, Phase.VERIFIED,
+    Phase.DELIVERING, Phase.DELIVERY_UNCONFIRMED, Phase.DELIVERED,
+})
+
+
 @dataclass(frozen=True)
 class Submission:
     run_id: str
@@ -269,6 +275,13 @@ class Registry:
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             current = self._replay(run_id)
+            if (phase is Phase.EXECUTION_FINISHED and current.phase in _EXIT_COMMITTED_PHASES
+                    and current.exit_code == evidence["exit_code"]
+                    and (current.evidence.get(Phase.EXECUTION_FINISHED) or {}).get("reconciled_receipt") is True):
+                # A status observer recovered this worker's receipt first.
+                # Revalidate it under the same transaction as the phase read.
+                self._reconcile_execution(run_id, current)
+                return phase
             if current.contract.execution_digest is not None:
                 self._validate_managed_evidence(current, phase, evidence)
             _transition(current.phase, phase, evidence, current.evidence[current.phase])
@@ -306,14 +319,23 @@ class Registry:
     def reconcile_execution(self, run_id):
         with self._lock, self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            current = self._replay(run_id)
-            result = self.job(run_id)["result"]
-            if (current is None or current.phase not in {Phase.RUNNING, Phase.UNKNOWN}
-                    or not current.start_evidence or not result
-                    or type(result.get("process_returncode")) is not int):
-                raise LifecycleError("No durable execution receipt to reconcile")
-            self._append(run_id, Phase.EXECUTION_FINISHED,
-                         {"exit_code": result["process_returncode"], "reconciled_receipt": True})
+            self._reconcile_execution(run_id, self._replay(run_id))
+
+    def _reconcile_execution(self, run_id, current):
+        result = self.job(run_id)["result"]
+        if (current is None or not current.start_evidence or not isinstance(result, Mapping)
+                or type(result.get("process_returncode")) is not int):
+            raise LifecycleError("No durable execution receipt to reconcile")
+        # A different registry may commit the exit (and later milestones)
+        # after status reads the receipt but before this transaction begins.
+        # Only an exit event matching that durable receipt permits a no-op.
+        if (current.phase in _EXIT_COMMITTED_PHASES
+                and current.exit_code == result["process_returncode"]):
+            return
+        if current.phase not in {Phase.RUNNING, Phase.UNKNOWN}:
+            raise LifecycleError("No durable execution receipt to reconcile")
+        self._append(run_id, Phase.EXECUTION_FINISHED,
+                     {"exit_code": result["process_returncode"], "reconciled_receipt": True})
 
 
     def prepare_job(self, run_id, payload):

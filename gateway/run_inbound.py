@@ -212,6 +212,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
+        from gateway.task_completion import capture_request, admit_request
+        captured_request = capture_request(event)
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
@@ -241,6 +243,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
+        admit_request(event, captured_request)
+        from gateway.task_completion_intake import admit_requirement
+        admit_requirement(self, event)
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: MessageEvent, source: SessionSource) -> bool:

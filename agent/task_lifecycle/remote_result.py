@@ -16,7 +16,7 @@ from .contract import _digest
 from .handoff import _durable_schema
 from .registry import Registry
 from .types import LifecycleError, Phase
-from .verification import evidence, snapshot, run_lock, read_artifact, _schema
+from .verification import evidence, snapshot, run_lock, read_artifact, check_files, _schema
 from .workflow import decode_contract, write_private, host_identity
 
 
@@ -31,6 +31,9 @@ def export_result(run_id, *, content, attachments=()):
             grant=job['payload']
             if run.phase not in {Phase.VERIFIED,Phase.DELIVERING,Phase.DELIVERY_UNCONFIRMED,Phase.DELIVERED} or not verified or not verified['accepted']:
                 raise LifecycleError('Remote result is not verified')
+            if (grant.get('check_files') is not None
+                    and check_files(grant['checks'], run.contract.repo_root) != grant['check_files']):
+                raise LifecycleError('Trusted acceptance executable/script changed since approval')
             if snapshot(run.contract.workdir,grant['artifacts'])!=verified['artifact']:
                 raise LifecycleError('Remote artifact changed since acceptance')
             if len(attachments)>1 or any(p not in grant['artifacts'] for p in attachments):
@@ -157,9 +160,11 @@ def receive_result(package, *, envelope, expected_run_id, content, attachments=(
                 else: write_private(target,data)
                 copies.append({k:item[k] for k in ('name','bytes','sha256')}|{'path':str(target)})
             destination=envelope['destination']
-            text=content+f'\n\n참조: {expected_run_id}'
+            from .publication import publication
+            published=publication(registry,expected_run_id,content)
+            text=published['content']
             oid=delivery_ledger.compute_obligation_id(destination['session_key'],expected_run_id,text)
-            handoff=dict(destination=destination,content=text,attachments=copies,artifact_revision=verified['artifact']['revision'])
+            handoff=dict(published,destination=destination,attachments=copies,artifact_revision=verified['artifact']['revision'])
             encoded=json.dumps(handoff,sort_keys=True)
             _durable_schema(registry)
             with registry._conn:

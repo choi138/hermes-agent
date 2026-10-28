@@ -34,7 +34,7 @@ class SSHExecutor:
             raise LifecycleError('Only the configured macOS zsh login environment is supported')
 
     def call(self, action, *arguments, payload=None):
-        if action not in {'import-request', 'export-result', 'status', 'receipt', 'cancel', 'verify'}:
+        if action not in {'capabilities', 'import-request', 'export-result', 'status', 'receipt', 'cancel', 'verify'}:
             raise LifecycleError('Unsupported remote lifecycle operation')
         argv = ['env', 'HERMES_HOME='+self.profile_home, 'PATH='+self.executable_path,
                 self.python, self.script, 'lifecycle', action, *arguments]
@@ -45,7 +45,7 @@ class SSHExecutor:
         completed = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                                     self.host, shlex.join(argv)],
             input=json.dumps(payload,ensure_ascii=False) if payload is not None else None,
-            capture_output=True, text=True, timeout=45, check=False)
+            capture_output=True, text=True, timeout=3600 if action == 'verify' else 45, check=False)
         if completed.returncode != 0:
             # Lost response is ambiguous. Caller reconciles by original key;
             # the same envelope is safe to resubmit, never a new revision.
@@ -56,7 +56,12 @@ class SSHExecutor:
             raise LifecycleError('SSH response was not a lifecycle receipt') from exc
 
     def submit(self, envelope):
+        self.negotiate()
         return self.call('import-request', payload=envelope)
+
+    def negotiate(self):
+        from .capabilities import require_compatible
+        return require_compatible(self.call('capabilities'))
 
     def receive(self, run_id, *, envelope, content, attachments=()):
         from .remote_result import receive_result

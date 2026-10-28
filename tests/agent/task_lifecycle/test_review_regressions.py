@@ -104,7 +104,9 @@ async def test_review_discord_table_keeps_exact_delivery_content(case):
     oid = queue_result(run_id, content)
     channel = Channel()
     assert await deliver_result(oid, discord_adapter(channel), adapter_profile='default')
-    assert channel.messages[0].content == content + f'\n\n참조: {run_id}'
+    assert channel.messages[0].content == (
+        '[Hermes execution result; parent completion not established]\n\n'
+        + content + f'\n\n참조: {run_id}')
     assert len(channel.messages) == 1
     duplicate = workflow.submit(case['grant'])
     assert duplicate['run_id'] == run_id and duplicate['complete']
@@ -194,7 +196,9 @@ print(oid)
     assert workflow.status(run_id)['complete']
     assert not delivery_ledger.defer_lifecycle_claim(oid, attempts=3)
     assert [m.content for m in channel.messages] == [
-        'ordinary result', 'verified result' + f'\n\n참조: {run_id}']
+        'ordinary result',
+        '[Hermes execution result; parent completion not established]\n\n'
+        + 'verified result' + f'\n\n참조: {run_id}']
     assert await runner._redeliver_failed_obligations_for_platform(Platform.DISCORD) == 0
     assert len(channel.messages) == 2
 

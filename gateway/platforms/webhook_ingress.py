@@ -181,6 +181,8 @@ async def _admit_once(authority, event, webhook, hooks, committed):
             if consumed:
                 await _release_preparation(authority, committed[0])
                 return None
+    from gateway.task_completion import restore_request
+    restore_request(admitted, committed[0]['native_text_v1'].get('completion_request_v1'))
     return await authority.admit_native(admitted)
 
 

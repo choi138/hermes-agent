@@ -155,7 +155,7 @@ def lifecycle_obligation(obligation_id):
         return conn.execute('SELECT 1 FROM lifecycle_handoffs WHERE obligation_id=?', (obligation_id,)).fetchone() is not None
 
 
-def queue_result(run_id, content, *, attachments=()):
+def queue_result(run_id, content, *, attachments=(), parent_id=None, decision_id=None, ledger=None):
     """Queue a verified result on its immutable original destination; no send."""
     import json
     from pathlib import Path
@@ -183,7 +183,10 @@ def queue_result(run_id, content, *, attachments=()):
                 raise LifecycleError('Only an original Discord destination has verified transport support')
             # Visible correlation makes an ACK-loss recoverable by readback;
             # inability to find it never licenses an automatic second send.
-            text = content + f'\n\n참조: {run_id}'
+            from .publication import publication
+            published = publication(registry, run_id, content, parent_id=parent_id,
+                decision_id=decision_id, ledger=ledger)
+            text = published['content']
             oid = delivery_ledger.compute_obligation_id(destination['session_key'], run_id, text)
             copied = []
             for relative in attachments:
@@ -197,7 +200,7 @@ def queue_result(run_id, content, *, attachments=()):
                 else:
                     write_private(target, data)
                 copied.append(dict(path=str(target), name=source.name, bytes=len(data), sha256=expected['sha256']))
-            payload = dict(destination=destination, content=text, attachments=copied,
+            payload = dict(published, destination=destination, attachments=copied,
                            artifact_revision=verified['artifact']['revision'])
             _durable_schema(registry)
             encoded = json.dumps(payload, sort_keys=True)
@@ -217,7 +220,7 @@ def queue_result(run_id, content, *, attachments=()):
             registry.close()
 
 
-async def deliver_result(obligation_id, adapter, *, adapter_profile):
+async def deliver_result(obligation_id, adapter, *, adapter_profile, ledger=None):
     """Called by the existing gateway finalizer/recovery with its owned adapter.
 
     Sent message ID + exact content/attachment bytes must be read back. ACK
@@ -258,6 +261,8 @@ async def deliver_result(obligation_id, adapter, *, adapter_profile):
                 registry.record_phase(run_id, Phase.DELIVERING, evidence={'delivery_ref':obligation_id})
             target = str(dest['thread_id'] or dest['channel_id'])
             try:
+                from .publication import validate_publication
+                validate_publication(registry, run_id, payload, ledger=ledger)
                 if not hasattr(adapter, 'read_lifecycle_result') or not hasattr(adapter, 'send_lifecycle_result'):
                     raise LifecycleError('Adapter cannot send and read back an exact lifecycle result')
                 # The ledger may have been claimed after a process died. Its

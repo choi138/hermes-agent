@@ -235,9 +235,11 @@ async def test_private_verification_reaches_queued_delivery_with_its_exact_turn(
     turn = TurnRunner(runner, ctx)
     assert turn._setup_stream_consumer(platform.value) == (None, None, None, False)
     result = turn._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
-    assert result['final_response'] == prose
+    from gateway.task_completion_delivery import execution_report
+    expected_report = execution_report(prose)
+    assert result['final_response'] == expected_report
     assert ledger.get_state(session.id)['verification'] == {**assessment, 'repair_attempts': 0}
-    assert ledger.get_state(session.id)['report_text'] == prose
+    assert ledger.get_state(session.id)['report_text'] == expected_report
     duplicate = turn._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
     assert duplicate['process_followup_disposition'] == 'skipped'
     assert _normalize_empty_agent_response(duplicate, duplicate['final_response']) == 'NO_REPLY'
@@ -251,7 +253,7 @@ async def test_private_verification_reaches_queued_delivery_with_its_exact_turn(
         turn_id=result['turn_id'], response_kind=result['response_kind'])
     assert turn_delivery_state(session.session_key, result['turn_id']) == 'delivered'
     adapter.send.assert_awaited_once()
-    assert adapter.send.call_args.kwargs['content'] == prose
+    assert adapter.send.call_args.kwargs['content'] == expected_report
     with ledger._db() as db:
         db.execute('UPDATE process_followups SET next_attempt=0')
     await reconcile(runner)
