@@ -220,6 +220,17 @@ def _move_dir(src: Path, dest: Path) -> None:
 def _copy_dir(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dest, ignore=_ignore_runtime_cache)
+    _make_copy_writable(dest)
+
+
+def _make_copy_writable(dest: Path, *, preserved_files=()) -> None:
+    """Package modes belong to the source; the user's skill copy must accept edits and sync-back."""
+    for path in (dest, *dest.rglob("*")):
+        if path.is_symlink() or path in preserved_files:
+            continue
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if not mode & stat.S_IWUSR:
+            path.chmod(mode | stat.S_IWUSR)
 
 
 def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Optional[str]:
@@ -335,7 +346,7 @@ def _replace_skill_dir(skill_src: Path, dest: Path) -> None:
         _rmtree_writable(backup)
     shutil.move(str(dest), str(backup))
     try:
-        shutil.copytree(skill_src, dest, ignore=_ignore_runtime_cache)
+        _copy_dir(skill_src, dest)
     except OSError:
         if backup.exists():  # clear a partially-written dest so it can't shadow/block the restore
             if dest.exists():
