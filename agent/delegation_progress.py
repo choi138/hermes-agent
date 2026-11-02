@@ -234,9 +234,11 @@ def _bounded_command(argv, *, cwd=None, limit=1024 * 1024, timeout=10):
 def _git(manifest, *args):
     if manifest.worktree.resolve(strict=True) != manifest.worktree:
         raise ValueError("worktree_boundary_changed")
+    # Scoped tasks still inventory the entire index/tree/status in a monorepo.
+    # Bound metadata separately from the smaller per-file/content budgets.
     return _bounded_command(["git", "--no-optional-locks", "-c", "core.fsmonitor=false",
                              "-c", "core.untrackedCache=false", *args], cwd=manifest.worktree,
-                            limit=4 * 1024 * 1024)
+                            limit=16 * 1024 * 1024)
 
 
 def file_class(path):
