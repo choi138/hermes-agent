@@ -35,7 +35,8 @@ Keep unrelated parent-task prose separate. To report this execution's verified r
 response with one internal ```process_reports JSON block containing
 {"reports":[{"execution_id":"EXACT_SESSION_ID","outcome":"verified","evidence":["actual checks"],
 "next_action":"none","report":"public completion report in the user's language"}]}.
-Use verification_failed or approval_wait with concrete remaining work when appropriate.
+Use verification_failed with concrete remaining checks for tool restrictions or missing goal context.
+Use approval_wait only for genuine missing user authorization, naming the action that needs approval.
 Put this execution's completion ONLY in its report segment, not also in parent prose.
 Only report IDs whose completed results you read in this turn. Exit zero alone is not verification.
 The gateway removes this block and publishes only segments it owns; never claim an automatic retry.
@@ -174,7 +175,8 @@ def verification_tool_block(name, args):
         return f'Wrong session_id: use session_id={execution!r} for this verification; do not inspect another execution.'
     return ("Automatic verification is read-only: this tool is blocked. "
             "Use read_file/search_files or poll/log this execution. "
-            "Report approval_wait if verification requires executing commands; do not repair.")
+            "Report verification_failed with the exact remaining check when the restriction blocks "
+            "already-authorized work. Use approval_wait only for missing user authorization; do not repair.")
 
 from functools import lru_cache
 
@@ -532,7 +534,10 @@ VERIFICATION_INSTRUCTION = """
 Verify the completed execution against the user's requested result; exit code alone is not verification.
 Do not rerun the completed command or start an automatic repair in this follow-up.
 Allowed checks are read_file, search_files, and process/process_manage poll or log for this execution only.
-Terminal commands and all other tools are blocked. If required evidence needs another tool or command, return approval_wait with the exact check that needs approval.
+Terminal commands and all other tools are blocked. A tool restriction is not missing user authorization.
+If an already-authorized check cannot run here, return verification_failed with the exact remaining check and restriction.
+Use approval_wait only for genuine missing user authorization; name the action and missing approval.
+If the original goal or completion criteria cannot be recovered, return verification_failed and name the missing context; do not invent an approval requirement.
 On failed verification, report the reason and concrete remaining work. Never loop repairs or bypass approval.
 First write a natural-language report in the user's language, including the outcome, evidence,
 and concrete remaining work. This is the only text shown to the user.

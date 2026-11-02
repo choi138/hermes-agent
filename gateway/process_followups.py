@@ -2,10 +2,52 @@
 import asyncio
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 _attention_sends = set()
 _attention_inflight = {}
+
+
+def _korean_context(evt):
+    scope = evt.get('verification_scope') or {}
+    hint = str(evt.get('language_hint') or '') + str(scope.get('task_request') or '')
+    return bool(re.search(r'[가-힣]', hint)) or evt.get('language') == 'ko'
+
+
+def verification_guidance(evt):
+    """Generated context follows the recorded request, never a global profile default."""
+    scope = evt.get('verification_scope') or {}
+    korean = _korean_context(evt)
+    text = ('\n실행 작업 경로: ' if korean else '\nExecution working directory: ') + str(scope.get('cwd', ''))
+    if scope.get('task_request'):
+        text += ('\n요청 메시지(대화에서 전체 목표와 완료 기준을 확인해):\n' if korean else
+                 '\nDispatching message (resolve the complete task and completion criteria from the conversation):\n') + scope['task_request']
+    else:
+        text += ('\n원래 요청이 기록되지 않았어. 원문 대화에서 목표와 완료 기준을 찾아봐. '
+                 '찾지 못하면 verification_failed로 누락된 맥락을 보고해.' if korean else
+                 '\nOriginal task request was not recorded. Resolve the goal and completion criteria from the source conversation; '
+                 'report verification_failed with the missing context if unavailable.')
+    if evt.get('observation_error'):
+        text += ('\n원격 출력이 불완전해. 결과물을 확인해야 해: ' if korean else
+                 '\nRemote output is incomplete; inspect artifacts before verifying: ') + evt['observation_error']
+    text += ('\n이미 승인된 작업의 결과를 검증하고 근거를 보고해. 끝난 명령은 반복하지 마. '
+             '도구 제한으로 승인된 확인을 못 하면 verification_failed와 정확히 남은 확인을 적어. '
+             '실제로 사용자 승인이 부족할 때만 approval_wait로 필요한 승인을 밝혀. '
+             '종료 코드만으로 검증 완료라고 하지 마.' if korean else
+             '\nContinue the previously authorized task: verify this result and report the evidence. '
+             'Do not repeat the completed command. Use verification_failed with the exact remaining check '
+             'when tool restrictions prevent an already-authorized check. Use approval_wait only for missing user authorization. '
+             'Do not claim verification merely because the process exited successfully.')
+    return text
+
+
+def attention_notice(execution, reason, evt):
+    if _korean_context(evt):
+        return (f'프로세스 {execution}: 검증 기록을 대조해야 해. 진단 기록: {reason}\n'
+                '원래 실행 기록은 남아 있어. 명령을 자동으로 다시 실행하지 않았어.')
+    return (f'Process {execution}: verification needs reconciliation. {reason}. '
+            'The original execution remains recorded; no command was automatically repeated.')
 
 
 class AttentionSendPending(TimeoutError):
@@ -163,19 +205,7 @@ async def reconcile(runner):
             continue
         evt['process_followup'] = {'execution_id': execution, 'token': token}
         text = format_process_notification(evt)
-        if evt.get('verification_scope'):
-            scope = evt['verification_scope']
-            text += '\nExecution working directory: ' + str(scope.get('cwd', ''))
-            if scope.get('task_request'):
-                text += '\nDispatching message (resolve the complete task and completion criteria from the conversation):\n' + scope['task_request']
-            else:
-                text += '\nOriginal task request was not recorded. Resolve it from the source message/conversation before claiming verification; report approval_wait if it is unavailable.'
-        if evt.get('observation_error'):
-            text += '\nRemote output is incomplete: ' + evt['observation_error'] + '. Inspect artifacts before verifying.'
-        text += ('\nContinue the previously authorized task: verify this result and report the evidence. '
-                 'Do not repeat the completed command. If verification fails, report the failure and '
-                 'remaining work. If approval is required, explicitly report what is waiting. '
-                 'Do not claim verification merely because the process exited successfully.')
+        text += verification_guidance(evt)
         try:
             accepted = await runner._inject_watch_notification(text, evt)
             from gateway.process_continuations import admission_settled, refused_for_good
@@ -353,8 +383,7 @@ async def _report_attention(runner, adapter, source, row, evt):
         if state == 'abandoned':
             await asyncio.to_thread(acknowledge_attention, execution, token, delivered=False)
             return
-        content = (f"Process {execution}: verification needs reconciliation. {row['reason']}. "
-                   "The original execution remains recorded; no command was automatically repeated.")
+        content = attention_notice(execution, row['reason'], evt)
         from gateway.process_continuations import _owner_mention
         mention = _owner_mention(source, evt)
         if mention:
