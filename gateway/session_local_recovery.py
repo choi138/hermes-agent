@@ -358,6 +358,21 @@ def local_receipt_ids(authority):
 
 
 def recover_local_sessions(authority, *, schedule=False):
+    for _ in _local_recovery_steps(authority, schedule=schedule):
+        pass
+
+
+async def recover_local_sessions_async(authority, *, schedule=False):
+    """Keep heartbeat and intake tasks running while restoring large policy histories.
+
+    Restoration publishes owner-loop state and can schedule tasks, so it cannot simply
+    be moved to a worker thread. Each receipt remains atomic on its owning loop.
+    """
+    for _ in _local_recovery_steps(authority, schedule=schedule):
+        await asyncio.sleep(0)
+
+
+def _local_recovery_steps(authority, *, schedule):
     for sid in local_receipt_ids(authority):
         try:
             ref = restore_local_session(authority, sid)
@@ -365,9 +380,10 @@ def recover_local_sessions(authority, *, schedule=False):
             if schedule and pending and not any(row['status'] == 'unknown' for row in pending):
                 authority._schedule(ref)
         except (_ReceiptRefused, _CatchUpPending):
-            continue  # logged: the check that refused it, or the catch-up handed to a worker
+            pass  # logged: the check that refused it, or the catch-up handed to a worker
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+        yield
     if schedule:
         # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
         from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
@@ -377,3 +393,4 @@ def recover_local_sessions(authority, *, schedule=False):
             if any(row['status'] == 'unknown' for row in list_session_admissions(authority.db, session_id=sid)):
                 # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
                 track_mutation(authority, settle_viewer_close(authority, sid))
+            yield
