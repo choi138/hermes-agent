@@ -94,6 +94,38 @@ def test_remote_cwd_is_not_validated_on_controller(ssh_context_lab):
     assert "REMOTE_ONLY_RULE" in build_context_files_prompt(skip_soul=True)
 
 
+def test_nested_remote_context_has_bounded_metadata_round_trips(ssh_context_lab, monkeypatch):
+    env = ssh_context_lab("batched-context", "a.invalid")
+    project = env.root / "workspace"
+    (project / "AGENTS.md").write_text("ROOT_RULE")
+    nested = project / "one" / "two" / "three"
+    nested.mkdir(parents=True)
+    (nested / "AGENTS.override.md").write_text("LEAF_RULE")
+    calls = []
+    execute = env.execute
+
+    def measured_execute(command, **kwargs):
+        calls.append(command)
+        return execute(command, **kwargs)
+
+    monkeypatch.setattr(env, "execute", measured_execute)
+    prompt = build_context_files_prompt(
+        cwd="/workspace/one/two/three", task_id="batched-context", skip_soul=True,
+    )
+    assert prompt.index("ROOT_RULE") < prompt.index("LEAF_RULE")
+    assert len(calls) <= 6, f"Context discovery made {len(calls)} remote round trips"
+
+
+def test_remote_context_metadata_is_refreshed_on_each_read(ssh_context_lab):
+    env = ssh_context_lab("fresh-context", "a.invalid")
+    context = env.root / "workspace" / "AGENTS.md"
+    assert build_context_files_prompt(cwd="/workspace", task_id="fresh-context", skip_soul=True) == ""
+    context.write_text("FRESH_RULE")
+    assert "FRESH_RULE" in build_context_files_prompt(
+        cwd="/workspace", task_id="fresh-context", skip_soul=True,
+    )
+
+
 def test_remote_read_failure_does_not_fall_back_to_controller(ssh_context_lab, monkeypatch):
     alpha = ssh_context_lab("session-a", "a.invalid")
     monkeypatch.setattr(alpha, "execute", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("offline")))

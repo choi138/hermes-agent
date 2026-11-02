@@ -609,9 +609,9 @@ class SessionPersistenceMixin:
         self, session_key: str, *, entry_data: Optional[dict[str, Any]] = None,
         lock_held: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
-        multi-MB sessions.json). The key -> session_id mapping never changes here: structural
-        transitions use the full rewrite (which also refreshes the sessions.json mirror; it may lag
-        in metadata only). The revision comes from the shared routing generation counter; under
+        multi-MB sessions.json). Structural transitions may use it when the legacy mirror is
+        disabled; otherwise they use the full save to keep its key -> session_id mapping current.
+        The revision comes from the shared routing generation counter; under
         ``_save_lock`` the upsert is skipped if a full snapshot or a newer fast save of this key
         already persisted (the reverse case lives in ``_persist_routing_data``). No DB or a failed
         upsert falls back to the full rewrite. ``entry_data`` persists a candidate BEFORE it is

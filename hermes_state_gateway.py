@@ -19,6 +19,26 @@ from hermes_state_common import (
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
 
+
+def _retired_routing_keys(conn, rows):
+    """Check deletion fences in bounded batches without one SQLite round trip per route."""
+    from hermes_state_mutation_retirement import ROUTE_RETIRED_SQL
+
+    retired = set()
+    predicate = ROUTE_RETIRED_SQL.replace(":entry", "candidate.entry").replace(":ns", "candidate.ns")
+    # Three bindings per route plus shared fence parameters stay below SQLite's legacy 999 limit.
+    for start in range(0, len(rows), 200):
+        batch = rows[start:start + 200]
+        params = dict(batch[0])
+        values = []
+        for index, row in enumerate(batch):
+            values.append(f"(:key_{index}, :entry_{index}, :ns_{index})")
+            params.update({f"{name}_{index}": row[name] for name in ("key", "entry", "ns")})
+        retired.update(row[0] for row in conn.execute(
+            "WITH candidate(key, entry, ns) AS (VALUES " + ",".join(values) + ") "
+            "SELECT key FROM candidate WHERE " + predicate, params))
+    return retired
+
 # Recursive CTE naming a session plus its compression ancestors (rows a
 # resume must keep on one routing peer); branch/delegate/tool/reset rows stop it
 # (same membership rule as get_compression_lineage / _CHAIN_STEP_SQL, #114271).
@@ -312,18 +332,28 @@ class SessionGatewayMixin:
         """Atomically replace the routing index for *scope* (keys absent from *entries*
         are removed); other scopes untouched. Returns the keys skipped as retired routes, which
         the sessions.json mirror must leave out too."""
-        from hermes_state_mutation_retirement import ROUTE_RETIRED_SQL, route_retired_params
+        from hermes_state_mutation_retirement import route_retired_params
         now = time.time()
         rows = [{'scope': scope, 'key': k, **route_retired_params(k, v, now)} for k, v in entries.items() if k and v]
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if rows:
+            # A structural save used to dirty every routing row and its index pages. Compare
+            # inside the write transaction so fences and concurrent writers stay atomic, but
+            # leave unchanged rows untouched (and retain their actual last-change timestamp).
+            current = dict(conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,)))
+            retired = _retired_routing_keys(conn, rows)
+            kept = {row['key'] for row in rows} - retired
+            conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
+                             [(scope, key) for key in current.keys() - kept])
+            changed = [row for row in rows
+                       if row['key'] in kept and current.get(row['key']) != row['entry']]
+            if changed:
                 conn.executemany(
                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "SELECT :scope, :key, :entry, :now WHERE NOT " + ROUTE_RETIRED_SQL,
-                    rows)
-            kept = {r[0] for r in conn.execute("SELECT session_key FROM gateway_routing WHERE scope = ?", (scope,))}
-            return {row['key'] for row in rows} - kept
+                    "VALUES (:scope, :key, :entry, :now) ON CONFLICT(scope, session_key) "
+                    "DO UPDATE SET entry_json = excluded.entry_json, updated_at = excluded.updated_at",
+                    changed)
+            return retired
         return self._execute_write(_do)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:

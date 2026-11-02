@@ -138,7 +138,9 @@ class BackendPath:
         path = result.get("output", "").strip()
         if result.get("returncode") != 0 or not path.startswith("/") or "\n" in path:
             raise OSError("Remote working directory unavailable")
-        metadata = {}
+        from agent.prompt_backend_metadata import context_metadata
+
+        metadata = context_metadata(path, execute)
 
         def cached_execute(command):
             if command.startswith("test "):

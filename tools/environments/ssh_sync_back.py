@@ -42,7 +42,10 @@ def paths():
         def fail(error): raise error
         for directory, dirs, files in os.walk(root, followlinks=False, onerror=fail):
             check()
-            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(directory, d))]
+            # Python execution creates disposable caches absent from the upload manifest.
+            # Prune before descent so an unreadable cache cannot abort unrelated results.
+            dirs[:] = [d for d in dirs if d != '__pycache__'
+                       and not os.path.islink(os.path.join(directory, d))]
             for name in files:
                 path = os.path.join(directory, name)
                 if path not in excluded: yield path

@@ -22,7 +22,9 @@ from cron.jobs import (
     rearm_oneshot,
     JOBS_FILE,
 )
-from cron.scheduler import tick
+# Store-only clients and external worker package boot do not need the scheduler's
+# provider/config imports. tick resolves its scheduler dependencies when called.
+from cron.scheduler_tick import tick
 
 __all__ = [
     "JOBS_FILE",

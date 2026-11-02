@@ -1079,7 +1079,7 @@ class SessionStore(
                 decision, session_key, source, now, force_new, observed
             )
         if decision.needs_save:
-            if decision.metadata_only_save:
+            if decision.metadata_only_save or not self._write_sessions_json:
                 self._save_entry(session_key)
             else:
                 self._save_entries()

@@ -256,9 +256,16 @@ class FileSyncManager:
         state is committed only if ALL operations succeed; on failure it rolls back so the
         next cycle retries everything."""
         with self._transaction_lock:
-            if (self._selective_download_fn is None and not self._pending_sync_back().exists()
-                    and not self._sync_back_intent().exists()):
+            recovery_pending = self._pending_sync_back().exists() or self._sync_back_intent().exists()
+            # A command with nothing to transfer must not wait behind another session's SSH
+            # upload. Recovery always wins over this shortcut: skipping an unfinished pull
+            # could expose its remote edits to a later stale upload.
+            if not recovery_pending and not self._sync_due(force):
+                return
+            if self._selective_download_fn is None and not recovery_pending:
                 self._sync_transaction(force=force)
+                return
+            if not recovery_pending and self._sync_unchanged():
                 return
             self._sync_back_deadline = _monotonic() + _sync_back_timeout()
             try:
@@ -271,12 +278,32 @@ class FileSyncManager:
             finally:
                 self._sync_back_deadline = None
 
+    def _sync_due(self, force: bool) -> bool:
+        return bool(force or os.environ.get(_FORCE_SYNC_ENV)
+                    or _monotonic() - self._last_sync_time >= self._sync_interval)
+
+    def _sync_unchanged(self) -> bool:
+        """Do local discovery/content checks before the shared transfer lock. Mutations still
+        re-plan under that lock, after recovery, so another session cannot invalidate a push."""
+        current_files = self._get_files_fn()
+        self._upload_only_host_paths.update(_credential_host_paths())
+        try:
+            to_upload, new_files, to_delete = self._plan_sync(current_files)
+        except OSError:
+            # A file may disappear between stat and hashing. Let the transaction's normal
+            # rollback/fail-closed policy own that error instead of changing command behavior.
+            return False
+        if to_upload or to_delete:
+            return False
+        if self._pending_sync_back().exists() or self._sync_back_intent().exists():
+            return False
+        self._synced_files = new_files
+        self._last_sync_time = _monotonic()
+        return True
+
     def _sync_transaction(self, *, force: bool = False, shared: bool = False) -> None:
         """Execute one sync cycle while holding the per-manager lock."""
-        if (
-            not force
-            and not os.environ.get(_FORCE_SYNC_ENV)
-            and _monotonic() - self._last_sync_time < self._sync_interval):
+        if not self._sync_due(force):
             return
 
         current_files = self._get_files_fn()
@@ -537,6 +564,10 @@ class FileSyncManager:
                 self._sync_back_once(lock_path)
                 return
             except Exception as exc:
+                if isinstance(exc, PermissionError):
+                    logger.warning("sync_back: permission denied; stopped without retry (%s); "
+                                   "remote changes retained", exc)
+                    return
                 if self._selective_download_fn is not None and isinstance(
                     exc, (SyncBackRefused, TimeoutError, subprocess.TimeoutExpired)
                 ):
@@ -843,6 +874,10 @@ class FileSyncManager:
         """Copy one extracted remote file onto the host if it changed since push. Returns 1 if
         applied, 0 if skipped (unchanged, unmapped, or an upload-only credential). A host file
         modified since push is overwritten with the remote version (last-write-wins) with a warning."""
+        # Skills are uploaded without bytecode caches. Executing them remotely creates these
+        # files, but replaying them into a read-only installed skill fails the whole batch.
+        if "__pycache__" in remote_path.split("/")[:-1]:
+            return 0
         pushed_hash = self._pushed_hashes.get(remote_path)
         if pushed_hash is not None and _sha256_file(staged_file) == pushed_hash:
             return 0  # unchanged from push

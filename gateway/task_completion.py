@@ -7,7 +7,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 import logging
+from pathlib import Path
 import re
+import threading
 from uuid import uuid4
 
 from agent.task_lifecycle.parent import ParentLedger
@@ -97,6 +99,9 @@ class CompletionScope:
         self.rendered_response = None
         self.followup = bool((getattr(ctx.event, "metadata", None) or {}).get("process_followup"))
         self._owned_registry = registry is None
+        self._lifetime_lock = threading.RLock()
+        self._closed = False
+        self._db_path = None
         request = getattr(ctx.event, '_completion_request', None)
         self.request = request if isinstance(request, AuthenticatedRequest) else None
         source = ctx.source
@@ -113,6 +118,7 @@ class CompletionScope:
             self.ctx.event._completion_decision = None
         try:
             self.registry = self.registry or Registry()
+            self._db_path = str(Path(self.registry.db_path).resolve())
             from gateway.task_completion_managed import remote_snapshot_reader
             self.ledger = ParentLedger(self.registry, remote_snapshot=remote_snapshot_reader(self.registry))
             self.parent = self.ledger.current(**self.identity)
@@ -138,6 +144,10 @@ class CompletionScope:
         return self
 
     def record(self, name):
+        with self._lifetime_connection():
+            self._record(name)
+
+    def _record(self, name):
         self.executed = True
         self.direct_write |= name in {'write_file', 'patch', 'apply_patch', 'edit_file', 'file_write', 'file_edit'}
         self.defer()
@@ -162,6 +172,16 @@ class CompletionScope:
             source_request=asdict(self.request) if self.request else None)
 
     def decision(self):
+        try:
+            with self._lifetime_connection():
+                return self._decision()
+        except Exception as exc:
+            logger.warning('Task completion ledger unavailable', exc_info=True)
+            self.error = str(exc)
+            self.defer()
+            return self._evidence_decision()
+
+    def _decision(self):
         from gateway.task_completion_modes import effective_mode, publication_decision
         if self.error:
             return self._evidence_decision()
@@ -235,8 +255,37 @@ class CompletionScope:
         return self.rendered_response
 
     def close(self):
-        if self._owned_registry and self.registry is not None:
-            self.registry.close()
+        with self._lifetime_lock:
+            if not self._closed:
+                self._closed = True
+                if self._owned_registry and self.registry is not None:
+                    self.registry.close()
+
+    @contextmanager
+    def _lifetime_connection(self):
+        """Copied child contexts outlive turns; reopen only the captured owning DB.
+
+        Serialize audit/close so a finishing parent cannot close a connection
+        inside a child's write. Late operations use short-lived connections,
+        keeping audit mandatory without leaking the parent's connection or
+        selecting a different profile from the child's ambient context.
+        """
+        with self._lifetime_lock:
+            if not self._closed or self.error:
+                yield
+                return
+            if self._db_path is None or not Path(self._db_path).is_file():
+                raise RuntimeError('Original task completion ledger is unavailable')
+            registry = Registry(self._db_path)
+            previous = self.registry, self.ledger
+            try:
+                from gateway.task_completion_managed import remote_snapshot_reader
+                self.registry = registry
+                self.ledger = ParentLedger(registry, remote_snapshot=remote_snapshot_reader(registry))
+                yield
+            finally:
+                self.registry, self.ledger = previous
+                registry.close()
 
 
 @contextmanager
