@@ -14,7 +14,7 @@ def safe_label(value):
 
 
 def fingerprint(observation):
-    if not observation['available']:
+    if not observation['available'] or observation.get('focused'):
         return None
     # Index/HEAD changes alone are not code changes. Deleted files contribute None.
     return hashlib.sha256(json.dumps({p: f['content'] for p, f in observation['files'].items()},

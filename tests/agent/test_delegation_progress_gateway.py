@@ -235,6 +235,53 @@ def test_observer_cli_exposes_allowlisted_binding_cause(tmp_path, capsys):
     assert result == {'status':'observation_unavailable', 'error':'gateway_thread_binding'}
 
 
+def test_cli_roundtrip_reports_only_uncertainty_transitions(tmp_path):
+    manifest, path, progress = owned_progress_case(tmp_path)
+    progress.ack(progress.peek()['id'])
+    link = manifest.worktree/'unsafe.py'
+    link.symlink_to('module.py')
+
+    def command(number):
+        item = {'id': str(number), 'type': 'command_execution', 'command': 'echo activity',
+                'status': 'completed', 'aggregated_output': '', 'exit_code': 0}
+        with manifest.event_path.open('a') as stream:
+            stream.write(json.dumps({'type': 'item.completed', 'item': item}) + '\n')
+
+    def read_cli():
+        result = subprocess.run([sys.executable, str(ROOT/'scripts/run_codex_task.py'), 'progress',
+            '--manifest', str(path), '--state-dir', str(progress.root), '--thread', '123'],
+            check=True, capture_output=True, text=True)
+        return json.loads(result.stdout)['message']
+
+    command(1)
+    progress.tick(now=602)
+    first = read_cli()
+    assert '심볼릭 링크 또는 특수 파일' in first['content']
+    progress.ack(first['id'])
+    command(2)
+    progress.tick(now=903)
+    second = read_cli()
+    assert '일부 관측 미수집' not in second['content']
+    assert '• 테스트:' not in second['content']
+    progress.ack(second['id'])
+    manifest.event_path.write_text('invalid json\n')
+    progress.tick(now=1204)
+    third = read_cli()
+    assert '실행 이벤트 누락 또는 읽기 실패' in third['content']
+    progress.ack(third['id'])
+    link.unlink()
+    command(3)
+    progress.tick(now=1505)
+    recovered = read_cli()
+    assert '현재 관측 오류가 해소' in recovered['content']
+    progress.ack(recovered['id'])
+    manifest.receipt_path.write_text(json.dumps({'status': 'cli_completed', 'exit_code': 0}))
+    progress.tick(now=1506)
+    terminal = read_cli()
+    assert terminal['event'] == 'cli_completed'
+    assert '결과 검증 대기' in terminal['content'] and '• 테스트:' in terminal['content']
+
+
 def test_late_worker_start_does_not_reorder_admitted_head(tmp_path):
     manifest, path, progress = owned_progress_case(tmp_path)
     first = progress.peek()['id']
@@ -281,3 +328,31 @@ def test_gateway_owner_cannot_be_downgraded_to_enable_manual_sender(tmp_path):
     manifest,_,progress=owned_progress_case(tmp_path)
     with pytest.raises(ValueError,match='state_identity_or_schema_mismatch'):
         Progress(replace(manifest,delivery_owner='manual'),progress.root).tick(now=302)
+
+
+def test_cli_roundtrip_late_start_and_legacy_warning(tmp_path):
+    manifest, path, progress = owned_progress_case(tmp_path)
+    progress.ack(progress.peek()['id'])
+    (manifest.worktree / 'unsafe.py').symlink_to('module.py')
+    progress.tick(now=602)
+    first = progress.peek()
+    assert '심볼릭 링크 또는 특수 파일' in first['content']
+    progress.ack(first['id'])
+    state = progress._load()
+    state.pop('reported_current_errors', None)
+    from agent.delegation_progress import _atomic
+    _atomic(progress.path, state)
+    item = {'id': 'late', 'type': 'command_execution', 'command': 'pnpm exec jest',
+            'status': 'completed', 'aggregated_output': 'Test Suites: 1 passed, 2 total\nTests: 1 passed, 1 total', 'exit_code': 0}
+    with manifest.event_path.open('a') as stream:
+        stream.write(json.dumps({'type': 'item.completed', 'item': item}) + '\n')
+        item['status'] = 'in_progress'
+        stream.write(json.dumps({'type': 'item.started', 'item': item}) + '\n')
+    progress.tick(now=903)
+    result = subprocess.run([sys.executable, str(ROOT/'scripts/run_codex_task.py'), 'progress',
+        '--manifest', str(path), '--state-dir', str(progress.root), '--thread', '123'],
+        check=True, capture_output=True, text=True)
+    message = json.loads(result.stdout)['message']
+    assert '심볼릭 링크 또는 특수 파일' not in message['content']
+    assert progress._load()['tests']['status'] == 'unknown'
+    assert message['id'] == progress.peek()['id']

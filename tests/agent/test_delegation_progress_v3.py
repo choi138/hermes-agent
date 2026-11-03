@@ -89,7 +89,7 @@ def test_light_poll_reuses_only_unchanged_working_observation(tmp_path, monkeypa
     p.light_poll = True
     calls = []
     original = module.collect
-    def counted(manifest):
+    def counted(manifest, **kwargs):
         calls.append(True)
         return original(manifest)
     monkeypatch.setattr(module, 'collect', counted)

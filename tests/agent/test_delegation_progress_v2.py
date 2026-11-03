@@ -71,7 +71,7 @@ def test_partial_inventory_is_not_monitor_loss_and_loss_rearms(tmp_path, monkeyp
     import agent.delegation_progress as module
     p = lane(tmp_path)
     original = module.collect
-    def partial(manifest):
+    def partial(manifest, **kwargs):
         value = original(manifest)
         value.update(available=False, errors=errors)
         return value
@@ -179,7 +179,7 @@ def test_worker_pass_bound_to_start_and_partial_files_keep_known_result(tmp_path
     event('item.completed')
     assert p.tick(now=2)['snapshot']['tests']['applicable']
     original = module.collect
-    def partial(manifest):
+    def partial(manifest, **kwargs):
         value = original(manifest)
         value.update(available=False, errors=['files_truncated'])
         return value
@@ -229,6 +229,9 @@ def test_explicit_scope_fingerprints_only_approved_code_and_new_absent_file(tmp_
     p = lane(tmp_path)
     p.manifest = replace(p.manifest, code_scope=['a.py', 'new.py'])
     p.tick(now=0)
+    with pytest.raises(ValueError, match='complete_code_inventory_required'):
+        begin(p)
+    (p.manifest.worktree / 'new.py').write_text('initial scope\n')
     receipt = validation(p)
     (p.manifest.worktree / 'outside.py').write_text('outside scope\n')
     assert p.snapshot()['validation']['applicable']
@@ -262,7 +265,7 @@ def test_partial_inventory_does_not_suppress_or_merge_wait_episode(tmp_path, mon
     import agent.delegation_progress as module
     p = lane(tmp_path)
     original = module.collect
-    def partial(manifest):
+    def partial(manifest, **kwargs):
         value = original(manifest)
         value.update(available=False, errors=['files_truncated'])
         return value

@@ -384,7 +384,7 @@ def test_partial_inventory_has_a_baseline_and_recovers_without_invention(lane, m
     git(repo, "add", "z.py")
     git(repo, "commit", "-qm", "second baseline file")
     original = module.collect
-    monkeypatch.setattr(module, "collect", lambda manifest: original(manifest, max_files=1))
+    monkeypatch.setattr(module, "collect", lambda manifest, **kwargs: original(manifest, max_files=1))
     p = Progress(Manifest.from_dict(data), state)
     assert p.tick(now=0)["snapshot"]["baseline"]
     unchanged = p.tick(now=300)
@@ -561,3 +561,60 @@ def test_bounded_inventory_prioritizes_current_changes(lane):
     result = collect(Manifest.from_dict(data), max_files=1)
     assert set(result["files"]) == {"z_changed.py"}
     assert "files_truncated" in result["errors"]
+
+
+def test_jest_event_reports_historical_result(lane):
+    _, artifacts, data, state = lane
+    p = Progress(Manifest.from_dict(data), state)
+    p.tick(now=0)
+    event(artifacts, 'item.started', 'pnpm exec jest tests/example.test.js', item_id='jest')
+    event(artifacts, 'item.completed', 'pnpm exec jest tests/example.test.js', item_id='jest',
+          output='Test Suites: 1 passed, 1 total\nTests: 2 passed, 1 skipped, 3 total\nTime: 1.2 s')
+    result = p.tick(now=1)['snapshot']['tests']
+    assert result['status'] == 'passed'
+    assert result['passed'] == 2
+    assert result['skipped'] == 1
+
+
+def test_large_inventory_focus_retains_changed_paths(lane):
+    repo, _, data, state = lane
+    for number in range(1030):
+        (repo / f'source{number:04}.py').write_text('baseline\n')
+    (repo / 'link.py').symlink_to('runner.py')
+    git(repo, 'add', '.')
+    git(repo, 'commit', '-qm', 'large baseline')
+    (repo / 'source0001.py').write_text('changed\n')
+    p = Progress(Manifest.from_dict(data), state)
+    baseline = p.tick(now=0)['snapshot']
+    assert baseline['available'] and baseline['code_fingerprint'] is None
+    (repo / 'source0002.py').write_text('changed\n')
+    result = p.tick(now=1)['snapshot']
+    assert any(c['path'] == 'source0002.py' and 'content' in c['kinds'] and 'added' not in c['kinds']
+               for c in result['changes'])
+    git(repo, 'add', 'source0001.py')
+    git(repo, 'commit', '-qm', 'first change')
+    result = p.tick(now=2)['snapshot']
+    assert not any('deleted' in c['kinds'] for c in result['changes'])
+    git(repo, 'restore', 'source0002.py')
+    result = p.tick(now=3)['snapshot']
+    assert any(c['path'] == 'source0002.py' and 'reverted' in c['kinds'] for c in result['changes'])
+    assert result['code_fingerprint'] is None
+
+
+@pytest.mark.parametrize(('command', 'output', 'code', 'expected'), [
+    ('npx jest tests/a.js', 'Test Suites: 1 passed, 1 total\nTests: 1 passed, 1 total', 0, 'passed'),
+    ('yarn vitest run', '\x1b[32m Test Files  1 passed (1)\n Tests  1 passed | 1 skipped | 1 todo (3)\x1b[0m', 0, 'unknown'),
+    ('npm exec -- jest tests/a.js', 'Tests: 1 passed, 1 total', 1, 'failed'),
+    ('pnpm exec jest', 'Test Suites: 1 failed, 1 total\nTests: 1 failed, 1 passed, 2 total', 0, 'failed'),
+    ('jest', 'Tests: 1 passed, 2 total', 0, 'unknown'),
+    ('jest', 'Tests: 1 passed, 1 total\nTests: 1 failed, 1 total', 0, 'unknown'),
+    ('jest | tail', 'Tests: 1 passed, 1 total', 0, 'unknown'),
+    ('node vitest.js', 'Tests  1 passed (1)', 0, 'unknown'),
+])
+def test_js_event_results_are_conservative(lane, command, output, code, expected):
+    _, artifacts, data, state = lane
+    p = Progress(Manifest.from_dict(data), state)
+    p.tick(now=0)
+    event(artifacts, 'item.started', command, item_id='js')
+    event(artifacts, 'item.completed', command, item_id='js', output=output, code=code)
+    assert p.tick(now=1)['snapshot']['tests']['status'] == expected

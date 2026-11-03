@@ -32,8 +32,20 @@ def render(snapshot, *, limit=1200):
     lines = ["작업 진행 상황을 전해드려요."]
     if snapshot.get("baseline"):
         lines.append("• 기준 상태를 기록했어요. 기존 수정은 이번 구간의 변경으로 세지 않았어요.")
-    if not snapshot.get("available"):
-        lines.append("• 상태 확인 불가: 이번 보고 구간에 일부 관측을 읽지 못했거나 수집 한도에 걸렸어요. 변경 없음으로 판단하지 않았어요.")
+    if snapshot.get('report_errors', not snapshot.get('available')):
+        errors = snapshot.get('report_error_reasons', snapshot.get('errors', []))
+        reasons = []
+        if any(e in errors for e in ('files_truncated', 'content_truncated', 'git_truncated')):
+            reasons.append('수집 한도 초과')
+        if 'symlink_or_special' in errors:
+            reasons.append('심볼릭 링크 또는 특수 파일')
+        if any(e.startswith('events_') for e in errors):
+            reasons.append('실행 이벤트 누락 또는 읽기 실패')
+        if any(e in errors for e in ('file_unreadable', 'file_changed_during_observation', 'git_unavailable', 'git_changed_during_observation', 'manifest_unavailable')):
+            reasons.append('파일 또는 상태 읽기 실패')
+        lines.append('• 일부 관측 미수집: ' + (', '.join(reasons) or '관측 오류') + '. 변경 없음으로 판단하지 않았어요.')
+    if snapshot.get('report_recovery'):
+        lines.append('• 현재 관측 오류가 해소됐어요. 이전에 누락된 근거는 복구되지 않았을 수 있어요.')
     changes = snapshot.get("changes", [])
     if changes:
         labels = {"source": "소스", "tests": "테스트", "docs": "문서", "build": "빌드 설정"}
@@ -66,12 +78,13 @@ def render(snapshot, *, limit=1200):
     tests = snapshot.get("tests", {"status": "unknown"})
     test_text = {"unknown": "결과 확인 전이에요.",
                  "in_progress": "시작 기록이 있어요. 완료 근거는 아직 없어요.",
-                 "failed": "마지막 pytest 실행 실패가 확인됐어요.",
-                 "passed": "마지막 개별 pytest 실행 통과가 확인됐어요. 현재 변경 전체의 재검증 여부는 미확인이에요."}
-    lines.append("• 테스트: " + test_text.get(tests["status"], test_text["unknown"]))
-    if tests.get("scope") == "canonical_command" and tests["status"] == "passed":
+                 "failed": "마지막 테스트 실행 실패가 확인됐어요.",
+                 "passed": "마지막 테스트 실행 통과가 확인됐어요. 현재 변경 전체의 재검증 여부는 미확인이에요."}
+    if snapshot.get('report_tests', True):
+        lines.append("• 테스트: " + test_text.get(tests["status"], test_text["unknown"]))
+    if snapshot.get('report_tests', True) and tests.get("scope") == "canonical_command" and tests["status"] == "passed":
         lines.append(f"• 최근 표준 테스트 명령: {tests['passed']}개 통과, {tests.get('skipped', 0)}개 건너뜀. 이후 수정의 승인 근거는 아니에요.")
-    elif tests.get("skipped"):
+    elif snapshot.get('report_tests', True) and tests.get("skipped"):
         lines.append(f"• 최근 개별 테스트에서 {tests['skipped']}개를 건너뛰었어요.")
     stage, status = snapshot.get("coordinator_stage"), snapshot.get("exit_status", "running")
     if stage == "final_verified":
@@ -88,7 +101,8 @@ def render(snapshot, *, limit=1200):
             lines.append("• 사용자 확인 대기 중이에요.")
         if stage == "verifying":
             lines.append("• 결과 검증 진행 중: 조정자 상태에 명시됐어요. 결과는 아직 미확인이에요.")
-        lines.append("• 아직 미검증: 결과 검증.")
+        if snapshot.get('report_tests', True):
+            lines.append("• 아직 미검증: 결과 검증.")
     text = "\n".join(lines)
     if len(text) > limit:
         suffix = "\n• 길이 제한으로 일부 설명을 생략했어요."
@@ -128,11 +142,21 @@ class GatewayProgress(V3Progress):
             state["last_queued_at"] = now
             state["last_queued_tests"] = dict(state["tests"])
             state["last_queued_errors"] = list(state.get("observation_errors", []))
-        meaningful = bool(state["accumulated"] or state["execution_since_queue"] or state["tests"] != state.get("last_queued_tests", {"status": "unknown"}) or (state["observation_errors"] and state["observation_errors"] != state.get("last_queued_errors", [])))
+        prior_errors = state.get('reported_current_errors', state.get('last_queued_errors', []))
+        current_errors = snapshot['current_errors']
+        error_change = current_errors != prior_errors
+        meaningful = bool(state["accumulated"] or state["execution_since_queue"] or state["tests"] != state.get("last_queued_tests", {"status": "unknown"}) or error_change or set(snapshot['errors']) - set(prior_errors))
         due = terminal is None and meaningful and now - state["last_queued_at"] >= self.interval and not state["pending"]
         if immediate:
             state["pending"] = [message for message in state["pending"] if message.get("admitted")]
         if immediate or due:
+            report_errors = set(snapshot['errors']) - set(prior_errors)
+            if immediate or error_change and current_errors:
+                report_errors.update(current_errors)
+            snapshot['report_errors'] = bool(report_errors)
+            snapshot['report_error_reasons'] = sorted(report_errors)
+            snapshot['report_recovery'] = bool(prior_errors and not current_errors)
+            snapshot['report_tests'] = bool(immediate or state['tests'] != state.get('last_queued_tests', {'status': 'unknown'}))
             if len(state["pending"]) >= 32:
                 raise ValueError("outbox_full")
             state["sequence"] += 1
@@ -145,6 +169,7 @@ class GatewayProgress(V3Progress):
             state["pending"].append(message)
             state["last_queued_tests"] = dict(state["tests"])
             state["last_queued_errors"] = list(state["observation_errors"])
+            state['reported_current_errors'] = list(current_errors)
             state["accumulated"] = {}
             state["execution_since_queue"] = False
             state["observation_errors"] = []

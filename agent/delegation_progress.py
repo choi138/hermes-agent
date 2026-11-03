@@ -256,7 +256,7 @@ def file_class(path):
     return None
 
 
-def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512 * 1024):
+def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512 * 1024, focus=False, retained=()):
     """Inventory allowlisted source, including clean tracked files between polls.
 
     Index and HEAD blob IDs distinguish staging/committing from worktree edits.
@@ -309,6 +309,10 @@ def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512
                 heads[os.fsdecode(path)] = meta.decode().split()[2]
         names = sorted(set(statuses) | set(index) | set(heads), key=lambda path: (path not in statuses, path))
         allowed = list(manifest.code_scope) if manifest.code_scope else [path for path in names if file_class(path)]
+        if focus and not manifest.code_scope and len(allowed) > max_files:
+            candidates = (set(statuses) & set(allowed)) | set(retained)
+            allowed = sorted(candidates, key=lambda path: (path not in statuses, path))
+            result['focused'] = True
         result["excluded"] = len(set(names) - set(allowed))
         if len(allowed) > max_files:
             result["errors"].append("files_truncated")
@@ -324,7 +328,8 @@ def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512
                 entry["content"] = _digest(content)
             except FileNotFoundError:
                 # Missing tracked paths are deletions; absent untracked paths raced status.
-                if path not in heads and path not in index and path not in manifest.code_scope:
+                known_retained = isinstance(retained, dict) and retained.get(path, {}).get('known', False)
+                if path not in heads and path not in index and not known_retained:
                     entry["known"] = False
                     result["errors"].append("file_changed_during_observation")
             except (OSError, ValueError) as exc:
@@ -359,7 +364,7 @@ def _changes(previous, current, *, head_changed=False):
             if new is None and old["head"] and head_changed:
                 kinds.append("committed")
         elif old is None:
-            kinds.append("added")
+            kinds.append("content" if new['head'] or new['index'] and new['status'] != '??' else "added")
         elif old["content"] != new["content"]:
             kinds.append("content")
         if old and new:
@@ -402,6 +407,18 @@ def _likely_pytest(command, *, depth=0):
     if not words:
         return False
     executable = Path(words[0]).name
+    if executable in ('jest', 'vitest'):
+        return True
+    if executable in ('pnpm', 'npm', 'npx', 'yarn'):
+        args = words[1:]
+        if args[:1] in (['exec'], ['dlx']):
+            args = args[1:]
+        if args[:1] == ['--']:
+            args = args[1:]
+        return bool(args and Path(args[0]).name in ('jest', 'vitest'))
+    if executable == 'node' and len(words) > 1:
+        return bool(re.search(r'/(?:jest/bin/jest\.js|vitest/vitest\.mjs)$', words[1]) or
+                    re.fullmatch(r'(?:[A-Za-z0-9_./-]+/)?(?:jest|vitest)(?:\.js|\.mjs|\.cjs)?', words[1]))
     if executable in ("bash", "zsh", "sh"):
         if len(words) >= 3 and words[1] in ("-c", "-lc"):
             return _likely_pytest(words[2], depth=depth + 1)
@@ -478,6 +495,124 @@ def _pytest_identity(command, *, canonical_only=False):
                        "--tb=short", "--tb=long", "--tb=no") or
                not arg.startswith("-") and re.fullmatch(r"[A-Za-z0-9_./:]+", arg)
                for arg in args)
+
+
+def _js_identity(command):
+    if not isinstance(command, str) or len(command) > 4096:
+        return None
+    try:
+        words = shlex.split(command)
+        if len(words) == 3 and words[0] in ('/bin/bash', '/bin/zsh', '/bin/sh') and words[1] in ('-c', '-lc'):
+            command = words[2]
+        if re.search(r'[^A-Za-z0-9_./:@+ =-]', command):
+            return None
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if not words:
+        return None
+    executable = Path(words.pop(0)).name
+    if executable == 'node' and words:
+        script = words.pop(0)
+        if re.fullmatch(r'[A-Za-z0-9_./@+:-]*/node_modules/vitest/vitest\.mjs', script):
+            executable = 'vitest'
+        elif re.fullmatch(r'[A-Za-z0-9_./@+:-]*/node_modules/jest/bin/jest\.js', script):
+            executable = 'jest'
+        else:
+            return None
+    if executable in ('pnpm', 'npm', 'npx', 'yarn'):
+        if executable != 'npx' and words[:1] != ['exec']:
+            return None
+        if words[:1] == ['exec']:
+            words.pop(0)
+        if words[:1] == ['--']:
+            words.pop(0)
+        if not words:
+            return None
+        executable = Path(words.pop(0)).name
+    if executable not in ('jest', 'vitest'):
+        return None
+    while words:
+        arg = words.pop(0)
+        if arg in ('--config', '--root'):
+            if not words or not re.fullmatch(r'[A-Za-z0-9_./:-]+', words.pop(0)):
+                return None
+        elif arg not in ('run', '--run', '--runInBand', '--silent', '--no-color', '--ci', '--globals', '--no-cache') and not (not arg.startswith('-') and re.fullmatch(r'[A-Za-z0-9_./:-]+', arg)):
+            return None
+    return executable
+
+
+def _js_summary(output, code, framework):
+    if type(code) is not int or not isinstance(output, str):
+        return {'status': 'unknown'}
+    if code != 0:
+        return {'status': 'failed', 'exit_code': code}
+    output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+    lines = output.splitlines()
+    snapshots = [line for line in lines if re.match(r'^\s*Snapshots:', line)]
+    if len(snapshots) > 1:
+        return {'status': 'unknown'}
+    if any(re.match(r'(?:Unhandled Errors?|Errors|Test suite failed to run)\b',
+                    re.sub(r'^[\W_]+', '', line)) for line in lines):
+        return {'status': 'failed', 'exit_code': 0}
+    suite_pattern = r'^\s*Test Suites:\s*(.*?)\s*$' if framework == 'jest' else r'^\s*Test Files\s+(.*?)\s*$'
+    suites = [m.group(1) for line in lines if (m := re.fullmatch(suite_pattern, line))]
+    if len(suites) != 1:
+        return {'status': 'unknown'}
+    if re.search(r'\b[1-9]\d* failed\b', suites[0]) or re.search(r'^\s*FAIL\s|^\s*Errors\s+[1-9]\d*\s+errors?\b|^\s*Snapshots:\s*[^\n]*\b[1-9]\d* failed\b', output, re.MULTILINE):
+        return {'status': 'failed', 'exit_code': 0}
+    if snapshots:
+        snapshot = re.fullmatch(r'\s*Snapshots:\s*(.*?)\s*(\d{1,8}) total\s*', snapshots[0])
+        if not snapshot:
+            return {'status': 'unknown'}
+        snapshot_counts = {}
+        for part in snapshot[1].rstrip(', ').split(',') if snapshot[1].strip() else []:
+            count = re.fullmatch(r'(\d{1,8}) (passed|skipped|written|updated|obsolete)', part.strip())
+            if not count or count[2] in snapshot_counts:
+                return {'status': 'unknown'}
+            snapshot_counts[count[2]] = int(count[1])
+        if sum(snapshot_counts.values()) != int(snapshot[2]):
+            return {'status': 'unknown'}
+    suite_body = suites[0]
+    suite_match = (re.fullmatch(r'(.*),\s*(\d+) total', suite_body) if framework == 'jest'
+                   else re.fullmatch(r'(.*?)\s*\((\d+)\)', suite_body))
+    if not suite_match:
+        return {'status': 'unknown'}
+    suite_counts = {}
+    for part in re.split(r'\s*,\s*' if framework == 'jest' else r'\s*\|\s*', suite_match[1]):
+        count = re.fullmatch(r'(\d{1,8}) (passed|failed|skipped|todo)', part.strip())
+        if not count or count[2] in suite_counts:
+            return {'status': 'unknown'}
+        suite_counts[count[2]] = int(count[1])
+    if sum(suite_counts.values()) != int(suite_match[2]) or not suite_counts.get('passed'):
+        return {'status': 'unknown'}
+    pattern = r'^\s*Tests:\s*(.*?)\s*$' if framework == 'jest' else r'^\s*Tests\s+(.*?)\s*$'
+    matches = [m.group(1) for line in lines if (m := re.fullmatch(pattern, line))]
+    if len(matches) != 1:
+        return {'status': 'unknown'}
+    body = matches[0]
+    if framework == 'jest':
+        parts = [part.strip() for part in body.split(',')]
+        total_match = re.fullmatch(r'(\d+) total', parts.pop() if parts else '')
+    else:
+        match = re.fullmatch(r'(.*?)\s*\((\d+)\)', body)
+        if not match:
+            return {'status': 'unknown'}
+        parts = [part.strip() for part in match[1].split('|')]
+        total_match = match
+    counts = {}
+    for part in parts:
+        match = re.fullmatch(r'(\d{1,8}) (passed|failed|skipped|todo)', part)
+        if not match or match[2] in counts:
+            return {'status': 'unknown'}
+        counts[match[2]] = int(match[1])
+    total = int(total_match[1] if framework == 'jest' and total_match else total_match[2] if total_match else 0)
+    if counts.get('failed'):
+        return {'status': 'failed', 'exit_code': 0}
+    if not total_match or sum(counts.values()) != total or counts.get('passed', 0) <= 0:
+        return {'status': 'unknown'}
+    return {'status': 'passed', 'passed': counts['passed'], 'skipped': counts.get('skipped', 0),
+            'todo': counts.get('todo', 0), 'exit_code': 0}
 
 
 def _test_summary(output, code, *, canonical=False):
@@ -591,10 +726,16 @@ def _event(value, state, now):
         return
     if state.get("latest_test") != key:
         return  # Completion of an older overlapping test is historical only.
-    trusted = _pytest_identity(command) and (prior is None or prior["command"] == command_hash)
-    state["tests"] = (_test_summary(item.get("aggregated_output"), item.get("exit_code"),
-                                   canonical=_pytest_identity(command, canonical_only=True))
-                      if completed and trusted else {"status": "unknown" if completed else "in_progress"})
+    framework = _js_identity(command)
+    trusted = (framework or _pytest_identity(command)) and (prior is None or prior["command"] == command_hash)
+    if completed and trusted:
+        state['tests'] = (_js_summary(item.get('aggregated_output'), item.get('exit_code'), framework)
+                          if framework else _test_summary(item.get('aggregated_output'), item.get('exit_code'),
+                                                          canonical=_pytest_identity(command, canonical_only=True)))
+    else:
+        state['tests'] = {'status': 'unknown' if completed else 'in_progress'}
+    if framework:
+        state['tests']['framework'] = framework
     state["tests"]["observed_at"] = now
     state['tests']['run_id'] = state.get('run_id')
     state['tests']['evidence_ref'] = identity
@@ -881,7 +1022,12 @@ class Progress:
         if (signature is not None and cached and 0 <= now - cached[0] < 60
                 and signature == cached[1]):
             return deepcopy(cached[2])
-        result = collect(self.manifest)
+        previous_files = (state.get('previous') or {}).get('files', {})
+        retained_paths = state.get('focused_paths', []) or list(previous_files)[:1024]
+        retained = {path: previous_files[path] for path in retained_paths if path in previous_files}
+        result = collect(self.manifest, focus=True, retained=retained)
+        if result.get('focused'):
+            state['focused_paths'] = list(result['files'])[:1024]
         # Changes during collection cannot authorize a cache hit.
         if signature is not None and result['available'] and signature == self._stat_signature():
             self._collection_cache = (now, signature, deepcopy(result))
@@ -946,20 +1092,32 @@ class Progress:
                          head_changed=previous["head"] != observation["head"]) if previous else []
         if previous and "files_truncated" in previous["errors"]:
             delta = [c for c in delta if c["path"] in previous["files"]]
+        if previous and (previous.get('focused') or previous['errors']):
+            delta = [c for c in delta if c['path'] in previous['files'] or
+                     observation['files'][c['path']]['status'] != '  ']
         # Incomplete global inventory must never make absent paths look deleted.
-        if not observation["available"]:
+        if not observation["available"] or observation.get('focused'):
             delta = [c for c in delta if c["path"] in observation["files"] and observation["files"][c["path"]]["known"]]
         if delta:
             state["latest_changes"] = delta
         for change in delta:
             path = change["path"]
+            state["accumulated"].pop(path, None)
+            state["cumulative"].pop(path, None)
             state["accumulated"][path] = change
             state["cumulative"][path] = change["class"]
+        for key in ('accumulated', 'cumulative'):
+            while len(state[key]) > 1024:
+                del state[key][next(iter(state[key]))]
         if observation["available"] or previous is None and "git_unavailable" not in observation["errors"]:
             state["previous"] = observation
         elif previous:
             # Retain unknown/missing entries, update only independently read files.
-            previous["files"].update({p: e for p, e in observation["files"].items() if e["known"]})
+            updated = {p: e for p, e in observation["files"].items() if e["known"]}
+            previous["files"] = dict(list(updated.items()) +
+                                     [(p, e) for p, e in previous["files"].items() if p not in updated])
+            previous["files"] = dict(list(previous["files"].items())[:1024])
+            previous['focused'] = True
         state['current_fingerprint'] = fingerprint(observation)
         state['run_id'] = self.manifest.run_id
         errors = observation["errors"] + _events(self.manifest, state, now) + _receipt(self.manifest, state)
