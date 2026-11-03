@@ -1,8 +1,11 @@
 """Coordinator-owned counterexamples; disposable Git fixtures only."""
 from agent.delegation_progress import Manifest, Progress
 from agent.delegation_progress_gateway import GatewayProgress
-from tests.agent.test_delegation_progress import lane, git, event
+from tests.agent.test_delegation_progress import git, event
+
 import pytest
+
+pytest_plugins = ('tests.agent.test_delegation_progress',)
 
 
 def test_r2_full_to_focused_never_invents_existing_deletion(lane):
@@ -34,7 +37,7 @@ def test_r2_contradictory_suite_summary_cannot_pass(lane, command, output):
 
 
 def test_r2_legacy_partial_state_resumes_without_false_deletions(lane):
-    repo, artifacts, data, state = lane
+    repo, _, data, state = lane
     p = GatewayProgress(Manifest.from_dict(dict(data, delivery_owner='gateway')), state)
     p.tick(now=0)
     s = p._load()
@@ -186,7 +189,7 @@ def test_coordinator_combined_malicious_cli_legacy_loss_recovery_terminal(lane):
     events.symlink_to(saved)
     rejected = subprocess.run([sys.executable, str(runner), 'progress', '--manifest', str(manifest_path),
                                '--state-dir', str(state), '--thread', data['thread_id']],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
     assert rejected.returncode == 74
     assert json.loads(rejected.stdout)['status'] == 'observation_unavailable'
     events.unlink()

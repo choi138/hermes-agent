@@ -25,13 +25,7 @@ def safe_source_name(path):
         return "안전한 이름 표시 불가"
     return path.replace('_', r'\_')
 
-def render(snapshot, *, limit=1200):
-    """Fixed factual operations plus bounded, escaped source names; no raw text."""
-    if not 200 <= limit <= 1900:
-        raise ValueError("message_limit")
-    lines = ["작업 진행 상황을 전해드려요."]
-    if snapshot.get("baseline"):
-        lines.append("• 기준 상태를 기록했어요. 기존 수정은 이번 구간의 변경으로 세지 않았어요.")
+def _render_errors(snapshot, lines):
     if snapshot.get('report_errors', not snapshot.get('available')):
         errors = snapshot.get('report_error_reasons', snapshot.get('errors', []))
         reasons = []
@@ -44,6 +38,30 @@ def render(snapshot, *, limit=1200):
         if any(e in errors for e in ('file_unreadable', 'file_changed_during_observation', 'git_unavailable', 'git_changed_during_observation', 'manifest_unavailable')):
             reasons.append('파일 또는 상태 읽기 실패')
         lines.append('• 일부 관측 미수집: ' + (', '.join(reasons) or '관측 오류') + '. 변경 없음으로 판단하지 않았어요.')
+
+
+def _render_tests(snapshot, lines):
+    tests = snapshot.get("tests", {"status": "unknown"})
+    test_text = {"unknown": "결과 확인 전이에요.",
+                 "in_progress": "시작 기록이 있어요. 완료 근거는 아직 없어요.",
+                 "failed": "마지막 테스트 실행 실패가 확인됐어요.",
+                 "passed": "마지막 테스트 실행 통과가 확인됐어요. 현재 변경 전체의 재검증 여부는 미확인이에요."}
+    if snapshot.get('report_tests', True):
+        lines.append("• 테스트: " + test_text.get(tests["status"], test_text["unknown"]))
+    if snapshot.get('report_tests', True) and tests.get("scope") == "canonical_command" and tests["status"] == "passed":
+        lines.append(f"• 최근 표준 테스트 명령: {tests['passed']}개 통과, {tests.get('skipped', 0)}개 건너뜀. 이후 수정의 승인 근거는 아니에요.")
+    elif snapshot.get('report_tests', True) and tests.get("skipped"):
+        lines.append(f"• 최근 개별 테스트에서 {tests['skipped']}개를 건너뛰었어요.")
+
+
+def render(snapshot, *, limit=1200):
+    """Fixed factual operations plus bounded, escaped source names; no raw text."""
+    if not 200 <= limit <= 1900:
+        raise ValueError("message_limit")
+    lines = ["작업 진행 상황을 전해드려요."]
+    if snapshot.get("baseline"):
+        lines.append("• 기준 상태를 기록했어요. 기존 수정은 이번 구간의 변경으로 세지 않았어요.")
+    _render_errors(snapshot, lines)
     if snapshot.get('report_recovery'):
         lines.append('• 현재 관측 오류가 해소됐어요. 이전에 누락된 근거는 복구되지 않았을 수 있어요.')
     changes = snapshot.get("changes", [])
@@ -75,17 +93,7 @@ def render(snapshot, *, limit=1200):
         lines.append("• 실행 근거: " + evidence[phase])
     elif not changes and snapshot.get("liveness") == "alive":
         lines.append("• 프로세스는 확인됐지만, 새 구현 활동 근거가 부족해요.")
-    tests = snapshot.get("tests", {"status": "unknown"})
-    test_text = {"unknown": "결과 확인 전이에요.",
-                 "in_progress": "시작 기록이 있어요. 완료 근거는 아직 없어요.",
-                 "failed": "마지막 테스트 실행 실패가 확인됐어요.",
-                 "passed": "마지막 테스트 실행 통과가 확인됐어요. 현재 변경 전체의 재검증 여부는 미확인이에요."}
-    if snapshot.get('report_tests', True):
-        lines.append("• 테스트: " + test_text.get(tests["status"], test_text["unknown"]))
-    if snapshot.get('report_tests', True) and tests.get("scope") == "canonical_command" and tests["status"] == "passed":
-        lines.append(f"• 최근 표준 테스트 명령: {tests['passed']}개 통과, {tests.get('skipped', 0)}개 건너뜀. 이후 수정의 승인 근거는 아니에요.")
-    elif snapshot.get('report_tests', True) and tests.get("skipped"):
-        lines.append(f"• 최근 개별 테스트에서 {tests['skipped']}개를 건너뛰었어요.")
+    _render_tests(snapshot, lines)
     stage, status = snapshot.get("coordinator_stage"), snapshot.get("exit_status", "running")
     if stage == "final_verified":
         lines.append("• 최종 검증 완료. 승인된 작업 범위의 진행 보고를 마칠게요.")

@@ -256,6 +256,27 @@ def file_class(path):
     return None
 
 
+def _collect_content(manifest, path, per_file, budget, retained, heads, index, entry, result):
+    try:
+        content = _read(manifest.worktree, path, min(per_file, max(0, budget)))
+        budget -= len(content)
+        entry["content"] = _digest(content)
+    except FileNotFoundError:
+        # Missing tracked paths are deletions; absent untracked paths raced status.
+        known_retained = isinstance(retained, dict) and retained.get(path, {}).get('known', False)
+        if path not in heads and path not in index and not known_retained:
+            entry["known"] = False
+            result["errors"].append("file_changed_during_observation")
+    except (OSError, ValueError) as exc:
+        entry["known"] = False
+        reason = "content_truncated" if str(exc) == "read_truncated" else "file_unreadable"
+        if isinstance(exc, OSError) and exc.errno in (errno.ELOOP, errno.ENOTDIR) or str(exc) == "symlink_or_special":
+            reason = "symlink_or_special"
+        result["errors"].append(reason)
+        result["omitted"] += 1
+    return budget
+
+
 def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512 * 1024, focus=False, retained=()):
     """Inventory allowlisted source, including clean tracked files between polls.
 
@@ -322,23 +343,7 @@ def collect(manifest, *, max_files=1024, max_bytes=8 * 1024 * 1024, per_file=512
             entry = {"class": file_class(path), "status": statuses.get(path, "  "),
                      "index": index.get(path), "head": heads.get(path), "content": None,
                      "known": True}
-            try:
-                content = _read(manifest.worktree, path, min(per_file, max(0, budget)))
-                budget -= len(content)
-                entry["content"] = _digest(content)
-            except FileNotFoundError:
-                # Missing tracked paths are deletions; absent untracked paths raced status.
-                known_retained = isinstance(retained, dict) and retained.get(path, {}).get('known', False)
-                if path not in heads and path not in index and not known_retained:
-                    entry["known"] = False
-                    result["errors"].append("file_changed_during_observation")
-            except (OSError, ValueError) as exc:
-                entry["known"] = False
-                reason = "content_truncated" if str(exc) == "read_truncated" else "file_unreadable"
-                if isinstance(exc, OSError) and exc.errno in (errno.ELOOP, errno.ENOTDIR) or str(exc) == "symlink_or_special":
-                    reason = "symlink_or_special"
-                result["errors"].append(reason)
-                result["omitted"] += 1
+            budget = _collect_content(manifest, path, per_file, budget, retained, heads, index, entry, result)
             result["files"][path] = entry
         # Do not call a concurrent stage/commit a stable observation.
         if raw != _git(manifest, "status", "--porcelain=v1", "-z", "--untracked-files=all") or index_raw != _git(manifest, "ls-files", "--stage", "-z"):
@@ -380,6 +385,28 @@ def _changes(previous, current, *, head_changed=False):
         if kinds:
             changes.append({"path": path, "class": (new or old)["class"], "kinds": kinds})
     return changes
+
+
+def _likely_env(words, depth):
+    args = words[1:]
+    while args:
+        if args[0] in ("-u", "--unset", "-C", "--chdir"):
+            args = args[2:]
+        elif args[0] in ("-i", "--ignore-environment", "--") or re.fullmatch(
+                r"(?:[A-Za-z_][A-Za-z0-9_]*|--unset|--chdir)=.*", args[0]):
+            args = args[1:]
+        else:
+            break
+    return _likely_pytest(shlex.join(args), depth=depth + 1)
+
+
+def _likely_timeout(words, depth):
+    args = words[1:]
+    while args and args[0].startswith("-"):
+        args = args[2:] if args[0] in ("-k", "--kill-after", "-s", "--signal") else args[1:]
+    if args and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?[smhd]?", args[0]):
+        return _likely_pytest(shlex.join(args[1:]), depth=depth + 1)
+    return False
 
 
 def _likely_pytest(command, *, depth=0):
@@ -424,25 +451,11 @@ def _likely_pytest(command, *, depth=0):
             return _likely_pytest(words[2], depth=depth + 1)
         return len(words) >= 2 and words[1] in ("scripts/run_tests.sh", "./scripts/run_tests.sh")
     if executable == "env":
-        args = words[1:]
-        while args:
-            if args[0] in ("-u", "--unset", "-C", "--chdir"):
-                args = args[2:]
-            elif args[0] in ("-i", "--ignore-environment", "--") or re.fullmatch(
-                    r"(?:[A-Za-z_][A-Za-z0-9_]*|--unset|--chdir)=.*", args[0]):
-                args = args[1:]
-            else:
-                break
-        return _likely_pytest(shlex.join(args), depth=depth + 1)
+        return _likely_env(words, depth)
     if executable in ("uv", "poetry", "pipenv") and words[1:2] == ["run"]:
         return _likely_pytest(shlex.join(words[2:]), depth=depth + 1)
     if executable in ("timeout", "gtimeout"):
-        args = words[1:]
-        while args and args[0].startswith("-"):
-            args = args[2:] if args[0] in ("-k", "--kill-after", "-s", "--signal") else args[1:]
-        if args and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?[smhd]?", args[0]):
-            return _likely_pytest(shlex.join(args[1:]), depth=depth + 1)
-        return False
+        return _likely_timeout(words, depth)
     if re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", executable):
         args = words[1:]
         while args:
@@ -542,6 +555,22 @@ def _js_identity(command):
     return executable
 
 
+def _valid_js_snapshot(snapshots):
+    if snapshots:
+        snapshot = re.fullmatch(r'\s*Snapshots:\s*(.*?)\s*(\d{1,8}) total\s*', snapshots[0])
+        if not snapshot:
+            return False
+        snapshot_counts = {}
+        for part in snapshot[1].rstrip(', ').split(',') if snapshot[1].strip() else []:
+            count = re.fullmatch(r'(\d{1,8}) (passed|skipped|written|updated|obsolete)', part.strip())
+            if not count or count[2] in snapshot_counts:
+                return False
+            snapshot_counts[count[2]] = int(count[1])
+        if sum(snapshot_counts.values()) != int(snapshot[2]):
+            return False
+    return True
+
+
 def _js_summary(output, code, framework):
     if type(code) is not int or not isinstance(output, str):
         return {'status': 'unknown'}
@@ -561,18 +590,8 @@ def _js_summary(output, code, framework):
         return {'status': 'unknown'}
     if re.search(r'\b[1-9]\d* failed\b', suites[0]) or re.search(r'^\s*FAIL\s|^\s*Errors\s+[1-9]\d*\s+errors?\b|^\s*Snapshots:\s*[^\n]*\b[1-9]\d* failed\b', output, re.MULTILINE):
         return {'status': 'failed', 'exit_code': 0}
-    if snapshots:
-        snapshot = re.fullmatch(r'\s*Snapshots:\s*(.*?)\s*(\d{1,8}) total\s*', snapshots[0])
-        if not snapshot:
-            return {'status': 'unknown'}
-        snapshot_counts = {}
-        for part in snapshot[1].rstrip(', ').split(',') if snapshot[1].strip() else []:
-            count = re.fullmatch(r'(\d{1,8}) (passed|skipped|written|updated|obsolete)', part.strip())
-            if not count or count[2] in snapshot_counts:
-                return {'status': 'unknown'}
-            snapshot_counts[count[2]] = int(count[1])
-        if sum(snapshot_counts.values()) != int(snapshot[2]):
-            return {'status': 'unknown'}
+    if not _valid_js_snapshot(snapshots):
+        return {'status': 'unknown'}
     suite_body = suites[0]
     suite_match = (re.fullmatch(r'(.*),\s*(\d+) total', suite_body) if framework == 'jest'
                    else re.fullmatch(r'(.*?)\s*\((\d+)\)', suite_body))

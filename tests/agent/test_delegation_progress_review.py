@@ -9,7 +9,9 @@ import pytest
 
 from agent.delegation_progress import Manifest, _atomic
 from agent.delegation_progress_gateway import GatewayProgress
-from tests.agent.test_delegation_progress import lane, event
+from tests.agent.test_delegation_progress import event
+
+pytest_plugins = ('tests.agent.test_delegation_progress',)
 
 
 JEST_PASS = 'Test Suites: 1 passed, 1 total\nTests: 1 passed, 1 total\n'
