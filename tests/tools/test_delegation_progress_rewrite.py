@@ -94,7 +94,7 @@ async def test_prompt_preserves_factual_and_uncertainty_contract(progress):
     await deliver(progress)
     prompt = progress.llm.call_args.kwargs['messages'][0]['content']
     for requirement in ('Korean', 'only facts', 'completion, success, passing tests, or verification',
-                        '단정하지 않아요', '미확인', '확인 전', 'no emoji or headings', '5 short lines',
+                        'uncertainty semantically', 'requested style consistently', 'no emoji or headings', '5 short lines',
                         'Do not invent next steps'):
         assert requirement in prompt
 
@@ -383,3 +383,38 @@ def test_builtin_slot_has_standard_routing_and_opt_out():
     assert slot['enabled'] is True
     assert isinstance(slot['style_prompt'], str)
     assert slot['timeout'] <= 20
+
+
+@pytest.mark.asyncio
+async def test_r1_mixed_register_response_falls_back_through_delivery(progress):
+    progress.message['content'] = '• 새 파일 변경 없음.\n• 실행 시작, 완료 미확인.\n• 테스트 및 결과 검증 미확인.'
+    progress.llm.return_value = ('새로 확인된 파일 변경은 없더라. 관측 사이에 작업이 있었는지는 단정하지 않아요.\n'
+        '도구 실행 시작 기록은 있는데, 완료 여부는 아직 확인 전이야.\n'
+        '테스트 결과도 확인 전이고, 결과 검증은 아직 미검증이야.')
+    assert await deliver(progress) == progress.message['content']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('style', 'output'), [
+    ('친근한 반말로 일관되게 써.',
+     '새 파일 변경은 없고 실행은 시작됐어. 완료와 테스트, 결과 검증은 아직 확인 전이야.'),
+    ('다정한 존댓말로 일관되게 써요.',
+     '새 파일 변경은 없고 실행은 시작됐어요. 완료와 테스트, 결과 검증은 아직 확인 전이에요.'),
+])
+async def test_d_consistent_voice_is_delivered_unchanged(progress, style, output):
+    (progress.home / 'config.yaml').write_text(
+        'auxiliary:\n  delegation_progress:\n    style_prompt: ' + style + '\n', encoding='utf-8')
+    progress.message['content'] = '• 새 파일 변경 없음.\n• 실행 시작, 완료 미확인.\n• 테스트 및 결과 검증 미확인.'
+    progress.llm.return_value = output
+    assert await deliver(progress) == output
+    assert style in progress.llm.call_args.kwargs['messages'][0]['content']
+
+
+@pytest.mark.parametrize('output', [
+    '"오류가 발생했어요"라는 메시지가 있어. 확인 전이야.',
+    '`src/있어요.py` 파일을 확인했어. 테스트 3개야.',
+    '“실패했어”라는 오류가 확인됐어요. 테스트 3개는 확인 전이에요.',
+])
+def test_d_quoted_and_code_literals_do_not_affect_register(output):
+    facts = FACTS + ' "오류가 발생했어요" `src/있어요.py` “실패했어”'
+    assert rewrite.validation_error(output, facts) is None

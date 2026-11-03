@@ -11,7 +11,8 @@ _pending = set()
 SYSTEM_PROMPT = """Rewrite the supplied fact sheet as a short, conversational Korean progress message.
 State only facts present in the fact sheet. The event kind is context, not additional evidence.
 Never claim completion, success, passing tests, or verification unless the fact sheet says so.
-Preserve uncertainty statements semantically, including '단정하지 않아요', '미확인', and '확인 전'.
+Preserve each distinct uncertainty semantically without copying the fact sheet's register.
+Use the requested style consistently throughout; combine redundant caveats without losing distinct unknowns.
 Do not invent next steps. Use no emoji or headings. Use at most about 5 short lines.
 Use no @, Discord mentions, URLs, or MEDIA: directives. Keep within 1200 characters.
 Do not introduce digit sequences or file paths/names absent from the fact sheet.
@@ -58,6 +59,13 @@ def validation_error(text, facts):
     if any(token not in known and re.sub(r'[\uac00-\ud7a3]+$', '', token).rstrip('.') not in known
            for token in _path_tokens(text)):
         return 'invented_path'
+    prose = re.sub(r'''`[^`]*`|"[^"\n]*"|'[^'\n]*'|“[^”]*”|‘[^’]*’''', '', text)
+    prose = re.sub(r'[^\s]*[/][^\s]*|[^\s]*\.[A-Za-z0-9_]+[^\s]*', '', prose)
+    endings = re.findall(r'([가-힣]+)(?=[.!?。！？\n]|$)', prose)
+    polite = any(re.search(r'(?:아요|어요|예요|게요|해요|돼요|져요|지요|네요|군요|나요|까요|죠|습니다|습니까)$', ending) for ending in endings)
+    casual = any(re.search(r'(?:이야|거야|했어|됐어|있어|없어|더라|않아|해|돼)$', ending) for ending in endings)
+    if polite and casual:
+        return 'mixed_register'
     return None
 
 

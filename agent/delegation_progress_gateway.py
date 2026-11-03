@@ -37,39 +37,39 @@ def _render_errors(snapshot, lines):
             reasons.append('실행 이벤트 누락 또는 읽기 실패')
         if any(e in errors for e in ('file_unreadable', 'file_changed_during_observation', 'git_unavailable', 'git_changed_during_observation', 'manifest_unavailable')):
             reasons.append('파일 또는 상태 읽기 실패')
-        lines.append('• 일부 관측 미수집: ' + (', '.join(reasons) or '관측 오류') + '. 변경 없음으로 판단하지 않았어요.')
+        lines.append('• 일부 관측 미수집: ' + (', '.join(reasons) or '관측 오류') + '. 변경 없음으로 판단 불가.')
 
 
 def _render_tests(snapshot, lines):
     tests = snapshot.get("tests", {"status": "unknown"})
-    test_text = {"unknown": "결과 확인 전이에요.",
-                 "in_progress": "시작 기록이 있어요. 완료 근거는 아직 없어요.",
-                 "failed": "마지막 테스트 실행 실패가 확인됐어요.",
-                 "passed": "마지막 테스트 실행 통과가 확인됐어요. 현재 변경 전체의 재검증 여부는 미확인이에요."}
+    test_text = {"unknown": "결과 확인 전.",
+                 "in_progress": "시작 기록 있음. 완료 근거 없음.",
+                 "failed": "마지막 테스트 실행 실패 확인.",
+                 "passed": "마지막 테스트 실행 통과 확인. 현재 변경 전체의 재검증 여부는 미확인."}
     if snapshot.get('report_tests', True):
         lines.append("• 테스트: " + test_text.get(tests["status"], test_text["unknown"]))
     if snapshot.get('report_tests', True) and tests.get("scope") == "canonical_command" and tests["status"] == "passed":
-        lines.append(f"• 최근 표준 테스트 명령: {tests['passed']}개 통과, {tests.get('skipped', 0)}개 건너뜀. 이후 수정의 승인 근거는 아니에요.")
+        lines.append(f"• 최근 표준 테스트 명령: {tests['passed']}개 통과, {tests.get('skipped', 0)}개 건너뜀. 이후 수정의 승인 근거는 아님.")
     elif snapshot.get('report_tests', True) and tests.get("skipped"):
-        lines.append(f"• 최근 개별 테스트에서 {tests['skipped']}개를 건너뛰었어요.")
+        lines.append(f"• 최근 개별 테스트에서 {tests['skipped']}개 건너뜀.")
 
 
 def render(snapshot, *, limit=1200):
     """Fixed factual operations plus bounded, escaped source names; no raw text."""
     if not 200 <= limit <= 1900:
         raise ValueError("message_limit")
-    lines = ["작업 진행 상황을 전해드려요."]
+    lines = ["작업 진행 상황."]
     if snapshot.get("baseline"):
-        lines.append("• 기준 상태를 기록했어요. 기존 수정은 이번 구간의 변경으로 세지 않았어요.")
+        lines.append("• 기준 상태 기록. 기존 수정은 이번 구간의 변경에서 제외.")
     _render_errors(snapshot, lines)
     if snapshot.get('report_recovery'):
-        lines.append('• 현재 관측 오류가 해소됐어요. 이전에 누락된 근거는 복구되지 않았을 수 있어요.')
+        lines.append('• 현재 관측 오류가 해소됨. 이전에 누락된 근거는 복구되지 않았을 수 있음.')
     changes = snapshot.get("changes", [])
     if changes:
         labels = {"source": "소스", "tests": "테스트", "docs": "문서", "build": "빌드 설정"}
         counts = {key: sum(c["class"] == key for c in changes) for key in labels}
         summary = ", ".join(f"{labels[key]} {count}개" for key, count in counts.items() if count)
-        lines.append(f"• 새로 확인: {summary} 파일의 내용·git 상태가 달라졌어요.")
+        lines.append(f"• 새로 확인: {summary} 파일의 내용·git 상태 변화.")
         operations = {"added": "파일 추가", "content": "파일 내용 변경", "staged": "스테이징",
                       "reverted": "수정 되돌림", "deleted": "삭제", "committed": "커밋 반영", "status": "git 상태 변경"}
         for change in changes[:5]:
@@ -77,43 +77,43 @@ def render(snapshot, *, limit=1200):
                         for kind in change['kinds'] if kind in operations]
             lines.append(f"• {safe_source_name(change['path'])}: {', '.join(observed)}.")
         if len(changes) > 5:
-            lines.append(f"• 이름 목록에서 {len(changes) - 5}개 파일을 생략했어요.")
+            lines.append(f"• 이름 목록에서 {len(changes) - 5}개 파일 생략.")
         kinds = {kind for c in changes for kind in c["kinds"]}
         special = [label for kind, label in (("staged", "스테이징"), ("committed", "커밋 반영"),
                    ("reverted", "수정 되돌림"), ("deleted", "삭제")) if kind in kinds]
         if special:
             lines.append("• 확인된 상태 변화: " + ", ".join(special) + ".")
     elif snapshot.get("available") and not snapshot.get("baseline"):
-        lines.append("• 새로 확인된 파일 변경 없음. 관측 사이의 작업까지 없었다고 단정하지는 않아요.")
+        lines.append("• 새로 확인된 파일 변경 없음. 관측 사이의 작업 유무는 알 수 없음.")
     phase = snapshot.get("execution", {}).get("phase", "unknown")
-    evidence = {"execution_started": "도구 실행 시작 기록이 있어요. 완료 여부는 확인 전이에요.",
-                "execution_completed": "도구 실행 완료 기록이 있어요. 기능 완성을 뜻하지는 않아요.",
-                "file_change_completed": "파일 변경 도구 완료 기록이 있어요. 실제 변경 범위는 git 관측 기준이에요."}
+    evidence = {"execution_started": "도구 실행 시작 기록 있음. 완료 여부 확인 전.",
+                "execution_completed": "도구 실행 완료 기록 있음. 기능 완성을 뜻하지 않음.",
+                "file_change_completed": "파일 변경 도구 완료 기록 있음. 실제 변경 범위는 git 관측 기준."}
     if snapshot.get("execution_since_queue") and phase in evidence:
         lines.append("• 실행 근거: " + evidence[phase])
     elif not changes and snapshot.get("liveness") == "alive":
-        lines.append("• 프로세스는 확인됐지만, 새 구현 활동 근거가 부족해요.")
+        lines.append("• 프로세스 확인. 새 구현 활동 근거는 부족.")
     _render_tests(snapshot, lines)
     stage, status = snapshot.get("coordinator_stage"), snapshot.get("exit_status", "running")
     if stage == "final_verified":
-        lines.append("• 최종 검증 완료. 승인된 작업 범위의 진행 보고를 마칠게요.")
-        lines.append("• 운영 활성화 여부는 이 보고로 확인하지 않아요.")
+        lines.append("• 최종 검증 완료. 승인된 작업 범위의 진행 보고 종료.")
+        lines.append("• 운영 활성화 여부는 이 보고로 확인 불가.")
     elif stage == "stopped":
-        lines.append("• 명시적 중단 요청으로 진행 보고를 마칠게요. 작업 완료 판정은 아니에요.")
+        lines.append("• 명시적 중단 요청으로 진행 보고 종료. 작업 완료 판정은 아님.")
     else:
         if status == "cli_completed":
-            lines.append("• 위임 실행은 종료됐어요." if stage == "verifying" else "• 위임 실행 종료, 결과 검증 대기.")
+            lines.append("• 위임 실행 종료." if stage == "verifying" else "• 위임 실행 종료, 결과 검증 대기.")
         elif status in TERMINAL:
-            lines.append("• 작업자 정리에 실패했어요. 프로세스가 남아 있을 수 있어 확인이 필요해요." if status == "cleanup_failed" else "• 위임 실행 실패·중단이 확인됐어요. 후속 판단을 기다려요.")
+            lines.append("• 작업자 정리 실패. 프로세스가 남아 있을 수 있어 확인 필요." if status == "cleanup_failed" else "• 위임 실행 실패·중단 확인. 후속 판단 대기.")
         elif status == "needs_user":
-            lines.append("• 사용자 확인 대기 중이에요.")
+            lines.append("• 사용자 확인 대기 중.")
         if stage == "verifying":
-            lines.append("• 결과 검증 진행 중: 조정자 상태에 명시됐어요. 결과는 아직 미확인이에요.")
-        if snapshot.get('report_tests', True):
+            lines.append("• 결과 검증 진행 중: 조정자 상태에 명시. 결과는 아직 미확인.")
+        if snapshot.get('report_tests', True) and status != 'cli_completed' and stage != 'verifying':
             lines.append("• 아직 미검증: 결과 검증.")
     text = "\n".join(lines)
     if len(text) > limit:
-        suffix = "\n• 길이 제한으로 일부 설명을 생략했어요."
+        suffix = "\n• 길이 제한으로 일부 설명 생략."
         text = text[:limit - len(suffix)].rstrip('\\') + suffix
     return text
 
@@ -251,7 +251,7 @@ def observe(manifest_path, state_dir, thread, *, ack=None, admit=None, stop=Fals
                         'id': f"{manifest.run_id}:{state['sequence']}",
                         'run_id': manifest.run_id, 'sequence': state['sequence'],
                         'thread_id': thread, 'event': 'started',
-                        'content': f"🔀 {started['cli'].capitalize()} 작업자 실행을 확인했어요. 진행 상황과 결과를 관찰하고 있어요.",
+                        'content': f"🔀 {started['cli'].capitalize()} 작업자 실행 확인. 진행 상황과 결과 관찰 중.",
                         'observed_at': progress.clock(),
                         'allowed_mentions': {'parse': [], 'replied_user': False},
                         **manifest.sender_identity()})

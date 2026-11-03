@@ -356,3 +356,50 @@ def test_cli_roundtrip_late_start_and_legacy_warning(tmp_path):
     assert '심볼릭 링크 또는 특수 파일' not in message['content']
     assert progress._load()['tests']['status'] == 'unknown'
     assert message['id'] == progress.peek()['id']
+
+
+def test_r1_cli_completion_does_not_repeat_final_verification_uncertainty():
+    from agent.delegation_progress_gateway import render
+    text = render({'available': True, 'changes': [], 'exit_status': 'cli_completed',
+                   'tests': {'status': 'unknown'}})
+    assert text.count('결과 검증') == 1
+    assert '테스트' in text and '확인 전' in text
+
+
+def test_d_fact_sheet_preserves_distinct_uncertainties():
+    from agent.delegation_progress_gateway import render
+    snapshot = {'available': True, 'changes': [], 'exit_status': 'running',
+                'execution_since_queue': True, 'execution': {'phase': 'execution_started'},
+                'tests': {'status': 'unknown'}}
+    text = render(snapshot)
+    assert any(phrase in text for phrase in (
+        '관측 사이의 작업 유무는 알 수 없음',
+        '관측 사이의 작업까지 없었다고 단정하지는 않아요',
+    ))
+    assert '실행 시작 기록' in text and '완료 여부' in text and '확인 전' in text
+    assert '테스트: 결과 확인 전' in text and '아직 미검증: 결과 검증' in text
+    assert '진행 중: 조정자' not in text
+
+
+def test_d_fact_sheet_preserves_test_and_coordinator_stages():
+    from agent.delegation_progress_gateway import render
+    snapshot = {'available': False, 'errors': ['file_unreadable'], 'changes': [],
+                'exit_status': 'cli_completed', 'coordinator_stage': 'verifying',
+                'tests': {'status': 'passed'}}
+    text = render(snapshot)
+    assert '일부 관측 미수집' in text and any(phrase in text for phrase in (
+        '변경 없음으로 판단 불가', '변경 없음으로 판단하지 않았어요',
+    ))
+    assert '테스트 실행 통과' in text and '현재 변경 전체의 재검증 여부는 미확인' in text
+    assert '결과 검증 진행 중' in text and '결과는 아직 미확인' in text
+    for status, expected in [('in_progress', '완료 근거'), ('failed', '실행 실패')]:
+        snapshot['tests'] = {'status': status}
+        assert expected in render(snapshot)
+
+
+def test_r1_verifying_does_not_repeat_final_verification_uncertainty():
+    from agent.delegation_progress_gateway import render
+    text = render({'available': True, 'changes': [], 'exit_status': 'cli_completed',
+                   'coordinator_stage': 'verifying', 'tests': {'status': 'unknown'}})
+    assert text.count('결과 검증') == 1
+    assert '결과는 아직 미확인' in text
