@@ -49,6 +49,7 @@ async def test_local_recovery_allows_heartbeats_between_receipts(
     monkeypatch.setattr(session_local_recovery, "list_session_admissions",
                         lambda *args, **kwargs: [{"status": receipt_status}])
     monkeypatch.setattr("gateway.session_viewer_close.rearm_persisted_closes", lambda _: [])
+    monkeypatch.setattr("gateway.session_viewer_close.arm_startup_orphan_closes", lambda *_: None)
     authority.db = object()
 
     async def heartbeat():

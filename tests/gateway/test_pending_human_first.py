@@ -187,5 +187,6 @@ async def test_depth_cap_requeue_keeps_the_queued_successor():
     await runner._run_agent_queued_followup(ctx, adapter, "first", deferred,
                                             {"final_response": "ok"}, {"final_response": "ok"}, None)
 
+    # The staged successor moves to the runner FIFO's head (upstream _requeue_event_at_front).
     assert pop_pending_message_event(adapter._pending_messages, KEY) is deferred
-    assert pop_pending_message_event(adapter._pending_messages, KEY) is successor
+    assert runner._overflow_queue(KEY) == [successor]

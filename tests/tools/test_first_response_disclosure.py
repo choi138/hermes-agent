@@ -167,14 +167,16 @@ def test_real_bridge_scoped_control_and_argument_rejection(production_assembly):
             "tool_describe", {"names": [name]}, enabled_toolsets=enabled, disabled_toolsets=disabled))
         assert name in described["not_found"]
         assert calls == [{"value": "fixture"}]
-    browser_args = {"direction": "down"}
+    # browser_scroll went with upstream's built-in browser_* tools (68500d9ff9); browser_dialog is
+    # a remaining deferred browser tool whose real schema carries an enum argument.
+    browser_args = {"action": "accept"}
     result = json.loads(model.handle_function_call(
-        "tool_call", {"calls": [{"name": "browser_scroll", "arguments": browser_args}]},
-        enabled_toolsets=["browser"]))
+        "tool_call", {"calls": [{"name": "browser_dialog", "arguments": browser_args}]},
+        enabled_toolsets=["browser-cdp"]))
     assert result["success"] is True
     assert calls[-1] == browser_args
     missing = json.loads(model.handle_function_call(
-        "tool_call", {"calls": [{"name": "browser_scroll", "arguments": {"direction": "sideways"}}]},
-        enabled_toolsets=["browser"]))
+        "tool_call", {"calls": [{"name": "browser_dialog", "arguments": {"action": "sideways"}}]},
+        enabled_toolsets=["browser-cdp"]))
     assert "error" in missing
     assert len(calls) == 2

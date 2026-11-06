@@ -180,10 +180,10 @@ async def test_follow_up_admits_on_a_renamed_auto_thread(tmp_path, monkeypatch):
             source, chat_name='first question', auto_thread_created=True, auto_thread_initial_name='first question')
         evt = _evt(route, parent, 'process_followup', platform='discord', chat_id='42', chat_type='dm')
         assert await runner._inject_watch_notification('[verify]', evt, raise_not_accepted=True) is True
+        # Upstream #143547 admits on the resolved route, so a drifted speaker label admits too.
         runner.session_store._entries[route].origin = replace_source(source, user_name='someone else')
         evt = _evt(route, parent, 'process_continuation', platform='discord', chat_id='42', chat_type='dm')
-        with pytest.raises(Exception, match='admission_conflict'):
-            await runner._inject_watch_notification('[verify]', evt, raise_not_accepted=True)
+        assert await runner._inject_watch_notification('[verify]', evt, raise_not_accepted=True) is True
     finally:
         authority.db.close()
 

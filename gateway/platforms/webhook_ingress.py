@@ -134,7 +134,7 @@ async def admit_producer(adapter, event):
         webhook = adapter.platform == Platform.WEBHOOK
         hooks = [name for name in ('pre_gateway_dispatch', POST_ADMISSION_HOOK) if has_hook(name)]
         if not (webhook or hooks):
-            return await authority.admit_native(event)
+            return await _admit_native(authority, event)
         from gateway.session_authority import native_write_started
         payload, principal = await _prepared(authority, event)
         writing = native_write_started.set(False)
@@ -183,7 +183,14 @@ async def _admit_once(authority, event, webhook, hooks, committed):
                 return None
     from gateway.task_completion import restore_request
     restore_request(admitted, committed[0]['native_text_v1'].get('completion_request_v1'))
-    return await authority.admit_native(admitted)
+    return await _admit_native(authority, admitted)
+
+
+async def _admit_native(authority, event):
+    # No adapter task brackets a producer's turn: the executor runs its adapter lifecycle (typing,
+    # processing hooks) once the row starts executing (``session_producer_lifecycle``).
+    event._producer_delivery = True
+    return await authority.admit_native(event)
 
 
 # Producer deliveries in flight by (profile, principal, provider id) -> [lock, holder + waiters]. This
