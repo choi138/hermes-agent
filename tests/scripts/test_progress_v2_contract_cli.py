@@ -248,7 +248,8 @@ def test_validation_cli_with_real_canonical_gate_log(tmp_path):
     # Keep the temporary checkout on the outer requested interpreter and copy
     # the real runner's shell activation dependency alongside its Python runner.
     (repo / '.venv').symlink_to(sys.prefix, target_is_directory=True)
-    for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
+    for name in ('run_tests.sh', 'run_tests_parallel.py', 'run_tests_launch.py', 'run_tests_fork_child.py',
+                 '_activation.sh'):
         shutil.copyfile(ROOT / 'scripts' / name, repo / 'scripts' / name)
     (repo / 'scripts/ci').mkdir()
     shutil.copyfile(ROOT / 'scripts/ci/list_os_marked_tests.py',

@@ -317,7 +317,7 @@ def test_streamable_http_client_does_not_follow_redirect(monkeypatch):
     monkeypatch.setattr(mcp_tool, "sdk_httpx", lambda: httpx)
 
     @asynccontextmanager
-    async def fake_sdk_transport(url, http_client):
+    async def fake_sdk_transport(url, http_client, **_sdk_options):
         response = await http_client.get(url)
         assert response.status_code == 302
         yield (None, None)

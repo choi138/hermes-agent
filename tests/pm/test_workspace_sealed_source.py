@@ -1,6 +1,8 @@
 """Generated metadata remains writable when the core is a sealed input."""
 import stat
+import sys
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -30,7 +32,7 @@ def test_generated_manifest_can_change_without_unsealing_core(tmp_path, with_mem
         members.append(member)
 
     root = tmp_path / "workspace"
-    workspace._generate_pyproject(members, root, source=core)
+    workspace._generate_pyproject(members, root, source=core, python=Path(sys.executable))
 
     generated = root / "pyproject.toml"
     metadata = tomllib.loads(generated.read_text(encoding="utf-8"))

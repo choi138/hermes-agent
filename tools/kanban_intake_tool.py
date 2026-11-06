@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 KANBAN_TASK_SCHEMA = {
     "name": "kanban_task",
     "description": (
+        "Manage a kanban card. "
         "Create needs title; status/update/retry need task_id; "
         "update allows title/body/priority."
     ),

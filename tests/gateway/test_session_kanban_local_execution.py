@@ -33,8 +33,8 @@ def _claimed_card(kanban_home, workspace_path):
         tid = kb.create_task(conn, title="t", assignee="elias",
                              workspace_kind="dir", workspace_path=workspace_path)
         task = kb.claim_task(conn, tid)
-    from gateway.session_contract import Principal
-    actor = Principal("owner", str(profile), frozenset({"session:create"}), "transport")
+    from gateway.session_contract import SessionActor
+    actor = SessionActor("owner", str(profile), frozenset({"session:create"}), "transport")
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(profile)), actor=actor,
                                  native_owner=True)
     params = {"board": kb.get_current_board(), "task_id": task.id, "run_id": task.current_run_id,

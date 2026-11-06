@@ -177,7 +177,8 @@ def install_runner(repo):
     source = Path(__file__).resolve().parents[2]
     (repo / "scripts").mkdir(exist_ok=True)
     (repo / "tests").mkdir(exist_ok=True)
-    for name in ("run_tests.sh", "run_tests_parallel.py", "_activation.sh"):
+    for name in ("run_tests.sh", "run_tests_parallel.py", "run_tests_launch.py", "run_tests_fork_child.py",
+                 "_activation.sh"):
         shutil.copyfile(source / "scripts" / name, repo / "scripts" / name)
     (repo / "scripts/ci").mkdir(exist_ok=True)
     shutil.copyfile(source / "scripts/ci/list_os_marked_tests.py",
