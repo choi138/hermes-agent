@@ -214,7 +214,7 @@ def test_recover_remote_without_sync_under_locked_home(monkeypatch, tmp_path):
     from tools.process_registry_remote import recover_remote
     from hermes_constants import get_hermes_home
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    monkeypatch.setattr(pr, '_checkpoint_path', lambda: tmp_path / 'processes.json')
     monkeypatch.setattr(SSHEnvironment, '_run_ssh', lambda self, cmd, timeout: ShellTransport()._run_ssh(cmd, timeout))
     env = SSHEnvironment('localhost', 'test', _status_only=True)
     env._sync_manager = type('NoSync', (), {'sync': lambda *a, **kw: pytest.fail('sync called')})()
@@ -346,7 +346,7 @@ def test_dispatch_intent_contains_notification_route_before_external_effect(monk
     from tools import process_registry as pr
     from gateway import session_context
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    monkeypatch.setattr(pr, '_checkpoint_path', lambda: tmp_path / 'processes.json')
     routing = {'HERMES_SESSION_PLATFORM': 'telegram', 'HERMES_SESSION_CHAT_ID': '4242',
                'HERMES_SESSION_ID': 'parent'}
     monkeypatch.setattr(session_context, 'async_delivery_supported', lambda: True)
@@ -397,7 +397,7 @@ def test_sync_failure_cannot_admit_background_execution(monkeypatch, tmp_path, f
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     checkpoint = tmp_path / 'processes.json'
-    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', checkpoint)
+    monkeypatch.setattr(pr, '_checkpoint_path', lambda: checkpoint)
     registry = pr.ProcessRegistry()
     monkeypatch.setattr(pr, 'process_registry', registry)
     monkeypatch.setattr(registry, '_track_started', lambda *a, **kw: None)
@@ -427,7 +427,7 @@ def test_checkpoint_failure_preserves_existing_execution_only(monkeypatch, tmp_p
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     checkpoint = tmp_path / 'processes.json'
-    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', checkpoint)
+    monkeypatch.setattr(pr, '_checkpoint_path', lambda: checkpoint)
     registry = pr.ProcessRegistry()
     monkeypatch.setattr(pr, 'process_registry', registry)
     monkeypatch.setattr(registry, '_track_started', lambda *a, **kw: None)

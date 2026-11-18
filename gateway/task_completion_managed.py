@@ -24,7 +24,12 @@ def managed_context(scope, message):
         scope.error = str(exc)
         scope.defer()
         managed = []
-    return message + ('\n[Hermes managed lifecycle executions: ' + json.dumps(managed) + ']' if managed else '')
+    if not managed:
+        return message
+    note = '\n[Hermes managed lifecycle executions: ' + json.dumps(managed) + ']'
+    if isinstance(message, list):  # native-image turns carry content parts, not a str
+        return [*message, {'type': 'text', 'text': note}]
+    return message + note
 
 
 def plan_path(scope):

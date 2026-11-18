@@ -90,6 +90,8 @@ async def test_native_recovery_allows_heartbeats_during_route_scan(monkeypatch):
     runner = SimpleNamespace(session_store=SimpleNamespace(list_sessions=lambda: entries),
                              _adapter_for_source=lambda _: "adapter")
     monkeypatch.setattr("gateway.session_authorities.owner_scope", lambda _: nullcontext())
+    monkeypatch.setattr("gateway.session_native_recovery_routes.recovered_native_source",
+                        lambda runner, authority, entry, owner: entry.origin)
 
     async def heartbeat():
         while True:

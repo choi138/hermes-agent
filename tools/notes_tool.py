@@ -286,10 +286,8 @@ def dispatch_notes_tool_for_agent(
     reason built-in memory writes don't fan out there (ADR-004 Phase 0)."""
     manager = None
     try:
-        from agent.memory_manager import memory_ingest_allowed
-
         candidate = getattr(agent, "_memory_manager", None)
-        if candidate is not None and memory_ingest_allowed(agent):
+        if candidate is not None and not candidate._fork_turn_hooks_suppressed():
             manager = candidate
     except Exception:
         manager = None

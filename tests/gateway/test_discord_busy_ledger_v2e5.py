@@ -32,11 +32,11 @@ def armed():
 
 class PayloadRecorder:
     ALLOWED_CALLLESS = {
-        ('gateway.run_turn', '_run_agent_deliver_first_response'): {18, 51},
-        ('gateway.run_turn', '_run_agent_mark_streamed_delivery'): {45},
-        ('gateway.run_notifications', '_deliver_queued_first_response'): {24},
+        ('gateway.run_turn', '_run_agent_deliver_first_response'): {20, 61},
+        ('gateway.run_turn', '_run_agent_mark_streamed_delivery'): {46},
+        ('gateway.run_notifications', '_deliver_queued_first_response'): {41},
         ('gateway.stream_consumer', '_mark_final_delivered'): {14},
-        ('gateway.stream_consumer_fallback', '_fallback_when_nothing_unseen'): {35, 38},
+        ('gateway.stream_consumer_fallback', '_fallback_when_nothing_unseen'): {43},
         ('gateway.platforms.base', '_record_delivery'): {8},
     }
 

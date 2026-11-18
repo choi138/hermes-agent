@@ -20,7 +20,6 @@ from typing import Any, Dict, List
 from urllib.parse import unquote, urlparse
 
 from tools import mcp_tool as _core
-from tools.mcp_tool_loop import _wrap_with_home_override, _wrap_with_dashboard_oauth_flow
 from tools.mcp_tool_schema import mcp_prefixed_tool_name, sanitize_mcp_name_component
 from tools.mcp_tool_scope import _resolve_server_key, _key_scope
 
@@ -69,18 +68,6 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
 
     coro = _own(coro_or_factory() if callable(coro_or_factory) else coro_or_factory)
 
-    # Propagate the context-local HERMES_HOME override onto the MCP loop.
-    # Tasks scheduled via run_coroutine_threadsafe are created INSIDE the
-    # loop thread, so they copy the loop thread's context — not the
-    # scheduling thread's. A per-request profile scope (the dashboard's
-    # ?profile= endpoints, e.g. the MCP "Test server" probe) would silently
-    # vanish here: OAuth token stores and any other get_hermes_home()
-    # resolution inside the coroutine would read the process home instead
-    # of the selected profile's. Re-establish the override inside the
-    # task's own context (task-local — concurrent calls carrying different
-    # scopes don't interfere). No-op when no override is active.
-    coro = _own(_wrap_with_home_override(coro))
-    coro = _own(_wrap_with_dashboard_oauth_flow(coro))
     cleanup_done = threading.Event()
 
     async def _tracked_coro():

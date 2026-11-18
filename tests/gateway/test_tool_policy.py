@@ -424,10 +424,10 @@ def test_real_discord_core_surface_stays_within_40k_without_losing_contracts(
             "search_files",
             "delegate_task",
             "kanban_task",
-            "text_to_speech",
         } <= set(raw_names)
         assert {
             "computer_use",
+            "text_to_speech",
             "cronjob_manage",
             "process_manage",
         } <= set(catalog_names)
