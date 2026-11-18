@@ -39,6 +39,21 @@ def verification_guidance(evt):
              'Do not repeat the completed command. Use verification_failed with the exact remaining check '
              'when tool restrictions prevent an already-authorized check. Use approval_wait only for missing user authorization. '
              'Do not claim verification merely because the process exited successfully.')
+    status = evt.get('continuation_status') or {}
+    armed = evt.get('continue_on_complete') is True and status.get('phase') != 'skipped'
+    if armed:
+        text += ('\n자동 이어하기: 켜짐. 이 검증 턴 뒤에 별도 이어하기 턴이 자동으로 시작돼. '
+                 '이 답변은 짧은 근거 요약까지만 쓰고 반드시 "바로 이어서 할게"로 끝내. '
+                 '사용자에게 메시지를 보내 달라고 요청하지 마. 작업이 중단됐다고 말하지 마. '
+                 '알림에 자동 이어하기 표시가 없다고 말하지 마.' if korean else
+                 '\nAuto-continue: armed. A separate continuation turn starts automatically after this verification turn. '
+                 'Reply with at most a short evidence summary ending with "I will continue immediately". '
+                 'Do not ask the user to send a message, say the work stopped, or say the notification lacks an auto-continue marker.')
+    else:
+        reason = status.get('reason') or ('프로세스가 continue_on_complete로 시작되지 않았어' if korean else
+                                        'the process was not launched with continue_on_complete')
+        text += ('\n자동 이어하기: 꺼짐. ' + reason + '. 계속하려면 사용자 메시지가 필요해.' if korean else
+                 '\nAuto-continue: off. ' + reason + '. Continuing requires a user message.')
     return text
 
 
@@ -61,8 +76,8 @@ def attention_inflight(turn_id):
 
 def _with_current_parent_status(ctx, report):
     """A saved process report certifies only its execution, never parent completion."""
-    from gateway.task_completion_delivery import execution_report
-    return execution_report(report)
+    from gateway.task_completion_reports import context_report
+    return context_report(ctx, report)
 
 
 def prepare_report(runner, ctx, result, turn_id):
@@ -142,8 +157,8 @@ async def deliver_foreground_report(runner, evt):
     event._gateway_active_turn_id = evt['followup_turn_id']
     event._gateway_response_kind = 'process_verification_report'
     event._gateway_session_key = evt['session_key']
-    from gateway.task_completion_delivery import execution_report
-    await adapter.send_final_ledgered(event, evt['session_key'], execution_report(evt['report_text']),
+    from gateway.task_completion_delivery import strip_task_markers
+    await adapter.send_final_ledgered(event, evt['session_key'], strip_task_markers(evt['report_text']),
         {'thread_id': source.thread_id, 'non_conversational': True}, reply_to=None)
     return True
 

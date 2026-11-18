@@ -104,9 +104,13 @@ def validate_obligation(obligation_id, content):
         registry.close()
 
 
+def strip_task_markers(text):
+    return re.sub(r'\n*\[Hermes task: [^\n]*\]', '', str(text or ''))
+
+
 def execution_report(text):
     """Process reports remain execution facts, including pre-upgrade recovery rows."""
-    text = re.sub(r'\n*\[Hermes task: [^\n]*\]', '', str(text or ''))
+    text = strip_task_markers(text)
     prefix = '[Hermes execution result; parent completion not established]\n\n'
     return text if text.startswith(prefix) else prefix + text
 
@@ -135,7 +139,7 @@ async def recover_content(row):
     content = row['content']
     try:
         if row['obligation_id'].startswith('process-report:'):
-            content = execution_report(content)
+            content = strip_task_markers(content)
         await asyncio.to_thread(validate_obligation, row['obligation_id'], content)
         return content
     except Exception:

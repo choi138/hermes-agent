@@ -13,6 +13,8 @@ State only facts present in the fact sheet. The event kind is context, not addit
 Never claim completion, success, passing tests, or verification unless the fact sheet says so.
 Preserve each distinct uncertainty semantically without copying the fact sheet's register.
 Use the requested style consistently throughout; combine redundant caveats without losing distinct unknowns.
+Write a neutral observation log. No first-person judgment, reassurance, or promise.
+Do not use phrases such as "단정하긴 어려워", "알려 줄게", or "보고 있어".
 Do not invent next steps. Use no emoji or headings. Use at most about 5 short lines.
 Use no @, Discord mentions, URLs, or MEDIA: directives. Keep within 1200 characters.
 Do not introduce digit sequences or file paths/names absent from the fact sheet.

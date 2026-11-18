@@ -235,8 +235,8 @@ async def test_private_verification_reaches_queued_delivery_with_its_exact_turn(
     turn = TurnRunner(runner, ctx)
     assert turn._setup_stream_consumer(platform.value) == (None, None, None, False)
     result = turn._run_conversation_with_approval(SimpleNamespace(run_conversation=run), [], None, None, None)
-    from gateway.task_completion_delivery import execution_report
-    expected_report = execution_report(prose)
+    from gateway.task_completion_delivery import strip_task_markers
+    expected_report = strip_task_markers(prose)
     assert result['final_response'] == expected_report
     assert ledger.get_state(session.id)['verification'] == {**assessment, 'repair_attempts': 0}
     assert ledger.get_state(session.id)['report_text'] == expected_report
