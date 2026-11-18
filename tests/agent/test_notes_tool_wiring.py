@@ -47,7 +47,10 @@ def test_both_agent_dispatch_paths_preserve_notes_agent_context(name):
             session_id="notes-discord-session",
         )
     agent.client = MagicMock()
-    args = {"action": "list"} if name == "notes_read" else {"content": "test fact"}
+    args = {
+        "notes_read": {"action": "list"},
+        "notes_write": {"step": "propose", "content": "test fact"},
+    }.get(name, {"content": "test fact"})
     call = SimpleNamespace(
         id="call_notes", type="function",
         function=SimpleNamespace(name=name, arguments=json.dumps(args)),
