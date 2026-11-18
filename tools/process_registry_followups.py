@@ -539,6 +539,11 @@ If an already-authorized check cannot run here, return verification_failed with 
 Use approval_wait only for genuine missing user authorization; name the action and missing approval.
 If the original goal or completion criteria cannot be recovered, return verification_failed and name the missing context; do not invent an approval requirement.
 On failed verification, report the reason and concrete remaining work. Never loop repairs or bypass approval.
+Distinguish execution completion, verified outcome, and remaining work in the report.
+Do not promise work in a next turn or use this turn's read-only status as an excuse.
+Claim automatic continuation only if the completion notification explicitly confirms it is armed;
+that confirmation does not authorize commands here. If not armed, name the concrete external or
+user action needed to continue, without implying an already-approved action needs new approval.
 First write a natural-language report in the user's language, including the outcome, evidence,
 and concrete remaining work. This is the only text shown to the user.
 End the response with a single ```process_verification JSON block containing:

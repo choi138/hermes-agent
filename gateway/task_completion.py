@@ -225,8 +225,8 @@ class CompletionScope:
         if not decision:
             return response
         if self.mode == 'support' and decision['status'] != 'unavailable':
-            from gateway.task_completion_delivery import execution_report
-            self.rendered_response = execution_report(response)
+            from gateway.task_completion_delivery import strip_task_markers
+            self.rendered_response = strip_task_markers(response)
             return self.rendered_response
         if decision['accepted']:
             self.rendered_response = ('[Hermes task: verified; parent ' + decision['parent_id']

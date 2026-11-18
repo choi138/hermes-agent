@@ -403,6 +403,9 @@ async def send_progress(runner, session, message):
         return
     sending = False
     try:
+        from tools.delegation_notifications_card import suppress_if_active, label_content, deliver_card
+        if await suppress_if_active(runner, session, message, oid):
+            return
         if created:
             from tools.delegation_progress_rewrite import rewrite_progress
             content = await rewrite_progress(content, message.get('event', ''),
@@ -413,42 +416,18 @@ async def send_progress(runner, session, message):
         # A concurrent first sender may have rewritten and released its claim since our reservation.
         with _db(read_only=True) as db:
             content = db.execute('SELECT content FROM delivery_obligations WHERE obligation_id=?', (oid,)).fetchone()[0]
+        content = label_content(session, message, content)
+        if not await asyncio.to_thread(_store_progress_content, oid, content):
+            return
         admission = await asyncio.to_thread(remote_observe, session, admit=message['id'])
         if admission.get('message', {}).get('id') != message['id']:
             await asyncio.to_thread(_release_progress_claim, oid, 'progress_head_superseded_unsent')
             return
+        if await suppress_if_active(runner, session, message, oid):
+            return
         # Keep ownership until transport resolves; caller cancellation is uncertain, never blindly replayed.
-        send = asyncio.create_task(adapter.send(source.chat_id, content,
-            metadata={'thread_id': source.thread_id, 'allowed_mentions': {'parse': [], 'replied_user': False},
-                      'non_conversational': True}))
         sending = True
-        try:
-            result = await asyncio.wait_for(asyncio.shield(send), timeout=20)
-        except (asyncio.TimeoutError, asyncio.CancelledError) as interruption:
-            async def settle():
-                try:
-                    receipt = await send
-                    if getattr(receipt, 'success', False):
-                        await asyncio.to_thread(_mark_progress_delivered, oid, message_id=getattr(receipt, 'message_id', None))
-                        await asyncio.to_thread(remote_observe, session, ack=message['id'])
-                    else:
-                        await asyncio.to_thread(_mark_progress_uncertain, oid,
-                            'progress_late_receipt_unknown:' + scrub_payload(str(getattr(receipt, 'error', '') or 'unconfirmed'))[:350])
-                except BaseException:
-                    await asyncio.to_thread(_mark_progress_uncertain, oid, 'Late progress send interrupted')
-            task = asyncio.create_task(settle())
-            _sends.add(task)
-            task.add_done_callback(_sends.discard)
-            if isinstance(interruption, asyncio.CancelledError):
-                # Cancellation must leave the durable fence up while shielded transport runs.
-                raise
-            return
-        if not getattr(result, 'success', False):
-            await asyncio.to_thread(_mark_progress_uncertain, oid,
-                'progress_receipt_unknown:' + scrub_payload(str(getattr(result, 'error', '') or 'unconfirmed'))[:350])
-            return
-        await asyncio.to_thread(_mark_progress_delivered, oid, message_id=getattr(result, "message_id", None))
-        await asyncio.to_thread(remote_observe, session, ack=message['id'])
+        await deliver_card(adapter, source, content, session, message, oid)
     except asyncio.CancelledError:
         if not sending:
             await asyncio.to_thread(_release_progress_claim, oid, 'progress_admission_cancelled_unsent')

@@ -317,6 +317,8 @@ class GatewayAgentCacheMixin:
             return False
         state = self._peek_session_state(session_key)
         if state is not None:
+            if state.turn.agent is not None:
+                state.last_turn_ended_at = time.time()
             if state.turn.lease is not None:
                 from gateway.active_lease_io import release_soon
                 release_soon(state.turn.lease)

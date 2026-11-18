@@ -124,6 +124,7 @@ class SessionState:
     turn: TurnState = field(default_factory=TurnState)
     conversation: ConversationState = field(default_factory=ConversationState)
     persistent: PersistentState = field(default_factory=PersistentState)
+    last_turn_ended_at: float = 0.0
 
 
 # --- Legacy dict-view adapters: tests read/write the old dict attributes directly
